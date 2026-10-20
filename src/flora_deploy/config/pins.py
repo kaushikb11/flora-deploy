@@ -117,4 +117,15 @@ RUNTIME = {
     "decord": "0.6.0",
     "av": "16.0.1",
     "python_image": "3.12",
+    # Added for the Modal images (WS-A). The *_reference pins mirror NVIDIA's TempSeg/Captioner
+    # batch_utils/requirements.txt exactly; Pillow/pyarrow are what uv.lock resolved.
+    "torchvision_reference": "0.26.0",
+    "huggingface_hub_reference": "1.33.0",
+    "accelerate": "1.12.0",
+    "safetensors": "0.7.0",
+    "pillow": "12.3.0",
+    "pyarrow": "26.0.0",
+    "huggingface_hub": ">=1.29,<2.0",
+    # CUDA 13.0 matches the torch 2.11.0 PyPI wheels (cu130); Modal's host driver is CUDA 13.3.
+    "cuda_base_vllm": "nvidia/cuda:13.0.2-devel-ubuntu24.04",
 }
