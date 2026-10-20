@@ -20,6 +20,8 @@ class FileEntry:
     path: str
     size: int
     lfs_sha256: str | None
+    # Git blob sha1 from the tree listing; for LFS files it hashes the pointer, not the payload.
+    blob_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +56,7 @@ def plan_snapshot(pin: RepoPin, api: TreeLister) -> SnapshotPlan:
                     path=e.path,
                     size=int(e.size or 0),
                     lfs_sha256=getattr(e.lfs, "sha256", None) if e.lfs else None,
+                    blob_id=getattr(e, "blob_id", None),
                 )
                 for e in selected
             ),

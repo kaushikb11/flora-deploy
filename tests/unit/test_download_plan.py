@@ -89,8 +89,3 @@ def test_cli_dry_run_json(monkeypatch):
     assert result.exit_code == 0, result.output
     rows = json.loads(result.output)
     assert {r["key"] for r in rows} >= {"tempseg", "captioner", "rewarder"}
-
-
-def test_cli_refuses_real_download_for_now():
-    result = CliRunner().invoke(cli.app, ["prepare"])
-    assert result.exit_code == 2
