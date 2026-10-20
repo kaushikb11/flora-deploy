@@ -16,6 +16,18 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: uv sync --dev
+      - run: uv sync --group dev
       - run: uv run ruff check .
-      - run: uv run pytest -q
+      - run: uv run pytest -q -m "not nvlink and not modal"
+
+  # Exercises NVIDIA's real code (downloaded at test time, never stored in the repo). CPU only.
+  nvlink:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --group dev --group nvlink
+      - run: uv run python scripts/fetch_nv_code.py --with-processor
+      - run: uv run pytest -q -m nvlink

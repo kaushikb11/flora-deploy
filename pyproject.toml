@@ -7,7 +7,12 @@ license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE.md"]
 requires-python = ">=3.11"
 dependencies = [
+    "av==16.0.1",
     "huggingface_hub>=1.29,<2.0",
+    "modal>=1.6.2",
+    "numpy<3",
+    "Pillow>=11,<13",
+    "pyarrow>=17",
     "rich>=13",
     "typer>=0.12",
 ]
@@ -18,7 +23,18 @@ flora = "flora_deploy.cli:app"
 [dependency-groups]
 dev = [
     "pytest>=8",
+    "pytest-asyncio>=0.24",
     "ruff>=0.6",
+]
+# CPU-only stack needed to exercise NVIDIA's code in `-m nvlink` tests; mirrors the pins in
+# NVIDIA's batch_utils/requirements.txt (no GPU, no weights).
+nvlink = [
+    "torch==2.11.0",
+    "torchvision==0.26.0",
+    "transformers==5.8.1",
+    "peft==0.18.1",
+    "safetensors==0.7.0",
+    "accelerate==1.12.0",
 ]
 
 [build-system]
@@ -37,3 +53,9 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "nvlink: needs NVIDIA's code pins fetched via scripts/fetch_nv_code.py (CPU only)",
+    "modal: runs on the Modal account (costs money; never in CI)",
+]
+addopts = "-m 'not modal'"
