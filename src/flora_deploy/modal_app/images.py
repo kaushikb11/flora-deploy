@@ -4,7 +4,8 @@ Each builder returns a lazy ``modal.Image``: nothing is built or uploaded until 
 runs. Access ``images.img_cpu`` / ``img_hfref`` / ``img_vllm`` or call the builders directly.
 
 Base choices:
-- ``img_cpu``: ``debian_slim`` with apt ffmpeg. No GPU.
+- ``img_cpu``: ``debian_slim``, no apt packages. PyAV wheels bundle FFmpeg; Modal's debian_slim apt
+  index can be stale (404s on bullseye security updates), so no apt until a step needs the CLI.
 - ``img_hfref``: ``debian_slim`` plus NVIDIA's pip stack verbatim. The torch 2.11.0 PyPI wheel
   ships its CUDA 13.0 user space as ``nvidia-*`` wheels, and Modal's host driver (CUDA 13.3)
   supports it on H200 (SM90). NVIDIA's reference runs HF transformers with SDPA and compiles
@@ -74,7 +75,6 @@ def cpu_image() -> modal.Image:
 
     return (
         modal.Image.debian_slim(python_version=PY)
-        .apt_install("ffmpeg")
         .uv_pip_install(*CPU_PACKAGES)
         .env(_HF_ENV)
         .add_local_python_source("flora_deploy")
