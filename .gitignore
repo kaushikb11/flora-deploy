@@ -1,0 +1,23 @@
+# Local research material. Some notes quote NVIDIA's noncommercially licensed prompts and
+# code verbatim, so they must never be committed to this Apache-2.0 repository.
+research_notes/
+reports/
+
+# Never commit NVIDIA code, prompts or weights (see NOTICE.md)
+**/batch_utils/
+*.safetensors
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
