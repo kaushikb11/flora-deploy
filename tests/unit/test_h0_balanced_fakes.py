@@ -52,14 +52,27 @@ def test_fake_balanced_plan(demo):
     assert {"FakeSegmentWorker", "FakeCaptionWorker"} <= set(classes)
 
 
+def cert_env_of(plan, kind: str) -> dict:
+    """The certification env of ``kind``'s own worker class in ``plan``."""
+    from flora_deploy.workers_impl import certstamp as CS
+
+    if plan is None:
+        return {}
+    env = plan.object(plan.worker_classes[kind]).env
+    return {k: env[k] for k in (CS.POOL_GPUS_ENV, CS.KIND_MODES_ENV, CS.EMBODIMENT_ENV,
+                                CS.SHARD_KINDS_ENV)}
+
+
 class _DeployedFakes(LocalRunner):
-    def __init__(self, *a, env: dict, **kw):
+    def __init__(self, *a, env: dict, app_plan=None, **kw):
         super().__init__(*a, **kw)
         self.env = env
+        self.app_plan = app_plan  # each kind's own worker-class env for its certification stamp
         self.preempted = 0
 
     def _runner(self, kind, container_id, call_id):
-        env = {**self.env, "FLORA_MEDIA_ROOT": str(self.media_root)}
+        env = {**self.env, **cert_env_of(self.app_plan, kind),
+               "FLORA_MEDIA_ROOT": str(self.media_root)}
 
         def crash(code):
             raise ContainerCrash(f"os._exit({code})")
@@ -97,7 +110,7 @@ def test_deployed_balanced_fakes_with_preempt_and_poison(demo, tmp_path, poison_
     env = dict(plan.object("FakeSegmentWorker").env)
     store_dir = tmp_path / "store"
     env.update({"FLORA_STORE_KIND": "local", "FLORA_STORE_ROOT": str(store_dir)})
-    r = _DeployedFakes(cfg, config_path=demo, store=store_dir, env=env)
+    r = _DeployedFakes(cfg, config_path=demo, store=store_dir, env=env, app_plan=plan)
     try:
         r.index()
         uids = sorted(json.loads(p.read_text())["uid"]
