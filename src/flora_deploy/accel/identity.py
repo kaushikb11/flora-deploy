@@ -50,6 +50,9 @@ class ModelCall:
 
 def _event(item: str | Mapping) -> dict | None:
     if isinstance(item, Mapping):
+        if "event" not in item and "kind" not in item:
+            # a record, not a log event: silently skipping it would compare 0 calls (review 4 M1)
+            raise ValueError(f"not a FLORA_RUNTIME / FLORA_OBSERVE event: {sorted(item)}")
         return dict(item)
     line = str(item).rstrip("\n")
     for prefix in (RUNTIME_PREFIX, OBSERVE_PREFIX):
@@ -89,13 +92,35 @@ def model_calls(events: Iterable[str | Mapping]) -> list[ModelCall]:
     return [ModelCall(**c) for c in calls]
 
 
+def _stage_call(i: int, c: Mapping) -> ModelCall:
+    """One ``stages.reference.model_calls`` entry (``input_digest``; output paired from NVIDIA's
+    result) as a :class:`ModelCall`."""
+    digest = c.get("input_digest")
+    if not isinstance(digest, str) or not digest:
+        raise ValueError(f"model_calls entry {i} has no input_digest")
+    return ModelCall(index=i, input_tensor_digest=digest, output_sha256=c.get("output_sha256"),
+                     input_tokens=c.get("input_tokens"), output_limit=c.get("output_limit"),
+                     generated_tokens=c.get("generated_tokens"), complete=c.get("complete"))
+
+
+def _is_record(c: object) -> bool:
+    return isinstance(c, Mapping) and "event" not in c and "kind" not in c
+
+
 def _calls(run: Iterable) -> list[ModelCall]:
+    """A run as calls: ``ModelCall``s, persisted ``call_records`` (``input_tensor_digest``),
+    persisted ``stages.reference.model_calls`` (``input_digest``), or an event stream. Records
+    of any other shape raise (they would otherwise parse as zero calls)."""
     run = list(run)
     if all(isinstance(c, ModelCall) for c in run):
         return run
-    if run and all(isinstance(c, Mapping) and "input_tensor_digest" in c and "index" in c
-                   and "event" not in c and "kind" not in c for c in run):
-        return [ModelCall(**c) for c in run]  # persisted ``call_records``
+    if run and all(_is_record(c) for c in run):
+        if all("input_tensor_digest" in c and "index" in c for c in run):
+            return [ModelCall(**c) for c in run]  # persisted ``call_records``
+        if all("input_digest" in c for c in run):
+            return [_stage_call(i, c) for i, c in enumerate(run)]
+        raise ValueError("unrecognised per-call records (need input_tensor_digest + index, or "
+                         "input_digest)")
     return model_calls(run)
 
 
@@ -130,10 +155,11 @@ def compare_calls(a: Iterable, b: Iterable) -> dict:
     rest_a, rest_b = ca[k:], cb[k:]
     seen_b = {c.input_tensor_digest for c in cb}
     seen_a = {c.input_tensor_digest for c in ca}
+    # ``ok`` needs at least one compared call: two empty runs prove nothing (review 4 M1)
     return dict(
         schema=IDENTITY_SCHEMA,
-        ok=not violations,
-        conclusive=not violations and not rest_a and not rest_b,
+        ok=not violations and paired > 0,
+        conclusive=not violations and paired > 0 and not rest_a and not rest_b,
         calls_a=len(ca),
         calls_b=len(cb),
         paired=paired,
@@ -141,6 +167,7 @@ def compare_calls(a: Iterable, b: Iterable) -> dict:
         unpaired_inputs_seen_in_other_run=sum(c.input_tensor_digest in seen_b for c in rest_a)
         + sum(c.input_tensor_digest in seen_a for c in rest_b),
         first_output_divergence=divergence,
+        coverage=round(paired / max(len(ca), len(cb)), 4) if (ca or cb) else 0.0,
         violations=violations,
     )
 
@@ -154,13 +181,17 @@ def compare_runs(a: Mapping[str, Iterable], b: Mapping[str, Iterable]) -> dict:
                 reason=f"episode only in run {'a' if key in a else 'b'}")])
             continue
         episodes[key] = compare_calls(a[key], b[key])
+    paired = sum(e.get("paired", 0) for e in episodes.values())
+    calls = sum(max(e.get("calls_a", 0), e.get("calls_b", 0)) for e in episodes.values())
     return dict(
         schema=IDENTITY_SCHEMA,
-        ok=all(e["ok"] for e in episodes.values()),
-        conclusive=all(e["conclusive"] for e in episodes.values()),
+        ok=bool(episodes) and all(e["ok"] for e in episodes.values()),
+        conclusive=bool(episodes) and all(e["conclusive"] for e in episodes.values()),
         episodes=episodes,
         violations=sum(len(e["violations"]) for e in episodes.values()),
-        paired=sum(e.get("paired", 0) for e in episodes.values()),
+        paired=paired,
+        calls=calls,
+        coverage=round(paired / calls, 4) if calls else 0.0,  # paired / calls (M6: report it)
     )
 
 

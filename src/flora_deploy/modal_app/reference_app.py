@@ -11,7 +11,22 @@
   - OPT-2 bit-identical BF16 Captioner (``accel.captioner_load``);
   - W3-B no-copy link-farm model cache, t=0 parallel weight prefetch, and (FP32 Captioner only)
     NVIDIA's manifest hash overlapped with the TempSeg load;
-  - W3-A episode concurrency (default 4) under one GPU lock around NVIDIA's ``generate``.
+  - W3-A episode concurrency (default 4) under one GPU lock around NVIDIA's ``generate``;
+  - Perf-1 ``accel.gpu_thread``: every NVIDIA ``generate`` runs on one persistent thread, so
+    torch's thread-local cuDNN SDPA graph cache stays warm (fidelity-neutral, default on).
+
+  Fix-X wiring: ``captioner_load.install(nv, background=True)`` before the TempSeg load (its
+  default full hash overlaps the load; ``Session.load('captioner')`` joins it), each episode's
+  ``accel`` scope entered in its own thread, ``nv.audit()`` before each batch, before each
+  episode and after it (``workers_impl.segcap.FastExactEngine``), the D-1 determinism mode
+  (``FLORA_DETERMINISM`` from the app factory, or the ``determinism`` parameter; default
+  ``nvidia`` = change nothing), and the GPU lock printing ``FLORA_OBSERVE generate_output`` after
+  every call so each episode's ``flora_reference.identity_calls`` feeds ``accel.identity``.
+
+  ``run_shard`` is the ``workers.ShardWorker`` for ``segcap`` shards
+  (``workers_impl.segcap.SegcapShardRunner`` over the job store from the container env, built
+  on the first call). ``validate_shard`` runs it on golden episodes over a container-local
+  store, then NVIDIA unmodified on a subset (P1a-5s validation, ``docs/exact-worker.md``).
 
   ``identity_proof`` runs the S1 acceptance gate in this one container: the fast composite on
   golden episodes, then NVIDIA's unmodified path (all swaps restored, a fresh NVIDIA ``Session``
@@ -53,8 +68,8 @@ GPU = "H200"
 MIN_GPU_GIB = 120  # NVIDIA sizes the Captioner as total - 12 GiB, ignoring resident TempSeg
 CPU_CORES = 8.0
 MEMORY_MIB = 96 * 1024  # TempSeg base is built on CPU in BF16 (~18 GiB) before .to("cuda")
-STARTUP_TIMEOUT_S = 8 * 60  # @modal.enter: layout + both loads (~2-3 min measured)
-TIMEOUT_S = 20 * 60  # per call; the hard runtime bound (with STARTUP_TIMEOUT_S)
+STARTUP_TIMEOUT_S = 5 * 60  # @modal.enter: layout + both loads (103 s measured in S1)
+TIMEOUT_S = 25 * 60  # per call; with STARTUP_TIMEOUT_S one container lasts <= 30 min
 SAMPLES_DIR = GOLDEN_MOUNT / "samples" / "wsd"
 RUNS_DIR = GOLDEN_MOUNT / "reference_runs"
 GOLDEN_MANIFEST = Path(GOLDEN_MOUNT) / "golden" / "v1" / "manifest.json"
@@ -164,8 +179,9 @@ def _load_kind(session, kind: str, callback=None) -> tuple[dict, list[dict]]:
 class ReferenceWorker:
     disable: str = modal.parameter(default="")  # ExactProfile toggles to switch off
     concurrency: int = modal.parameter(default=4)
-    # D-1 (docs/determinism.md): "nvidia" (default, NVIDIA's behavior) or "deterministic"
-    determinism: str = modal.parameter(default="nvidia")
+    # D-1 (docs/determinism.md): "nvidia" (NVIDIA's behavior) or "deterministic"; "" = the
+    # app factory's FLORA_DETERMINISM env, else "nvidia"
+    determinism: str = modal.parameter(default="")
 
     @modal.enter()
     def load(self) -> None:
@@ -181,7 +197,15 @@ class ReferenceWorker:
         # initialized, so the class env stays NVIDIA's default for the "nvidia" mode.
         from flora_deploy.accel import determinism
 
-        self.determinism_record = determinism.apply(self.determinism)
+        # review 4 M2: the deployed app passes the mode only through FLORA_DETERMINISM (the
+        # spawner instantiates the class without parameters); a parameter that disagrees with
+        # the env is refused rather than silently winning.
+        env_mode = os.environ.get("FLORA_DETERMINISM")
+        if self.determinism and env_mode and self.determinism != env_mode:
+            raise determinism.DeterminismError(
+                f"determinism parameter {self.determinism!r} != FLORA_DETERMINISM {env_mode!r}")
+        self.determinism_mode = self.determinism or env_mode or determinism.NVIDIA
+        self.determinism_record = determinism.apply(self.determinism_mode)
 
         from flora_deploy.stages.reference import (
             ExactProfile,
@@ -222,25 +246,7 @@ class ReferenceWorker:
         base_thread.start()
         mark("layout")
 
-        # OPT-2's install-time check is fast (headers + small files) and would accept corrupted
-        # shard bodies: re-hash every byte of the derived BF16 Captioner against its receipt in
-        # the background (overlapped with the TempSeg load); not ready until it passes.
-        from flora_deploy.accel.captioner_load import default_derived_dir, verify_derived
-
-        derived_check: dict = {}
-
-        def check_derived():
-            try:
-                derived_check["report"] = verify_derived(default_derived_dir(WEIGHTS_MOUNT),
-                                                         full=True)
-            except BaseException as e:  # noqa: BLE001 - re-raised before ready
-                derived_check["error"] = e
-
-        derived_thread = None
-        if profile.captioner_bf16:
-            derived_thread = threading.Thread(target=check_derived, daemon=True,
-                                              name="flora-bf16-hash")
-            derived_thread.start()
+        from flora_deploy.accel.captioner_load import default_derived_dir
 
         # 2. t=0 prefetch of the weights this load reads (base, then the Captioner)
         from flora_deploy.modal_app.warm import BackgroundPrefetch, snapshot_files
@@ -278,7 +284,10 @@ class ReferenceWorker:
         if profile.captioner_bf16:
             from flora_deploy.accel import captioner_load
 
-            self.bf16 = captioner_load.install(nv, self.derived_dir)
+            # Fix-X: cheap checks + toolchain now; the default full hash of every byte runs in
+            # the background, overlapped with the TempSeg load; Session.load('captioner') joins
+            # it and fails closed if it failed.
+            self.bf16 = captioner_load.install(nv, self.derived_dir, background=True)
         mark("linked")
 
         # 4. TempSeg, with NVIDIA's FP32 Captioner hash overlapped (W3-B) if it is needed
@@ -315,13 +324,12 @@ class ReferenceWorker:
             raise base_check["error"]
         receipts["tempseg_base"] = base_check["report"]
         mark("base_verified")
-        if derived_thread is not None:
-            derived_thread.join()
-            if "error" in derived_check:
-                raise derived_check["error"]
-            receipts["captioner_bf16_full"] = {
-                k: derived_check["report"].get(k) for k in ("mode", "files", "bytes", "seconds")}
-            mark("bf16_full_hash_verified")
+        if self.bf16 is not None:
+            reports = self.bf16.wait()  # already joined by the Captioner load; re-raises
+            receipts["captioner_bf16"] = [
+                {k: r.get(k) for k in ("mode", "files", "bytes", "seconds", "background")}
+                for r in reports]
+            mark("bf16_verified")
 
         # 5. runtime swaps: GPU lock, NVIDIA's entry point bound to our session, OPT-1 patches
         self._install_fast()
@@ -343,6 +351,8 @@ class ReferenceWorker:
             "prefetch": prefetch,
             "captioner_hash": hash_info or None,
             "bf16_receipt": self.bf16.verifications[0] if self.bf16 else None,
+            "captioner_bf16": self.bf16.provenance() if self.bf16 else None,  # opt-outs visible
+            "gpu_thread": self.gpu_thread.provenance() if self.gpu_thread else None,
             "loads": loads,
             "loaded_kinds": list(self.session.loaded_kinds),
             "torch": torch.__version__,
@@ -368,10 +378,23 @@ class ReferenceWorker:
                 "pipeline.human_transport": nv.pipeline.human_transport,
                 "pipeline.caption_single": nv.pipeline.caption_single,
                 "pipeline.caption_three": nv.pipeline.caption_three,
-                "pipeline.Predictor.predict": nv.pipeline.Predictor.predict}
+                "pipeline.Predictor.predict": nv.pipeline.Predictor.predict,
+                **self._accel_targets()}
+
+    def _accel_targets(self) -> dict:
+        """Every attribute an ``accel`` patch can replace (review 4 L1: incl. the vendor
+        ``robot_caption_geometry`` / ``unified_input`` targets), from the registry itself."""
+        from flora_deploy.accel.registry import registered, resolve_target
+
+        out = {}
+        for patch in registered().values():
+            for target in patch.targets:
+                owner, attr = resolve_target(self.nv, target)
+                out[target] = getattr(owner, attr)
+        return out
 
     def _install_fast(self) -> None:
-        from flora_deploy.accel import apply_patches
+        from flora_deploy.accel import apply_patches, gpu_thread
         from flora_deploy.observe import Patcher, TimedLock
         from flora_deploy.stages.reference import (
             GPU_LOCK_NAME,
@@ -379,14 +402,27 @@ class ReferenceWorker:
             install_gpu_lock,
             install_nvidia_entry,
         )
+        from flora_deploy.workers_impl.segcap import FastExactEngine
 
         self.gpu_lock = TimedLock(GPU_LOCK_NAME)
         self.patcher = Patcher()
-        install_gpu_lock(self.nv, self.gpu_lock, self.patcher)
+        # Perf-1: innermost layer (its own Patcher: one Patcher patches an attribute once), so
+        # the lock is taken in the episode thread and the call itself runs on the GPU thread.
+        self.gt_patcher = Patcher()
+        self.gpu_thread = (gpu_thread.install(self.nv, self.gt_patcher)
+                           if self.profile.gpu_thread else None)
+        install_gpu_lock(self.nv, self.gpu_lock, self.patcher, emit_output=True)
         install_nvidia_entry(self.nv, self.patcher,
                              request_lock=self.profile.concurrency <= 1)
         self.accel = apply_patches(self.nv, self.profile.accel) if self.profile.accel else None
         self.clones = ProcessorClones()
+        self.engine = FastExactEngine(
+            self.nv, self.session, gpu_lock=self.gpu_lock, clones=self.clones,
+            accel=self.accel, gpu_thread=self.gpu_thread, concurrency=self.profile.concurrency,
+            profile=self.profile.provenance(), determinism=self.determinism_record,
+            image_fingerprint=_image_fingerprint(), captioner_bf16=self.bf16,
+            progress=lambda ep, frac, desc="": print(f"[{ep}] {frac:.0%} {desc}", flush=True))
+        self.runner = None
 
     def _restore_nvidia(self) -> dict:
         """Undo every swap and release the resident models: NVIDIA's unmodified state."""
@@ -397,6 +433,7 @@ class ReferenceWorker:
         if self.accel is not None:
             self.accel.restore()
         self.patcher.restore()
+        self.gt_patcher.restore()
         if self.bf16 is not None:
             self.bf16.uninstall()
         self.session.close_all()
@@ -433,6 +470,8 @@ class ReferenceWorker:
         out["batch"]["gpu"] = _gpu_memory()
         if fast:
             out["batch"]["profile"] = self.profile.provenance()
+            if self.gpu_thread is not None:
+                out["batch"]["gpu_thread"] = self.gpu_thread.provenance()
         return out
 
     def _persist(self, out: dict, run: str) -> None:
@@ -450,6 +489,8 @@ class ReferenceWorker:
         for name, result in out["results"].items():
             ref = result["flora_reference"]
             ref["determinism"] = {k: self.determinism_record[k] for k in ("schema", "mode")}
+            ref.setdefault("gpu_thread", self.gpu_thread.provenance()
+                           if self.gpu_thread is not None and self.state == "fast" else None)
             if drift:
                 ref["determinism"]["flags_changed_since_enter"] = drift
             ref["run_id"] = run
@@ -601,23 +642,254 @@ class ReferenceWorker:
             "container_age_s": round(time.time() - self.started, 1),
         }
 
-    @modal.method()
-    def run_shard(self, job_id: str, shard_id: str, config_hash: str):
-        """``flora_deploy.workers.ShardWorker`` for the ``segcap`` kind.
+    def _shard_runner(self, store=None, settings=None):
+        from flora_deploy.workers_impl.segcap import SegcapShardRunner
 
-        TODO(P1a-5): attempt marker -> skip episodes already in earlier parts -> per episode
-        ``annotate_batch`` + ``stages.reference.stage_records`` (``segment`` and ``caption``
-        records) into a local JSONL part -> whole-file copy to the job store -> ``ShardReceipt``
-        last. Not done in S1: it needs the job store client in the container and the episode
-        input resolution from ``EpisodeRef.index_ref`` (source URIs and ranges -> local camera
-        files), which P1a-5 owns."""
-        raise NotImplementedError("run_shard is built by P1a-5 (see the docstring)")
+        if self.state != "fast":
+            raise RuntimeError(f"worker is in state {self.state!r}, not 'fast'")
+        if store is None:
+            from flora_deploy.modal_app.workers_app import store_from_env
+
+            store = store_from_env()
+        return SegcapShardRunner(store, self.engine, settings or segcap_settings_from_env(),
+                                 call_id=modal.current_function_call_id)
+
+    @modal.method()
+    def run_shard(self, job_id: str, shard_id: str, config_hash: str, token: str = ""):
+        """``flora_deploy.workers.ShardWorker`` for ``segcap`` shards
+        (``workers_impl.segcap.SegcapShardRunner``; the job store comes from the container env
+        the app factory sets: ``FLORA_STORE_KIND`` / ``FLORA_STORE_ROOT`` / ...)."""
+        if self.runner is None:
+            self.runner = self._shard_runner()
+        return self.runner.run_shard(job_id, shard_id, config_hash, token=token)
+
+    @modal.method()
+    def validate_shard(self, ids: list[str], run_id: str, *, nvidia_ids: list[str] | None = None,
+                       compare_to: str | None = None, deadline_s: float = 19 * 60,
+                       nvidia_s_per_video_s: float = 14.0) -> dict:
+        """P1a-5s GPU validation in this one container (``docs/exact-worker.md``).
+
+        1. ``run_shard`` of one ``segcap`` shard over golden episodes ``ids`` (longest first),
+           through the production runner and engine, on a container-local job store whose index
+           receipts point at the golden files: throughput and per-call generation times.
+        2. Restore every swap; NVIDIA unmodified (fresh ``Session`` per episode, sequential,
+           shortest first) on ``nvidia_ids`` while ``deadline_s`` allows.
+        3. ``accel.identity.compare_runs`` of NVIDIA unmodified against this run's fast records
+           and, with ``compare_to`` (an earlier run id), against that run's stored fast results.
+        Results go to ``flora-golden:/reference_runs/<run_id>-{fast,nvidia}/``; numbers only are
+        returned."""
+        import json
+
+        from flora_deploy.accel.identity import compare_runs as identity_compare
+        from flora_deploy.jobs import progress as P
+        from flora_deploy.jobs.attempts import JobFiles
+        from flora_deploy.jobs.manifest import save_manifest
+        from flora_deploy.jobs.store import JobPaths
+        from flora_deploy.jobs.stores import LocalStore
+        from flora_deploy.jobs.types import EpisodeRef, Manifest, Shard, episode_uid
+        from flora_deploy.stages.reference import (
+            ModeMismatch,
+            check_same_mode,
+            golden_episode_inputs,
+            golden_name,
+            identity_calls_from_model_calls,
+            identity_summary,
+            safe_name,
+        )
+
+        if self.state != "fast":
+            raise RuntimeError(f"worker is in state {self.state!r}, not 'fast'")
+        t0 = time.monotonic()
+        golden.reload()
+        manifest = json.loads(GOLDEN_MANIFEST.read_text())
+        episodes = golden_episode_inputs(manifest, ids, GOLDEN_MOUNT)
+        episodes.sort(key=lambda e: -e["duration_s"])
+
+        # 1. a one-shard job on a container-local store
+        job, cfg = safe_name(f"val-{run_id}")[:60], "cfgvalidate"
+        store = LocalStore(f"/tmp/flora-validate/{job}")
+        paths = JobPaths(job)
+        refs, names = [], {}
+        for e in episodes:
+            pool, ds, slug = e["id"].split("/", 2)
+            dataset = f"golden/{pool}/{ds}"
+            uid = episode_uid(dataset, slug)
+            names[uid] = e
+            refs.append(EpisodeRef(uid=uid, dataset=dataset, episode_id=slug, pool=e["pool"],
+                                   duration_s=e["duration_s"], oracle_eligible=True,
+                                   envelope_ok=True, index_ref=paths.index(uid)))
+            store.put_bytes(paths.index(uid), json.dumps({
+                "episode_id": slug, "dataset": dataset, "task": e["instruction"],
+                "profile": e["profile"], "yam32": e["long_windows"],
+                "streams": {role: {"source": {"uri": path, "start_s": None, "end_s": None}}
+                            for role, path in e["videos"].items()},
+                "envelope": {"ok": True, "reasons": []}}).encode())
+        shard = Shard("segcap-00000", "segcap", tuple(r.uid for r in refs),
+                      sum(r.duration_s for r in refs))
+        save_manifest(store, Manifest(job, cfg, tuple(refs), (shard,),
+                                      time.strftime("%Y-%m-%dT%H:%M:%S.000000Z", time.gmtime())))
+        from flora_deploy.modal_app.workers_app import gpu_name
+
+        runner = self._shard_runner(store, segcap_settings_from_env(
+            gpu=gpu_name(), container_id="validate", local_dir=f"/tmp/flora-validate/{job}-l"))
+        # NVIDIA's unmodified arm hashes the FP32 Captioner once (_VERIFIED_MANIFESTS reuses it):
+        # do that, and warm the page cache, while the shard runs (as identity_proof does).
+        bg: dict = {}
+
+        def warm_fp32():
+            from flora_deploy.modal_app.warm import BackgroundPrefetch, snapshot_files
+
+            t = time.monotonic()
+            src = Path(snapshot_path(PINS_BY_KEY["captioner"], WEIGHTS_MOUNT))
+            stats = BackgroundPrefetch(snapshot_files(src), threads=PREFETCH_THREADS).wait()
+            bg["prefetch"] = stats.as_json() if stats else None
+            models = self.nv.models
+            validate = self.bf16.original_validate if self.bf16 else models.validate_manifest
+            nv_snapshot = self.bf16.original_snapshot if self.bf16 else models.snapshot
+            validate(nv_snapshot("captioner"))
+            bg["hash_done_s"] = round(time.monotonic() - t, 1)
+
+        warm = threading.Thread(target=warm_fp32, daemon=True, name="flora-fp32-warm")
+        if nvidia_ids and self.bf16 is not None:
+            warm.start()
+        gt0 = self.gpu_thread.provenance() if self.gpu_thread else None
+        t_shard = time.monotonic()
+        receipt = runner.run_shard(job, shard.shard_id, cfg)
+        shard_wall = time.monotonic() - t_shard
+        audit_prefix = paths.audit(cfg, "segcap", shard.shard_id, "x", 0)[:-len("x-0.jsonl")]
+        fast: dict[str, dict] = {}
+        for p in store.list(audit_prefix):
+            for line in store.get_bytes(p).decode().splitlines():
+                if line.strip():
+                    a = json.loads(line)
+                    fast[golden_name(names[a["uid"]]["id"])] = a["result"]
+        jf = JobFiles(store, job, cfg)
+        records = sum(len(P.read_part(jf, p)) for p in receipt.parts)
+        self._persist({"results": fast}, safe_name(f"{run_id}-fast"))
+
+        per_call = {"tempseg": [], "captioner": []}
+        gen_s = 0.0
+        for r in fast.values():
+            g = r["flora_reference"]["generation"]
+            gen_s += g["segment"]["generation_s"] + g["caption"]["generation_s"]
+            for kind, key in (("tempseg", "segment"), ("captioner", "caption")):
+                if g[key]["calls"]:
+                    per_call[kind].append(g[key]["generation_s"] / g[key]["calls"])
+        video_s = sum(float(r.get("duration_s", 0.0)) for r in fast.values())
+        fast_summary = {
+            "receipt": {"done": len(receipt.episodes_done), "failed": len(receipt.episodes_failed),
+                        "parts": len(receipt.parts), "records": records,
+                        "wall_seconds": receipt.wall_seconds},
+            "shard_wall_s": round(shard_wall, 1), "video_s": round(video_s, 2),
+            "generation_s": round(gen_s, 1),
+            "gpu_s_per_video_s": round(gen_s / video_s, 3) if video_s else None,
+            "calls": sum(len(r["flora_reference"]["model_calls"]) for r in fast.values()),
+            "mean_s_per_call": {k: round(sum(v) / len(v), 2) if v else None
+                                for k, v in per_call.items()},
+            "batch": {k: v for k, v in (runner.last_batch or {}).items() if k != "calls"},
+            "gpu_thread_before": gt0,
+            "gpu_thread_after": self.gpu_thread.provenance() if self.gpu_thread else None,
+            "episodes": {name: {"duration_s": r.get("duration_s"),
+                                "total_s": r["flora_reference"]["timings_s"]["total"],
+                                "calls": len(r["flora_reference"]["model_calls"]),
+                                "outputs_logged": sum(c.get("output_sha256") is not None for c in
+                                                      r["flora_reference"]["identity_calls"]),
+                                "generation": r["flora_reference"]["generation"]}
+                         for name, r in fast.items()},
+        }
+        t_fast = time.monotonic() - t0
+
+        # 2. NVIDIA unmodified
+        restored = self._restore_nvidia()
+        if warm.is_alive():
+            warm.join()
+        nvidia = {"results": {}, "errors": {}, "walls": {}, "skipped": []}
+        nv_eps = [e for e in episodes if e["id"] in set(nvidia_ids or ())]
+        for ep in sorted(nv_eps, key=lambda e: e["duration_s"]):
+            elapsed = time.monotonic() - t0
+            if elapsed + 90 + nvidia_s_per_video_s * ep["duration_s"] > deadline_s:
+                nvidia["skipped"].append(ep["episode"])
+                continue
+            out = self._batch([ep], 1, fast=False)
+            self._persist(out, safe_name(f"{run_id}-nvidia"))
+            nvidia["results"].update(out["results"])
+            nvidia["errors"].update(out["errors"])
+            nvidia["walls"][ep["episode"]] = {"wall_s": out["batch"]["wall_s"],
+                                              "video_s": ep["duration_s"]}
+
+        # 3. identity (accel.identity, NVIDIA's logged input digests; outputs paired from results)
+        def calls(results):
+            return {n: identity_calls_from_model_calls(r["flora_reference"]["model_calls"])
+                    for n, r in results.items()}
+
+        def compare(name: str, other: dict) -> None:
+            # every NVIDIA-arm episode must be present (missing -> violation, M1 / L5)
+            try:
+                check_same_mode(nvidia["results"], other)  # M2: never across modes
+            except ModeMismatch as e:
+                identity[name] = {"ok": False, "paired": 0, "episodes": {}, "refused": str(e)}
+                return
+            identity[name] = identity_compare(calls(nvidia["results"]), calls(other))
+            identity["summary_" + name] = identity_summary(nvidia["results"], other)
+
+        identity: dict = {}
+        compare("vs_this_run", {n: r for n, r in fast.items() if n in nvidia["results"]})
+        if compare_to:
+            d = Path(RUNS_DIR / f"{compare_to}-fast")
+            compare("vs_" + compare_to, {
+                n: json.loads((d / f"{n}.json").read_text()) for n in nvidia["results"]
+                if (d / f"{n}.json").is_file()})
+        for v in identity.values():  # numbers only: drop the per-call digests of violations
+            for row in v.get("episodes", {}).values():
+                for viol in row.get("violations", []):
+                    viol.pop("a", None)
+                    viol.pop("b", None)
+        return {
+            "run_id": run_id, "ids": ids, "fast": fast_summary, "fast_wall_s": round(t_fast, 1),
+            "nvidia": {"errors": nvidia["errors"], "skipped": nvidia["skipped"],
+                       "walls": nvidia["walls"]},
+            "identity": identity, "restored": restored, "fp32_warm": bg,
+            "call_s": round(time.monotonic() - t0, 1),
+            "container_age_s": round(time.time() - self.started, 1),
+        }
 
     @modal.exit()
     def close(self) -> None:
+        runner = getattr(self, "runner", None)
+        if runner is not None:  # flush + mark_preempted (no-op when no shard is in flight)
+            runner.preempt()
         session = getattr(self, "session", None)
         if session is not None:
             session.close_all()
+
+
+def _image_fingerprint() -> str | None:
+    try:
+        from flora_deploy.modal_app.images import image_fingerprint
+
+        return image_fingerprint("img_hfref")
+    except Exception:  # noqa: BLE001 - provenance only; the config hash covers the image
+        return None
+
+
+def segcap_settings_from_env(env=None, **overrides):
+    """``SegcapWorkerSettings`` from the container env the app factory sets (``FLORA_PRESET``,
+    ``FLORA_ENVELOPE``, ``FLORA_MEDIA_ROOT``, ``FLORA_INSTRUCTION_TEXT``) and the pins."""
+    from flora_deploy.workers_impl.segcap import SegcapWorkerSettings
+
+    env = os.environ if env is None else env
+    if "gpu" not in overrides:
+        from flora_deploy.modal_app.workers_app import gpu_name
+
+        overrides["gpu"] = gpu_name()
+    keys = ("tempseg", "tempseg_code", "tempseg_base", "captioner")
+    return SegcapWorkerSettings(**{
+        "preset": env.get("FLORA_PRESET", "exact"),
+        "models": {k: PINS_BY_KEY[k].revision for k in keys},
+        "envelope": env.get("FLORA_ENVELOPE", "warn"),
+        "media_root": env.get("FLORA_MEDIA_ROOT"),
+        "instruction_text": env.get("FLORA_INSTRUCTION_TEXT"),
+        **overrides})
 
 
 # The smoke app's binding. ``ReferenceWorker`` itself stays undecorated at module scope so the

@@ -387,6 +387,48 @@ def capture_runtime_events() -> Iterator[list[dict]]:
         yield events
 
 
+IDENTITY_PREFIXES = (RUNTIME_PREFIX, "FLORA_OBSERVE ")
+
+
+@contextmanager
+def capture_identity_events() -> Iterator[tuple[list[dict], list[str]]]:
+    """Like :func:`capture_runtime_events`, and also keep the raw ``FLORA_RUNTIME`` /
+    ``FLORA_OBSERVE`` lines ``accel.identity.model_calls`` reads (``generation_start`` /
+    ``generation_end`` and the GPU lock's ``generate_output``), in order."""
+    from flora_deploy.observe.stdout import route_stdout
+
+    events: list[dict] = []
+    lines: list[str] = []
+
+    def sink(line: str) -> None:
+        if line.startswith(IDENTITY_PREFIXES):
+            lines.append(line)
+        event = parse_runtime_line(line)
+        if event is not None:
+            events.append(event)
+
+    with route_stdout(sink):
+        yield events, lines
+
+
+def identity_records(lines: list[str]) -> list[dict]:
+    """``accel.identity.call_records`` of one episode's captured lines (``[]`` if none)."""
+    from flora_deploy.accel.identity import call_records
+
+    return call_records(lines)
+
+
+def identity_calls_from_model_calls(calls: list[dict]) -> list[dict]:
+    """``model_calls`` entries (persisted results, also older ones without ``identity_calls``)
+    as ``accel.identity`` call records. The output hash is the one paired from NVIDIA's result
+    (``model_calls``), so both runs compared this way must use this same conversion."""
+    return [{"index": i, "input_tensor_digest": c.get("input_digest") or "",
+             "output_sha256": c.get("output_sha256"), "input_tokens": c.get("input_tokens"),
+             "output_limit": c.get("output_limit"),
+             "generated_tokens": c.get("generated_tokens"), "complete": c.get("complete")}
+            for i, c in enumerate(calls)]
+
+
 def generation_stats(events: list[dict]) -> dict:
     """Totals over NVIDIA's ``generation_end`` events (``models.py:183``)."""
     gens = [e for e in events if e.get("event") == "generation_end"]
@@ -512,7 +554,7 @@ def annotate_nvidia(
 
     t0 = time.time()
     with (bind_session(session) if session is not None else nullcontext()), \
-            capture_runtime_events() as events:
+            capture_identity_events() as (events, lines):
         result = nv.api.DataEnginePipeline().annotate(
             videos["main"], profile=profile, left_wrist=videos.get("left_wrist"),
             right_wrist=videos.get("right_wrist"), yam32=long_windows, instruction=instruction,
@@ -555,6 +597,9 @@ def annotate_nvidia(
                        "caption": generation_stats(cap_events)},
         "tokens": {"segment": token_stats(seg_events), "caption": token_stats(cap_events)},
         "model_calls": model_calls(events, result),
+        # accel.identity records from the raw log (output sha256 from the GPU lock's
+        # ``generate_output`` line; None where no lock printed one, e.g. NVIDIA unmodified)
+        "identity_calls": identity_records(lines),
     }
     return result
 
@@ -587,6 +632,22 @@ def nvidia_result(result: dict) -> dict:
 # caption (calls follow plan order, which is segment order).
 
 TEMPSEG_BUDGET, CAPTION_BUDGET = 1024, 512
+# NVIDIA's ``generate`` stops at ``max_time=300`` s (``models.py:179``): a call near that wall
+# clock can be cut at a load-dependent token count (review 4 M4), so its output is timing-, not
+# input-determined. Such calls are flagged ``timing_dependent`` in ``model_calls``.
+NVIDIA_MAX_TIME_S = 300.0
+TIMING_FLAG_S = 150.0
+
+
+def timing_dependent(call: dict) -> bool:
+    """A call that ran long enough to be near NVIDIA's ``max_time``, or stopped incomplete
+    before its token budget (a time stop, not an EOS / budget stop)."""
+    elapsed = call.get("elapsed_s")
+    if isinstance(elapsed, int | float) and elapsed > TIMING_FLAG_S:
+        return True
+    gen, limit = call.get("generated_tokens"), call.get("output_limit")
+    return (call.get("complete") is False and isinstance(gen, int) and isinstance(limit, int)
+            and gen < limit)
 
 
 def _sha(text: str) -> str:
@@ -611,7 +672,8 @@ def model_calls(events: list[dict], result: dict | None = None) -> list[dict]:
             calls.append(open_call)
         elif kind == "generation_end" and open_call is not None:
             open_call.update(generated_tokens=e.get("generated_tokens"),
-                             complete=bool(e.get("complete")))
+                             complete=bool(e.get("complete")), elapsed_s=e.get("elapsed_s"))
+            open_call["timing_dependent"] = timing_dependent(open_call)
             open_call = None
     if result is not None:
         windows = [w.get("output") for w in result.get("pipeline", {}).get("temporal_windows", [])]
@@ -672,8 +734,32 @@ def compare_model_inputs(a: list[dict], b: list[dict]) -> dict:
     }
 
 
+def determinism_mode(result: dict) -> str:
+    """The D-1 mode a result was produced in (results from before D-1: ``nvidia``)."""
+    det = result.get("flora_reference", {}).get("determinism") or {}
+    return str(det.get("mode") or "nvidia")
+
+
+class ModeMismatch(ValueError):
+    """Two runs in different D-1 determinism modes are different references (never compared)."""
+
+
+def check_same_mode(a: dict[str, dict], b: dict[str, dict]) -> str | None:
+    """Raise :class:`ModeMismatch` unless every result of both runs has the same mode."""
+    modes = {determinism_mode(r) for r in (*a.values(), *b.values())}
+    if len(modes) > 1:
+        raise ModeMismatch(f"runs mix determinism modes {sorted(modes)}: a nvidia-mode and a "
+                           "deterministic-mode reference are never compared (docs/determinism.md)")
+    return next(iter(modes), None)
+
+
 def identity_summary(a: dict[str, dict], b: dict[str, dict]) -> dict:
-    """Per-episode ``compare_model_inputs`` + output agreement for two ``{episode: result}``."""
+    """Per-episode ``compare_model_inputs`` + output agreement for two ``{episode: result}``.
+
+    Refuses runs in different determinism modes. ``complete_coverage``: every episode is in both
+    runs and every call of both was gated (review 4 L5 / M6); ``timing_dependent_calls`` counts
+    calls near NVIDIA's ``max_time`` in either run (M4)."""
+    mode = check_same_mode(a, b)
     episodes = {}
     for ep in sorted(set(a) | set(b)):
         if ep not in a or ep not in b:
@@ -682,6 +768,7 @@ def identity_summary(a: dict[str, dict], b: dict[str, dict]) -> dict:
         ca = a[ep].get("flora_reference", {}).get("model_calls", [])
         cb = b[ep].get("flora_reference", {}).get("model_calls", [])
         row = compare_model_inputs(ca, cb)
+        row["timing_dependent_calls"] = sum(bool(c.get("timing_dependent")) for c in ca + cb)
         row["output_identical"] = comparable_result(a[ep]) == comparable_result(b[ep])
         row["digest_a"], row["digest_b"] = result_digest(a[ep])[:12], result_digest(b[ep])[:12]
         if not row["output_identical"]:
@@ -689,9 +776,16 @@ def identity_summary(a: dict[str, dict], b: dict[str, dict]) -> dict:
                                            limit=5)
         episodes[ep] = row
     both = [r for r in episodes.values() if "missing_in" not in r]
+    calls = sum(max(r["calls_a"], r["calls_b"]) for r in both)
+    gated = sum(r["gated_calls"] for r in both)
     return {
         "episodes": episodes,
+        "determinism_mode": mode,
         "compared": len(both),
+        "missing": len(episodes) - len(both),
+        "coverage": round(gated / calls, 4) if calls else 0.0,
+        "complete_coverage": bool(both) and len(both) == len(episodes) and gated == calls,
+        "timing_dependent_calls": sum(r["timing_dependent_calls"] for r in both),
         "gate_ok": bool(both) and all(r["gate_ok"] for r in both),
         "strict_episodes": sum(r["strict"] for r in both),
         "output_identical_episodes": sum(r["output_identical"] for r in both),
@@ -758,6 +852,8 @@ class ExactProfile:
     - ``prefetch``: W3-B t=0 parallel read of the weights into the page cache;
     - ``overlap_hash``: W3-B NVIDIA's FP32 Captioner manifest hash while TempSeg loads (only
       meaningful with ``captioner_bf16`` off; NVIDIA's ``_VERIFIED_MANIFESTS`` then reuses it);
+    - ``gpu_thread``: Perf-1 every NVIDIA ``generate`` on one persistent thread
+      (``accel.gpu_thread``; fidelity-neutral, keeps torch's thread-local cuDNN graphs warm);
     - ``concurrency``: W3-A episode threads under one GPU lock (1 = NVIDIA's sequential order).
     """
 
@@ -766,9 +862,10 @@ class ExactProfile:
     linked_layout: bool = True
     prefetch: bool = True
     overlap_hash: bool = True
+    gpu_thread: bool = True
     concurrency: int = 4
 
-    FEATURES = ("captioner_bf16", "linked_layout", "prefetch", "overlap_hash")
+    FEATURES = ("captioner_bf16", "linked_layout", "prefetch", "overlap_hash", "gpu_thread")
 
     @classmethod
     def from_spec(cls, disable: str = "", concurrency: int | None = None) -> ExactProfile:
@@ -792,6 +889,7 @@ class ExactProfile:
             "linked_layout": self.linked_layout,
             "prefetch": self.prefetch,
             "overlap_hash": self.overlap_hash and not self.captioner_bf16,
+            "gpu_thread": self.gpu_thread,
             "concurrency": self.concurrency,
             "gpu_lock": True,
         }
@@ -801,10 +899,12 @@ class ExactProfile:
 
 
 def stage_records(result: dict, *, uid: str, dataset: str, episode_id: str, provenance,
-                  audit_ref: str | None = None) -> list:
+                  audit_ref: str | None = None, certified: bool = True,
+                  uncertified_reason: str | None = None) -> list:
     """NVIDIA's result as ``segment`` and ``caption`` ``StageRecord``s (``records.py``).
 
-    ``exact`` is the reference by construction, so records are certified."""
+    ``exact`` is the reference by construction, so records are certified unless the episode is
+    outside NVIDIA's reference envelope (``certified=False`` with ``uncertified_reason``, D13)."""
     from flora_deploy.records import Segment, StageRecord
 
     rows = result.get("segments", [])
@@ -820,8 +920,9 @@ def stage_records(result: dict, *, uid: str, dataset: str, episode_id: str, prov
             for i, s in enumerate(rows))
 
     return [StageRecord(uid=uid, dataset=dataset, episode_id=episode_id, stage=stage,
-                        provenance=provenance, certified=True, segments=segs(cap),
-                        audit_ref=audit_ref)
+                        provenance=provenance, certified=certified,
+                        uncertified_reason=None if certified else uncertified_reason,
+                        segments=segs(cap), audit_ref=audit_ref)
             for stage, cap in (("segment", False), ("caption", True))]
 
 
@@ -854,8 +955,11 @@ GPU_LOCK_NAME = "gpu"
 TIMING_FIELDS = ("elapsed_s",)  # NVIDIA result fields that are wall-clock, not output
 
 
-def locked_generate(generate: Callable, lock) -> Callable:
-    """NVIDIA's ``generate`` run under ``lock`` (an ``observe.TimedLock``) and timed."""
+def locked_generate(generate: Callable, lock, *, emit_output: bool = False) -> Callable:
+    """NVIDIA's ``generate`` run under ``lock`` (an ``observe.TimedLock``) and timed.
+
+    ``emit_output``: always print the ``FLORA_OBSERVE generate_output`` line (otherwise only
+    while an ``observe`` recorder is active), so ``accel.identity`` can pair every call."""
     import functools
     import hashlib
 
@@ -868,7 +972,7 @@ def locked_generate(generate: Callable, lock) -> Callable:
     def generate_locked(*args, **kwargs):
         with lock.held(GPU_LOCK_LABEL):
             text = inner(*args, **kwargs)
-            if current_recorder() is not None:
+            if emit_output or current_recorder() is not None:
                 # Printed right after NVIDIA's generation_end line (still under the lock), so a
                 # log pairs each call's input_tensor_digest with a hash of its output text.
                 emit_json({"kind": "generate_output", "sha256": hashlib.sha256(
@@ -879,7 +983,7 @@ def locked_generate(generate: Callable, lock) -> Callable:
     return generate_locked
 
 
-def install_gpu_lock(nv, lock, patcher) -> None:
+def install_gpu_lock(nv, lock, patcher, *, emit_output: bool = False) -> None:
     """Route every NVIDIA model call through ``lock``.
 
     ``pipeline.py`` does ``from .models import generate`` at import time, so the name its
@@ -887,7 +991,8 @@ def install_gpu_lock(nv, lock, patcher) -> None:
     (NVIDIA's files are untouched)."""
     if getattr(nv.pipeline.generate, "__flora_gpu_lock__", None) is not None:
         raise RuntimeError("NVIDIA generate() already runs under a GPU lock")
-    patcher.patch(nv.pipeline, "generate", lambda orig: locked_generate(orig, lock))
+    patcher.patch(nv.pipeline, "generate",
+                  lambda orig: locked_generate(orig, lock, emit_output=emit_output))
 
 
 class ProcessorSet:
@@ -1068,7 +1173,9 @@ def diff_paths(a: Any, b: Any, path: str = "$", limit: int = 20) -> list[str]:
 
 
 def compare_runs(a: dict[str, dict], b: dict[str, dict]) -> dict:
-    """Compare two ``{episode: result}`` maps on ``comparable_result``."""
+    """Compare two ``{episode: result}`` maps on ``comparable_result`` (same determinism mode
+    only: :class:`ModeMismatch` otherwise)."""
+    check_same_mode(a, b)
     episodes = {}
     for ep in sorted(set(a) | set(b)):
         if ep not in a or ep not in b:
@@ -1117,6 +1224,8 @@ def annotate_batch(
     sampler=None,
     progress: Callable[[str, float, str], None] | None = None,
     accel=None,
+    on_start: Callable[[dict], None] | None = None,
+    on_done: Callable[[dict, dict | None, NvidiaError | None], None] | None = None,
 ) -> dict:
     """Run ``annotate_nvidia`` over ``episodes`` with ``concurrency`` worker threads.
 
@@ -1126,6 +1235,9 @@ def annotate_batch(
 
     ``episodes`` items: ``{"episode", "videos", "profile", ["long_windows"], ["instruction"]}``.
     ``concurrency=1`` runs them in order in the calling thread (the sequential baseline). With
+    ``on_start(ep)`` / ``on_done(ep, result, error)`` run in the episode's own thread, before
+    and after it (``error``: the ``NvidiaError`` it raised); an exception they raise is not an
+    episode error, it propagates (the batch fails). With
     ``concurrency>1`` NVIDIA's ``generate`` must already run under ``gpu_lock``
     (``install_gpu_lock``); each running episode leases private processor clones from ``clones``
     (a long-lived ``ProcessorClones`` pool; a fresh one if omitted) unless
@@ -1172,7 +1284,10 @@ def annotate_batch(
         if progress is not None:
             def report(frac, desc="", _name=ep["episode"]):
                 progress(_name, frac, desc)
+        if on_start is not None:
+            on_start(ep)
         try:
+            # accel.episode() is entered here, inside the episode's own thread (docs/accel.md)
             with recording(rec), (clones.lease() if clones else nullcontext()) as procs, \
                     (accel.episode() if accel is not None else nullcontext()):
                 result = annotate_nvidia(
@@ -1182,6 +1297,8 @@ def annotate_batch(
                 )
         except Exception as e:  # noqa: BLE001 - one bad episode must not sink the batch
             err = transport_error(e)
+            if on_done is not None:
+                on_done(ep, None, err)
             return None, f"{err.type_name}: {err.message}"
         ref = result["flora_reference"]
         ref["batch"] = {"concurrency": concurrency, "end_s": round(time.perf_counter() - t0, 3)}
@@ -1190,6 +1307,8 @@ def annotate_batch(
         if rec is not None:
             ref["observe"] = episode_observe(rec, result, t0,
                                              gpu_lock.name if gpu_lock else GPU_LOCK_NAME)
+        if on_done is not None:
+            on_done(ep, result, None)
         return result, None
 
     if concurrency == 1:

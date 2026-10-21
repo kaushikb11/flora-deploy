@@ -38,7 +38,7 @@ This page holds numbers only. Full results are on `flora-golden:/reference_runs/
 
   **The Volume's receipts are still schema 1**, which has no fingerprints. So the worker re-hashes all 19.3 GB of the TempSeg base against its receipt in the background (41 s, overlapped). The base is the only snapshot with no NVIDIA manifest. Re-running `flora prepare` would upgrade the receipts to schema 2. I did not do that, because it rewrites the shared weights Volume.
 - **OPT-2 shard check.** `captioner_load`'s install-time check is fast and does not catch corrupted shard bodies. The worker therefore also runs `verify_derived(full=True)` over all 54.7 GB, in the background during the TempSeg load. It is not ready until that passes. *This was added after the measured run; its cost is not measured yet* (≈25 s of I/O, overlapped).
-- **M3, runtime bound.** The `os._exit` watchdog is gone. Runtime is bounded by Modal's `startup_timeout` (8 min) plus the per-call `timeout` (20 min), so one container lasts at most 28 min. A timed-out input fails; it is not retried as a crash. The script stops submitting work against its own deadlines and never starts a fresh container just to report (L7).
+- **M3, runtime bound.** The `os._exit` watchdog is gone. Runtime is bounded by Modal's `startup_timeout` plus the per-call `timeout`: 8 + 20 = 28 min in S1, and 5 + 25 = 30 min since P1a-5s (`--timeout-min` lowers it per run). A timed-out input fails; it is not retried as a crash. The script stops submitting work against its own deadlines and never starts a fresh container just to report (L7).
 - **M4, exceptions.** Errors cross to the client as `NvidiaError` / `NvidiaInputError`. These are `RuntimeError` subclasses that carry the original qualified type name and message, and they pickle by value.
 - **L1, L4, L6.**
   - Client-generated `new_run_id()` (UTC time plus uuid4 hex).
@@ -48,7 +48,141 @@ This page holds numbers only. Full results are on `flora-golden:/reference_runs/
 - **L3.** No `ephemeral_disk`: the link farm copies only a few KB of hub metadata.
 - **L2.** The docstring now says mtimes are not required. Hub logs "outdated metadata" and still resolves offline.
 
-**ShardWorker.** `ReferenceWorker.run_shard` is a documented `NotImplementedError` (TODO P1a-5). The reason: it needs the job-store client inside the container and episode input resolution from `EpisodeRef.index_ref`, which P1a-5 owns. The record mapping it needs is in place: `stages.reference.stage_records` produces certified `segment` and `caption` `StageRecord`s from NVIDIA's result.
+**ShardWorker.** S1 left `ReferenceWorker.run_shard` as a `NotImplementedError`. P1a-5s implements it (next section).
+
+## P1a-5s: the SegcapWorker and the fully wired worker
+
+Status: measured 2026-10-21, one H200 container (`cpu=8`, 160 GiB, $6.20/h), ephemeral `flora-reference`, run `p1a5s-20261021T155655Z-ba42121d`. Results are on `flora-golden:/reference_runs/p1a5s-…-{fast,nvidia}/`.
+
+### Contract (`workers_impl/segcap.py`)
+
+`SegcapShardRunner` implements the `workers.py` contract, steps 0–6. It has the same structure as `RewardShardRunner` and reuses its part sink, index-receipt parser and stream-copy `VideoResolver`:
+
+- `store.refresh()` runs first. Then:
+  - step 0: a superseded token returns `None` and writes nothing;
+  - step 1: the attempt marker, with token and call id;
+  - step 2: episodes that already have both a `segment` and a `caption` record are skipped;
+  - step 3: upstream poison becomes `poison_pill` errors.
+- Step 4, inputs from each index receipt:
+  - camera roles become local files; ranges are stream-copy cut;
+  - NVIDIA's `profile` and `yam32`;
+  - NVIDIA's `instruction`, from the receipt's instruction source. `fixed` needs `FLORA_INSTRUCTION_TEXT`.
+- Step 4, one `FastExactEngine` batch (`annotate_batch`):
+  - **Each episode is flushed as soon as it finishes, in its own thread.** Its two records and one audit line go to the store as whole files. The audit line holds NVIDIA's full result and the runtime provenance.
+  - NVIDIA `InputError` / `ValueError` becomes `nv_failure`; anything else becomes `infra`. There is one `EpisodeError` per stage, and the container never crashes.
+- Step 5: SIGINT or `preempt()` (`@modal.exit`) flushes, then `mark_preempted`. Any other exception does `mark_exception`, then re-raises.
+- Step 6: the receipt is written last, with the earlier parts plus this container's own.
+
+Records:
+- `certified` follows the envelope verdict (D13). `envelope=ignore` certifies regardless.
+- `provenance.engine` is `nvidia-hf`, or `nvidia-hf+deterministic` in D-1 mode, which is a different reference.
+- `provenance.source` holds the camera URIs and ranges; `models` holds the four pins.
+- The rest of the provenance is in the audit line, under `runtime`:
+  - exact profile, `accel` patches, `gpu_thread`, determinism record;
+  - BF16 receipt provenance, image fingerprint, `nv.audit_report()`;
+  - `timing_dependent_calls`.
+
+**Conformance:**
+- `tests/conformance/registry.py` registers `segcap-worker`: the real runner and the real `FastExactEngine` composite over the fake NVIDIA family of `test_reference_concurrency`, with gpu_thread, GPU lock and entry swap, 2 episode threads. **All 10 checks pass.**
+- Unit tests: `tests/unit/test_segcap_worker.py` and `tests/unit/test_segcap_worker_identity.py`.
+
+### Wiring (`modal_app/reference_app.py`, the class the factory decorates)
+
+- **Fix-X / review 4 M5.** `captioner_load.install(nv, background=True)` runs before the TempSeg load. Its default full hash (54.7 GB) is the only hash and runs overlapped; `Session.load('captioner')` joins it. The separate `verify_derived` thread is gone, and `load_report.captioner_bf16` records `provenance()`. Measured `@enter`: **78 s**, against S1's 103 s.
+- **`gpu_thread`.** It is an `ExactProfile` toggle, `gpu_thread`, on by default, installed exactly once with its own `Patcher`, as the innermost layer. The composite is therefore `locked(pinned(generate))`:
+  - the GPU lock is taken in the episode thread, so lock wait/hold metrics stay meaningful;
+  - the call itself runs on `flora-gpu`.
+  - `docs/perf-1.md`'s "lock always taken on the GPU thread" and its single-`Patcher` recipe are wrong (review 4 M3).
+  - `FastExactEngine.annotate` refuses to run if the toggle is on and `generate` is not on that thread. Provenance goes into `load_report`, batch, persisted results and audit lines.
+  - Measured: 41/41 calls on the GPU thread, 0 inline.
+- **Per-thread `accel.episode()`.** It is entered inside each episode thread (`annotate_batch`).
+- **`nv.audit()`.** It runs before every batch, before each episode (`on_start`) and after it, before its records are written (review 4 L2). It fails closed.
+- **Determinism (review 4 M2).**
+  - The worker reads `FLORA_DETERMINISM` (set by the app factory); the `determinism` parameter now defaults to "". A parameter that disagrees with the env is refused. `apply()` still runs first in `@enter`.
+  - `stages.reference.identity_summary` / `compare_runs` raise `ModeMismatch` on arms of different modes, and `validate_shard` refuses them.
+  - Hashing the mode into the config is Fix-W2's.
+- **Identity logging.**
+  - The GPU lock prints `FLORA_OBSERVE generate_output` after every call (`emit_output=True`).
+  - `annotate_nvidia` keeps the raw `FLORA_RUNTIME` / `FLORA_OBSERVE` lines and stores `flora_reference.identity_calls` (`accel.identity.call_records`). Measured: output logged for 41/41 calls.
+- **`accel.identity` (review 4 M1).** It fails closed:
+  - it reads persisted `model_calls` (`input_digest`);
+  - it raises on unrecognised records;
+  - `ok` requires at least one paired call, and a missing episode is a violation;
+  - it reports `coverage`.
+- **`identity_summary`.** It reports `coverage`, `complete_coverage` and `timing_dependent_calls`.
+- **Review 4 M4.** `model_calls` records `elapsed_s` and flags `timing_dependent` calls: over 150 s, or incomplete below budget, near NVIDIA's `max_time=300`. The worker prints `FLORA_WARN` for them. **0 such calls in this run.**
+- **Review 4 L1.** `_restore_nvidia` also checks every `accel` registry target, including the vendor ones.
+- `run_shard(job_id, shard_id, config_hash, token="")` builds the runner over `store_from_env()` on first use. `@modal.exit` calls `runner.preempt()`.
+- `validate_shard` runs the production runner over a container-local store whose index receipts point at the golden files, then NVIDIA unmodified.
+
+### Identity: S1's gap, now closed for 3 of the 4 episodes
+
+The NVIDIA unmodified arm ran in the same container after `_restore_nvidia`, with a fresh `Session` per episode, sequentially, in `nvidia` mode. It was compared call by call with `accel.identity.compare_runs` and with the stage gate:
+
+| Episode | Calls | vs this run's fast worker (gpu_thread) | vs S1's fast results |
+|---|---|---|---|
+| `human/egodex_make_sandwich/episode_000002` | 12 | strict 12/12; all 12 paired, outputs identical | inputs strict 12/12; output differed at call 2 (same input), so 3 gated |
+| `single_view_robot/wgo/robointer_droid_000010` | 4 | strict 4/4; 4 paired; result identical | strict 4/4; 4 gated; identical |
+| `yam/aloha_static_towel/episode_000000` | 4 | strict 4/4; 4 paired; result identical | strict 4/4; 4 gated; identical |
+| `dex/g1_dex3_toasted_bread/episode_000034` | — | **not run** (deadline) | — |
+
+**Verdict.**
+- Against the new fully wired worker: **0 violations, 20/20 calls paired, coverage 1.0, conclusive.** All three full NVIDIA results are identical.
+- Against S1's composite: 0 violations, but 11/20 calls gated (coverage 0.55, not conclusive). Every one of the 20 input digests is still identical (strict).
+- S1 plus this run: **5 of 6 golden episodes are now proven in hardware.** All pools are covered except dex, which still rests on the CPU twin (`tests/nvlink/test_reference_entry.py`).
+- **Dex was skipped** because the conservative deadline estimate (90 s + 14 s per video-s) did not fit after the fast shard. Finishing it needs a dex-only unmodified run (≈$0.8). It did not fit the $3 cap with billing lag.
+- Review 4 M6: the next identity proof should run in `--determinism deterministic`, so that output divergence does not cut coverage.
+
+### Throughput of the fully wired worker (c=4, gpu_thread on)
+
+The shard ran 6 golden episodes, 80.97 video-s, in a single short-lived container (cold graph cache):
+
+| | This run | S1 (no gpu_thread) | Perf-1 projection |
+|---|---|---|---|
+| Batch wall | **519 s** | 566 s | — |
+| Video-h per container-h | **0.156** | 0.143 | ≈ 0.23 |
+| Generation GPU-s per video-s | **5.04** | 6.35 | ≈ 3.9 (TempSeg warm, Captioner cold) |
+| TempSeg per call | 18.9 s (10 calls, 0.27 s/token) | 54–62 s for 142 tokens (≈0.41 s/token) | 0.067 s/token warm |
+| Captioner per call | 7.1 s (31 calls, 0.45 s/output token incl. prefill) | 11.5 s for 21 tokens | cold: ≈ 0.4 s/token + ≈3 s prefill |
+| $/video-h at $6.20/h (160 GiB) | **$39.7** | $43 | — |
+| $/video-h at $5.68/h (96 GiB default) | **$36.4** | $40 | $25 |
+
+**Reading.**
+- `gpu_thread` works: TempSeg dropped from ≈0.41 to 0.27 s per token. Calls of later episodes reuse the shapes of earlier ones; the first call was still 37 s for 44 tokens.
+- The Captioner stays cold, as Perf-1 predicted. Its prompt lengths differ on every call, so in a short container almost every decode step builds a graph.
+- Two artifacts of this validation run make the number pessimistic. Production never does either:
+  - ≈115 s passed from `@enter` ready to the first `generate`;
+  - the first ≈3.5 min of the batch overlapped the background FP32 Captioner prefetch and hash that the unmodified arm needed (109 GB read plus `manifest_full_verification`, done at 16:02:11).
+- Projection, not measured: a long-lived worker should approach Perf-1's ≈3.9 GPU-s per video-s.
+
+### Proposed `planner/rates.json` value (not applied)
+
+| Entry (`exact`, `segcap`, cameras 1, concurrency 4) | Now | Proposal |
+|---|---|---|
+| container-s per video-s | 4.08, "measured" (W3-A, cu130 image) | **6.4, status `measured`, ±35%** (519 s / 80.97 video-s, this image, gpu_thread on, short-lived container). Re-measure after a long-lived run. Perf-1's 4.35 stays a projection |
+| concurrency 8 | 2.5, projected | Keep as projected. It is only plausible with gpu_thread and a long-lived container with a warm Captioner |
+
+That gives ≈$36/video-h at the default $5.68/h. W3-A's $23 belongs to the cu130 image.
+
+### Spend (P1a-5s)
+
+| Item | Cost |
+|---|---|
+| One H200 container, ≈20 min (15:57–16:17 UTC) at $6.20/h | ≈ $2.05 |
+| `scripts/spend.py --app flora-reference` | $8.33 before, $8.63 shortly after (+$0.30 so far; billing lags ≈1 h) |
+
+**≈ $2.1 of the $3 cap.** The run's local summary was lost:
+- `validate_shard` crashed in its last step, because `RUNS_DIR` is a `PurePosixPath` (fixed);
+- the persisted results above were downloaded from `flora-golden`;
+- they were re-scored with this branch's `accel.identity` / `identity_summary`.
+
+```bash
+uv run python scripts/reference_smoke.py --validate --memory-gib 160 --deadline-min 19 \
+    --timeout-min 22 [--golden ID ...] [--nvidia ID ...] [--determinism deterministic] \
+    --summary p1a5s.json
+```
+
+The script exits non-zero if any comparison has 0 paired calls, a violation, or a missing episode.
 
 ## Identity proof
 
