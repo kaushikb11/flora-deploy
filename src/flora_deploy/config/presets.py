@@ -13,9 +13,10 @@ A preset maps each pipeline stage to a shard kind and gives every shard kind a d
 - ``budget`` / ``interactive``: declared (D9) but not available yet; selecting one is an error.
 
 Certification (D9, D16): ``exact`` is the reference by construction. Every other preset needs a
-Gate certificate matching (shard kind, GPU) before it may run. None exist yet
-(``find_certificates``), so ``balanced`` is refused unless the config opts in with
-``allow_uncertified: true`` (its records are then an uncertified stack).
+Gate certificate matching (shard kind, GPU, engine spec) before it may run (``find_certificates``;
+the registry is ``config/certificates/``, the match rule ``validate/certkey.py``). Without a
+``certified`` one (``provisional`` does not count), ``balanced`` is refused unless the config
+opts in with ``allow_uncertified: true`` (its records are then an uncertified stack).
 
 GPU overrides are checked against ``GPU_MEMORY_GIB`` (Modal GPU types) and a per-shard-kind
 minimum (``min_gpu_memory_gib``): exact ``segcap`` keeps TempSeg and Captioner resident (80.95 GiB
@@ -126,7 +127,7 @@ def _build() -> dict[str, PresetSpec]:
         engines={"segment": vllm, "caption": vllm, **reward_engines},
         pins={"segment": _SEG_PINS, "caption": _CAP_PINS, **reward_pins},
         derived_weights={"segment": ("tempseg_merged",), "caption": ("captioner_bf16",)},
-        note="vLLM 0.24.0, stage-separated pools; needs Gate certificates (none exist yet)",
+        note="vLLM 0.24.0, stage-separated pools; needs Gate certificates (config/certificates/)",
     )
     unavailable = {
         "budget": "planned for P2 (FP8 / B200 kernels; uncertified until validated)",
@@ -227,6 +228,7 @@ class Certificate:
     preset: str
     kind: str
     gpu: str
+    verdict: str = "certified"  # certified | provisional | fail (validate/certify.py)
 
 
 def needs_certificate(preset: str) -> bool:
@@ -234,9 +236,17 @@ def needs_certificate(preset: str) -> bool:
     return preset != "exact"
 
 
-def find_certificates(preset: str, pools: Mapping[str, PoolSettings]) -> dict[str, Certificate]:
-    """The certificate matching each (shard kind, GPU) of ``pools``, by shard kind.
+def find_certificates(preset: str, pools: Mapping[str, PoolSettings], *,
+                      modes: Mapping[str, Mapping] | None = None,
+                      **kwargs) -> dict[str, Certificate]:
+    """The ``certified`` certificate matching each (shard kind, GPU, engine spec) of ``pools``,
+    by shard kind (``validate.certkey.matching``; ``modes``: each kind's output-affecting run
+    modes, ``config.hashing.kind_modes``). Provisional and failed certificates never count."""
+    from flora_deploy.validate.certkey import matching
 
-    Stub: no certificates exist yet (Gates D/E have not run), so this is always empty."""
-    del preset, pools
-    return {}
+    out: dict[str, Certificate] = {}
+    for kind, certs in matching(preset, pools, modes=modes, **kwargs).items():
+        best = certs[0]
+        if best["verdict"] == "certified":
+            out[kind] = Certificate(best["id"], preset, kind, best["gpu"], best["verdict"])
+    return out

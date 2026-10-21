@@ -337,12 +337,16 @@ class FloraConfig(_Model):
             raise ValueError("; ".join(bad_gpu))
         allow = self.allow_uncertified or bool((info.context or {}).get("allow_uncertified"))
         if needs_certificate(self.preset) and not allow:
-            certs = find_certificates(self.preset, pools)
+            from flora_deploy.config.hashing import kind_modes
+
+            certs = find_certificates(self.preset, pools,
+                                      modes={k: kind_modes(self, k) for k in pools})
             missing = [f"{k} on {p.gpu}" for k, p in pools.items() if k not in certs]
             if missing:
                 raise ValueError(
                     f"preset {self.preset!r} has no Gate certificate for {', '.join(missing)} "
-                    "(none exist yet), so its outputs are not certified faithful to NVIDIA's. "
+                    "(a provisional certificate does not count; config/certificates/), so its "
+                    "outputs are not certified faithful to NVIDIA's. "
                     "Use preset 'exact', or set `allow_uncertified: true` (or pass "
                     "--allow-uncertified) to run it as an uncertified stack")
         need = sum(p.gpu_count * p.max_containers for p in pools.values())
