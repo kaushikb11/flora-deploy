@@ -3,6 +3,9 @@
 :class:`RewardShardRunner` processes one ``reward.terminal`` / ``reward.dense`` shard per
 :meth:`~RewardShardRunner.run_shard` call, following the worker contract in ``workers.py``:
 
+Before step 0 a Volume store is refreshed (``store.refresh()``), so a warm container never reads
+a stale ledger or stale parts.
+
 0. ``attempts.superseded`` → return ``None`` having written nothing (the shard is looked up with
    ``jobs.deps.StoreManifestSource.shard``, which also finds bisection children);
 1. ``attempts.write_attempt`` with the spawn ``token`` and the Modal call id;
@@ -111,10 +114,25 @@ class IndexInputs:
 
 
 def parse_index_receipt(data: bytes | str) -> IndexInputs:
-    """An index receipt: ``dataclasses.asdict(media.types.EpisodeIndex)`` as JSON (Fractions as
-    strings; only ``episode_id``, ``dataset``, ``task``, ``streams.<role>.source`` and
-    ``envelope.ok`` are read). TODO(P1a-6b): switch to the index job's reader once it lands."""
+    """An episode's index receipt. Two layouts are read:
+
+    * ``flora_index_receipt_v1`` (``jobs.indexing``, ``flora index``): ``status`` must be
+      ``indexed`` (a ``source_error`` receipt raises ``ValueError``); ``dataset.name``; stream
+      uris are dataset-relative (resolved against ``RewardWorkerSettings.media_root``); the task
+      is the receipt's ``task`` for the ``dataset_task`` instruction source and ``None`` for
+      ``fixed`` / ``none`` (the worker then uses ``default_task``: the configured fixed text);
+    * plain ``dataclasses.asdict(media.types.EpisodeIndex)`` JSON (tests, ad-hoc jobs).
+
+    Only the episode id, dataset, task, ``streams.<role>.source`` and ``envelope.ok`` are read."""
     d = json.loads(data)
+    task = d.get("task")
+    dataset = d.get("dataset")
+    if d.get("schema") == "flora_index_receipt_v1":
+        if d.get("status") != "indexed":
+            raise ValueError(f"episode {d.get('uid')!r} was not indexed: {d.get('error')}")
+        dataset = dataset["name"]
+        if d.get("instruction", "dataset_task") != "dataset_task":
+            task = None
     sources: dict[str, SourceRef] = {}
     for role, stream in (d.get("streams") or {}).items():
         src = stream.get("source") if isinstance(stream, Mapping) else None
@@ -123,8 +141,8 @@ def parse_index_receipt(data: bytes | str) -> IndexInputs:
         sources[str(role)] = SourceRef(uri=str(src["uri"]), start_s=src.get("start_s"),
                                        end_s=src.get("end_s"))
     env = d.get("envelope")
-    return IndexInputs(episode_id=str(d["episode_id"]), dataset=str(d["dataset"]),
-                       task=d.get("task"), sources=sources,
+    return IndexInputs(episode_id=str(d["episode_id"]), dataset=str(dataset), task=task,
+                       sources=sources,
                        envelope_ok=env.get("ok") if isinstance(env, Mapping) else None)
 
 
@@ -329,8 +347,12 @@ class RewardShardRunner:
 
     def __init__(self, store: Store, engine: RewardEngine, nv, settings: RewardWorkerSettings,
                  *, call_id: Callable[[], str | None] = lambda: "",
-                 clock: Callable[[], float] = time.time, resolver: VideoResolver | None = None):
+                 clock: Callable[[], float] = time.time, resolver: VideoResolver | None = None,
+                 episodes: Callable[[EpisodeRef], R.Episode] | None = None):
+        """``episodes``: EpisodeRef -> ``stages.reward.Episode`` (default: from the index receipt
+        ``EpisodeRef.index_ref`` names, :meth:`episode_from_index`)."""
         self.store, self.engine, self.nv, self.settings = store, engine, nv, settings
+        self.episode_for = episodes or self.episode_from_index
         self.call_id, self.clock = call_id, clock
         self.container_id = safe_key(settings.container_id)
         self.resolver = resolver or VideoResolver(
@@ -343,6 +365,9 @@ class RewardShardRunner:
 
     def run_shard(self, job_id: str, shard_id: str, config_hash: str,
                   token: str = "") -> ShardReceipt | None:
+        refresh = getattr(self.store, "refresh", None)
+        if callable(refresh):  # Volume stores: see current ledgers / parts in a warm container
+            refresh()
         jf = A.JobFiles(self.store, job_id, config_hash)
         manifests = StoreManifestSource(jf)
         shard = manifests.shard(shard_id)
@@ -375,6 +400,10 @@ class RewardShardRunner:
             active = self._active
         return active is not None and self._end(active, preempted=True)
 
+    def on_exit(self) -> None:
+        """The ``@modal.exit`` hook (runs after SIGINT, and on a normal scale-down)."""
+        self.preempt()
+
     # -- internals -----------------------------------------------------------------------
 
     def _end(self, active: _Active, *, preempted: bool = False, error: str | None = None
@@ -398,7 +427,7 @@ class RewardShardRunner:
                              error=error or "error", marker=active.marker)
         return True
 
-    def _episode(self, ref: EpisodeRef) -> R.Episode:
+    def episode_from_index(self, ref: EpisodeRef) -> R.Episode:
         idx = parse_index_receipt(self.store.get_bytes(ref.index_ref))
         if not idx.sources:
             raise ValueError(f"episode {ref.uid!r}: index receipt has no camera streams")
@@ -443,7 +472,7 @@ class RewardShardRunner:
             try:
                 if uid not in refs:
                     raise KeyError(f"episode {uid!r} is not in the manifest")
-                episodes.append(self._episode(refs[uid]))
+                episodes.append(self.episode_for(refs[uid]))
             except Exception as exc:  # noqa: BLE001 - becomes this episode's EpisodeError
                 kind = "nv_failure" if isinstance(exc, ValueError) else "infra"
                 errors.append(EpisodeError(

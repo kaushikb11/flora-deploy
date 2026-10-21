@@ -1,8 +1,7 @@
 """RewardWorker core (``workers_impl.reward``): the ``workers.ShardWorker`` contract, steps 0-6,
 with a fake NVIDIA core / LLM (``test_reward_stage``) and ``FakeStore`` listing lag.
 
-TODO(conformance): register ``RewardShardRunner`` with ``tests/conformance/worker_suite.py`` once
-that suite is on main; these tests cover the same contract steps meanwhile.
+The contract is also checked by ``tests/conformance`` (``registry.py`` registers the runner).
 """
 
 from __future__ import annotations
@@ -444,3 +443,34 @@ def test_worker_output_composes(tmp_path):
     out = compose(store, JOB)
     assert [r.uid for r in out.records["reward.terminal"]] == [uid("a"), uid("b")]
     assert [r.uid for r in out.records["reward.dense"]] == [uid("a")]
+
+
+def test_index_receipt_v1_layout():
+    rec = {"schema": "flora_index_receipt_v1", "status": "indexed", "uid": uid("e"),
+           "episode_id": "e", "dataset": {"name": DS}, "instruction": "dataset_task",
+           "task": "pick", "envelope": {"ok": False, "reasons": ["x"]},
+           "streams": {"main": {"source": {"uri": "videos/f.mp4", "start_s": 1.0,
+                                           "end_s": 3.0}}}}
+    idx = parse_index_receipt(json.dumps(rec))
+    assert (idx.dataset, idx.task, idx.envelope_ok) == (DS, "pick", False)
+    assert idx.sources == {"main": SourceRef("videos/f.mp4", 1.0, 3.0)}
+    assert parse_index_receipt(json.dumps({**rec, "instruction": "fixed"})).task is None
+    with pytest.raises(ValueError, match="not indexed"):
+        parse_index_receipt(json.dumps({**rec, "status": "source_error", "error": "missing"}))
+
+
+def test_volume_store_is_refreshed_before_every_input(tmp_path):
+    class Refreshing(FakeStore):
+        refreshes = 0
+
+        def refresh(self):
+            self.refreshes += 1
+            return True
+
+    store = Refreshing()
+    shard = tshard(["a"])
+    setup(store, [ep("a")], [shard])
+    runner = make_runner(store, tmp_path)
+    runner.run_shard(JOB, shard.shard_id, CFG)
+    runner.run_shard(JOB, shard.shard_id, CFG)
+    assert store.refreshes == 2
