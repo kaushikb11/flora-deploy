@@ -435,20 +435,27 @@ def reference_cross_check(primary: Sequence[dict], reference: Sequence[dict]) ->
 def gate_verdict(builds: Sequence[dict], results: dict[str, dict], *,
                  expected_parts: Sequence[tuple[str, str]], expected_cases: Sequence[str],
                  variant: str = PRIMARY_VARIANT, quota: int | None = None,
-                 reference: dict | None = None) -> dict:
+                 reference: dict | None = None, capacity: dict[str, dict] | None = None,
+                 allow_unverified_reference: bool = False) -> dict:
     """The Gate C verdict over a whole run, not just the rows that exist.
 
     ``builds``: ``build_part`` results (``kind``, ``part``, ``n``, ``errors``, optionally
     ``quota``); ``results``: kind -> ``run_gate_c`` result (``rows``). PASS needs every expected
     (kind, part) built with no error and at least one request, every ``golden:<pool>`` part at
-    its request quota (``quota``, or the build's own ``quota``: a shortfall fails, review 4 L3),
-    a ``variant`` row for every built request, every expected case present, and every
-    ``variant`` row passed. A pool whose builds all failed is a FAIL, never a silent ``n/a``.
+    its request quota (a shortfall fails, review 4 L3), a ``variant`` row for every built
+    request, every expected case present, and every ``variant`` row passed. A pool whose builds
+    all failed is a FAIL, never a silent ``n/a``.
+
+    Quota (review 5 M-A): the required quota is ``max(quota, build's own quota)``: a build that
+    reports a lower quota never lowers the caller's floor. ``capacity`` (from
+    ``gatec_driver.golden_capacity``): per pool, how many requests the golden selection can
+    give at most; a shortfall names that reason (add episodes to the golden selection), and a
+    pool that cannot reach the quota at all is listed in ``unsatisfiable``.
 
     ``reference``: ``{"image": <where the HF reference ran>, "cross_check":
     reference_cross_check(...)}`` (review 3 C2). If the HF side ran anywhere but ``img_hfref``,
-    a passing cross-check against ``img_hfref`` is required; without ``reference`` the verdict
-    carries a warning."""
+    a passing cross-check against ``img_hfref`` is required. Without ``reference`` the verdict
+    FAILS (review 5 M-A) unless ``allow_unverified_reference`` (then a warning)."""
     problems: list[str] = []
     warnings: list[str] = []
     by_part = {(b["kind"], b["part"]): b for b in builds}
@@ -462,13 +469,34 @@ def gate_verdict(builds: Sequence[dict], results: dict[str, dict], *,
         elif not b.get("n"):
             problems.append(f"{kind} {part}: 0 requests")
         elif part.startswith("golden:"):
-            want = b.get("quota", quota)
+            wants = [q for q in (quota, b.get("quota")) if q is not None]
+            want = max(wants) if wants else None
             if want is not None and b["n"] < want:
-                problems.append(f"{kind} {part}: {b['n']} of {want} requests (quota shortfall)")
+                cap = (capacity or {}).get(part.split(":", 1)[1])
+                why = ""
+                if cap is not None and cap["max_requests"] < want:
+                    why = (f": the golden selection has {cap['episodes']} episode(s), at most "
+                           f"{cap['max_requests']} requests; add episodes to reach the quota")
+                elif cap is not None:
+                    why = (f": the golden selection's {cap['episodes']} episode(s) yielded "
+                           f"fewer calls than their {cap['max_requests']} maximum; add episodes")
+                problems.append(f"{kind} {part}: {b['n']} of {want} requests "
+                                f"(quota shortfall{why})")
             elif want is None:
                 warnings.append(f"{kind} {part}: no quota given; shortfalls not checked")
+    unsatisfiable = sorted(p for p, c in (capacity or {}).items()
+                           if quota is not None and c["max_requests"] < quota
+                           and any(part == f"golden:{p}" for _, part in expected_parts))
+    for pool in unsatisfiable:
+        warnings.append(f"golden:{pool}: quota {quota} is unsatisfiable from the golden "
+                        f"selection ({capacity[pool]['episodes']} episode(s), at most "
+                        f"{capacity[pool]['max_requests']} requests)")
     if reference is None:
-        warnings.append("HF reference image not recorded (review 3 C2)")
+        msg = "HF reference image not recorded (review 3 C2)"
+        if allow_unverified_reference:
+            warnings.append(msg)
+        else:
+            problems.append(msg)
     elif reference.get("image") != REFERENCE_IMAGE:
         check = reference.get("cross_check") or {}
         if not check.get("passed"):
@@ -491,7 +519,8 @@ def gate_verdict(builds: Sequence[dict], results: dict[str, dict], *,
     failed = sorted(c for c, ok in verdicts.items() if not ok)
     return {"passed": not problems and not failed and bool(verdicts), "variant": variant,
             "failed_cases": failed, "problems": problems, "coverage": coverage,
-            "cases": verdicts, "warnings": warnings}
+            "cases": verdicts, "warnings": warnings, "quota": quota,
+            "unsatisfiable": unsatisfiable}
 
 
 def _git(args: Sequence[str], cwd: str | None) -> str | None:

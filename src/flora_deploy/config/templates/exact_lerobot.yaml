@@ -43,12 +43,17 @@ pipeline:
     source: dataset_task            # dataset_task | fixed (then set `text`) | none
                                     # (none is refused with reward stages: they need a task)
   envelope: warn                    # warn | enforce | ignore: out-of-envelope episodes (D13)
+  # determinism: nvidia             # nvidia (NVIDIA's kernels) | deterministic (D-1: cuDNN SDPA
+                                    # off, a different reference); in the segcap stage hash
+  # terminal_rationale: false       # true: reward.terminal also returns NVIDIA's rationale;
+                                    # in the reward.terminal stage hash
 
 # Per shard kind overrides of the preset's pools: gpu, gpu_count, max_containers, max_inputs,
 # cpu (physical cores), memory (GiB). The exact preset runs segment+caption as one `segcap`
 # worker, which needs >= 81 GiB of GPU memory (H200 or B200); rewards need an 80 GB GPU
-# (H100!, H100, A100-80GB, H200, B200). These change cost and speed only, never outputs (nor
-# the config hash).
+# (H100!, H100, A100-80GB, H200, B200). These are not in the config hash: they never change
+# the model inputs, but a different GPU type runs different kernels, so outputs are
+# input-identical, not bit-identical, across GPU types (recorded in provenance.gpu).
 resources:
   segcap: {gpu: H200, max_containers: 1}
   reward.terminal: {max_containers: 1}

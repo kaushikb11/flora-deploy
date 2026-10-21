@@ -10,9 +10,13 @@ same shape.
 Lookup is most-specific-first: an exact ``preset`` beats ``"*"``, exact ``cameras`` beats
 ``"*"``, and among concurrencies the largest one not above the request is used (so a kind
 without concurrency entries, like the batched rewarder, just uses its ``concurrency: 1`` rate).
-``stale`` entries (measured on another image) are never used, and an entry that ``requires``
-a feature is used only when the caller enables it (``features=``); when both apply, the entry
-with the feature wins (review 4 M5).
+``stale`` entries (measured on another image, or superseded) are never used. An entry that
+``requires`` a feature is used only when it is enabled, and one that ``excludes`` a feature only
+when it is not. ``features=None`` (the default, used by ``jobs.budget``) means the **deployed**
+configuration's features, :data:`DEPLOYED_FEATURES`; pass ``()`` for none. At equal concurrency
+a measured entry beats a projected one, and only then does the entry that uses more enabled
+features win (review 5 M-C: a projection must never displace a measurement of the configuration
+that actually runs).
 """
 
 from __future__ import annotations
@@ -25,6 +29,16 @@ from typing import Any
 
 STATUS_RANK = {"measured": 0, "projected": 1, "placeholder": 2, "stale": 3}
 Features = frozenset[str] | set[str] | tuple[str, ...]
+
+# Worker features the deployed configuration runs with. ``gpu_thread``: the exact worker's
+# persistent generate thread, ``stages.reference.ExactProfile.gpu_thread`` (on by default since
+# P1a-5s; the factory never disables it). ``long_lived_container`` (warm Captioner graph cache,
+# overlapping shards) is *not* deployed: rates that need it are projections.
+DEPLOYED_FEATURES: tuple[str, ...] = ("gpu_thread",)
+
+
+def resolve_features(features: Features | None) -> frozenset[str]:
+    return frozenset(DEPLOYED_FEATURES if features is None else features)
 
 
 @dataclass(frozen=True)
@@ -40,9 +54,12 @@ class RateEntry:
     date: str
     image: str | None = None  # the image it was measured / projected on
     requires: tuple[str, ...] = ()  # worker features the rate depends on
+    excludes: tuple[str, ...] = ()  # features under which the rate is invalid (measured without)
 
-    def usable(self, features: Features = ()) -> bool:
-        return self.status != "stale" and set(self.requires) <= set(features)
+    def usable(self, features: Features | None = None) -> bool:
+        f = resolve_features(features)
+        return (self.status != "stale" and set(self.requires) <= f
+                and not set(self.excludes) & f)
 
 
 @dataclass(frozen=True)
@@ -80,7 +97,8 @@ class RateTable:
         rates, startup = [], []
         for i, r in enumerate(data.get("rates", [])):
             try:
-                e = RateEntry(**{**r, "requires": tuple(r.get("requires") or ())})
+                e = RateEntry(**{**r, "requires": tuple(r.get("requires") or ()),
+                                 "excludes": tuple(r.get("excludes") or ())})
             except TypeError as exc:
                 raise RatesFileError(f"{source}: rates[{i}]: {exc}") from None
             _check(e.container_s_per_video_s > 0, f"{source}: rates[{i}] must be positive")
@@ -116,7 +134,7 @@ class RateTable:
         return {f for e in self.rates for f in e.requires}
 
     def _candidates(self, preset: str, kind: str, cameras: int,
-                    features: Features = ()) -> list[RateEntry]:
+                    features: Features | None = None) -> list[RateEntry]:
         out = [e for e in self.rates if e.kind == kind and e.preset in (preset, "*")
                and e.usable(features)]
         if not out:
@@ -134,19 +152,24 @@ class RateTable:
         return [e for e in out if e.cameras == near.cameras]
 
     def concurrencies(self, preset: str, kind: str, cameras: int,
-                      features: Features = ()) -> list[int]:
+                      features: Features | None = None) -> list[int]:
         return sorted({e.concurrency for e in self._candidates(preset, kind, cameras,
                                                                 features)})
 
     def rate(self, preset: str, kind: str, cameras: int, concurrency: int = 1,
-             features: Features = ()) -> RateEntry:
+             features: Features | None = None) -> RateEntry:
+        """The entry for ``concurrency`` (largest not above it, else the smallest), measured
+        before projected before placeholder at that concurrency, then the most features used.
+        ``features=None``: :data:`DEPLOYED_FEATURES`."""
         cands = self._candidates(preset, kind, cameras, features)
         if not cands:
             raise KeyError(f"no rate for preset {preset!r} kind {kind!r} in {self.source}")
         below = [e for e in cands if e.concurrency <= concurrency]
         if below:
-            return max(below, key=lambda e: (e.concurrency, len(e.requires)))
-        return min(cands, key=lambda e: (e.concurrency, -len(e.requires)))
+            return max(below, key=lambda e: (e.concurrency, -STATUS_RANK[e.status],
+                                             len(e.requires)))
+        return min(cands, key=lambda e: (e.concurrency, STATUS_RANK[e.status],
+                                         -len(e.requires)))
 
     def startup_for(self, preset: str, kind: str) -> StartupEntry:
         def score(e: StartupEntry) -> tuple[int, int] | None:

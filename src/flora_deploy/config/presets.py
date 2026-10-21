@@ -75,10 +75,13 @@ def _engines() -> tuple[EngineIdentity, EngineIdentity, EngineIdentity]:
     from flora_deploy.config.pins import RUNTIME
     from flora_deploy.nv.capture import REQUIRED_VLLM_ENGINE_KWARGS
 
+    # Review 3 A9: the versions img_hfref actually installs (locks/hfref.txt): torch is the
+    # cu128 wheel, and qwen_vl_utils / decord are not in that image (NVIDIA's HF path does not
+    # use them), so they are not part of this identity. The image fingerprint covers the rest.
     hf = EngineIdentity(
         name="nvidia-hf",
-        version={k: RUNTIME[k] for k in ("transformers", "torch_reference", "peft",
-                                         "qwen_vl_utils", "decord")},
+        version={"transformers": RUNTIME["transformers"], "torch": RUNTIME["torch_hfref"],
+                 "peft": RUNTIME["peft"]},
         image="img_hfref",
     )
     nv_vllm = EngineIdentity(name="nvidia-vllm-offline", version={"vllm": RUNTIME["vllm"]},

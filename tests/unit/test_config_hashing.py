@@ -271,7 +271,8 @@ class _Edit:
                                  "nv/budget.py", "media/rangedecode.py", "media/cuts.py",
                                  "jobs/indexing.py", "workers_impl/reward.py",
                                  "modal_app/workers_app.py", "media/sources/lerobot_v3.py",
-                                 "observe/stdout.py"])
+                                 "observe/stdout.py", "config/schema.py",
+                                 "modal_app/factory.py", "jobs/settings.py"])
 def test_editing_an_output_module_changes_the_hash(pkg_copy, rel):
     assert h(base(), logic_root=pkg_copy) == BASE  # the copy hashes like the checkout
     with _Edit(pkg_copy, rel):
@@ -281,7 +282,7 @@ def test_editing_an_output_module_changes_the_hash(pkg_copy, rel):
 
 @pytest.mark.parametrize("rel", ["cli/init.py", "cli/plan.py", "jobs/orchestrator.py",
                                  "planner/options.py", "observe/aggregate.py", "media/synth.py",
-                                 "validate/gatec.py", "config/schema.py", "__init__.py"])
+                                 "validate/gatec.py", "config/presets.py", "__init__.py"])
 def test_editing_a_non_output_module_keeps_the_hash(pkg_copy, rel):
     with _Edit(pkg_copy, rel):
         assert h(base(), logic_root=pkg_copy) == BASE
@@ -383,6 +384,34 @@ def test_input_content_digest_is_hashed():
     assert h(base(), input_digest="a" * 64) != BASE
     assert h(base(), input_digest="a" * 64) != h(base(), input_digest="b" * 64)
     assert h(base(), input_digest=None) == BASE
+
+
+def test_local_mp4_dir_contents_are_hashed(tmp_path):
+    """Review 3 A8: a local input directory's file contents are in the hash, not just its
+    path. Hidden files do not count; a caller's ``input_digest`` takes precedence."""
+    from flora_deploy.config.hashing import local_input_digest
+
+    (tmp_path / "a").mkdir()
+    (tmp_path / "a" / "ep0.mp4").write_bytes(b"one")
+    (tmp_path / "ep1.mp4").write_bytes(b"two")
+
+    def local():
+        d = base()
+        d["input"] = {"format": "mp4_dir", "path": str(tmp_path)}
+        return d
+
+    first = h(local())
+    assert local_input_digest(tmp_path) is not None
+    (tmp_path / ".DS_Store").write_bytes(b"finder")
+    assert h(local()) == first
+    (tmp_path / "ep1.mp4").write_bytes(b"TWO")  # same size, new content
+    changed = h(local())
+    assert changed != first
+    (tmp_path / "a" / "ep0.mp4").rename(tmp_path / "a" / "ep9.mp4")  # renamed file
+    assert h(local()) not in (first, changed)
+    assert h(local(), input_digest="c" * 64) == h(local(), input_digest="c" * 64)
+    assert local_input_digest(tmp_path / "missing") is None
+    assert local_input_digest(None) is None
 
 
 def test_gpu_type_is_not_hashed_but_gpu_count_is_checked():

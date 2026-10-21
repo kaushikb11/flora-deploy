@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
 import sys
@@ -334,7 +335,8 @@ def test_generate_error_retried_per_episode():
     assert err.kind == "infra" and "prompt too long" in err.message
     assert run.stats["retries"] == 1 and len(llm.calls) == 1 + 5
     # identical outputs to a run without the poison episode
-    clean = reward.run(FakeLLM(), make_nv(), "P", eps[:3] + eps[4:], "terminal")
+    clean = reward.run(FakeLLM(), make_nv(), "P", eps[:3] + eps[4:], "terminal",
+                       limits=reward.UNBOUNDED)
     assert [r.to_json() for r in clean.records] == [r.to_json() for r in run.records]
 
 
@@ -591,16 +593,91 @@ def test_resume_with_planned_order_keeps_nvidia_groups():
 
 def test_planned_offset_and_bisection_children():
     """A bisection child (or a shard) holding job positions 5..12 groups by job position:
-    [5, 6, 7] then [8..12], as NVIDIA's script on the whole job would."""
+    [5, 6, 7] then [8..12], as NVIDIA's script on the whole job would. Neither group is whole
+    in that window, so neither is reported aligned (review 5 M-B), with the job list or with a
+    window of it plus its offset."""
     eps = _sixteen()
     planned = [e.uid for e in eps]
     llm = FakeLLM()
-    reward.run(llm, make_nv(), "P", eps[5:13], "terminal", planned=planned[5:13],
-               planned_offset=5)
+    win = reward.run(llm, make_nv(), "P", eps[5:13], "terminal", planned=planned[5:13],
+                     planned_offset=5, planned_total=16)
     assert _batches(llm) == [["5", "6", "7"], ["8", "9", "10", "11", "12"]]
     llm2 = FakeLLM()
-    reward.run(llm2, make_nv(), "P", eps[5:13], "terminal", planned=planned)
+    job = reward.run(llm2, make_nv(), "P", eps[5:13], "terminal", planned=planned)
     assert _batches(llm2) == _batches(llm)
+    for run in (win, job):
+        assert not any(a["grouping"]["aligned"] for a in run.audits)
+        assert run.stats["grouping"]["unaligned"] == 8
+    w = {a["episode_id"]: a["grouping"] for a in win.audits}
+    assert w["5"]["reasons"] == ["group_outside_planned"]
+    assert w["5"]["members"] == planned[5:8]  # what the window knows of group 0
+    j = {a["episode_id"]: a["grouping"] for a in job.audits}
+    assert j["5"]["members"] == planned[:8] and j["5"]["reasons"] == ["partial_group"]
+    assert j["12"]["members"] == planned[8:16] and j["12"]["batch"] == planned[8:13]
+
+
+def test_window_without_total_runs_to_the_job_end():
+    eps = _sixteen()
+    planned = [e.uid for e in eps]
+    run = reward.run(FakeLLM(), make_nv(), "P", eps[8:], "terminal", planned=planned[8:],
+                     planned_offset=8)
+    assert all(a["grouping"]["aligned"] for a in run.audits)  # group 1 = positions 8..15
+    with pytest.raises(ValueError, match="planned_total"):
+        reward.run(FakeLLM(), make_nv(), "P", eps[8:], "terminal", planned=planned[8:],
+                   planned_offset=8, planned_total=12)
+
+
+def _twenty():
+    return [reward.Episode(f"{i}", f"task {i}", ("/v/vvvv",)) for i in range(20)]
+
+
+def test_shard_split_13_7_groups_by_job_position():
+    """Review 5 M-B, the reviewer's case: a 20-episode job whose terminal shards were packed
+    13 + 7 by duration. NVIDIA's script on the job's jobs file runs [0..7] [8..15] [16..19].
+    With the job's order as ``planned``, the shards run [0..7] [8..12] and [13..15] [16..19]:
+    the cut group 1 is flagged in both shards and never reported aligned. The old shard-local
+    list (W1) claimed [8..12] and [13..19] were complete NVIDIA groups."""
+    eps = _twenty()
+    job = [e.uid for e in eps]
+    batches, audits = [], {}
+    for shard in (eps[:13], eps[13:]):
+        llm = FakeLLM()
+        run = reward.run(llm, make_nv(), "P", shard, "terminal", planned=job)
+        batches += _batches(llm)
+        audits.update({a["episode_id"]: a["grouping"] for a in run.audits})
+    assert batches == [[str(i) for i in range(8)], [str(i) for i in range(8, 13)],
+                       [str(i) for i in range(13, 16)], [str(i) for i in range(16, 20)]]
+    for i in range(20):
+        g = audits[str(i)]
+        assert g["aligned"] is (i < 8 or i >= 16), (i, g)
+        if 8 <= i < 16:
+            assert g["members"] == job[8:16] and g["reasons"] == ["partial_group"]
+    assert audits["17"]["members"] == job[16:20]  # the job's last, short group is whole
+
+    # Shards cut on NVIDIA group boundaries (``jobs.manifest``) run exactly NVIDIA's batches.
+    batches, flags = [], []
+    for shard in (eps[:16], eps[16:]):
+        llm = FakeLLM()
+        run = reward.run(llm, make_nv(), "P", shard, "terminal", planned=job)
+        batches += _batches(llm)
+        flags += [a["grouping"]["aligned"] for a in run.audits]
+    assert batches == [[str(i) for i in range(j, min(j + 8, 20))] for j in (0, 8, 16)]
+    assert all(flags) and len(flags) == 20
+
+
+def test_packed_mode_is_visible_in_records():
+    """Review 5 L-c: packed rounds are not NVIDIA's batches; the record says so."""
+    eps = [dataclasses.replace(e, envelope_ok=True) for e in _sixteen()[:3]]
+    packed = reward.run(FakeLLM(), make_nv(), "P", eps, "terminal",
+                        limits=reward.RoundLimits(align="packed"))
+    nvidia = reward.run(FakeLLM(), make_nv(), "P", eps, "terminal")
+    a, b = packed.records[0], nvidia.records[0]
+    assert a.provenance.config_hash != b.provenance.config_hash
+    assert a.certified is False and a.uncertified_reason == "packed_grouping"
+    assert b.certified is True
+    assert a.terminal == b.terminal  # content-keyed fake: same labels
+    same = reward.same_outputs(packed.as_json(), nvidia.as_json())
+    assert same["identical"] and not same["provenance_equal"]
 
 
 def test_decode_failure_leaves_a_hole():

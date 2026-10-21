@@ -39,7 +39,7 @@ def test_plan_table(cfg):
     assert "exact x4" in r.output and "balanced x1" in r.output
     assert "reference" in r.output and "needs certificates" in r.output
     assert "Recommended: 1 (exact x4)" in r.output
-    assert "exact x8 +gpu_thread" in r.output and "projection only" in r.output
+    assert "exact x8 +long_lived_container" in r.output and "projection only" in r.output
     assert "warning: includes projected" in r.output
     assert "pinned 2026-10-21" in r.output
 

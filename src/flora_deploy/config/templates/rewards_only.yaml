@@ -28,6 +28,7 @@ pipeline:
     source: dataset_task            # task text from the dataset; or `fixed` + `text`
                                     # (`none` is refused: reward prompts need a task)
   envelope: warn
+  # terminal_rationale: false       # true: reward.terminal also returns NVIDIA's rationale
 
 resources:
   reward.terminal: {gpu: H100!, max_containers: 1}

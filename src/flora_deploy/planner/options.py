@@ -16,10 +16,12 @@ Model, per option (one preset at one episode concurrency per container):
 Not modelled: queueing for GPUs beyond the cap, a single long episode's critical path, idle
 ``scaledown_window`` time and Volume/egress costs. ``flora estimate`` calibrates the rates.
 
-Rate status (review 4 M5): an option whose cost rests on rates that are not ``measured`` carries
-a ``warning:`` flag naming them. Rates that need a worker feature that is not enabled
-(``PlanRequest.features``; e.g. ``gpu_thread``, not wired yet) only appear in *projection*
-options (``requires`` set, named ``... +gpu_thread``), which ``recommended`` never picks; among
+Rate status (review 4 M5, review 5 M-C): an option whose cost rests on rates that are not
+``measured`` carries a ``warning:`` flag naming them. ``PlanRequest.features`` defaults to the
+deployed configuration's features (``planner.rates.DEPLOYED_FEATURES``: ``gpu_thread``, wired
+and on by default since P1a-5s), the same rates ``jobs.budget`` charges. Rates that need a
+feature outside it (e.g. ``long_lived_container``) only appear in *projection* options
+(``requires`` set, named ``... +long_lived_container``), which ``recommended`` never picks; among
 runnable options it prefers measured rates over projected over placeholder, then the cheapest.
 
 Everything is deterministic: same inputs, same options in the same order.
@@ -35,7 +37,7 @@ from typing import Any, Literal
 from flora_deploy.config.presets import AVAILABLE_PRESETS, get_preset, shard_kinds_for
 from flora_deploy.jobs.budget import Rates, pinned_rates
 from flora_deploy.jobs.settings import PoolSettings
-from flora_deploy.planner.rates import STATUS_RANK, RateTable
+from flora_deploy.planner.rates import DEPLOYED_FEATURES, STATUS_RANK, RateTable
 from flora_deploy.records import Stage
 
 ORCHESTRATOR_CORES = 0.25  # modal_app/orchestrator_app.py
@@ -142,7 +144,7 @@ class PlanOption:
     status: Status
     flags: tuple[str, ...]
     rate_status: str  # worst status among the kinds' rates
-    requires: tuple[str, ...] = ()  # worker features this option needs that are not enabled
+    requires: tuple[str, ...] = ()  # worker features this option needs that are not deployed
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -159,9 +161,9 @@ class PlanRequest:
     # per preset: shard kind -> pool overriding the preset default (e.g. from flora.yaml)
     pools: Mapping[str, Mapping[str, PoolSettings]] = field(default_factory=dict)
     max_options: int = 4
-    # Worker features that are wired and enabled (rates.json ``requires``). None yet:
-    # ``gpu_thread`` rates are shown as projections only.
-    features: tuple[str, ...] = ()
+    # Worker features of the configuration that will run (rates.json ``requires`` /
+    # ``excludes``): by default the deployed ones, as ``jobs.budget`` assumes.
+    features: tuple[str, ...] = DEPLOYED_FEATURES
 
 
 def _pool(req: PlanRequest, preset: str, kind: str) -> PoolSettings:
@@ -289,8 +291,8 @@ def build_option(req: PlanRequest, table: RateTable, rates: Rates, preset: str, 
             worse("at risk")
     worst = max((k.status for k in kinds), key=lambda s: STATUS_RANK[s])
     if missing:
-        flags.append(f"projection only: needs {', '.join(missing)}, which is not wired into "
-                     "the worker yet (not runnable today)")
+        flags.append(f"projection only: needs {', '.join(missing)}, which the deployed "
+                     "configuration does not provide (not runnable today)")
     unmeasured = [f"{k.kind} ({k.status})" for k in kinds if k.status != "measured"]
     if unmeasured:
         what = ("placeholder rates (not measured yet)" if worst == "placeholder"
