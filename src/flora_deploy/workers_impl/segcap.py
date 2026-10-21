@@ -493,6 +493,8 @@ class SegcapWorkerSettings:
     # G3 (docs/exact-cost.md; ``config.schema.ExactScheduling``, not hashed): "plan" (manifest
     # order) or "longest_first" (LPT by the manifest's ``duration_s``, ties in plan order)
     episode_order: str = "plan"
+    # shard kind -> ``workers_impl.binding.CertBinding`` stamped into its records
+    cert_bindings: Mapping[str, Any] = field(default_factory=dict)
 
 
 def scheduling_from_env(env: Mapping[str, str] | None = None) -> dict[str, Any]:
@@ -844,7 +846,7 @@ class SegcapShardRunner:
         ks = _container_ks(prior.parts, self.container_id)
         start_k = max([self._next_k.get(key, 0), *(k + 1 for k in ks)])
         sink = ShardPartSink(jf, shard.kind, shard.shard_id, self.container_id, s.local_dir,
-                             start_k=start_k)
+                             start_k=start_k, binding=s.cert_bindings.get(shard.kind))
         active.sink = sink
 
         poisoned: set[str] = set()  # step 3
