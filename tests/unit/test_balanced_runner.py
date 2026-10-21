@@ -19,16 +19,7 @@ from flora_deploy.workers_impl.segment import (
     StageInfo,
 )
 from tests.conformance.worker_suite import WorkerSpec, World
-from tests.fakes import fake_nvidia as F
-
-
-def nv_raised(exc: BaseException) -> BaseException:
-    """``exc`` as raised by a frame of "NVIDIA's code" (a registered NVIDIA root)."""
-    try:
-        F.nvidia_raise(exc)
-    except BaseException as e:  # noqa: BLE001
-        return e
-    raise AssertionError("did not raise")
+from tests.fakes import fake_nvidia
 
 
 class NullEngine:
@@ -108,8 +99,16 @@ def test_truncated_index_receipt_is_infra(tmp_path, monkeypatch):
 
 def test_nvidia_builtin_runtime_error_rejection_is_terminal(tmp_path, monkeypatch):
     bad = []
-    w = world(tmp_path, monkeypatch, exc_for=lambda uid: nv_raised(RuntimeError(
-        "The pipeline returned an invalid caption interval.")) if uid in bad else None)
+    def exc_for(uid):
+        if uid not in bad:
+            return None
+        try:  # raised by NVIDIA's (fake) code: a builtin RuntimeError from its frame
+            fake_nvidia.nvidia_raise(RuntimeError(
+                "The pipeline returned an invalid caption interval."))
+        except RuntimeError as e:
+            return e
+
+    w = world(tmp_path, monkeypatch, exc_for=exc_for)
     bad.append(w.uids[1])
     rec = w.run("ta-1")
     assert rec is not None and rec.episodes_failed == (w.uids[1],)
@@ -142,25 +141,36 @@ def test_cuda_fault_fails_fast_and_exits_container(tmp_path, monkeypatch):
     assert len(seen) == 1, "episodes kept running on a dead engine"
     m = w.marker("ta-1")
     assert m is not None and m.ended_utc and not m.preempted
+    assert m.crashed  # the container is replaced: the start counts toward D15
 
 
-@pytest.mark.parametrize("exc,phase,want", [
-    (RuntimeError("No common caption input geometry fits"), "nvidia", "nv_failure"),
-    (RuntimeError("The pipeline returned an invalid caption interval."), "nvidia",
+@pytest.mark.parametrize("exc,phase,src,want", [
+    (RuntimeError("No common caption input geometry fits"), "nvidia", "nv", "nv_failure"),
+    (RuntimeError("The pipeline returned an invalid caption interval."), "nvidia", "nv",
      "nv_failure"),
-    (nv_raised(ValueError("NVIDIA InputError")), "nvidia", "nv_failure"),
-    (ValueError("no NVIDIA profile"), "inputs", "infra"),
-    (ValueError("nan"), "records", "python"),
-    (RuntimeError("CUDA error: device-side assert triggered"), "nvidia", "cuda_fatal"),
-    (RuntimeError("CUDA out of memory"), "nvidia", "oom"),
-    (KeyError("x"), "nvidia", "python"),
+    (RuntimeError("The pipeline returned an invalid caption interval."), "nvidia", "ours",
+     "python"),
+    (fake_nvidia.InputError("NVIDIA InputError"), "nvidia", "ours", "nv_failure"),
+    (ValueError("our ValueError"), "nvidia", "ours", "python"),
+    (ValueError("no NVIDIA profile"), "inputs", "ours", "infra"),
+    (ValueError("nan"), "records", "nv", "python"),
+    (RuntimeError("CUDA error: device-side assert triggered"), "nvidia", "ours", "cuda_fatal"),
+    (RuntimeError("CUDA out of memory"), "nvidia", "ours", "oom"),
+    (KeyError("x"), "nvidia", "ours", "python"),
+    (KeyError("x"), "nvidia", "nv", "nv_failure"),
 ])
-def test_classify_categories(exc, phase, want):
+def test_classify_categories(exc, phase, src, want):
+    """By phase, then by origin (``nv.errors``): ``src`` is the frame that raised ``exc``,
+    NVIDIA's (fake) code or this test's."""
     from flora_deploy.workers_impl.segment import _classify
 
-    exc.flora_phase = phase
-    assert _classify(exc) == want
-
+    try:
+        if src == "nv":
+            fake_nvidia.nvidia_raise(exc)
+        raise exc
+    except BaseException as e:  # noqa: BLE001
+        e.flora_phase = phase
+        assert _classify(e) == want
 
 
 def test_sigint_in_main_thread_marks_preempted_promptly(tmp_path, monkeypatch):

@@ -229,3 +229,37 @@ def test_never_recommends_an_unavailable_option():
 def test_exact_segcap_is_available():
     req = PlanRequest(WorkloadSummary.from_hours(10), presets=("exact",), max_gpus=10)
     assert all(not o.unavailable for o in plan_options(req) if not o.requires)
+
+
+def test_certified_pools_drop_the_uncertified_reason():
+    """``with_certificates``: an option whose every pool is certified (``cli.plan.
+    certified_options``) loses its "uncertified" unavailable reason and flag, keeps the others,
+    and can be recommended once nothing else blocks it."""
+    from dataclasses import replace
+
+    from flora_deploy.planner.options import (
+        PlanRequest,
+        WorkloadSummary,
+        plan_options,
+        recommended,
+        with_certificates,
+    )
+
+    req = PlanRequest(WorkloadSummary.from_hours(100), deadline_s=96 * 3600, budget_usd=6000,
+                      max_gpus=10)
+    opts = plan_options(req)
+    bal = next(o for o in opts if o.preset == "balanced")
+    assert any(u.startswith("uncertified") for u in bal.unavailable)
+    out = with_certificates(opts, {bal.name})
+    cbal = next(o for o in out if o.preset == "balanced")
+    assert cbal.certification == "certified"
+    assert not any(u.startswith("uncertified") for u in cbal.unavailable)
+    assert set(cbal.unavailable) == set(bal.unavailable) - {
+        u for u in bal.unavailable if u.startswith("uncertified")}
+    assert not any("uncertified until" in f for f in cbal.flags)
+    assert with_certificates(opts, set()) == list(opts)  # nothing certified: unchanged
+    # once its rates are measured and its workers deploy, the certified, cheaper balanced wins
+    ready = [replace(o, rate_status="measured", unavailable=()) if o is cbal else o for o in out]
+    assert recommended(ready, certified={bal.name}).preset == "balanced"
+    assert recommended([replace(bal, rate_status="measured", unavailable=tuple(
+        u for u in bal.unavailable if u.startswith("uncertified")))] + opts[1:]).preset == "exact"

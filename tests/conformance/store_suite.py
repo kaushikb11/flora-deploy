@@ -12,7 +12,13 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 
 from flora_deploy.jobs.store import JobPaths, Store
-from flora_deploy.jobs.stores import BucketStore, LocalStore, VolumeStore, check_rel_path
+from flora_deploy.jobs.stores import (
+    BucketStore,
+    ClientVolumeStore,
+    LocalStore,
+    VolumeStore,
+    check_rel_path,
+)
 
 
 class FakeVolume:
@@ -68,7 +74,14 @@ STORES: dict[str, Callable[[Path], Store]] = {
     "local": lambda root: LocalStore(root / "local"),
     "volume": lambda root: VolumeStore(root / "mount", FakeVolume(), tmp_dir=root),
     "bucket": lambda root: BucketStore("bkt", prefix="pre/fix", client=FakeS3(), page_size=2),
+    "client-volume": lambda root: _client_volume(),
 }
+
+
+def _client_volume() -> Store:
+    from tests.fakes.client_volume import FakeClientVolume
+
+    return ClientVolumeStore(FakeClientVolume(), "/flora-root")
 
 P = JobPaths("job")
 RECEIPT = P.receipt("cfg", "segcap", "segcap-00000")

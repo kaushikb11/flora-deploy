@@ -34,6 +34,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     ValidationError,
     ValidationInfo,
     field_validator,
@@ -346,6 +347,25 @@ class FloraConfig(_Model):
     weights: WeightsSection = Field(default_factory=WeightsSection)
     retries: RetriesSection = Field(default_factory=RetriesSection)
     observability: ObservabilitySection = Field(default_factory=ObservabilitySection)
+    # Directory of the file this config was loaded from (``load_config``): a relative local
+    # ``input.path`` resolves against it, never the cwd (:meth:`local_input_root`). Not a field:
+    # not hashed, not dumped.
+    _base_dir: str | None = PrivateAttr(default=None)
+
+    @property
+    def base_dir(self) -> Path | None:
+        return Path(self._base_dir) if self._base_dir else None
+
+    def local_input_root(self) -> Path | None:
+        """The local input directory (no ``repo``): ``input.path`` with ``~`` expanded and, when
+        relative, resolved against the config file's directory (:attr:`base_dir`; the cwd only
+        for a config that was not loaded from a file). ``None`` for a Hub input."""
+        if self.input.repo is not None or not self.input.path:
+            return None
+        p = Path(self.input.path).expanduser()
+        if p.is_absolute():
+            return p
+        return (self.base_dir or Path.cwd()) / p
 
     @model_validator(mode="after")
     def _resolve(self, info: ValidationInfo) -> FloraConfig:
@@ -521,7 +541,7 @@ def with_pipeline(cfg: FloraConfig, **fields: Any) -> FloraConfig:
     the config, and with it the hash, the app name and the store paths."""
     data = cfg.model_dump(mode="python")
     data["pipeline"] = {**data["pipeline"], **fields}
-    return parse_config(data, allow_uncertified=cfg.allow_uncertified)
+    return parse_config(data, allow_uncertified=cfg.allow_uncertified, base_dir=cfg.base_dir)
 
 
 def _format_errors(err: ValidationError, source: str) -> str:
@@ -539,19 +559,24 @@ def _format_errors(err: ValidationError, source: str) -> str:
 
 def parse_config(data: Any, *, source: str = "flora.yaml",
                  allow_uncertified: bool = False,
-                 derived_content: Mapping[str, str] | None = None) -> FloraConfig:
+                 derived_content: Mapping[str, str] | None = None,
+                 base_dir: str | Path | None = None) -> FloraConfig:
     """Validate a parsed YAML/JSON document. Raises ``ConfigError`` listing every problem.
 
     ``allow_uncertified`` (the CLI's ``--allow-uncertified``) has the effect of the config's
     ``allow_uncertified: true``. ``derived_content``: derived-weight content digests, needed to
-    match a certificate for a kind with derived weights (``validate.certkey.matching``)."""
+    match a certificate for a kind with derived weights (``validate.certkey.matching``).
+    ``base_dir``: the config file's directory (``FloraConfig.base_dir``)."""
     if not isinstance(data, dict):
         raise ConfigError(f"{source}: expected a mapping at the top level")
     try:
-        return FloraConfig.model_validate(data, context={"allow_uncertified": allow_uncertified,
-                                                         "derived_content": derived_content})
+        cfg = FloraConfig.model_validate(data, context={"allow_uncertified": allow_uncertified,
+                                                        "derived_content": derived_content})
     except ValidationError as e:
         raise ConfigError(_format_errors(e, source)) from None
+    if base_dir is not None:
+        cfg._base_dir = str(Path(base_dir).resolve())
+    return cfg
 
 
 def _yaml_loader():
@@ -594,15 +619,17 @@ def loads_yaml(text: str, *, source: str = "flora.yaml") -> Any:
 
 
 def loads_config(text: str, *, source: str = "flora.yaml",
-                 allow_uncertified: bool = False) -> FloraConfig:
+                 allow_uncertified: bool = False,
+                 base_dir: str | Path | None = None) -> FloraConfig:
     return parse_config(loads_yaml(text, source=source), source=source,
-                        allow_uncertified=allow_uncertified)
+                        allow_uncertified=allow_uncertified, base_dir=base_dir)
 
 
 def load_config(path: str | Path, *, allow_uncertified: bool = False) -> FloraConfig:
+    """``path`` validated; a relative local ``input.path`` resolves against its directory."""
     p = Path(path)
     return loads_config(p.read_text(encoding="utf-8"), source=str(p),
-                        allow_uncertified=allow_uncertified)
+                        allow_uncertified=allow_uncertified, base_dir=p.resolve().parent)
 
 
 def to_run_settings(

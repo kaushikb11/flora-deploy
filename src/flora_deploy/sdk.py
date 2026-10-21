@@ -49,7 +49,6 @@ live in its process) and :meth:`Job.logs` refuses (no Modal logs).
 from __future__ import annotations
 
 import dataclasses
-import io
 import json
 import math
 import os
@@ -61,6 +60,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from flora_deploy.jobs.store import JobPaths, Store, fake_job_id, is_fake_job_id
+from flora_deploy.jobs.stores.client_volume import ClientVolumeStore
 
 RUN_SPEC_SCHEMA = "flora_run_v1"
 FACTORY = "flora_deploy.sdk:deployed_deps"  # the deps factory the deployed orchestrator loads
@@ -125,84 +125,21 @@ class Backend(Protocol):
              tail: int | None = None, function_call: str | None = None) -> Iterator[str]: ...
 
 
-class RemoteVolumeStore:
-    """``Store`` over a Modal Volume (v2) through the client API, for processes that do not mount
-    it (your laptop). Whole-file writes (``batch_upload``), whole-file reads (``read_file``),
-    recursive listings (``listdir``). ``root``: the store's path inside the Volume."""
-
-    def __init__(self, volume: Any, root: str = ""):
-        self.volume = volume
-        self.root = root.strip("/")
-
-    def _abs(self, path: str) -> str:
-        from flora_deploy.jobs.stores.local import check_rel_path
-
-        check_rel_path(path)
-        return f"/{self.root}/{path}" if self.root else f"/{path}"
-
-    def put_bytes(self, path: str, data: bytes) -> None:
-        with self.volume.batch_upload(force=True) as batch:
-            batch.put_file(io.BytesIO(data), self._abs(path))
-
-    def get_bytes(self, path: str) -> bytes:
-        try:
-            return b"".join(self.volume.read_file(self._abs(path)))
-        except FileNotFoundError:
-            raise
-        except Exception as e:
-            if type(e).__name__ == "NotFoundError":
-                raise FileNotFoundError(path) from None
-            raise
-
-    def exists(self, path: str) -> bool:
-        try:
-            self.get_bytes(path)
-        except FileNotFoundError:
-            return False
-        return True
-
-    def list(self, prefix: str) -> Iterator[str]:
-        base = prefix.rstrip("/")
-        d = base if prefix.endswith("/") or not base else base.rsplit("/", 1)[0]
-        try:
-            entries = self.volume.listdir(self._abs(d) if d else
-                                          (f"/{self.root}" if self.root else "/"),
-                                          recursive=True)
-        except Exception as e:
-            if isinstance(e, FileNotFoundError) or type(e).__name__ == "NotFoundError":
-                return iter(())
-            raise
-        cut = len(self.root) + 1 if self.root else 0
-        out = []
-        for entry in entries:
-            if int(getattr(entry.type, "value", entry.type)) != 1:  # FileEntryType.FILE
-                continue
-            rel = entry.path.lstrip("/")[cut:]
-            if rel.startswith(prefix) and ".tmp" not in rel.rsplit("/", 1)[-1]:
-                out.append(rel)
-        return iter(sorted(out))
+# ``Store`` over a Volume through the Modal client (no mount): ``jobs.stores.ClientVolumeStore``.
+RemoteVolumeStore = ClientVolumeStore
 
 
 class ModalBackend:
     """The real backend (modal 1.6.2). Never used by tests."""
 
     def store(self, uri: str, *, environment: str | None = None) -> Store:
-        from urllib.parse import urlparse
-
-        u = urlparse(uri)
-        if u.scheme in ("modal-volume", "volume"):
-            mount = os.environ.get("FLORA_VOLUME_MOUNT") or f"/vol/{u.netloc}"
-            if Path(mount).is_dir():
-                from flora_deploy.export.results import store_from_uri
-
-                return store_from_uri(f"modal-volume://{u.netloc}{u.path}")
-            import modal
-
-            vol = modal.Volume.from_name(u.netloc, environment_name=environment, version=2)
-            return RemoteVolumeStore(vol, u.path)
+        """The mount inside a container that has it, else the Modal client's Volume API
+        (``export.results.store_from_uri``)."""
         from flora_deploy.export.results import store_from_uri
 
-        return store_from_uri(uri)
+        if uri.startswith("volume://"):
+            uri = "modal-volume://" + uri[len("volume://"):]
+        return store_from_uri(uri, environment=environment)
 
     def spawn(self, app_name: str, function: str, *args: Any, environment: str | None = None,
               **kwargs: Any) -> str:
@@ -823,11 +760,14 @@ def _done_shards(job: Job, manifest: Any) -> set[str]:
 # ----------------------------------------------------------------------------------------------
 
 
-def _load_cfg(cfg: Any, *, allow_uncertified: bool = False) -> Any:
+def _load_cfg(cfg: Any, *, allow_uncertified: bool = False,
+              receipts: Mapping[str, str] | None = None) -> Any:
+    """A ``FloraConfig`` (a path is loaded with its derived content digests,
+    ``config.receipts.load_certified``, so a certified preset validates)."""
     if isinstance(cfg, str | Path):
-        from flora_deploy.config.schema import load_config
+        from flora_deploy.config.receipts import load_certified
 
-        return load_config(cfg, allow_uncertified=allow_uncertified)
+        return load_certified(cfg, allow_uncertified=allow_uncertified, overrides=receipts)[0]
     return cfg
 
 
@@ -877,6 +817,7 @@ def submit(cfg: Any, *, job_id: str | None = None, store: str | None = None,
     (recorded by ``flora prepare``; ``config.receipts.resolve``). ``budget_usd`` overrides
     ``modal.budget_usd``."""
     from flora_deploy.config.hashing import MissingReceiptError
+    from flora_deploy.config.receipts import derived_content
     from flora_deploy.config.receipts import resolve as resolve_receipts
     from flora_deploy.config.schema import to_run_settings
     from flora_deploy.jobs.orchestrator import utc
@@ -885,11 +826,12 @@ def submit(cfg: Any, *, job_id: str | None = None, store: str | None = None,
 
     say = log or (lambda m: None)
     be = backend or get_backend()
-    cfg = _load_cfg(cfg, allow_uncertified=allow_uncertified)
+    cfg = _load_cfg(cfg, allow_uncertified=allow_uncertified, receipts=receipts)
     try:
         plan = (planner or _plan_deployment)(
             cfg, store=store, bucket_secret=bucket_secret,
             derived_receipts=resolve_receipts(cfg, receipts),
+            derived_content=derived_content(cfg, receipts),
             allow_uncertified=allow_uncertified, determinism=determinism)
     except (DeployError, MissingReceiptError, ValueError) as e:
         raise FloraError(str(e)) from None
@@ -920,6 +862,8 @@ def submit(cfg: Any, *, job_id: str | None = None, store: str | None = None,
 
     settings = to_run_settings(cfg, job_id, config_hash=plan.config_hash,
                                stage_hashes=dict(plan.stage_hashes))
+    if getattr(plan, "fake_models", False):  # CPU containers: priced as such (jobs.budget)
+        settings = dataclasses.replace(settings, fake_models=True)
     if budget_usd is not None:
         settings = dataclasses.replace(settings, budget_usd=float(budget_usd))
     now = utc(time.time())

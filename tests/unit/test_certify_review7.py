@@ -431,8 +431,11 @@ def test_recommended_prefers_a_cheaper_certified_balanced():
 
     req = PlanRequest(WorkloadSummary.from_hours(100), deadline_s=96 * 3600, budget_usd=6000,
                       max_gpus=10)
-    opts = [replace(o, rate_status="measured") if o.preset == "balanced" else o
-            for o in plan_options(req)]
+    # balanced as if measured and deployable (its rates and workers are not, today): only its
+    # certification differs from exact's
+    opts = [replace(o, rate_status="measured", unavailable=tuple(
+        u for u in o.unavailable if u.startswith("uncertified"))) if o.preset == "balanced"
+        else o for o in plan_options(req)]
     bal = next(o for o in opts if o.preset == "balanced")
     ex = recommended(opts)
     assert ex.preset == "exact" and bal.cost_usd < ex.cost_usd  # uncertified: exact

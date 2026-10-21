@@ -29,7 +29,7 @@ input:
 
 pipeline:
   stages: [segment, caption, reward.terminal, reward.dense]
-  embodiment: yam                   # bimanual robot with 3 synchronized views
+  embodiment: yam                   # bimanual ALOHA arms, 3 synchronized views (NVIDIA's yam pool)
   episode_instruction: {source: dataset_task}
 
 output:

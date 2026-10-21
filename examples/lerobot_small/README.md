@@ -5,6 +5,10 @@ The `balanced` preset on [`lerobot/aloha_static_cups_open`](https://huggingface.
 are used: `cam_high` as the main view and the two wrist cameras. `cam_low` is not, because the
 `yam` embodiment takes exactly three views and `cam_low`, a second low overview, has no YAM role
 (the golden set drops it the same way). ALOHA is not YAM hardware; it stands in for it here.
+
+**Embodiment: `yam`** (bimanual ALOHA arms standing in for NVIDIA's `yam` pool; camera
+keys from `meta/info.json` at the pinned revision).
+
 Set `output.sink` to your bucket or Volume, then run `flora doctor -c flora.yaml` and follow the
 "Run on Modal" steps in the top-level README.
 

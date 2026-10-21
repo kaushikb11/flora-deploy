@@ -195,10 +195,12 @@ def run(
     if resume:
         raise fail("on Modal, continue a stopped job with `flora resume <job> [--budget-usd X]`")
     from flora_deploy import sdk
-    from flora_deploy.config.schema import ConfigError, load_config
+    from flora_deploy.config.receipts import load_certified
+    from flora_deploy.config.schema import ConfigError
 
     try:
-        cfg = load_config(config, allow_uncertified=allow_uncertified)
+        cfg = load_certified(config, allow_uncertified=allow_uncertified,
+                             overrides=_receipts(receipt))[0]
     except FileNotFoundError:
         raise fail(f"{config} not found; run `flora init` first") from None
     except ConfigError as e:

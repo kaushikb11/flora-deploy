@@ -11,9 +11,11 @@ Parquet table, and the other way round.
 * ``file:///abs/dir`` (or a bare path) → ``LocalStore``;
 * ``s3://bucket[/prefix]`` → ``BucketStore`` (boto3; endpoint from ``AWS_ENDPOINT_URL`` or
   ``endpoint_url=`` for R2/GCS);
-* ``modal-volume://name`` → ``VolumeStore`` over the Volume's mount inside a Modal container
-  (``/vol/<name>`` unless ``volume_mount=`` / ``FLORA_VOLUME_MOUNT`` says otherwise). No Modal
-  API is called; Modal commits the container's writes when it exits.
+* ``modal-volume://name[/path]`` → ``VolumeStore`` over the Volume's mount inside a Modal
+  container (``/vol/<name>`` unless ``volume_mount=`` / ``FLORA_VOLUME_MOUNT`` says otherwise;
+  no Modal API is called, Modal commits the container's writes when it exits); where it is not
+  mounted (a laptop), ``jobs.stores.ClientVolumeStore`` through the Modal client's Volume file
+  API (``environment=``: the Modal environment; no container is started).
 """
 
 from __future__ import annotations
@@ -40,8 +42,8 @@ class ResultsNotFound(FileNotFoundError):
 
 
 def store_from_uri(uri: str, *, endpoint_url: str | None = None,
-                   volume_mount: str | None = None) -> Store:
-    from flora_deploy.jobs.stores import BucketStore, LocalStore, VolumeStore
+                   volume_mount: str | None = None, environment: str | None = None) -> Store:
+    from flora_deploy.jobs.stores import BucketStore, ClientVolumeStore, LocalStore, VolumeStore
 
     u = urlparse(uri)
     if u.scheme in ("", "file"):
@@ -60,10 +62,11 @@ def store_from_uri(uri: str, *, endpoint_url: str | None = None,
         if not u.netloc:
             raise ValueError(f"store {uri!r}: modal-volume://<name>")
         mount = Path(volume_mount or os.environ.get("FLORA_VOLUME_MOUNT") or f"/vol/{u.netloc}")
-        if not mount.is_dir():
-            raise ValueError(f"store {uri!r}: Volume mount {mount} not found (run inside a "
-                             "Modal container that mounts it, or pass the mount path)")
-        return VolumeStore(mount)
+        sub = u.path.strip("/")
+        if mount.is_dir():
+            return VolumeStore(mount / sub if sub else mount)
+        return ClientVolumeStore.from_uri(f"modal-volume://{u.netloc}/{sub}",
+                                          environment=environment)
     raise ValueError(f"store {uri!r}: use file://, s3:// or modal-volume://")
 
 

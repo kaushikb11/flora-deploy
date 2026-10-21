@@ -33,8 +33,9 @@ from typing import Any
 from flora_deploy.config.hashing import MissingReceiptError
 from flora_deploy.config.pins import DERIVED_PINS_BY_KEY
 
-__all__ = ["MissingReceiptError", "ReceiptPinMismatch", "check_pinned", "needed", "pin_key",
-           "record", "resolve", "set_derived_text"]
+__all__ = ["MissingReceiptError", "ReceiptPinMismatch", "check_overrides", "check_pinned",
+           "derived_content", "load_certified", "needed", "pin_key", "record", "resolve",
+           "set_derived_text"]
 
 YAML_PATH = "weights.derived"
 
@@ -97,6 +98,43 @@ def resolve(cfg: Any, overrides: Mapping[str, str] | None = None) -> dict[str, s
             "(it builds them in your Modal Volume and records their receipts in flora.yaml), "
             "or pass --receipt NAME=<sha256>")
     return out
+
+
+def derived_content(cfg: Any, overrides: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Content digests of the derived weights ``cfg`` needs, for certificate matching
+    (``validate.certkey``): for each needed name with a receipt (``weights.derived`` plus
+    ``overrides``), the content its ``pins.DERIVED_PINS`` entry pins. ``flora prepare`` refuses
+    to record a receipt whose content is not the pinned one (:func:`check_pinned`) and the
+    workers refuse to load one (``accel/captioner_load.py``), so the pinned digest is the content
+    that runs. Fail closed: a name without a receipt, or whose pin has no content digest yet, is
+    left out, and a kind that needs it then matches no certificate."""
+    recorded = {**dict(cfg.weights.derived),
+                **{k: v for k, v in (overrides or {}).items() if v}}
+    out: dict[str, str] = {}
+    for name in needed(cfg):
+        pin = DERIVED_PINS_BY_KEY.get(pin_key(name))
+        if recorded.get(name) and pin is not None and pin.content_sha256:
+            out[name] = pin.content_sha256
+    return out
+
+
+def load_certified(path: str | os.PathLike[str], *, allow_uncertified: bool = False,
+                   overrides: Mapping[str, str] | None = None) -> tuple[Any, dict[str, str]]:
+    """``(config, derived content digests)``: ``path`` validated with the content digests of its
+    own derived weights (:func:`derived_content`), so the certificate check can match a kind
+    that needs derived weights. What ``flora deploy`` / ``run`` / ``plan`` and ``sdk.submit``
+    load a config with."""
+    from flora_deploy.config.schema import loads_yaml, parse_config
+
+    p = Path(path)
+    data = loads_yaml(p.read_text(encoding="utf-8"), source=str(p))
+    base = p.resolve().parent  # a relative input.path resolves against it
+    first = parse_config(data, source=str(p), allow_uncertified=True, base_dir=base)
+    content = derived_content(first, overrides)
+    if allow_uncertified:
+        return first, content
+    return parse_config(data, source=str(p), allow_uncertified=False,
+                        derived_content=content, base_dir=base), content
 
 
 def check_overrides(overrides: Mapping[str, str]) -> None:

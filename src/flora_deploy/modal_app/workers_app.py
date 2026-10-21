@@ -208,8 +208,10 @@ def reward_settings_from_env(env: Mapping[str, str] = os.environ, *,
 
 
 def _die(exc: BaseException) -> None:
-    """After a CUDA fault the engine is unusable: replace the container (the attempt marker is
-    already written with the error, so this start does not count toward D15)."""
+    """After a CUDA fault (or GPU OOM) the engine is unusable: replace the container. The
+    runner has already written the attempt marker with the error and ``crashed=True``
+    (``jobs.attempts.mark_exception``), so this start **counts** toward D15 quarantine: an input
+    that faults every time ends isolated (bisected, then poison-pilled) instead of crash-looping."""
     print(f"fatal: {type(exc).__name__}: {exc}; exiting the container", flush=True)
     os._exit(70)
 

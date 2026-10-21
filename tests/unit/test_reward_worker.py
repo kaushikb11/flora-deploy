@@ -458,6 +458,7 @@ def test_cuda_fault_calls_fatal_after_marking(tmp_path):
     with pytest.raises(ShardInfraError):
         runner.run_shard(JOB, shard.shard_id, CFG)
     assert len(seen) == 1 and seen[0].error  # the marker was written before the container dies
+    assert seen[0].crashed  # and it counts toward D15 quarantine
 
 
 def test_receipt_instruction_text_and_fixed_default(tmp_path):

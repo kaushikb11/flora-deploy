@@ -85,6 +85,7 @@ OUTPUT_MODULES: dict[str, tuple[str, ...]] = {
         # mode is only as good as the code that applies it: the W2-merge bug (determinism and
         # terminal_rationale hashed but not applied) lived here, while these were non-output.
         "config/schema.py",  # output_settings / with_pipeline / to_run_settings
+        "workers_impl/binding.py",  # provenance.embodiment / cert_key / gpu of every record
         "jobs/settings.py",  # RunSettings carries the modes to the workers
         "modal_app/factory.py",  # worker env (FLORA_DETERMINISM, FLORA_TERMINAL_MODE, ...)
         # certification provenance stamped into records (embodiment, cert_key, gpu)
@@ -152,6 +153,7 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     # cli: argument parsing; every output-affecting choice goes through the (hashed) config
     "cli/__init__.py",
     "cli/_app.py",
+    "cli/_certs.py",  # certificate status report (validate.certkey.status); display only
     "cli/cancel.py",
     "cli/certify.py",
     "cli/deploy.py",
@@ -188,6 +190,7 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     "jobs/store.py",
     "jobs/stores/__init__.py",
     "jobs/stores/bucket.py",
+    "jobs/stores/client_volume.py",  # a Volume through the Modal client (laptops); no outputs
     "jobs/stores/local.py",
     "jobs/stores/volume.py",
     # local: the in-process runner, spawner, fault injection and fake engines (G2). Never on a

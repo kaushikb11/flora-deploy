@@ -117,6 +117,15 @@ class Rates:
         return replace(self, region_multiplier=multiplier)
 
 
+def pool_rate(rates: Rates, settings: RunSettings, kind: str) -> float:
+    """$/s of one container of ``kind``'s pool **as billed**: a ``fake_models`` job (the H0
+    rehearsal app) runs every kind on a CPU container (``jobs.settings.billed_pool``), never on
+    the pool's GPU."""
+    from flora_deploy.jobs.settings import billed_pool
+
+    return rates.pool_per_second(billed_pool(settings, kind))
+
+
 def pinned_rates(*, region_multiplier: float = 1.0) -> Rates:
     return Rates(gpu_per_s={k: v / 3600.0 for k, v in PINNED_PRICES.items()},
                  core_per_s=PINNED_CORE_HOUR / 3600.0, gib_per_s=PINNED_GIB_HOUR / 3600.0,
@@ -306,7 +315,7 @@ def calls_cost(calls: Iterable[CallRecord], settings: RunSettings, rates: Rates,
     for kind, ev in by_kind.items():
         pool = settings.pools[kind]  # type: ignore[index]
         mi = max(pool.max_inputs, 1)
-        per_s = rates.pool_per_second(pool)
+        per_s = pool_rate(rates, settings, kind)
         ev.sort(key=lambda e: (e[0], -e[1]))  # starts before ends at the same instant
         ev.append((now, 0))
         n = 0
@@ -531,7 +540,7 @@ def project(*, spent: float, pending: Sequence[Shard], in_flight: Mapping[str, i
         cal = (calibration or {}).get(s.kind, 1.0)
         by_kind.setdefault(s.kind, []).append(
             shard_container_seconds(s, pool, cal, estimator=estimator)
-            * rates.pool_per_second(pool))
+            * pool_rate(rates, settings, s.kind))
     in_flight_usd = queued_usd = startup_usd = 0.0
     for kind in sorted(set(by_kind) | set(in_flight) | set(live_remaining_usd or {})):
         costs = by_kind.get(kind, [])
@@ -547,7 +556,7 @@ def project(*, spent: float, pending: Sequence[Shard], in_flight: Mapping[str, i
             running = math.ceil(n_live / max(pool.max_inputs, 1))
             new = min(max(pool.max_containers - running, 0),
                       math.ceil(n_queued / max(pool.max_inputs, 1)))
-            startup_usd += new * startup_s[kind] * rates.pool_per_second(pool)
+            startup_usd += new * startup_s[kind] * pool_rate(rates, settings, kind)
     return Projection(spent, in_flight_usd, queued_usd, startup_usd)
 
 
@@ -748,7 +757,7 @@ class ProjectionBudgetGate:
             est_cs = self._cs(s) * cal.get(c.kind, 1.0) if s else 0.0
             wall = self._startup(c.kind) + est_cs * mi
             left = max(wall - (now - c.spawned_at), 0.0)
-            out[c.call_id] = left / mi * self.rates.pool_per_second(pool)
+            out[c.call_id] = left / mi * pool_rate(self.rates, self.settings, c.kind)
         return out
 
     def burn_per_s(self) -> float:
@@ -761,7 +770,8 @@ class ProjectionBudgetGate:
         out = 0.0
         for kind, k in n.items():
             pool = self.settings.pools[kind]  # type: ignore[index]
-            out += math.ceil(k / max(pool.max_inputs, 1)) * self.rates.pool_per_second(pool)
+            out += math.ceil(k / max(pool.max_inputs, 1)) * pool_rate(self.rates, self.settings,
+                                                                      kind)
         return out
 
     # spend / projection ---------------------------------------------------------------------
@@ -808,8 +818,8 @@ class ProjectionBudgetGate:
     def admit(self, shard: Shard, in_flight: Mapping[str, int]) -> BudgetDecision:
         p = self.projection(in_flight)
         cal = self.effective_calibration()
-        pool = self.settings.pools[shard.kind]
-        this = self._cs(shard) * cal.get(shard.kind, 1.0) * self.rates.pool_per_second(pool)
+        this = self._cs(shard) * cal.get(shard.kind, 1.0) * pool_rate(self.rates, self.settings,
+                                                                      shard.kind)
         if self.policy == "projection":
             need = p.total_usd
         else:

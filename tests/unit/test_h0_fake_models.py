@@ -122,7 +122,11 @@ def test_fake_workers_refuse_outside_a_fake_app():
 
 class _DeployedFakes(LocalRunner):
     """G2's local orchestrator + spawner, but each container runs the *deployed* fake workers'
-    runners and fault hook, configured only through the env the factory sets."""
+    runners and fault hook, configured only through the env the factory sets. Spend is priced
+    as the deployed app's CPU containers (``RunSettings.fake_models``), as ``sdk.submit`` does
+    for a ``--fake-models`` plan."""
+
+    bill_as_fake_app = True
 
     def __init__(self, *a, env: dict, **kw):
         super().__init__(*a, **kw)

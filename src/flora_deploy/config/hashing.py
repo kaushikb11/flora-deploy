@@ -16,9 +16,11 @@ Shared (every stage hash):
   nobody bumps the label);
 - preset, embodiment pool, episode-instruction source/text, envelope policy;
 - decode pins (av, Pillow, numpy, arch);
-- input identity: format, dataset (repo or normalized path), revision, subdirectory, camera map,
-  and the input ``content`` digest: the caller's ``input_digest`` when it has one, else for a
-  **local** input (no ``repo``) :func:`local_input_digest` of the directory (relative path,
+- input identity: format, dataset (repo, or a local path relative to the config file's
+  directory: never the cwd, so the hash is the same from any cwd and machine), revision,
+  subdirectory, camera map, and the input ``content`` digest: the caller's ``input_digest``
+  when it has one, else for a **local** input (no ``repo``) :func:`local_input_digest` of the
+  directory, resolved against the config file's directory (relative path,
   size and sha256 of every file; review 3 A8: the path string alone does not bind the
   contents). A Hugging Face input is bound by its 40-hex ``revision``. The
   camera map is hashed as written: ``cameras: None`` and an explicit map that resolves to the
@@ -152,6 +154,19 @@ def local_input_digest(path: str | os.PathLike[str] | None) -> str | None:
     return _sha({"schema": "flora-local-input/v1", "files": entries})
 
 
+def _canonical_local(path: str, root: Path | None, base: Path | None) -> str:
+    """A local input's path as hashed: relative to the config file's directory when it is
+    inside it (an absolute path to the same directory hashes like the relative one), else as
+    written."""
+    if root is None or base is None:
+        return path
+    try:
+        rel = Path(os.path.abspath(root)).relative_to(Path(os.path.abspath(base)))
+    except ValueError:
+        return path
+    return rel.as_posix() or "."
+
+
 def kind_modes(cfg, kind: str) -> dict[str, Any]:
     """The output-affecting run modes of ``kind`` (hashed in its entry, read by its worker)."""
     modes: dict[str, Any] = {}
@@ -238,8 +253,15 @@ def hash_document(
         }
 
     inp = cfg.input
-    if input_digest is None and inp.repo is None:
-        input_digest = local_input_digest(inp.path)
+    dataset = inp.dataset
+    if inp.repo is None:
+        # resolved against the config file's directory, never the cwd (H0); hashed as its path
+        # relative to that directory when it is inside it, and digested over relative paths,
+        # so the hash is the same from any cwd and on any machine
+        root = cfg.local_input_root() if hasattr(cfg, "local_input_root") else None
+        dataset = _canonical_local(inp.dataset, root, getattr(cfg, "base_dir", None))
+        if input_digest is None:
+            input_digest = local_input_digest(root if root is not None else inp.path)
     instr = cfg.pipeline.episode_instruction
     shared = {
         "logic_version": LOGIC_VERSION,
@@ -252,7 +274,7 @@ def hash_document(
                    "arch": IMAGE_ARCH},
         "input": {
             "format": inp.format,
-            "dataset": inp.dataset,
+            "dataset": dataset,
             "revision": inp.revision,
             "path": inp.subdir,
             "cameras": dict(sorted(inp.cameras.items())) if inp.cameras is not None else None,

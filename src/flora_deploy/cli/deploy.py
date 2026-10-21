@@ -1,6 +1,8 @@
 """`flora deploy`: build the config's Modal app (``modal_app.factory``) and deploy it.
 
-``--dry-run`` prints the plan without contacting Modal; ``--emit out.py`` writes the equivalent
+``--dry-run`` prints the plan without contacting Modal; every run also prints each stage's Gate
+certificate status on its GPU (certified / provisional / fail / none, or reference for
+``exact``) and why (``cli._certs``); ``--emit out.py`` writes the equivalent
 standalone script for review instead of deploying. A real deploy records the deployment (app
 name, stage hashes, image fingerprints, worker classes) in the job store at
 ``flora/deployments/<app>.json``.
@@ -74,6 +76,39 @@ def _record(plan: Any, record: dict[str, Any]) -> str:
     return f"{st.uri.rstrip('/')}/{rel}"
 
 
+def _certificates(cfg: Any, plan: Any, derived_content: dict[str, str] | None
+                  ) -> dict[str, dict[str, Any]]:
+    """Gate certificate status of each deployed shard kind on its GPU (``cli._certs``)."""
+    pools: dict[str, str | None] = {}
+    for o in plan.objects:
+        for k in o.shard_kinds:
+            pools.setdefault(k, o.gpu)
+    if getattr(plan, "fake_models", False):
+        return {k: {"gpu": g, "status": "none", "certificate": None,
+                    "why": "fake models (CPU rehearsal): records are marked "
+                           "certificate: fake-models"} for k, g in pools.items()}
+    from flora_deploy.cli._certs import certificate_report
+
+    try:
+        return certificate_report(cfg, pools, derived_content=derived_content)
+    except Exception as e:  # noqa: BLE001 - a report; never block the deploy on it
+        return {k: {"gpu": g, "status": "unknown", "certificate": None,
+                    "why": f"could not check: {e!r}"} for k, g in pools.items()}
+
+
+_CERT_STYLE = {"reference": "green", "certified": "green", "provisional": "yellow",
+               "none": "yellow", "fail": "red", "unknown": "red"}
+
+
+def _print_certificates(certs: dict[str, dict[str, Any]]) -> None:
+    from rich.markup import escape
+
+    for kind, c in certs.items():
+        style = _CERT_STYLE.get(c["status"], "yellow")
+        console.print(f"  certificate {kind} on {c['gpu'] or 'cpu'}: "
+                      f"[{style}]{c['status']}[/{style}] - {escape(c['why'])}")
+
+
 def _print_plan(plan: Any) -> None:
     fake = ("  [yellow]FAKE MODELS (CPU rehearsal)[/yellow]"
             if getattr(plan, "fake_models", False) else "")
@@ -126,28 +161,38 @@ def deploy(
 ) -> None:
     """Deploy the config's Modal app (one app per config; workers scale from zero)."""
     from flora_deploy.config.hashing import MissingReceiptError
-    from flora_deploy.config.schema import ConfigError, load_config
+    from flora_deploy.config.receipts import load_certified
+    from flora_deploy.config.receipts import resolve as resolve_receipts
+    from flora_deploy.config.schema import ConfigError
     from flora_deploy.modal_app.factory import DeployError, deployment_record, materialize, plan_app
 
+    overrides = _receipts(receipt)
     try:
-        cfg = load_config(config, allow_uncertified=allow_uncertified)
+        cfg, content = load_certified(config, allow_uncertified=allow_uncertified,
+                                      overrides=overrides)
     except (ConfigError, OSError) as e:
         raise _fail(str(e)) from None
-    from flora_deploy.config.receipts import resolve as resolve_receipts
-
     try:
+        derived = resolve_receipts(cfg, overrides)
         plan = plan_app(cfg, store=store, bucket_secret=bucket_secret,
-                        derived_receipts=resolve_receipts(cfg, _receipts(receipt)),
+                        derived_receipts=derived, derived_content=content,
                         allow_uncertified=allow_uncertified,
                         min_containers=min_containers, reconcile_cron=reconcile_cron,
                         determinism=determinism, fake_models=fake_models)
     except (DeployError, MissingReceiptError, ValueError) as e:
         raise _fail(str(e)) from None
 
+    cert_cfg = cfg
+    if determinism is not None and determinism != cfg.pipeline.determinism:
+        from flora_deploy.config.schema import with_pipeline
+
+        cert_cfg = with_pipeline(cfg, determinism=determinism)  # plan_app accepted it
+    certs = _certificates(cert_cfg, plan, content)
     if as_json:
-        print(json.dumps(plan.to_json(), indent=2, sort_keys=True))
+        print(json.dumps({**plan.to_json(), "certificates": certs}, indent=2, sort_keys=True))
     else:
         _print_plan(plan)
+        _print_certificates(certs)
     if emit is not None:
         from flora_deploy.modal_app.emit import write_script
 
