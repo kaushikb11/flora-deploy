@@ -209,10 +209,12 @@ def _engine_facts(llm) -> dict[str, Any]:
         facts["enable_prefix_caching"] = config.cache_config.enable_prefix_caching
         facts["mamba_cache_mode"] = getattr(config.cache_config, "mamba_cache_mode", None)
         facts["block_size"] = config.cache_config.block_size
-        facts["gdn_prefill_backend"] = str(
-            getattr(config.model_config, "gdn_prefill_backend", None)
-            or getattr(getattr(config, "kernel_config", None), "gdn_prefill_backend", None)
-        )
+        # Not on a stable config path in 0.24.0; the engine log line
+        # "Using Triton/FLA GDN prefill kernel (requested=triton ...)" is the evidence.
+        for holder in (config.model_config, getattr(config, "kernel_config", None)):
+            value = getattr(holder, "gdn_prefill_backend", None)
+            if value is not None:
+                facts["gdn_prefill_backend"] = str(value)
         facts["limit_mm_per_prompt"] = str(
             getattr(config.model_config.multimodal_config, "limit_per_prompt", None)
         )

@@ -144,7 +144,8 @@ def shared_engine(
         calls.append({"path": str(path), **{k: getattr(args, k) for k in LOAD_LLM_ARGS},
                       "videos_per_prompt": videos_per_prompt, **requested})
         problems = []
-        if str(Path(path)) != str(Path(spec.model_path)):
+        # NVIDIA's resolve_model() resolves symlinks (e.g. a Modal Volume mount point).
+        if Path(path).resolve() != Path(spec.model_path).resolve():
             problems.append(f"model {path} != {spec.model_path}")
         if videos_per_prompt != 1:
             problems.append(f"videos_per_prompt {videos_per_prompt} != 1")

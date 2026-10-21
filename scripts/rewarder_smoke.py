@@ -56,8 +56,13 @@ def main(modes: str = ",".join(MODES), out: str = "reports/wsh", skip_stage: boo
     t0 = time.time()
     summaries, engine = [], None
     for mode in [m for m in modes.split(",") if m]:
-        ref = rewarder.reference.remote(mode)
-        bat = rewarder.batched.remote(mode)
+        try:
+            ref = rewarder.reference.remote(mode)
+            bat = rewarder.batched.remote(mode)
+        except Exception as exc:  # keep the warm container working on the other modes
+            print(f"{mode}: FAILED {exc!r}")
+            summaries.append({"mode": mode, "error": repr(exc)})
+            continue
         parity = compare(mode, ref["records"], bat["records"], ref.get("probabilities"))
         (out_dir / f"{mode}.json").write_text(
             json.dumps({"reference": ref, "batched": bat, "parity": parity}, indent=2)
