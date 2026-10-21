@@ -12,7 +12,9 @@ concatenated file; ``scripts/convert_dataset_v21_to_v30.convert_videos_of_camera
 ``aggregate.py`` compute them as float sums of per-episode ``get_video_duration_in_s``).
 
 Each camera of an episode becomes ``SourceRef(file, from_timestamp, to_timestamp)``.
-``index.select_episode`` matches frames to that range with a half-frame tolerance.
+``index.select_episode`` matches frames to that range with a half-frame tolerance. The metadata is
+not trusted: ``sources.verify_episode`` checks every range against the file's real sample table
+(a published dataset has an episode pointing at the wrong file, docs/golden-candidates.md §3.3).
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ from flora_deploy.media.sources.lerobot_v21 import load_info, video_keys
 from flora_deploy.media.types import SourceRef
 
 DEFAULT_VIDEO_PATH = "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
+V3_VIDEO_COLUMNS = ("chunk_index", "file_index", "from_timestamp", "to_timestamp")
 
 
 class LeRobotV3Source:
@@ -45,15 +48,31 @@ class LeRobotV3Source:
         self.roles = resolve_camera_map(video_keys(self.info), camera_map)
         self.name = name or self.root.name
 
+    def _columns(self) -> list[str]:
+        cols = ["episode_index", "tasks", "length"]
+        for key in self.roles:
+            cols += [f"videos/{key}/{c}" for c in V3_VIDEO_COLUMNS]
+        return cols
+
     def _rows(self) -> list[dict]:
+        """Episode rows, reading only the columns the reader uses (LeRobot episode parquet files
+        also carry per-feature ``stats/*`` arrays, which are large)."""
         import pyarrow.parquet as pq
 
         files = sorted((self.root / "meta" / "episodes").glob("chunk-*/file-*.parquet"))
         if not files:
             raise SourceError(f"{self.root}: no meta/episodes/chunk-*/file-*.parquet")
+        want = self._columns()
         rows: list[dict] = []
         for f in files:
-            rows += pq.read_table(f).to_pylist()
+            names = set(pq.read_schema(f).names)
+            missing = [c for c in want if c not in names and c not in ("tasks", "length")]
+            if missing:
+                raise SourceError(f"{f}: missing columns {missing}")
+            rows += pq.read_table(f, columns=[c for c in want if c in names]).to_pylist()
+        for r in rows:
+            if r.get("episode_index") is None:
+                raise SourceError(f"{self.root}: an episode row has a null episode_index")
         return sorted(rows, key=lambda r: int(r["episode_index"]))
 
     def list_episodes(self) -> list[EpisodeRef]:
@@ -67,6 +86,9 @@ class LeRobotV3Source:
                 missing = [c for c in cols + ts if c not in row]
                 if missing:
                     raise SourceError(f"episode {e}: missing columns {missing}")
+                nulls = [c for c in cols + ts if row[c] is None]
+                if nulls:
+                    raise SourceError(f"episode {e}: null values in {nulls}")
                 rel = self.template.format(
                     video_key=key, chunk_index=int(row[cols[0]]), file_index=int(row[cols[1]])
                 )

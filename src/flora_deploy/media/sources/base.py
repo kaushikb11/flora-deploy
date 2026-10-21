@@ -15,9 +15,14 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Protocol, get_args, runtime_checkable
+from fractions import Fraction
+from pathlib import Path
+from typing import TYPE_CHECKING, Protocol, get_args, runtime_checkable
 
 from flora_deploy.media.types import CameraRole, SourceRef
+
+if TYPE_CHECKING:
+    from flora_deploy.media.index import ScanStore
 
 ROLES: tuple[str, ...] = get_args(CameraRole)
 CameraMap = Mapping[str, CameraRole]
@@ -77,3 +82,44 @@ def task_text(tasks: Sequence[str] | str | None) -> str | None:
         return tasks
     tasks = [t for t in tasks if t]
     return "\n".join(tasks) if tasks else None
+
+
+def verify_episode(
+    ep: EpisodeRef, *, scans: ScanStore | None = None, check_length: bool = True
+) -> None:
+    """Check every camera's ``(file, from, to)`` against the file's real sample table.
+
+    Dataset metadata is not trusted (docs/golden-candidates.md §3.3: an ALOHA episode's range
+    points past the end of its file; the frames are in the next file). Raises ``SourceError``
+    when a file is missing, a range ends after its file, a range selects no frame, or (with
+    ``check_length`` and a ``length`` in ``ep.extra``, as LeRobot provides) the number of frames
+    the range selects differs from the episode length. Demux only - no decoding.
+    """
+    from flora_deploy.media.index import MediaError, get_scan, plan_episode
+
+    length = ep.extra.get("length") if check_length else None
+    for role, ref in sorted(ep.cameras.items()):
+        where = f"{ep.episode_id}/{role}"
+        if not Path(ref.uri).is_file():
+            raise SourceError(f"{where}: video file missing: {ref.uri}")
+        try:
+            scan = get_scan(scans, ref.uri)
+        except (MediaError, OSError) as e:
+            raise SourceError(f"{where}: cannot read {ref.uri}: {e}") from e
+        if not len(scan):
+            raise SourceError(f"{where}: {ref.uri} has no video packets")
+        file_end = Fraction(int((scan.pts + scan.duration).max())) * scan.time_base
+        span = f"range [{ref.start_s}, {ref.end_s}) of {ref.uri} ({float(file_end):.3f} s)"
+        if ref.end_s is not None and Fraction(ref.end_s) - file_end > scan.half_frame:
+            raise SourceError(
+                f"{where}: {span} ends after the file; the metadata points at the wrong file"
+            )
+        try:
+            plan = plan_episode(scan, ref.start_s, ref.end_s, cross_check=False)
+        except MediaError as e:
+            raise SourceError(
+                f"{where}: {span} selects no frame; the metadata points at the wrong file"
+            ) from e
+        n = len(plan.frames)
+        if length is not None and n != int(length):
+            raise SourceError(f"{where}: {span} holds {n} frames, the metadata says {int(length)}")

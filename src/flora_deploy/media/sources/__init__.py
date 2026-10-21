@@ -11,6 +11,7 @@ from flora_deploy.media.sources.base import (
     Source,
     SourceError,
     resolve_camera_map,
+    verify_episode,
 )
 from flora_deploy.media.sources.lerobot_v3 import LeRobotV3Source
 from flora_deploy.media.sources.lerobot_v21 import LeRobotV21Source
@@ -26,6 +27,7 @@ __all__ = [
     "SourceError",
     "open_source",
     "resolve_camera_map",
+    "verify_episode",
 ]
 
 

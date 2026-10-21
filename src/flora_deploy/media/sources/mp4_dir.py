@@ -10,7 +10,8 @@ Layout (both forms may be mixed in one directory; names are case-sensitive):
 
 ``.mp4``, ``.mov`` and ``.m4v`` are accepted. Hidden files are skipped. Each file is a whole
 episode (``SourceRef.start_s/end_s`` are None). Episode ids are the stem / directory name and must
-be unique.
+be unique, and so must camera stems inside an episode directory (``main.mp4`` + ``main.mov`` is
+an error).
 """
 
 from __future__ import annotations
@@ -55,11 +56,20 @@ class Mp4DirSource:
                     task=_read_task(entry.with_suffix(".txt")),
                 )
             elif entry.is_dir():
-                files = {
-                    f.stem: f
-                    for f in sorted(entry.iterdir())
-                    if f.is_file() and f.suffix.lower() in VIDEO_SUFFIXES and f.name[0] != "."
-                }
+                files: dict[str, Path] = {}
+                for f in sorted(entry.iterdir()):
+                    if (
+                        not f.is_file()
+                        or f.suffix.lower() not in VIDEO_SUFFIXES
+                        or f.name[0] == "."
+                    ):
+                        continue
+                    if f.stem in files:
+                        raise SourceError(
+                            f"{entry}: camera {f.stem!r} has two files ({files[f.stem].name}, "
+                            f"{f.name})"
+                        )
+                    files[f.stem] = f
                 if not files:
                     continue
                 roles = resolve_camera_map(list(files), self.camera_map)
