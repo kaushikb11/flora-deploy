@@ -106,6 +106,7 @@ KIND_GROUPS: dict[str, str] = {
 
 # Reviewed and judged not to change outputs (or hashed by value elsewhere in the document).
 NON_OUTPUT_MODULES: tuple[str, ...] = (
+    "accel/identity.py",  # compares two runs' logged inputs; never on the inference path
     "__init__.py",  # version strings; LOGIC_VERSION is hashed as its own field
     "layout.py",  # volume names and mount paths
     "workers.py",  # orchestrator <-> worker contract (types only)

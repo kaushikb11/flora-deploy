@@ -61,7 +61,7 @@ def test_named_output_modules_are_hashed():
                 "media/index.py", "media/rangedecode.py", "media/cuts.py",
                 "stages/reference.py", "records.py", "config/hashing.py"):
         assert rel in seg, rel
-    accel = {p for p in _modules_in("accel")}
+    accel = {p for p in _modules_in("accel")} - set(logic.NON_OUTPUT_MODULES)
     assert accel <= seg and accel <= set(logic.modules_for("caption"))
     assert "stages/reward.py" in logic.modules_for("reward.dense")
     assert "stages/reward.py" not in seg
