@@ -1,5 +1,10 @@
 # Execution plan: closing Phase 0, then P1a (`exact`) and P1b (`balanced`)
 
+> **Historical (archived 2026-10-22).** Execution log for closing Phase 0, P1a and P1b, with its
+> dated updates (reviews 3-6, the budget-first plan, Wave H-lite, balanced-first). Its live
+> content (the GPU session, deferred items, operating rules) is folded into
+> [PLAN.md](../PLAN.md) v4 §9 and §10. Do not update this file.
+
 > 2026-10-21. These are internal milestones only; no release, tag or publish until the user asks.
 > Budget: $50 total. $10.25 spent at writing, **$39.75 left**. Track with `scripts/spend.py`.
 

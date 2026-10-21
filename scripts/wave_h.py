@@ -1,4 +1,4 @@
-"""Wave H-lite runbook (``docs/NEXT_EXECUTION.md``, 2026-10-22; ``docs/wave-h-runbook.md``).
+"""Wave H-lite runbook (``docs/archive/NEXT_EXECUTION.md``, 2026-10-22; ``docs/wave-h-runbook.md``).
 
 Usage::
 

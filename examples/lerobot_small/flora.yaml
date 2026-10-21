@@ -2,7 +2,8 @@
 # lerobot/aloha_static_cups_open (MIT): 50 episodes of ~8 s each, 4 cameras, ~0.5 GB.
 # 3 of the 4 cameras are used. cam_low is not: the `yam` embodiment takes exactly 3 views
 # (a main view and the two wrists, as YAM's front/left/right), and cam_low is a second, low
-# overview with no YAM role. The golden set drops it the same way (docs/PLAN.md section 9).
+# overview with no YAM role. The golden set drops it the same way
+# (docs/archive/PLAN-v3.md section 9).
 # ALOHA is not YAM hardware; this is a stand-in.
 # tests/unit/test_examples.py validates this file.
 
