@@ -1,5 +1,10 @@
 # WS-D reference smoke: NVIDIA's pipeline on one Modal H200
 
+> **Superseded in part by S1 (`docs/exact-worker.md`).** The worker now runs NVIDIA's own
+> `api.DataEnginePipeline().annotate` (the `annotate_reference` re-expression below is gone).
+> It uses the W3-B link farm instead of the 109 GB copy and the BF16 Captioner, and it has no
+> watchdog: runtime is bounded by Modal's timeouts. Measurements on this page are from the WS-D run.
+
 Status: first run 2026-10-21, run id `wsd-20261021T052758Z`. Numbers only. The full results
 (segments, captions, NVIDIA's audit with prompt hashes) stay on the `flora-golden` Volume under
 `reference_runs/<run_id>/<episode>.json` and are never committed.
@@ -117,8 +122,7 @@ evidence for Gate D.
   ≈2 min, overlapped, plus 109 GB of local disk.
 - NVIDIA's Captioner `validate_manifest` re-hashes 109 GB on every container start (≈100 s on
   H200 time). There is no way to skip it without changing NVIDIA's code.
-- `img_cpu`: `numpy<3` is satisfied by debian_slim's preinstalled numpy 1.26, and pyarrow 26
-  then fails at import. `stage_samples` uses a local variant that forces numpy 2. The fix
-  belongs in `images.cpu_image()`, which WS-D does not own.
+- (Fixed since.) The numpy/pyarrow mismatch in `img_cpu`: `images.CPU_PACKAGES` now pins
+  numpy exactly.
 - PEFT warns that `base_model_name_or_path` was renamed to the local base path. This is
   harmless: NVIDIA's loader asserts that the adapter values are exact.

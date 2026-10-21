@@ -2,9 +2,6 @@
 
 import json
 import sys
-from fractions import Fraction
-from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -76,101 +73,158 @@ def test_aloha_video_file():
     )
 
 
-# --- orchestration with a fake NVIDIA family -------------------------------------------------
+# --- NVIDIA's own entry point with the session injected -------------------------------------
+
+from tests.unit.test_reference_concurrency import (  # noqa: E402 - shared fake family
+    FakeNvSession,
+    GpuProbe,
+    fake_nv,
+)
+from tests.unit.test_reference_concurrency import InputError as FakeInputError  # noqa: E402
 
 
-class InputError(ValueError):
-    pass
+def _entry(calls=None):
+    from flora_deploy.nv.session import CachedSession
+    from flora_deploy.observe import Patcher
+
+    nv = fake_nv(GpuProbe(), calls)
+    patcher = Patcher()
+    ref.install_nvidia_entry(nv, patcher)
+    return nv, CachedSession(FakeNvSession), patcher
 
 
-def _video(path, n=40):
-    rate = Fraction(4)
-    pts = tuple(Fraction(i * 250000) for i in range(n))
-    return SimpleNamespace(path=Path(path), sha256="ab" * 32, rate=rate, pts_us=pts,
-                           duration_us=n * 250000, duration_s=n / 4, size=(64, 48), cfr=True)
-
-
-def fake_nv(calls):
-    profiles = {"human": "Human", "yam": "YAM"}
-
-    def _inputs(video, profile, left, right, yam32, instruction):
-        calls.append(("inputs", profile, yam32))
-        paths = {"main": video} | ({"left_wrist": left, "right_wrist": right} if left else {})
-        return {r: _video(p) for r, p in paths.items()}, profiles[profile]
-
-    def segment(videos, pool, session, instruction, progress):
-        calls.append(("segment", pool, session.load("tempseg")))
-        print("FLORA_RUNTIME " + json.dumps({"event": "generation_end", "input_tokens": 9,
-                                             "generated_tokens": 4, "complete": True}))
-        return ([{"start_s": 0.0, "end_s": 5.0, "metadata": {"fine_event_id": "e0"}},
-                 {"start_s": 5.0, "end_s": 10.0,
-                  "metadata": {"segmentation_provenance": "fine_repaired_by_fine_retry"}}],
-                [{"window": 1}])
-
-    def caption_single(videos, segments, profile, session, instruction, progress):
-        calls.append(("caption_single", profile, session.load("captioner")))
-        return ([dict(start_s=s["start_s"], end_s=s["end_s"], caption="c", status="complete")
-                 for s in segments], [{"event_id": "event_0000"}, {"event_id": "event_0001"}])
-
-    def caption_three(videos, segments, session, instruction, progress, profile="YAM"):
-        calls.append(("caption_three", profile))
-        return caption_single(videos, segments, profile, session, instruction, progress)
-
-    return SimpleNamespace(
-        api=SimpleNamespace(DataEnginePipeline=SimpleNamespace(_inputs=_inputs)),
-        media=SimpleNamespace(check_synchronized=lambda v: calls.append(("sync", len(v))),
-                              InputError=InputError),
-        preprocessing=SimpleNamespace(instruction_suffix=lambda s: ""),
-        config=SimpleNamespace(PROFILE_POOLS={"Human": "human", "YAM": "yam"},
-                               MODELS={"tempseg": {"revision": "r"}}),
-        models=SimpleNamespace(runtime_event=lambda e, **kw: calls.append(("event", e))),
-        pipeline=SimpleNamespace(segment=segment, caption_single=caption_single,
-                                 caption_three=caption_three),
-    )
-
-
-class FakeSession:
-    def __init__(self):
-        self.loads = []
-
-    def load(self, kind):
-        self.loads.append(kind)
-        return kind
-
-
-def test_annotate_reference_single_view():
-    calls, session = [], FakeSession()
-    out = ref.annotate_reference(fake_nv(calls), session, {"main": "/v/h.mp4"}, "human")
-    assert [c[0] for c in calls] == ["inputs", "sync", "segment", "event", "caption_single",
-                                     "event"]
-    assert ("segment", "human", "tempseg") in calls
-    assert out["schema_version"] == "flora_demo_annotation_v1"
+def test_annotate_nvidia_single_view():
+    calls = []
+    nv, session, patcher = _entry(calls)
+    out = ref.annotate_nvidia(nv, session, {"main": "/v/h.mp4"}, "human")
+    assert ("api.annotate", "human", False) in calls  # NVIDIA's entry point ran
+    assert not [c for c in calls if c[0] == "fresh_session"]  # with our session
     assert out["profile"] == "Human" and out["camera_roles"] == ["main"]
-    assert [s["segmentation_provenance"] for s in out["segments"]] == [
-        "fine", "fine_repaired_by_fine_retry"]
-    assert out["pipeline"] == {"temporal_windows": [{"window": 1}],
-                               "caption_inputs": [{"event_id": "event_0000"},
-                                                  {"event_id": "event_0001"}]}
+    assert "pipeline" in out  # include_audit=True
     fr = out["flora_reference"]
-    assert fr["counts"] == {"temporal_windows": 1, "segments": 2, "caption_inputs": 2,
-                            "captions_complete": 2}
-    assert fr["generation"]["segment"]["generated_tokens"] == 4
-    assert fr["generation"]["caption"]["calls"] == 0
+    assert fr["entry"] == "api.DataEnginePipeline.annotate"
+    n = fr["counts"]["temporal_windows"]
+    assert fr["counts"]["segments"] == fr["counts"]["captions_complete"] == n
+    assert fr["generation"]["segment"]["calls"] == n  # split at segmentation_complete
+    assert fr["generation"]["caption"]["calls"] == n
+    assert [c["model"] for c in fr["model_calls"]] == ["tempseg"] * n + ["captioner"] * n
     assert set(fr["timings_s"]) == {"probe", "segment", "caption", "total"}
     assert "flora_reference" not in ref.nvidia_result(out)
     row = ref.summary_row("h", out)
-    assert row["windows"] == 1 and row["captions"] == 2 and row["views"] == 1
+    assert row["windows"] == n and row["views"] == 1
+    patcher.restore()
 
 
-def test_annotate_reference_three_view_and_checks():
+def test_annotate_nvidia_three_view_and_nvidia_errors():
     calls = []
+    nv, session, _ = _entry(calls)
     videos = {"main": "/m.mp4", "left_wrist": "/l.mp4", "right_wrist": "/r.mp4"}
-    out = ref.annotate_reference(fake_nv(calls), FakeSession(), videos, "yam")
-    assert ("caption_three", "YAM") in calls and ("sync", 3) in calls
+    out = ref.annotate_nvidia(nv, session, videos, "yam")
+    assert ("caption_three", "YAM") in calls
     assert out["camera_roles"] == ["main", "left_wrist", "right_wrist"]
     with pytest.raises(ValueError, match="camera roles"):
-        ref.annotate_reference(fake_nv([]), FakeSession(), {"main": "/m", "left_wrist": "/l"},
-                               "yam")
-    with pytest.raises(InputError, match="32-second"):
-        ref.annotate_reference(fake_nv([]), FakeSession(), {"main": "/m"}, "human",
-                               long_windows=True)
+        ref.annotate_nvidia(nv, session, {"main": "/m", "left_wrist": "/l"}, "yam")
+    with pytest.raises(FakeInputError, match="yam32 requires"):  # NVIDIA's own check
+        ref.annotate_nvidia(nv, session, {"main": "/m"}, "human", long_windows=True)
+
+
+def test_model_calls_pairs_outputs_and_skips_incomplete():
+    events = [
+        {"event": "generation_start", "output_limit": 1024, "input_tensor_digest": "a"},
+        {"event": "generation_end", "complete": False, "generated_tokens": 1024},
+        {"event": "generation_start", "output_limit": 1024, "input_tensor_digest": "b"},
+        {"event": "generation_end", "complete": True, "generated_tokens": 5},
+        {"event": "segmentation_complete"},
+        {"event": "generation_start", "output_limit": 512, "input_tensor_digest": "c"},
+        {"event": "generation_end", "complete": True, "generated_tokens": 3},
+    ]
+    result = {"pipeline": {"temporal_windows": [{"output": "W"}]},
+              "segments": [{"status": "unsupported_target_frames", "caption": ""},
+                           {"status": "complete", "caption": "C"}]}
+    calls = ref.model_calls(events, result)
+    assert [c["input_digest"] for c in calls] == ["a", "b", "c"]
+    assert calls[0]["output_sha256"] is None and calls[0]["complete"] is False
+    assert calls[1]["output_sha256"] == ref._sha("W") and calls[1]["model"] == "tempseg"
+    assert calls[2]["output_sha256"] == ref._sha("C") and calls[2]["model"] == "captioner"
+
+
+def test_nvidia_errors_pickle_with_type_name():
+    import pickle
+
+    class InputError(ValueError):  # stands in for NVIDIA's aliased media.InputError
+        pass
+
+    err = ref.transport_error(InputError("Choose a supported action profile."))
+    assert isinstance(err, ref.NvidiaInputError) and isinstance(err, RuntimeError)
+    back = pickle.loads(pickle.dumps(err))
+    assert type(back) is ref.NvidiaInputError
+    assert back.type_name.endswith("InputError") and back.message.startswith("Choose")
+    other = ref.transport_error(KeyError("x"))
+    assert type(other) is ref.NvidiaError and "KeyError" in str(other)
+    assert ref.transport_error(other) is other
+
+
+def test_run_ids_are_unique_and_safe():
+    ids = {ref.new_run_id("s1") for _ in range(50)}
+    assert len(ids) == 50 and all(ref.SAFE_NAME.fullmatch(i) for i in ids)
+
+
+def test_persist_refuses_overwrite(tmp_path):
+    ref.persist_result({"a": 1}, golden_root=tmp_path, run_id="r", episode="e")
+    with pytest.raises(FileExistsError):
+        ref.persist_result({"a": 2}, golden_root=tmp_path, run_id="r", episode="e")
+    path = ref.persist_result({"a": 2}, golden_root=tmp_path, run_id="r", episode="e",
+                              overwrite=True)
+    assert json.loads(path.read_text()) == {"a": 2}
+
+
+def test_exact_profile_toggles():
+    p = ref.ExactProfile.from_spec()
+    assert p.captioner_bf16 and p.linked_layout and p.prefetch and p.concurrency == 4
+    assert len(p.accel) == 4
+    prov = p.provenance()
+    assert prov["overlap_hash"] is False  # irrelevant with the BF16 Captioner
+    q = ref.ExactProfile.from_spec("captioner_bf16, png_inmem", concurrency=1)
+    assert not q.captioner_bf16 and "png_inmem" not in q.accel and q.concurrency == 1
+    assert q.provenance()["overlap_hash"] is True
+    with pytest.raises(ValueError, match="unknown"):
+        ref.ExactProfile.from_spec("turbo")
+
+
+def test_stage_records_from_result():
+    from flora_deploy.records import Provenance, StageRecord
+
+    prov = Provenance(models={"tempseg": "r"}, engine="hf-ref", preset="exact",
+                      config_hash="c", logic_version="1", framework="flora-deploy 0")
+    result = {"segments": [
+        {"start_s": 0.0, "end_s": 1.5, "caption": "pick", "status": "complete",
+         "segmentation_provenance": "fine"},
+        {"start_s": 1.5, "end_s": 2.0, "caption": "", "status": "unsupported_target_frames",
+         "segmentation_provenance": "fine_repaired_by_fine_retry"}]}
+    seg, cap = ref.stage_records(result, uid="ds--e1", dataset="ds", episode_id="e1",
+                                 provenance=prov, audit_ref="runs/x.json")
+    assert (seg.stage, cap.stage) == ("segment", "caption")
+    assert seg.segments[0].caption is None and cap.segments[0].caption == "pick"
+    assert cap.segments[1].status == "unsupported_target_frames"
+    assert StageRecord.from_json(cap.to_json()) == cap
+
+
+def test_golden_episode_inputs():
+    manifest = {"episodes": [
+        {"id": "yam/ds/ep1", "pool": "yam", "profile": "yam", "yam32": False,
+         "oracle_eligible": True, "duration_s": 8.0, "task": " fold ",
+         "path": "golden/v1/yam/ds/ep1",
+         "files": {"main": {"file": "main.mp4"}, "left_wrist": {"file": "left_wrist.mp4"},
+                   "right_wrist": {"file": "right_wrist.mp4"}}},
+        {"id": "reward/x/y", "pool": "reward", "oracle_eligible": True, "files": {}},
+    ]}
+    eps = ref.golden_episode_inputs(manifest, ["yam/ds/ep1"], "/golden")
+    assert eps[0]["episode"] == "yam__ds__ep1" and eps[0]["instruction"] == "fold"
+    assert eps[0]["videos"]["left_wrist"] == "/golden/golden/v1/yam/ds/ep1/left_wrist.mp4"
+    assert ref.golden_episode_inputs(manifest, ["yam/ds/ep1"], "/g",
+                                     instruction=False)[0]["instruction"] == ""
+    with pytest.raises(ValueError):
+        ref.golden_episode_inputs(manifest, ["reward/x/y"], "/g")
+    with pytest.raises(KeyError):
+        ref.golden_episode_inputs(manifest, ["nope"], "/g")
+    assert all(i.count("/") == 2 for i in ref.IDENTITY_EPISODES)

@@ -1,11 +1,20 @@
-"""WS-D smoke: stage the public samples, then label them with NVIDIA's pipeline on one H200.
+"""The fast ``exact`` worker on one H200: S1 identity proof, WS-D smoke, W3-A concurrency.
+
+S1 (docs/exact-worker.md): CPU pre-check, then the identity proof in ONE H200 container
+(fast composite vs NVIDIA unmodified on golden episodes, model-input digests compared):
+
+    uv run python scripts/reference_smoke.py --offline-check
+    uv run python scripts/reference_smoke.py --identity [--golden ID ...] [--memory-gib 160] \
+        [--deadline-min 16] [--disable FEATURES] --summary PATH
+
+WS-D smoke (docs/reference-smoke.md):
 
     uv run python scripts/reference_smoke.py [--only EPISODE ...] [--summary PATH] [--force-stage]
 
 W3-A concurrency experiment (docs/exact-concurrency.md), one container, one model load:
 
     uv run python scripts/reference_smoke.py --concurrency 4 --sequential --measure \\
-        [--cpu 8] [--torch-threads N] [--repeat K] [--compare-to SUMMARY.json] --summary PATH
+        [--cpu 8] [--repeat K] [--compare-to SUMMARY.json] --summary PATH
 
 ``--sequential`` first runs every episode with concurrency 1, then all of them with
 ``--concurrency`` threads, and compares NVIDIA's full result dicts (minus wall-clock fields).
@@ -27,21 +36,30 @@ from pathlib import Path
 import modal
 
 from flora_deploy.modal_app.reference_app import (
-    HARD_LIFETIME_S,
+    STARTUP_TIMEOUT_S,
+    TIMEOUT_S,
     ReferenceWorker,
     app,
+    identity_from_volume,
+    offline_check,
     stage_samples,
 )
-from flora_deploy.stages.reference import compare_runs, summary_row
+from flora_deploy.stages.reference import (
+    IDENTITY_EPISODES,
+    compare_runs,
+    new_run_id,
+    summary_row,
+)
 
 COLUMNS = (
     "episode", "views", "profile", "duration_s", "windows", "segments", "captions",
     "probe_s", "segment_s", "caption_s", "seg_out_tok", "cap_out_tok", "peak_gib",
 )
-DEADLINE_S = 40 * 60  # stop submitting episodes after this much wall-clock
-# Skip the concurrent batch if the container is already this old after the sequential one
-# (the container watchdog kills it at reference_app.HARD_LIFETIME_S).
-MAX_AGE_FOR_CONCURRENT_S = 28 * 60
+DEADLINE_S = 25 * 60  # stop submitting episodes after this much wall-clock
+# Skip the concurrent batch if the container is already this old after the sequential one.
+MAX_AGE_FOR_CONCURRENT_S = 15 * 60
+# Modal list prices (docs/exact-concurrency.md): H200, per physical core, per GiB of memory.
+H200_PER_S, CORE_PER_S, GIB_PER_S = 0.001261, 0.0000131, 0.00000222
 
 
 def table(rows: list[dict]) -> str:
@@ -62,10 +80,28 @@ def main(argv: list[str] | None = None) -> int:
                    help="W3-A: first run the same episodes with concurrency 1 and compare")
     p.add_argument("--measure", action="store_true", help="W3-A: per-call timers, RSS, /dev/shm")
     p.add_argument("--cpu", type=float, help="W3-A: physical cores for the worker")
-    p.add_argument("--torch-threads", type=int, help="W3-A: torch intra-op threads per batch")
+    p.add_argument("--offline-check", action="store_true", help="S1: CPU receipt/offline check")
+    p.add_argument("--identity", action="store_true", help="S1: the identity proof (one H200)")
+    p.add_argument("--golden", action="append", default=[], help="S1: golden manifest id(s)")
+    p.add_argument("--memory-gib", type=int, help="worker memory request (GiB)")
+    p.add_argument("--deadline-min", type=float, default=16.0,
+                   help="S1: no NVIDIA-unmodified episode starts after this (call minutes)")
+    p.add_argument("--disable", default="", help="ExactProfile toggles to switch off")
+    p.add_argument("--determinism", default="nvidia", choices=("nvidia", "deterministic"),
+                   help="D-1 mode (docs/determinism.md)")
+    p.add_argument("--no-instruction", action="store_true",
+                   help="S1: blank instruction instead of the dataset task text")
     p.add_argument("--repeat", type=int, default=1, help="W3-A: run each episode K times")
     p.add_argument("--compare-to", type=Path, help="W3-A: earlier summary to compare digests")
     args = p.parse_args(argv)
+    if args.offline_check:
+        with modal.enable_output(), app.run():
+            out = offline_check.remote()
+        print(json.dumps(out, indent=2))
+        _write(args.summary, out)
+        return 0 if all("error" not in r for r in out["receipts"].values()) else 1
+    if args.identity:
+        return identity(args)
     if args.concurrency:
         return concurrency_experiment(args)
 
@@ -78,23 +114,29 @@ def main(argv: list[str] | None = None) -> int:
         if args.stage_only:
             print(json.dumps(manifest, indent=2))
             return 0
-        worker = ReferenceWorker()
+        worker = _worker(args)
         load = worker.report.remote()
         print("load report:", json.dumps(load, indent=2))
+        run_id = new_run_id("wsd")
+        container_error = False
         for ep in episodes:
             if time.monotonic() - t0 > DEADLINE_S:
                 errors.append({"episode": ep["episode"], "error": "deadline: not submitted"})
                 continue
             try:
-                result = worker.annotate.remote(ep["videos"], ep["profile"], episode=ep["episode"])
+                result = worker.annotate.remote(ep["videos"], ep["profile"],
+                                                episode=ep["episode"], run_id=run_id)
             except Exception as e:  # noqa: BLE001 - report and continue with the next episode
                 errors.append({"episode": ep["episode"], "error": f"{type(e).__name__}: {e}"})
+                # NVIDIA errors arrive as NvidiaError; anything else is container-level
+                container_error = type(e).__name__ not in ("NvidiaError", "NvidiaInputError")
                 continue
             row = summary_row(ep["episode"], result)
             row["stored_at"] = result["flora_reference"].get("stored_at")
             rows.append(row)
             print(table([row]))
-        final = worker.report.remote()
+        # review2-wsd L7: never start a fresh container (a full model load) just to report
+        final = {} if container_error else worker.report.remote()
 
     print()
     print(table(rows))
@@ -102,16 +144,105 @@ def main(argv: list[str] | None = None) -> int:
         print("FAILED", e["episode"], e["error"])
     summary = {
         "load": load,
-        "final_gpu": final["gpu_now"],
-        "container_age_s": final["container_age_s"],
+        "final_gpu": final.get("gpu_now"),
+        "container_age_s": final.get("container_age_s"),
         "episodes": rows,
         "errors": errors,
         "local_wall_s": round(time.monotonic() - t0, 1),
     }
-    print(f"container age {final['container_age_s']}s; local wall {summary['local_wall_s']}s")
-    if args.summary:
-        args.summary.write_text(json.dumps(summary, indent=2) + "\n")
+    print(f"container age {final.get('container_age_s')}s; local wall {summary['local_wall_s']}s")
+    _write(args.summary, summary)
     return 1 if errors else 0
+
+
+def _write(path: Path | None, obj: dict) -> None:
+    if path:
+        path.write_text(json.dumps(obj, indent=2) + "\n")
+
+
+def _worker(args):
+    options = {}
+    if getattr(args, "cpu", None):
+        options["cpu"] = args.cpu
+    if getattr(args, "memory_gib", None):
+        options["memory"] = args.memory_gib * 1024
+    cls = ReferenceWorker.with_options(**options) if options else ReferenceWorker
+    return cls(disable=getattr(args, "disable", ""), concurrency=args.concurrency or 4,
+               determinism=getattr(args, "determinism", "nvidia"))
+
+
+def container_rate(cpu: float, memory_gib: float) -> float:
+    """$/s of one H200 container at Modal list prices."""
+    return H200_PER_S + cpu * CORE_PER_S + memory_gib * GIB_PER_S
+
+
+# --- S1 ----------------------------------------------------------------------------------------
+
+
+def identity(args) -> int:
+    """Fast composite vs NVIDIA unmodified in one container (``ReferenceWorker.identity_proof``)."""
+    from flora_deploy.modal_app.reference_app import CPU_CORES, MEMORY_MIB
+
+    t0 = time.monotonic()
+    ids = args.golden or list(IDENTITY_EPISODES)
+    run_id = new_run_id("s1")
+    memory_gib = args.memory_gib or MEMORY_MIB / 1024
+    cpu = args.cpu or CPU_CORES
+    rate = container_rate(cpu, memory_gib)
+    bound_s = STARTUP_TIMEOUT_S + TIMEOUT_S
+    print(f"run {run_id}: {len(ids)} episodes; worst case {bound_s / 60:.0f} min "
+          f"= ${rate * bound_s:.2f} at ${rate * 3600:.2f}/h")
+    summary: dict = {"run_id": run_id, "ids": ids, "rate_per_h": round(rate * 3600, 3)}
+    with modal.enable_output(), app.run():
+        worker = _worker(args)
+        try:
+            summary["load"] = worker.report.remote()
+            print("load:", json.dumps({k: summary["load"][k] for k in
+                                       ("enter_s", "marks_s", "container_import_to_enter_s")}))
+            summary["proof"] = worker.identity_proof.remote(
+                ids, run_id, deadline_s=args.deadline_min * 60,
+                instruction=not args.no_instruction)
+        except Exception as e:  # noqa: BLE001 - keep what we have
+            summary["error"] = f"{type(e).__name__}: {e}"
+            summary["identity_from_volume"] = identity_from_volume.remote(run_id)
+            print("identity (from the Volume):", json.dumps(
+                {k: v for k, v in summary["identity_from_volume"].items() if k != "episodes"}))
+    summary["local_wall_s"] = round(time.monotonic() - t0, 1)
+    proof = summary.get("proof")
+    if proof:
+        summary["throughput"] = throughput(summary["load"], proof, rate)
+        ident = proof["identity"]
+        print(json.dumps({k: v for k, v in ident.items() if k != "episodes"}, indent=1))
+        for name, row in ident["episodes"].items():
+            print(name, json.dumps({k: row.get(k) for k in (
+                "calls_a", "calls_b", "strict", "multiset", "gate_ok", "gated_calls",
+                "first_output_difference_call", "same_input_pairs",
+                "same_input_different_output", "output_identical")}))
+        print("throughput:", json.dumps(summary["throughput"], indent=1))
+    else:
+        print("FAILED:", summary.get("error"))
+    _write(args.summary, summary)
+    return 0 if proof and proof["identity"]["gate_ok"] else 1
+
+
+def throughput(load: dict, proof: dict, rate_per_s: float) -> dict:
+    """Video-hours per GPU-hour and $/video-hour of both arms (numbers only)."""
+    fast = proof["fast"]["batch"]
+    nv_eps = proof["nvidia"]["episodes"]
+    nv_video = sum(r["duration_s"] for r in nv_eps.values())
+    nv_wall = sum(w["wall_s"] for w in proof["nvidia"]["walls"].values())
+    out = {"fast": {"video_s": fast["video_s"], "wall_s": fast["wall_s"],
+                    "concurrency": fast["concurrency"],
+                    "gpu_busy_fraction": fast.get("gpu_busy_fraction")},
+           "nvidia_unmodified": {"video_s": round(nv_video, 2), "wall_s": round(nv_wall, 1),
+                                 "episodes": len(nv_eps)},
+           "startup_s": load.get("enter_s")}
+    for arm in out.values():
+        if isinstance(arm, dict) and arm.get("wall_s"):
+            vh_per_h = arm["video_s"] / arm["wall_s"]
+            arm["video_h_per_gpu_h"] = round(vh_per_h, 4)
+            arm["usd_per_video_h"] = round(rate_per_s * 3600 / vh_per_h, 2) if vh_per_h else None
+    return out
 
 
 # --- W3-A ------------------------------------------------------------------------------------
@@ -152,23 +283,22 @@ def concurrency_experiment(args) -> int:
         # longest first, so the concurrent batch does not end on one long straggler
         dur = {e["episode"]: e["probe"]["main"]["duration_s"] for e in manifest["episodes"]}
         episodes.sort(key=lambda e: -dur[base_name(e["episode"])])
-        worker_cls = ReferenceWorker.with_options(cpu=args.cpu) if args.cpu else ReferenceWorker
-        worker = worker_cls()
+        worker = _worker(args)
+        run_id = new_run_id("w3a")
         summary["load"] = worker.report.remote()
         print("load report:", json.dumps(summary["load"], indent=2))
         if args.sequential:
             runs["c1"] = worker.annotate_batch.remote(
-                episodes, 1, measure=args.measure, torch_threads=args.torch_threads, tag="c1")
+                episodes, run_id, concurrency=1, measure=args.measure, tag="c1")
             summary["c1"] = batch_summary(runs["c1"])
             print(table(summary["c1"]["episodes"]))
         age = worker.report.remote()["container_age_s"]
         tag = f"c{args.concurrency}"
-        if age > min(MAX_AGE_FOR_CONCURRENT_S, HARD_LIFETIME_S - 10 * 60):
+        if age > MAX_AGE_FOR_CONCURRENT_S:
             summary["skipped"] = f"container age {age}s: concurrent batch not submitted"
         elif tag not in runs:
             runs[tag] = worker.annotate_batch.remote(
-                episodes, args.concurrency, measure=args.measure,
-                torch_threads=args.torch_threads, tag=tag)
+                episodes, run_id, concurrency=args.concurrency, measure=args.measure, tag=tag)
             summary[tag] = batch_summary(runs[tag])
             print(table(summary[tag]["episodes"]))
             if "c1" in runs:
@@ -201,8 +331,7 @@ def concurrency_experiment(args) -> int:
         if key in summary:
             print(key, json.dumps(summary[key], indent=1))
     print(f"container age {summary['container_age_s']}s; local wall {summary['local_wall_s']}s")
-    if args.summary:
-        args.summary.write_text(json.dumps(summary, indent=2) + "\n")
+    _write(args.summary, summary)
     errors = any(summary[k]["errors"] for k in runs)
     identical = summary.get("identity", {}).get("identical", True)
     return 0 if identical and not errors else 1

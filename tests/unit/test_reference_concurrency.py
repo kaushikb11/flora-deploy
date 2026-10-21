@@ -7,6 +7,7 @@ stateful processor, and ``generate`` prints ``FLORA_RUNTIME`` events.
 """
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import random
@@ -40,8 +41,17 @@ class FakeProc:
         return {"input_ids": hashlib.sha256(f"{self.kind}:{self._state}".encode()).hexdigest()}
 
 
+def runtime_event(event, **values):
+    """NVIDIA's ``models.runtime_event`` format (``FLORA_RUNTIME {json}`` with ``utc``)."""
+    from datetime import UTC, datetime
+
+    print("FLORA_RUNTIME " + json.dumps(dict(event=event, utc=datetime.now(UTC).isoformat(),
+                                             **values), sort_keys=True), flush=True)
+
+
 class GpuProbe:
-    """Fake ``models.generate``: deterministic output; records overlap and procs seen."""
+    """Fake ``models.generate``: deterministic output; records overlap and procs seen; logs
+    ``generation_start`` (with an input digest) and ``generation_end`` like NVIDIA's."""
 
     def __init__(self):
         self.active = 0
@@ -57,12 +67,13 @@ class GpuProbe:
             self.calls += 1
             self.procs.setdefault(threading.get_ident(), set()).add(id(proc))
         try:
+            digest = hashlib.sha256(str(inputs["input_ids"]).encode()).hexdigest()
+            runtime_event("generation_start", input_tokens=10, output_limit=budget,
+                          input_tensor_digest=digest)
             time.sleep(random.uniform(0.001, 0.004))
             text = hashlib.sha256(f"{model}:{inputs['input_ids']}:{budget}".encode()).hexdigest()
-            print("FLORA_RUNTIME " + json.dumps({"event": "generation_end", "input_tokens": 10,
-                                                 "generated_tokens": len(text) % 7 + 1,
-                                                 "output_limit": budget, "complete": True,
-                                                 "elapsed_s": 0.01}), flush=True)
+            runtime_event("generation_end", input_tokens=10, generated_tokens=len(text) % 7 + 1,
+                          output_limit=budget, complete=True, elapsed_s=0.01)
             return text[:16]
         finally:
             with self._lock:
@@ -76,11 +87,35 @@ def _video(path, n=40):
                            duration_s=n / 4, size=(64, 48), cfr=True)
 
 
-def fake_nv(probe: GpuProbe):
+def fake_nv(probe: GpuProbe, calls: list | None = None):
+    """A fake SEGCAP family with NVIDIA's call structure: ``api.DataEnginePipeline().annotate``
+    takes ``api._REQUEST_LOCK`` (looked up at call time), runs ``_inputs`` then
+    ``pipeline.annotate``, which builds ``pipeline.Session()`` (looked up at call time) and
+    closes it in ``finally``; ``pipeline`` functions call ``pipeline.generate``."""
+    calls = [] if calls is None else calls
     profiles = {"human": "Human", "yam": "YAM"}
+    pools = {"Human": "human", "YAM": "yam"}
     pipeline = SimpleNamespace(generate=probe)
+    api = SimpleNamespace(_REQUEST_LOCK=threading.RLock())
+
+    class NvSession:  # NVIDIA's own Session: fresh processors per video
+        def __init__(self):
+            calls.append(("fresh_session",))
+            self.audit = {}
+
+        def load(self, kind):
+            return f"model-{kind}", FakeProc(kind)
+
+        def close(self):
+            calls.append(("fresh_close",))
+
+    pipeline.Session = NvSession
 
     def _inputs(video, profile, left, right, yam32, instruction):
+        if bool(left) != bool(right):
+            raise InputError("Provide both left and right wrist videos together.")
+        if yam32 and not left:
+            raise InputError("yam32 requires YAM and all three camera views.")
         paths = {"main": video} | ({"left_wrist": left, "right_wrist": right} if left else {})
         return {r: _video(p) for r, p in paths.items()}, profiles[profile]
 
@@ -123,17 +158,56 @@ def fake_nv(probe: GpuProbe):
         return rows, audit
 
     def caption_three(videos, segments, session, instruction, progress, profile="YAM"):
+        calls.append(("caption_three", profile))
         return caption_single(videos, segments, profile, session, instruction, progress)
 
+    def annotate(videos, profile, long_windows, instruction, progress):
+        if long_windows and len(videos) != 3:
+            raise InputError("The 32-second profile requires three synchronized camera views.")
+        pool = "yam32" if long_windows else pools[profile]
+        session = pipeline.Session()
+        try:
+            progress(0.1, desc="Loading the action segmenter")
+            segments, temporal = pipeline.segment(videos, pool, session, instruction, progress)
+            runtime_event("segmentation_complete", windows=len(temporal), segments=len(segments))
+            if len(videos) == 3:
+                captions, cap_audit = pipeline.caption_three(videos, segments, session,
+                                                             instruction, progress,
+                                                             profile=profile)
+            else:
+                captions, cap_audit = pipeline.caption_single(videos, segments, profile, session,
+                                                              instruction, progress)
+            for row in captions:
+                row["segmentation_provenance"] = "fine"
+            runtime_event("annotation_complete", segments=len(captions))
+            return dict(schema_version="fake_v1", duration_s=videos["main"].duration_s,
+                        segments=captions, elapsed_s=random.random(), camera_roles=list(videos),
+                        profile=profile, input_sha256={r: v.sha256 for r, v in videos.items()},
+                        pipeline=dict(temporal_windows=temporal, caption_inputs=cap_audit))
+        finally:
+            session.close()
+
+    class DataEnginePipeline:
+        def annotate(self, video, *, profile="human", left_wrist=None, right_wrist=None,
+                     yam32=False, instruction="", progress=None, include_audit=False):
+            calls.append(("api.annotate", profile, yam32))
+            with api._REQUEST_LOCK:
+                videos, canonical = _inputs(video, profile, left_wrist, right_wrist, yam32,
+                                            instruction)
+                result = pipeline.annotate(videos, canonical, yam32, instruction,
+                                           progress or (lambda *a, **k: None))
+            if not include_audit:
+                result.pop("pipeline", None)
+            return result
+
     pipeline.segment, pipeline.caption_single = segment, caption_single
-    pipeline.caption_three = caption_three
+    pipeline.caption_three, pipeline.annotate = caption_three, annotate
+    api.DataEnginePipeline = DataEnginePipeline
     return SimpleNamespace(
-        api=SimpleNamespace(DataEnginePipeline=SimpleNamespace(_inputs=_inputs)),
-        media=SimpleNamespace(check_synchronized=lambda v: None, InputError=InputError),
-        preprocessing=SimpleNamespace(instruction_suffix=lambda s: ""),
-        config=SimpleNamespace(PROFILE_POOLS={"Human": "human", "YAM": "yam"},
-                               MODELS={"tempseg": {"revision": "r"}}),
-        models=SimpleNamespace(runtime_event=lambda e, **kw: None),
+        api=api,
+        media=SimpleNamespace(InputError=InputError),
+        config=SimpleNamespace(PROFILE_POOLS=pools, MODELS={"tempseg": {"revision": "r"}}),
+        models=SimpleNamespace(runtime_event=runtime_event),
         pipeline=pipeline,
     )
 
@@ -164,6 +238,7 @@ def setup(lock: bool = True):
     gpu_lock, patcher = TimedLock("gpu"), Patcher()
     if lock:
         ref.install_gpu_lock(nv, gpu_lock, patcher)
+    ref.install_nvidia_entry(nv, patcher, request_lock=False)
     return probe, nv, session, gpu_lock, patcher
 
 
@@ -353,3 +428,107 @@ def test_pil_save_is_timed_by_format(tmp_path):
     table = call_table(rec.events)
     assert table["pil.save.PNG"]["calls"] == 1 and table["pil.save.JPG"]["calls"] == 1
     assert table["pil.resize"]["calls"] == 1
+
+
+# --- S1: NVIDIA's own entry point, fresh vs resident session, identity summary ---------------
+
+
+def test_concurrency_needs_request_lock_swapped():
+    probe = GpuProbe()
+    nv = fake_nv(probe)
+    gpu_lock, patcher = TimedLock("gpu"), Patcher()
+    ref.install_gpu_lock(nv, gpu_lock, patcher)
+    ref.install_nvidia_entry(nv, patcher)  # NVIDIA's whole-request RLock kept
+    session = CachedSession(FakeNvSession)
+    with pytest.raises(RuntimeError, match="request_lock"):
+        ref.annotate_batch(nv, session, EPISODES, concurrency=2, gpu_lock=gpu_lock)
+    out = ref.annotate_batch(nv, session, EPISODES[:2], concurrency=1, gpu_lock=gpu_lock)
+    assert not out["errors"]
+    with pytest.raises(RuntimeError, match="already bound"):
+        ref.install_nvidia_entry(nv, Patcher())
+
+
+def test_fresh_nvidia_session_matches_resident_concurrent():
+    """The identity-proof shape: NVIDIA's own fresh Session per video, sequential, no swaps,
+    vs the resident session with 4 threads under the GPU lock."""
+    probe = GpuProbe()
+    calls: list = []
+    nv = fake_nv(probe, calls)
+    original = (nv.pipeline.Session, nv.pipeline.generate, nv.api._REQUEST_LOCK)
+    gpu_lock, patcher = TimedLock("gpu"), Patcher()
+    ref.install_gpu_lock(nv, gpu_lock, patcher)
+    ref.install_nvidia_entry(nv, patcher, request_lock=False)
+    session = CachedSession(FakeNvSession)
+    fast = ref.annotate_batch(nv, session, EPISODES, concurrency=4, gpu_lock=gpu_lock)
+    assert not [c for c in calls if c[0] == "fresh_session"]  # resident session only
+    with pytest.raises(RuntimeError, match="restore"):
+        ref.annotate_nvidia(nv, None, EPISODES[0]["videos"], "human")
+    patcher.restore()
+    assert (nv.pipeline.Session, nv.pipeline.generate, nv.api._REQUEST_LOCK) == original
+    with pytest.raises(RuntimeError, match="not active"):
+        ref.annotate_nvidia(nv, session, EPISODES[0]["videos"], "human")
+    with pytest.raises(RuntimeError, match="resident"):
+        ref.annotate_batch(nv, None, EPISODES, concurrency=2)
+    calls.clear()
+    nvidia = ref.annotate_batch(nv, None, EPISODES, concurrency=1)
+    assert sum(c[0] == "fresh_session" for c in calls) == len(EPISODES)
+    assert sum(c[0] == "fresh_close" for c in calls) == len(EPISODES)
+    ident = ref.identity_summary(nvidia["results"], fast["results"])
+    assert ident["gate_ok"] and ident["compared"] == len(EPISODES)
+    assert ident["strict_episodes"] == ident["output_identical_episodes"] == len(EPISODES)
+    assert ident["same_input_different_output"] == 0
+    assert ident["gated_calls"] == ident["calls_a"] == probe.calls // 2
+    for r in nvidia["results"].values():
+        assert r["flora_reference"]["session"] == "nvidia_fresh"
+        mc = r["flora_reference"]["model_calls"]
+        assert all(c["output_sha256"] and c["input_digest"] for c in mc)
+        t = r["flora_reference"]["timings_s"]
+        assert all(t[k] is not None and t[k] >= 0 for k in ("probe", "segment", "caption"))
+
+
+def test_accel_episode_scope_and_provenance():
+    probe, nv, session, gpu_lock, _ = setup()
+
+    class FakeAccel:
+        depth = max_depth = 0
+
+        @contextlib.contextmanager
+        def episode(self):
+            FakeAccel.depth += 1
+            FakeAccel.max_depth = max(FakeAccel.max_depth, FakeAccel.depth)
+            try:
+                yield
+            finally:
+                FakeAccel.depth -= 1
+
+        def provenance(self):
+            return {"schema": "flora_accel_patches_v1", "patches": []}
+
+    out = ref.annotate_batch(nv, session, EPISODES, concurrency=3, gpu_lock=gpu_lock,
+                             accel=FakeAccel())
+    assert not out["errors"] and FakeAccel.depth == 0 and FakeAccel.max_depth >= 2
+    assert all(r["flora_reference"]["accel"]["schema"] == "flora_accel_patches_v1"
+               for r in out["results"].values())
+
+
+def _call(d, out="o", complete=True, tok=3):
+    return {"input_digest": d, "output_sha256": out, "complete": complete,
+            "generated_tokens": tok}
+
+
+def test_compare_model_inputs_gate():
+    a = [_call("x"), _call("y"), _call("z")]
+    assert ref.compare_model_inputs(a, list(a))["strict"]
+    # an output differs at call 1: call 2's input may differ (downstream), the gate holds
+    b = [_call("x"), _call("y", out="p"), _call("w")]
+    r = ref.compare_model_inputs(a, b)
+    assert r["gate_ok"] and not r["strict"] and r["first_output_difference_call"] == 1
+    assert r["gated_calls"] == 2 and r["same_input_different_output"] == 1
+    # an input differs while everything upstream agreed: violation
+    c = [_call("x"), _call("q"), _call("z")]
+    r = ref.compare_model_inputs(a, c)
+    assert not r["gate_ok"] and r["gate_violation_call"] == 1
+    # one run made more calls with everything else equal: violation
+    r = ref.compare_model_inputs(a, a[:2])
+    assert not r["gate_ok"] and r["gate_violation_call"] == 2
+    assert ref.compare_model_inputs(a, a[::-1])["multiset"]
