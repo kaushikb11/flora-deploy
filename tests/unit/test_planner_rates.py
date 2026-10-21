@@ -104,3 +104,36 @@ def test_bad_files(tmp_path):
     p.write_text(json.dumps({"schema": 1, "rates": [{"kind": "segcap"}]}))
     with pytest.raises(RatesFileError, match=r"rates\[0\]"):
         RateTable.load(p)
+
+
+def test_balanced_measurement_slot(table):
+    """The balanced segment/caption rows are the slot a measurement wave flips in rates.json
+    alone: placeholder | measured, and a measured row names its source and date."""
+    from flora_deploy.planner.rates import MEASURED_SLOTS, SLOT_STATUSES
+
+    for preset, kind in MEASURED_SLOTS:
+        rows = [e for e in table.rates if e.preset == preset and e.kind == kind]
+        assert rows, (preset, kind)
+        for e in rows:
+            assert e.status in SLOT_STATUSES
+            if e.status == "measured":
+                assert e.source and e.date
+
+
+def _slot_file(tmp_path, **row):
+    base = {"preset": "balanced", "kind": "segment", "cameras": "*", "concurrency": 1,
+            "container_s_per_video_s": 0.4, "uncertainty": 0.2, "provenance": "x",
+            "date": "2026-11-01"}
+    p = tmp_path / "r.json"
+    p.write_text(json.dumps({"schema": 1, "rates": [{**base, **row}]}))
+    return p
+
+
+def test_flipping_the_slot_needs_no_code(tmp_path):
+    t = RateTable.load(_slot_file(tmp_path, status="measured", source="docs/wave-h.md"))
+    e = t.rate("balanced", "segment", 1)
+    assert e.status == "measured" and e.source == "docs/wave-h.md"
+    with pytest.raises(RatesFileError, match="needs `source` and `date`"):
+        RateTable.load(_slot_file(tmp_path, status="measured"))
+    with pytest.raises(RatesFileError, match="placeholder [|] measured"):
+        RateTable.load(_slot_file(tmp_path, status="projected"))

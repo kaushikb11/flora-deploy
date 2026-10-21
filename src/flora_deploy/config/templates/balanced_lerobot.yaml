@@ -1,0 +1,84 @@
+# flora.yaml: label a LeRobot dataset with the `balanced` preset (vLLM engines; the default).
+# Every key is documented below. Unknown keys are an error.
+
+project: my-lerobot-labels          # names the job and its Modal tags
+
+# NVIDIA's Flora models are licensed for non-commercial research only. Required.
+license_ack: research-only
+
+modal:
+  environment: main                 # Modal Environment to deploy into
+  max_gpus: 4                       # workspace GPU cap; all pools together stay under it
+  budget_usd: 25                    # hard spend cap (a Modal Environment budget backs it up)
+  region: null                      # null = any region (pinning costs >= 1.15x)
+  tags: {}                          # extra key/value tags on every Modal object
+
+# balanced: vLLM engines on stage-separated pools: TempSeg on an L40S, the Captioner on an
+# H100!, the Rewarder on an H100!. Workers scale from zero, so you pay only while a job runs.
+# It has no Gate certificates yet, so it needs `allow_uncertified: true` (its records are
+# marked certified: false). exact: NVIDIA's own HF pipeline on an H200, the certification
+# reference (see exact_lerobot.yaml).
+preset: balanced
+allow_uncertified: true
+
+# Derived weights (TempSeg merged, Captioner BF16) by receipt name. `flora prepare` will fill
+# this in; until it does, pass them as `--receipt NAME=<sha256>` to `flora deploy` / `flora run`.
+# weights:
+#   derived:
+#     tempseg_merged: <sha256>
+#     captioner_bf16: <sha256>
+
+input:
+  format: lerobot_v3                # lerobot_v21 | lerobot_v3 | mp4_dir
+  repo: griffinlabs/EgoDex-LeRobot-v3.0
+  revision: 41d60b449629b2181ff5b735d31c2a2cf8b3cad8   # full commit SHA, never a branch
+  path: test/make_sandwich          # subdirectory inside the repo (optional)
+  # Map dataset camera keys to NVIDIA's views: 1 view (main) or 3 (main, left_wrist,
+  # right_wrist). Leave out for a single-camera dataset.
+  # cameras:
+  #   observation.images.top: main
+  #   observation.images.left_wrist: left_wrist
+  #   observation.images.right_wrist: right_wrist
+  # Where workers read the videos. null: from the Hub at `revision` (each worker downloads the
+  # files its episodes need). volume://<vol>/<dir>: the copy `flora index` staged there (read
+  # once from the Hub, kept for reruns and later stages).
+  stage_to: null
+
+pipeline:
+  # segment, caption, reward.terminal, reward.dense, reward.rubric
+  # (caption needs segment; each stage runs on its own pool)
+  stages: [segment, caption, reward.terminal, reward.dense]
+  embodiment: human                 # human | yam | yam32 | dex | tianji
+  episode_instruction:
+    source: dataset_task            # dataset_task | fixed (then set `text`) | none
+                                    # (none is refused with reward stages: they need a task)
+  envelope: warn                    # warn | enforce | ignore: out-of-envelope episodes (D13)
+  # `determinism` applies to the exact preset's segcap worker only; leave it unset here.
+  # terminal_rationale: false       # true: reward.terminal also returns NVIDIA's rationale;
+                                    # in the reward.terminal stage hash
+
+# Per shard kind overrides of the preset's pools: gpu, gpu_count, max_containers, max_inputs,
+# cpu (physical cores), memory (GiB). balanced runs one pool per stage: `segment` (TempSeg,
+# >= 44 GiB GPU: L40S or larger), `caption` (Captioner, an 80 GB GPU: H100!, H100, A100-80GB,
+# H200, B200) and one per reward stage (an 80 GB GPU). These are not in the config hash: they
+# never change the model inputs, but a different GPU type runs different kernels, so outputs
+# are input-identical, not bit-identical, across GPU types (recorded in provenance.gpu).
+resources:
+  segment: {gpu: L40S, max_containers: 1}
+  caption: {gpu: H100!, max_containers: 1}
+  reward.terminal: {gpu: H100!, max_containers: 1}
+  reward.dense: {gpu: H100!, max_containers: 1}
+
+output:
+  sink: s3://my-bucket/flora/my-lerobot-labels   # s3:// r2:// gs:// volume:// file://
+  formats: [parquet, jsonl]
+
+retries:
+  max_starts_before_quarantine: 3   # then the shard is quarantined and bisected
+  # A job that excludes more than this share of a stage's episodes (NVIDIA-semantics failures,
+  # poison pills) ends `completed_with_errors` instead of `done`.
+  max_episode_error_rate: 0.1
+
+observability:
+  log_level: info
+  heartbeat_s: 60

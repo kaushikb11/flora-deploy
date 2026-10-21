@@ -1,4 +1,6 @@
-# flora.yaml: label a LeRobot dataset with NVIDIA's own pipeline (`exact` preset).
+# flora.yaml: REFERENCE / CERTIFICATION template. Labels a LeRobot dataset with NVIDIA's own
+# pipeline (`exact` preset): the reference `balanced` is certified against. For everyday
+# labelling start from balanced_lerobot.yaml (`flora init`'s default).
 # Every key is documented below. Unknown keys are an error.
 
 project: my-lerobot-labels          # names the job and its Modal tags

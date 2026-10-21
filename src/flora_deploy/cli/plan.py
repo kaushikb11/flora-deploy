@@ -70,14 +70,16 @@ def plan(
     from rich.markup import escape
     from rich.table import Table
 
-    from flora_deploy.config.presets import AVAILABLE_PRESETS, PresetUnavailableError
+    from flora_deploy.config.presets import PresetUnavailableError
     from flora_deploy.config.schema import ConfigError, load_config, parse_config
     from flora_deploy.jobs.budget import load_rates, modal_rates_provider, region_multiplier_for
     from flora_deploy.planner.options import (
         PlanRequest,
         WorkloadSummary,
         apply_option,
+        default_presets,
         plan_options,
+        rates_label,
         recommended,
         with_pool_overrides,
     )
@@ -110,7 +112,7 @@ def plan(
     region = region_multiplier_for(cfg.modal.region)
     rates = load_rates(modal_rates_provider if live_prices else None, region_multiplier=region)
 
-    presets = tuple(preset or AVAILABLE_PRESETS)
+    presets = tuple(preset or default_presets())  # balanced first
     deadline_s = parse_duration(deadline) if deadline else None
     req = PlanRequest(workload=workload, stages=cfg.pipeline.stages, presets=presets,
                       deadline_s=deadline_s,
@@ -130,7 +132,8 @@ def plan(
             "budget_usd": req.budget_usd, "deadline_s": deadline_s, "max_gpus": req.max_gpus,
             "prices": rates.source, "rates": table.source,
             "recommended": options.index(best) + 1 if best else None,
-            "options": [o.as_dict() for o in options]}, indent=2))
+            "options": [{**o.as_dict(), "rates": rates_label(o)} for o in options]},
+            indent=2))
     else:
         dl = f", deadline {deadline_s / 3600:.0f} h" if deadline_s else ""
         console.print(f"[bold]{escape(cfg.project)}[/bold]: {workload.video_s / 3600:,.1f} "
@@ -138,7 +141,7 @@ def plan(
                       f"{_money(req.budget_usd or 0)}{dl}, max {req.max_gpus} GPUs")
         t = Table(show_lines=False)
         for col in ("#", "option", "GPUs (containers x inputs)", "cost (range)", "wall-clock",
-                    "peak GPUs", "fidelity", "status"):
+                    "peak GPUs", "fidelity", "rates", "status"):
             t.add_column(col)
         for i, o in enumerate(options, 1):
             gpus = ", ".join(
@@ -150,7 +153,8 @@ def plan(
             t.add_row(str(i) + mark, o.name, gpus,
                       f"{_money(o.cost_usd)} ({_money(o.cost_low_usd)}-{_money(o.cost_high_usd)})",
                       f"{o.wall_s / 3600:.1f} h (<= {o.wall_high_s / 3600:.1f} h)",
-                      str(o.peak_gpus), o.certification, f"[{colour}]{o.status}[/{colour}]")
+                      str(o.peak_gpus), o.certification, rates_label(o),
+                      f"[{colour}]{o.status}[/{colour}]")
         console.print(t)
         for i, o in enumerate(options, 1):
             for f in o.flags:

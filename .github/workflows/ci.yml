@@ -40,6 +40,17 @@ jobs:
           test "$code" -eq 3
           uv run flora results --job local-demo --stage caption --store "$demo/faults"
           uv run flora results --job local-demo --stage reward.terminal --store "$demo/faults"
+      # README-as-test: run the README's "Try it locally" block exactly as written (minus the
+      # clone + install lines, which this checkout already did) in an empty directory.
+      - name: README "Try it locally" block
+        timeout-minutes: 2
+        run: |
+          uv run python scripts/readme_blocks.py try-it README.md > "$RUNNER_TEMP/try-it.sh"
+          cat "$RUNNER_TEMP/try-it.sh"
+          mkdir -p "$RUNNER_TEMP/try-it"
+          cd "$RUNNER_TEMP/try-it"
+          source "$GITHUB_WORKSPACE/.venv/bin/activate"
+          bash "$RUNNER_TEMP/try-it.sh"
 
   # Exercises NVIDIA's real code (downloaded at test time, never stored in the repo). CPU only.
   nvlink:

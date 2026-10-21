@@ -14,12 +14,25 @@ import typer
 
 from flora_deploy.cli._app import app, console
 
-TEMPLATES = {
-    "exact_lerobot": "exact_lerobot.yaml",
-    "exact_mp4_dir": "exact_mp4_dir.yaml",
-    "rewards_only": "rewards_only.yaml",
-    "local_demo": "local_demo.yaml",
+DEFAULT_TEMPLATE = "balanced_lerobot"
+
+# name -> (file, one-line description). `balanced_*` are the user-facing defaults; `exact_*` are
+# the reference / certification templates.
+TEMPLATE_INFO: dict[str, tuple[str, str]] = {
+    "balanced_lerobot": ("balanced_lerobot.yaml",
+                         "LeRobot dataset, balanced preset (vLLM; L40S + H100!); the default"),
+    "balanced_mp4_dir": ("balanced_mp4_dir.yaml",
+                         "folder of MP4s, balanced preset (vLLM; L40S + H100!)"),
+    "exact_lerobot": ("exact_lerobot.yaml",
+                      "LeRobot dataset, exact preset (NVIDIA's HF code on H200); reference / "
+                      "certification"),
+    "exact_mp4_dir": ("exact_mp4_dir.yaml",
+                      "folder of MP4s, exact preset; reference / certification"),
+    "rewards_only": ("rewards_only.yaml",
+                     "score policy rollouts with the Rewarder only (terminal + dense)"),
+    "local_demo": ("local_demo.yaml", "local demo: fake models, no GPU, no Modal account"),
 }
+TEMPLATES: dict[str, str] = {name: f for name, (f, _) in TEMPLATE_INFO.items()}
 
 
 def templates_dir() -> Traversable:
@@ -41,15 +54,22 @@ def template_text(name: str) -> str:
 def init(
     path: Annotated[Path, typer.Argument(help="Where to write the config.")] = Path("flora.yaml"),
     template: str = typer.Option(
-        "exact_lerobot", "--template", "-t", help=f"One of: {', '.join(TEMPLATES)}."
+        DEFAULT_TEMPLATE, "--template", "-t", help=f"One of: {', '.join(TEMPLATES)}."
     ),
     force: bool = typer.Option(False, "--force", help="Overwrite an existing file."),
+    list_: bool = typer.Option(False, "--list", help="List the templates and exit."),
 ) -> None:
     """Write a commented flora.yaml to start from."""
     from rich.markup import escape
 
     from flora_deploy.config.schema import ConfigError, loads_config
 
+    if list_:
+        width = max(map(len, TEMPLATE_INFO))
+        for name, (_, desc) in TEMPLATE_INFO.items():
+            mark = "*" if name == DEFAULT_TEMPLATE else " "
+            console.print(f"{mark} {name:<{width}}  {escape(desc)}", soft_wrap=True)
+        return
     try:
         text = template_text(template)
     except (KeyError, FileNotFoundError) as e:

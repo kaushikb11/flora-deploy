@@ -83,3 +83,41 @@ def test_init_unknown_template(tmp_path):
     r = runner.invoke(app, ["init", str(tmp_path / "f.yaml"), "-t", "nope"])
     assert r.exit_code == 2 and "unknown template" in r.output
     assert not (tmp_path / "f.yaml").exists()
+
+
+def test_init_defaults_to_balanced(tmp_path):
+    out = tmp_path / "flora.yaml"
+    r = runner.invoke(app, ["init", str(out)])
+    assert r.exit_code == 0, r.output
+    assert out.read_text() == template_text("balanced_lerobot")
+    cfg = loads_config(out.read_text())
+    assert cfg.preset == "balanced"
+    assert set(cfg.pools()) == {"segment", "caption", "reward.terminal", "reward.dense"}
+    assert cfg.pools()["segment"].gpu == "L40S" and cfg.pools()["caption"].gpu == "H100!"
+
+
+@pytest.mark.parametrize("name", ["balanced_lerobot", "balanced_mp4_dir"])
+def test_balanced_templates_leave_a_derived_weights_slot(name):
+    text = template_text(name)
+    assert "preset: balanced" in text
+    # `weights.derived` is not a config key yet: the slot is a comment `flora prepare` fills.
+    assert "# weights:" in text and "#   derived:" in text
+
+
+@pytest.mark.parametrize("name", ["exact_lerobot", "exact_mp4_dir"])
+def test_exact_templates_are_labelled_reference(name):
+    assert "REFERENCE / CERTIFICATION" in template_text(name).splitlines()[0]
+
+
+def test_init_list_shows_every_template_with_a_description(tmp_path):
+    from flora_deploy.cli.init import DEFAULT_TEMPLATE, TEMPLATE_INFO
+
+    out = tmp_path / "flora.yaml"
+    r = runner.invoke(app, ["init", str(out), "--list"], terminal_width=200)
+    assert r.exit_code == 0, r.output
+    lines = [ln for ln in r.output.splitlines() if ln.strip()]
+    assert len(lines) == len(TEMPLATE_INFO)
+    for ln, (name, (_, desc)) in zip(lines, TEMPLATE_INFO.items(), strict=True):
+        assert ln.split()[-len(desc.split()):] == desc.split()
+        assert name in ln and ln.startswith("*") == (name == DEFAULT_TEMPLATE)
+    assert not out.exists()  # --list writes nothing

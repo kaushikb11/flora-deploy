@@ -94,7 +94,8 @@ def test_options_deterministic_and_bounded():
     assert a == b
     assert 2 <= len(a) <= 4
     assert {o.preset for o in a} == {"exact", "balanced"}
-    assert [o.name for o in a] == ["exact x4", "balanced x1", "exact x8 +long_lived_container"]
+    # balanced (the primary preset) is listed first; `recommended` is a separate choice
+    assert [o.name for o in a] == ["balanced x1", "exact x4", "exact x8 +long_lived_container"]
     best = recommended(a)
     assert best is not None and best.name == "exact x4" and best.certification == "reference"
     bal = next(o for o in a if o.preset == "balanced")
@@ -197,3 +198,13 @@ def test_apply_option_round_trips_config():
                                    max_gpus=10))[0]
     cfg2 = parse_config(apply_option(data, bal), allow_uncertified=True)  # no certificates yet
     assert cfg2.preset == "balanced" and "segcap" not in cfg2.resources
+
+
+def test_placeholder_rates_are_labelled_estimate():
+    from flora_deploy.planner.options import DEFAULT_PRESETS, rates_label
+
+    assert DEFAULT_PRESETS[0] == "balanced" and "exact" in DEFAULT_PRESETS
+    opts = plan_options(PlanRequest(WorkloadSummary.from_hours(100), max_gpus=10))
+    bal = next(o for o in opts if o.preset == "balanced")
+    assert bal.rate_status == "placeholder" and rates_label(bal) == "estimate (placeholder)"
+    assert rates_label(next(o for o in opts if o.name == "exact x4")) == "measured"

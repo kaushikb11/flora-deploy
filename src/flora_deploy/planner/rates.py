@@ -55,6 +55,7 @@ class RateEntry:
     image: str | None = None  # the image it was measured / projected on
     requires: tuple[str, ...] = ()  # worker features the rate depends on
     excludes: tuple[str, ...] = ()  # features under which the rate is invalid (measured without)
+    source: str | None = None  # where the measurement lives (doc / run id); see MEASURED_SLOTS
 
     def usable(self, features: Features | None = None) -> bool:
         f = resolve_features(features)
@@ -71,6 +72,14 @@ class StartupEntry:
     status: str
     provenance: str
     date: str
+    source: str | None = None
+
+
+# Rows a later measurement wave flips from ``placeholder`` to ``measured`` by editing rates.json
+# only (rate, uncertainty, status, source, date), by (preset, kind). Their status must be
+# ``placeholder`` or ``measured``, and a ``measured`` one must name its ``source`` and ``date``.
+MEASURED_SLOTS: tuple[tuple[str, str], ...] = (("balanced", "segment"), ("balanced", "caption"))
+SLOT_STATUSES: tuple[str, ...] = ("placeholder", "measured")
 
 
 class RatesFileError(ValueError):
@@ -80,6 +89,17 @@ class RatesFileError(ValueError):
 def _check(cond: bool, msg: str) -> None:
     if not cond:
         raise RatesFileError(msg)
+
+
+def _check_slots(rates: list[RateEntry], source: str) -> None:
+    for preset, kind in MEASURED_SLOTS:
+        for e in (r for r in rates if r.preset == preset and r.kind == kind):
+            _check(e.status in SLOT_STATUSES,
+                   f"{source}: {preset} {kind} rate status {e.status!r}; use "
+                   f"{' | '.join(SLOT_STATUSES)}")
+            if e.status == "measured":
+                _check(bool(e.source and e.date),
+                       f"{source}: a measured {preset} {kind} rate needs `source` and `date`")
 
 
 @dataclass(frozen=True)
@@ -113,6 +133,7 @@ class RateTable:
                 raise RatesFileError(f"{source}: startup[{i}]: {exc}") from None
             _check(e2.startup_s >= 0, f"{source}: startup[{i}] must be >= 0")
             startup.append(e2)
+        _check_slots(rates, source)
         return cls(tuple(rates), tuple(startup), source=source, updated=data.get("updated", ""))
 
     @classmethod
