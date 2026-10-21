@@ -75,6 +75,10 @@ OUTPUT_MODULES: dict[str, tuple[str, ...]] = {
         "nv/linker.py",
         "config/hashing.py",
         "config/logic.py",
+        # Which Gate certificate applies to a pool decides a record's ``certified`` flag and
+        # ``provenance.certificate``, so the match key is output-affecting (the certificates and
+        # their generator, validate/certify.py, are not).
+        "validate/certkey.py",
         # Review 5 L-a: the code that turns hashed config fields into worker behaviour. A hashed
         # mode is only as good as the code that applies it: the W2-merge bug (determinism and
         # terminal_rationale hashed but not applied) lived here, while these were non-output.
@@ -140,6 +144,7 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     "cli/__init__.py",
     "cli/_app.py",
     "cli/cancel.py",
+    "cli/certify.py",
     "cli/deploy.py",
     "cli/index.py",
     "cli/init.py",
@@ -213,6 +218,7 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     "prep/run.py",
     "prep/verify.py",  # verification only
     "validate/__init__.py",
+    "validate/certify.py",  # certificate generator: metrics over finished records
     "validate/gatec.py",
     "validate/gatec_driver.py",
     "validate/golden.py",  # golden build; stream_receipt digests are integrity data

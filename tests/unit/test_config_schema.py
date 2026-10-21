@@ -177,10 +177,10 @@ def test_balanced_needs_certificates_or_explicit_opt_in(monkeypatch):
     # once matching certificates exist, no opt-in is needed
     certs = {k: presets.Certificate(f"c-{k}", "balanced", k, "x")
              for k in ("segment", "caption", "reward.terminal")}
-    monkeypatch.setattr(schema, "find_certificates", lambda preset, pools: certs)
+    monkeypatch.setattr(schema, "find_certificates", lambda preset, pools, **kw: certs)
     assert parse_config(d).preset == "balanced"
     monkeypatch.setattr(schema, "find_certificates",
-                        lambda preset, pools: {"segment": certs["segment"]})
+                        lambda preset, pools, **kw: {"segment": certs["segment"]})
     assert "for caption on H100!, reward.terminal on H100!" in err(d)
 
 

@@ -34,6 +34,18 @@ def _fail(msg: str, code: int = 2) -> typer.Exit:
     return typer.Exit(code=code)
 
 
+def certificate_status(cfg, option) -> dict[str, dict]:
+    """Per shard kind of ``option``: the Gate certificate status of its (kind, GPU) pool
+    (``validate.certkey.status``: reference / certified / provisional / fail / none)."""
+    from types import SimpleNamespace
+
+    from flora_deploy.config.hashing import kind_modes
+    from flora_deploy.validate.certkey import status
+
+    pools = {k.kind: SimpleNamespace(gpu=k.gpu) for k in option.kinds}
+    return status(option.preset, pools, modes={k: kind_modes(cfg, k) for k in pools})
+
+
 def _cameras_from_config(cfg) -> int:
     cams = cfg.input.cameras
     return len(cams) if cams else 1
@@ -130,7 +142,8 @@ def plan(
             "budget_usd": req.budget_usd, "deadline_s": deadline_s, "max_gpus": req.max_gpus,
             "prices": rates.source, "rates": table.source,
             "recommended": options.index(best) + 1 if best else None,
-            "options": [o.as_dict() for o in options]}, indent=2))
+            "options": [{**o.as_dict(), "certificates": certificate_status(cfg, o)}
+                        for o in options]}, indent=2))
     else:
         dl = f", deadline {deadline_s / 3600:.0f} h" if deadline_s else ""
         console.print(f"[bold]{escape(cfg.project)}[/bold]: {workload.video_s / 3600:,.1f} "
@@ -155,6 +168,12 @@ def plan(
         for i, o in enumerate(options, 1):
             for f in o.flags:
                 console.print(f"  {i}. {escape(f)}")
+            if o.preset != "exact":
+                certs = certificate_status(cfg, o)
+                console.print(f"  {i}. certificates: " + ", ".join(
+                    f"{k} on {c['gpu']}: {c['status']}" + (f" ({c['certificate']})"
+                                                         if c["certificate"] else "")
+                    for k, c in certs.items()))
         console.print(f"Prices: {escape(rates.source)}" +
                       (f" (x{rates.region_multiplier} region)" if rates.region_multiplier != 1
                        else "") + f". Rates: {escape(table.source)} ({table.updated}).")
