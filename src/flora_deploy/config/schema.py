@@ -3,12 +3,13 @@
 The job system only ever sees ``RunSettings`` (``jobs/settings.py``); this module is the one
 place that knows the YAML layout. Every model forbids unknown keys so typos fail loudly.
 
-Layout (see ``examples/*.yaml`` for commented templates)::
+Layout (see ``config/templates/*.yaml`` for commented templates)::
 
     project: my-labels
     license_ack: research-only          # required (NVIDIA's models are non-commercial)
     modal: {environment, max_gpus, budget_usd, region, tags}
     preset: exact | balanced             # budget / interactive: not available yet
+    allow_uncertified: false             # required for balanced until its certificates exist
     input: {format, repo, revision, path, cameras, stage_to}
     pipeline: {stages, embodiment, episode_instruction, envelope, shard_target_gpu_minutes}
     resources: {<shard kind>: {gpu, gpu_count, max_containers, max_inputs, cpu, memory}}
@@ -19,17 +20,35 @@ Layout (see ``examples/*.yaml`` for commented templates)::
 
 from __future__ import annotations
 
+import posixpath
 import re
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
-from flora_deploy.config.presets import PresetUnavailableError, get_preset, shard_kinds_for
+from flora_deploy.config.presets import (
+    GPU_MEMORY_GIB,
+    PresetUnavailableError,
+    find_certificates,
+    get_preset,
+    gpu_problem,
+    needs_certificate,
+    shard_kinds_for,
+)
 from flora_deploy.jobs.settings import EnvelopePolicy, PoolSettings, Preset, RunSettings
 from flora_deploy.jobs.types import MAX_STARTS_BEFORE_QUARANTINE, ShardKind
 from flora_deploy.media.types import CameraRole
+from flora_deploy.nv.capture import FORBIDDEN_PROMPT_TOKENS, VIDEO_TOKEN
 from flora_deploy.records import Stage
 
 InputFormat = Literal["lerobot_v21", "lerobot_v3", "mp4_dir"]
@@ -38,7 +57,12 @@ Embodiment = Literal["human", "yam", "yam32", "dex", "tianji"]
 OutputFormat = Literal["parquet", "jsonl", "lerobot"]
 
 _SHA = re.compile(r"^[0-9a-f]{40}$")
-_GPU = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*!?$")  # Modal GPU string without ":count"
+# Tokens an instruction must not contain: NVIDIA's processor and our vLLM wrap treat them as
+# structure, not text (nv.capture.vllm_prompt refuses them per episode; refuse them up front).
+INSTRUCTION_FORBIDDEN_TOKENS = (*FORBIDDEN_PROMPT_TOKENS, VIDEO_TOKEN)
+# Sane upper bounds: a typo (or ``.inf``) must not disable a hard cap.
+MAX_BUDGET_USD = 1_000_000.0
+MAX_GPUS = 4096
 _TAG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 
 
@@ -52,11 +76,13 @@ class _Model(BaseModel):
 
 class ModalSection(_Model):
     environment: str = "main"
-    max_gpus: int = Field(ge=1, description="workspace GPU cap the job must stay under")
-    budget_usd: float = Field(gt=0, description="hard spend cap for the job")
+    max_gpus: int = Field(ge=1, le=MAX_GPUS, strict=True,
+                          description="workspace GPU cap the job must stay under")
+    budget_usd: float = Field(gt=0, le=MAX_BUDGET_USD, allow_inf_nan=False,
+                              description="hard spend cap for the job")
     region: str | None = None
     tags: dict[str, str] = Field(default_factory=dict)
-    environment_budget_factor: float = Field(1.2, ge=1.0)
+    environment_budget_factor: float = Field(1.2, ge=1.0, le=10.0, allow_inf_nan=False)
 
     @field_validator("tags")
     @classmethod
@@ -76,6 +102,17 @@ class InputSection(_Model):
         None, description="dataset camera key -> main | left_wrist | right_wrist")
     stage_to: str | None = Field(None, description="where to stage downloaded inputs")
 
+    @field_validator("path")
+    @classmethod
+    def _path(cls, v: str | None) -> str | None:
+        """Normalize, so ``sub``, ``./sub`` and ``sub/`` are one input (and one hash)."""
+        if v is None:
+            return v
+        if not v.strip():
+            raise ValueError("`path` is empty; leave it out instead")
+        norm = posixpath.normpath(v.strip())
+        return "/" + norm.lstrip("/") if norm.startswith("/") else norm
+
     @model_validator(mode="after")
     def _where(self) -> InputSection:
         if self.repo is None and self.path is None:
@@ -85,6 +122,9 @@ class InputSection(_Model):
                 raise ValueError(
                     f"`revision` must be the full 40-hex commit of {self.repo!r} (got "
                     f"{self.revision!r}); branch names would make results non-reproducible")
+            if self.path is not None and (self.path.startswith("/") or self.path == ".."
+                                          or self.path.startswith("../")):
+                raise ValueError(f"`path` {self.path!r} must be a subdirectory inside the repo")
         elif self.revision is not None:
             raise ValueError("`revision` only applies with `repo`")
         if self.format == "mp4_dir" and self.repo is None and not self.path:
@@ -105,6 +145,13 @@ class InputSection(_Model):
     def dataset(self) -> str:
         return self.repo if self.repo is not None else str(self.path)
 
+    @property
+    def subdir(self) -> str | None:
+        """Subdirectory inside ``repo`` (None: the repo root, or a local input)."""
+        if self.repo is None or self.path in (None, "."):
+            return None
+        return self.path
+
 
 class EpisodeInstruction(_Model):
     source: Literal["dataset_task", "fixed", "none"] = "dataset_task"
@@ -116,6 +163,11 @@ class EpisodeInstruction(_Model):
             raise ValueError("episode_instruction.source 'fixed' needs `text`")
         if self.source != "fixed" and self.text is not None:
             raise ValueError("episode_instruction.text only applies with source 'fixed'")
+        if self.text is not None:
+            bad = [t for t in INSTRUCTION_FORBIDDEN_TOKENS if t in self.text]
+            if bad:
+                raise ValueError(f"episode_instruction.text contains special token(s) {bad}, "
+                                 "which NVIDIA's processor treats as video structure")
         return self
 
 
@@ -124,7 +176,7 @@ class PipelineSection(_Model):
     embodiment: Embodiment
     episode_instruction: EpisodeInstruction = Field(default_factory=EpisodeInstruction)
     envelope: EnvelopePolicy = "warn"  # D13
-    shard_target_gpu_minutes: float = Field(10.0, gt=0)
+    shard_target_gpu_minutes: float = Field(10.0, gt=0, le=24 * 60, allow_inf_nan=False)
 
     @field_validator("stages")
     @classmethod
@@ -142,8 +194,9 @@ class ResourceOverride(_Model):
     gpu_count: int | None = Field(None, ge=1, le=8)
     max_containers: int | None = Field(None, ge=1)
     max_inputs: int | None = Field(None, ge=1)
-    cpu: float | None = Field(None, gt=0, description="physical cores")
-    memory: float | None = Field(None, gt=0, description="GiB")
+    cpu: float | None = Field(None, gt=0, le=512, allow_inf_nan=False,
+                              description="physical cores")
+    memory: float | None = Field(None, gt=0, le=4096, allow_inf_nan=False, description="GiB")
 
     @field_validator("gpu")
     @classmethod
@@ -152,8 +205,9 @@ class ResourceOverride(_Model):
             return v
         if ":" in v:
             raise ValueError(f"gpu {v!r}: give the count as `gpu_count`, not 'TYPE:N'")
-        if not _GPU.match(v):
-            raise ValueError(f"gpu {v!r} is not a Modal GPU type (e.g. H200, H100!, L40S)")
+        if v not in GPU_MEMORY_GIB:
+            raise ValueError(f"gpu {v!r} is not a Modal GPU type; use one of "
+                             f"{', '.join(GPU_MEMORY_GIB)}")
         return v
 
     def apply(self, pool: PoolSettings) -> PoolSettings:
@@ -189,7 +243,7 @@ class RetriesSection(_Model):
 
 class ObservabilitySection(_Model):
     log_level: Literal["debug", "info", "warning", "error"] = "info"
-    heartbeat_s: float = Field(60.0, gt=0)
+    heartbeat_s: float = Field(60.0, gt=0, le=3600, allow_inf_nan=False)
     progress: bool = True
 
 
@@ -198,6 +252,10 @@ class FloraConfig(_Model):
     license_ack: Literal["research-only"]
     modal: ModalSection
     preset: Preset = "exact"
+    # Run a preset whose Gate certificates do not exist (yet) for its (shard kind, GPU) pools.
+    # Also settable per invocation (``parse_config(..., allow_uncertified=True)``, the CLI's
+    # ``--allow-uncertified``). Not hashed: it changes what may run, not what a run produces.
+    allow_uncertified: bool = Field(False, strict=True)
     input: InputSection
     pipeline: PipelineSection
     resources: dict[ShardKind, ResourceOverride] = Field(default_factory=dict)
@@ -206,7 +264,7 @@ class FloraConfig(_Model):
     observability: ObservabilitySection = Field(default_factory=ObservabilitySection)
 
     @model_validator(mode="after")
-    def _resolve(self) -> FloraConfig:
+    def _resolve(self, info: ValidationInfo) -> FloraConfig:
         try:
             preset = get_preset(self.preset)
         except PresetUnavailableError as e:
@@ -223,6 +281,20 @@ class FloraConfig(_Model):
             raise ValueError("the exact preset runs NVIDIA's pipeline, which does segment and "
                              "caption together: list both or neither")
         pools = self.pools()
+        bad_gpu = [p for k, pool in pools.items()
+                   if (p := gpu_problem(self.preset, k, pool.gpu, pool.gpu_count))]
+        if bad_gpu:
+            raise ValueError("; ".join(bad_gpu))
+        allow = self.allow_uncertified or bool((info.context or {}).get("allow_uncertified"))
+        if needs_certificate(self.preset) and not allow:
+            certs = find_certificates(self.preset, pools)
+            missing = [f"{k} on {p.gpu}" for k, p in pools.items() if k not in certs]
+            if missing:
+                raise ValueError(
+                    f"preset {self.preset!r} has no Gate certificate for {', '.join(missing)} "
+                    "(none exist yet), so its outputs are not certified faithful to NVIDIA's. "
+                    "Use preset 'exact', or set `allow_uncertified: true` (or pass "
+                    "--allow-uncertified) to run it as an uncertified stack")
         need = sum(p.gpu_count * p.max_containers for p in pools.values())
         if need > self.modal.max_gpus:
             raise ValueError(
@@ -255,29 +327,69 @@ def _format_errors(err: ValidationError, source: str) -> str:
     return "\n".join(lines)
 
 
-def parse_config(data: Any, *, source: str = "flora.yaml") -> FloraConfig:
-    """Validate a parsed YAML/JSON document. Raises ``ConfigError`` listing every problem."""
+def parse_config(data: Any, *, source: str = "flora.yaml",
+                 allow_uncertified: bool = False) -> FloraConfig:
+    """Validate a parsed YAML/JSON document. Raises ``ConfigError`` listing every problem.
+
+    ``allow_uncertified`` (the CLI's ``--allow-uncertified``) has the effect of the config's
+    ``allow_uncertified: true``."""
     if not isinstance(data, dict):
         raise ConfigError(f"{source}: expected a mapping at the top level")
     try:
-        return FloraConfig.model_validate(data)
+        return FloraConfig.model_validate(data, context={"allow_uncertified": allow_uncertified})
     except ValidationError as e:
         raise ConfigError(_format_errors(e, source)) from None
 
 
-def loads_config(text: str, *, source: str = "flora.yaml") -> FloraConfig:
+def _yaml_loader():
+    """``yaml.SafeLoader`` that rejects duplicate mapping keys (PyYAML keeps the last one)."""
+    import yaml
+
+    class UniqueKeyLoader(yaml.SafeLoader):
+        pass
+
+    def construct_mapping(loader, node, deep=False):
+        loader.flatten_mapping(node)
+        seen: dict[Any, Any] = {}
+        for key_node, _ in node.value:
+            key = loader.construct_object(key_node, deep=deep)
+            try:
+                first = seen.get(key)
+            except TypeError:  # unhashable key: PyYAML raises its own error below
+                continue
+            if first is not None:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping", node.start_mark,
+                    f"found duplicate key {key!r} (first at line {first.line + 1})",
+                    key_node.start_mark)
+            seen[key] = key_node.start_mark
+        return yaml.SafeLoader.construct_mapping(loader, node, deep=deep)
+
+    UniqueKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+                                    construct_mapping)
+    return UniqueKeyLoader
+
+
+def loads_yaml(text: str, *, source: str = "flora.yaml") -> Any:
+    """Parse YAML safely and strictly (a duplicate key is an error). Raises ``ConfigError``."""
     import yaml
 
     try:
-        data = yaml.safe_load(text)
+        return yaml.load(text, Loader=_yaml_loader())  # a SafeLoader subclass
     except yaml.YAMLError as e:
         raise ConfigError(f"{source}: not valid YAML: {e}") from None
-    return parse_config(data, source=source)
 
 
-def load_config(path: str | Path) -> FloraConfig:
+def loads_config(text: str, *, source: str = "flora.yaml",
+                 allow_uncertified: bool = False) -> FloraConfig:
+    return parse_config(loads_yaml(text, source=source), source=source,
+                        allow_uncertified=allow_uncertified)
+
+
+def load_config(path: str | Path, *, allow_uncertified: bool = False) -> FloraConfig:
     p = Path(path)
-    return loads_config(p.read_text(encoding="utf-8"), source=str(p))
+    return loads_config(p.read_text(encoding="utf-8"), source=str(p),
+                        allow_uncertified=allow_uncertified)
 
 
 def to_run_settings(

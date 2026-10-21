@@ -108,6 +108,53 @@ def grids_match_runs(ids: Sequence[int], grids: Sequence[Sequence[int]], sp: Spe
         return False
 
 
+def placeholder_problem(ids: Sequence[int], placeholders: Sequence[Sequence[int]],
+                        grids: Sequence[Sequence[int]], sp: SpecialIds,
+                        merge_size: int) -> str | None:
+    """Do vLLM's ``mm_placeholders['video']`` ranges (``[offset, length]`` per video) cover
+    exactly where each video's embeddings go? None if so, else why not.
+
+    vLLM 0.24.0 marks a video's whole prompt replacement as its placeholder: from the first
+    group's timestamp text to the last group's ``vision_end``. So, per video ``k`` (in order):
+    the range lies inside the prompt, starts at or before its first ``vision_start`` with no
+    special token in between, ends right after its ``T``-th ``vision_end``, holds exactly
+    ``T*H*W/merge^2`` pads, and does not overlap the previous range. Every pad must be inside a
+    range. (Where the timestamp text starts is not checked: it needs the tokenizer, and only the
+    pads inside a range receive embeddings.)"""
+    if len(placeholders) != len(grids):
+        return f"{len(placeholders)} placeholder ranges for {len(grids)} videos"
+    try:
+        runs = frame_runs(ids, sp)
+    except ValueError as exc:
+        return str(exc)
+    specials = {sp.vision_start, sp.vision_end, sp.video_pad}
+    i, prev_end, covered = 0, 0, 0
+    for k, (rng, (t, h, w)) in enumerate(zip(placeholders, grids, strict=True)):
+        off, length = int(rng[0]), int(rng[1])
+        mine = runs[i:i + int(t)]
+        i += int(t)
+        if len(mine) != t:
+            return f"video {k}: {len(mine)} frame groups for T={t}"
+        first, last_end = mine[0].start, mine[-1].start + mine[-1].pads + 1
+        if off < 0 or length < 0 or off + length > len(ids):
+            return f"video {k}: range [{off}, {off + length}) outside the prompt ({len(ids)})"
+        if off < prev_end:
+            return f"video {k}: range starts at {off}, inside the previous one (ends {prev_end})"
+        if off > first or any(ids[j] in specials for j in range(off, first)):
+            return f"video {k}: range starts at {off}, not at its timestamp before {first}"
+        if off + length != last_end + 1:
+            return f"video {k}: range ends at {off + length}, its last vision_end is {last_end}"
+        pads = sum(ids[j] == sp.video_pad for j in range(off, off + length))
+        want = int(t) * int(h) * int(w) // (merge_size * merge_size)
+        if pads != want:
+            return f"video {k}: {pads} pads in its range, grid implies {want}"
+        covered += pads
+        prev_end = off + length
+    if i != len(runs) or covered != sum(t == sp.video_pad for t in ids):
+        return "pads outside every placeholder range"
+    return None
+
+
 def first_diff(a: Sequence[int], b: Sequence[int]) -> int | None:
     for i, (x, y) in enumerate(zip(a, b, strict=False)):
         if x != y:
@@ -203,6 +250,9 @@ def pixels_equal_per_video(hf_digests: Sequence[dict], vllm_parts: Sequence[Any]
     return out
 
 
+PRIMARY_VARIANT = "wrapped"
+
+
 @dataclass
 class Comparison:
     case_id: str
@@ -223,6 +273,9 @@ class Comparison:
     # LLM.generate saw the rendered ids; None = generate not run on this variant
     generate_ids_equal: bool | None = None
     extras: dict = field(default_factory=dict)
+    # vLLM's placeholder ranges sit on the frame runs (``placeholder_problem``); None = not checked
+    placeholders_ok: bool | None = None
+    placeholder_error: str | None = None
 
     @property
     def pixels_ok(self) -> bool:
@@ -231,9 +284,14 @@ class Comparison:
 
     @property
     def passed(self) -> bool:
+        """The primary ``wrapped`` variant must have run ``generate`` and the placeholder check
+        (not run = FAIL); diagnostic variants fail only on a negative result."""
+        if self.variant == PRIMARY_VARIANT:
+            checks_ok = self.generate_ids_equal is True and self.placeholders_ok is True
+        else:
+            checks_ok = self.generate_ids_equal is not False and self.placeholders_ok is not False
         return (self.error is None and self.ids_equal and self.grids_equal
-                and self.runs_match_grid and self.pixels_ok
-                and self.generate_ids_equal is not False
+                and self.runs_match_grid and self.pixels_ok and checks_ok
                 and "bare_video_pad_positions" not in self.hf
                 and "bare_video_pad_positions" not in self.vllm)
 
@@ -245,21 +303,28 @@ def compare(*, case_id: str, index: int, source: str, variant: str, hf_ids: Sequ
             hf_grids: Sequence[Sequence[int]], vllm_ids: Sequence[int] | None,
             vllm_grids: Sequence[Sequence[int]] | None, sp: SpecialIds, merge_size: int,
             pixels_equal: Sequence[bool] | None = None, generate_ids_equal: bool | None = None,
-            error: str | None = None, extras: dict | None = None) -> Comparison:
+            error: str | None = None, extras: dict | None = None,
+            placeholders: Sequence[Sequence[int]] | None = None) -> Comparison:
     """Compare one request's vLLM model inputs with NVIDIA's HF call.
 
     PASS needs: no error, identical ids, identical grids, vLLM's frame runs as the grids imply,
-    pixels equal for every video, ``generate`` (if run) saw the same ids, and no stray bare
-    ``video_pad`` in either sequence."""
+    vLLM's placeholder ranges on those runs, pixels equal for every video, ``generate`` saw the
+    same ids, and no stray bare ``video_pad`` in either sequence. For the ``wrapped`` variant the
+    placeholder and ``generate`` checks must have run. ``placeholders`` (vLLM's
+    ``mm_placeholders['video']`` as ``[offset, length]``) defaults to ``extras['placeholders']``."""
     hf_ids, hf_grids = list(hf_ids), [list(g) for g in hf_grids]
     pix = None if pixels_equal is None else [bool(p) for p in pixels_equal]
+    extras = dict(extras or {})
+    if placeholders is None:
+        placeholders = extras.get("placeholders")
     if vllm_ids is None:
         return Comparison(case_id, index, source, variant, False, False, False,
                           summarize_ids(hf_ids, sp), {}, hf_grids, [], None,
-                          error or "no vLLM output", pix, generate_ids_equal,
-                          dict(extras or {}))
+                          error or "no vLLM output", pix, generate_ids_equal, extras)
     vllm_ids = list(vllm_ids)
     vgrids = [list(g) for g in (vllm_grids or [])]
+    ph_error = (None if placeholders is None else
+                placeholder_problem(vllm_ids, placeholders, vgrids, sp, merge_size))
     return Comparison(
         case_id=case_id, index=index, source=source, variant=variant,
         ids_equal=hf_ids == vllm_ids,
@@ -268,7 +333,9 @@ def compare(*, case_id: str, index: int, source: str, variant: str, hf_ids: Sequ
         hf=summarize_ids(hf_ids, sp), vllm=summarize_ids(vllm_ids, sp),
         hf_grids=hf_grids, vllm_grids=vgrids,
         first_diff=first_diff(hf_ids, vllm_ids), error=error, pixels_equal=pix,
-        generate_ids_equal=generate_ids_equal, extras=dict(extras or {}),
+        generate_ids_equal=generate_ids_equal, extras=extras,
+        placeholders_ok=None if placeholders is None else ph_error is None,
+        placeholder_error=ph_error,
     )
 
 
@@ -324,19 +391,88 @@ def render_report(rows: Sequence[dict], *, primary: str = "wrapped") -> str:
             cells.append("n/a" if ok is None else
                          f"{'PASS' if ok else 'FAIL'} ({sum(r['passed'] for r in n)}/{len(n)})")
         lines.append(f"| {c} | " + " | ".join(cells) + " |")
-    lines += ["", "| case | # | source | variant | ids | grid | runs | pixels | gen | HF len | "
-              "vLLM len | first diff | grids (T,H,W) | error |", "|" + "---|" * 14]
+    lines += ["", "| case | # | source | variant | ids | grid | runs | pixels | gen | ph | "
+              "HF len | vLLM len | first diff | grids (T,H,W) | error |", "|" + "---|" * 15]
     yn = lambda b: "=" if b else "≠"  # noqa: E731
     for r in sorted(rows, key=lambda r: (r["case_id"], r["source"], r["index"], r["variant"])):
         pix = r.get("pixels_equal")
         gen = r.get("generate_ids_equal")
+        ph = r.get("placeholders_ok")
         lines.append(
             f"| {r['case_id']} | {r['index']} | {r['source']} | {r['variant']} | "
             f"{yn(r['ids_equal'])} | {yn(r['grids_equal'])} | {yn(r['runs_match_grid'])} | "
             f"{'-' if pix is None else ''.join(yn(p) for p in pix)} | "
-            f"{'-' if gen is None else yn(gen)} | "
+            f"{'-' if gen is None else yn(gen)} | {'-' if ph is None else yn(ph)} | "
             f"{r['hf'].get('length', '')} | {r['vllm'].get('length', '')} | "
             f"{'' if r['first_diff'] is None else r['first_diff']} | "
             f"{';'.join(','.join(map(str, g)) for g in r['hf_grids'])} | "
             f"{r['error'] or ''} |")
     return "\n".join(lines) + "\n"
+
+
+def gate_verdict(builds: Sequence[dict], results: dict[str, dict], *,
+                 expected_parts: Sequence[tuple[str, str]], expected_cases: Sequence[str],
+                 variant: str = PRIMARY_VARIANT) -> dict:
+    """The Gate C verdict over a whole run, not just the rows that exist.
+
+    ``builds``: ``build_part`` results (``kind``, ``part``, ``n``, ``errors``); ``results``: kind
+    -> ``run_gate_c`` result (``rows``). PASS needs every expected (kind, part) built with no
+    error and at least one request, a ``variant`` row for every built request, every expected
+    case present, and every ``variant`` row passed. A pool whose builds all failed is a FAIL,
+    never a silent ``n/a``."""
+    problems: list[str] = []
+    by_part = {(b["kind"], b["part"]): b for b in builds}
+    for kind, part in expected_parts:
+        b = by_part.get((kind, part))
+        if b is None:
+            problems.append(f"{kind} {part}: not built")
+        elif b.get("errors"):
+            classes = sorted({e.get("error", "?") for e in b["errors"]})
+            problems.append(f"{kind} {part}: {len(b['errors'])} build error(s) {classes}")
+        elif not b.get("n"):
+            problems.append(f"{kind} {part}: 0 requests")
+    coverage: dict[str, dict[str, int]] = {}
+    for kind in sorted({k for k, _ in expected_parts} | set(results)):
+        built = sum(b.get("n", 0) for b in builds if b["kind"] == kind)
+        rows = [r for r in (results.get(kind) or {}).get("rows", []) if r["variant"] == variant]
+        coverage[kind] = {"built": built, "compared": len(rows),
+                          "passed": sum(bool(r["passed"]) for r in rows)}
+        if len(rows) != built:
+            problems.append(f"{kind}: {built} requests built but {len(rows)} {variant} rows")
+    all_rows = [r for res in results.values() for r in res.get("rows", [])]
+    verdicts = case_verdicts(all_rows, variant)
+    missing = sorted(set(expected_cases) - set(verdicts))
+    if missing:
+        problems.append(f"no {variant} rows for case(s) {missing}")
+    failed = sorted(c for c, ok in verdicts.items() if not ok)
+    return {"passed": not problems and not failed and bool(verdicts), "variant": variant,
+            "failed_cases": failed, "problems": problems, "coverage": coverage,
+            "cases": verdicts}
+
+
+def _git(args: Sequence[str], cwd: str | None) -> str | None:
+    import subprocess
+
+    try:
+        out = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True,
+                             timeout=30, check=True)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip()
+
+
+def results_provenance(*, cwd: str | None = None,
+                       git: Callable[[Sequence[str], str | None], str | None] = _git,
+                       fingerprint: Callable[[str], str] | None = None,
+                       images: Sequence[str] = ("img_vllm",)) -> dict:
+    """What ties a ``results.json`` to the code and image that produced it: the git commit
+    (``git_dirty`` if the tree had uncommitted changes, so the commit alone does not describe
+    it) and the ``image_fingerprint`` of every image the run used."""
+    if fingerprint is None:
+        from flora_deploy.modal_app.images import image_fingerprint as fingerprint
+    status = git(["status", "--porcelain", "--untracked-files=no"], cwd)
+    return {
+        "git_sha": git(["rev-parse", "HEAD"], cwd),
+        "git_dirty": None if status is None else bool(status),
+        "image_fingerprints": {name: fingerprint(name) for name in images},
+    }

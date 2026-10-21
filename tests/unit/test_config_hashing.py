@@ -1,19 +1,27 @@
-"""D11 config hash: invariance to resource/cost knobs, sensitivity to everything hashed."""
+"""D11 config hash: invariance to resource/cost knobs, sensitivity to everything hashed, the
+logic digest and per-stage hashes."""
 
 from __future__ import annotations
 
 import copy
 import json
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
 import flora_deploy
-from flora_deploy.config import hashing, pins, presets
-from flora_deploy.config.hashing import MissingReceiptError, canonical_json, config_hash
+from flora_deploy.config import hashing, logic, pins, presets
+from flora_deploy.config.hashing import (
+    MissingReceiptError,
+    canonical_json,
+    config_hash,
+    stage_hashes,
+)
 from flora_deploy.config.schema import parse_config
 
 SHA = "41d60b449629b2181ff5b735d31c2a2cf8b3cad8"
@@ -36,7 +44,12 @@ def base() -> dict:
 
 
 def h(d: dict, receipts=RECEIPTS, **kw) -> str:
-    return config_hash(parse_config(d), derived_receipts=receipts, **kw).hash
+    return config_hash(parse_config(d, allow_uncertified=True), derived_receipts=receipts,
+                       **kw).hash
+
+
+def sh(d: dict, receipts=RECEIPTS, **kw) -> dict[str, str]:
+    return stage_hashes(parse_config(d, allow_uncertified=True), derived_receipts=receipts, **kw)
 
 
 def set_(d: dict, path: str, value) -> dict:
@@ -68,6 +81,9 @@ BASE = h(base())
         ("modal.environment_budget_factor", 2.0),
         ("project", "other"),
         ("input.stage_to", "volume://inputs"),
+        ("input.path", "./sub/"),
+        ("input.path", "sub//"),
+        ("allow_uncertified", True),
         ("output", {"sink": "gs://other/q", "formats": ["jsonl", "parquet"]}),
         ("retries", {"max_starts_before_quarantine": 7}),
         ("pipeline.shard_target_gpu_minutes", 33),
@@ -174,14 +190,23 @@ def test_document_contents_and_exclusions():
     res = config_hash(parse_config(base()), derived_receipts=RECEIPTS)
     doc = res.document
     assert json.loads(res.canonical) == doc
-    assert doc["logic_version"] == flora_deploy.LOGIC_VERSION
-    assert set(doc["nvidia_pins"]) == {"tempseg", "tempseg_code", "tempseg_base", "captioner",
-                                       "captioner_code", "rewarder"}
-    assert doc["derived_weights"] == {"captioner_bf16": "c" * 64}
-    assert set(doc["shard_kinds"]) == {"segcap", "reward.terminal", "reward.dense"}
-    assert doc["decode"]["arch"] == "x86_64"
+    assert doc["shared"]["logic_version"] == flora_deploy.LOGIC_VERSION
+    assert doc["shared"]["logic_common"] == logic.logic_digest(None)
+    kinds = doc["shard_kinds"]
+    assert set(kinds) == {"segcap", "reward.terminal", "reward.dense"}
+    assert set(kinds["segcap"]["nvidia_pins"]) == {"tempseg", "tempseg_code", "tempseg_base",
+                                                   "captioner", "captioner_code"}
+    assert set(kinds["reward.dense"]["nvidia_pins"]) == {"rewarder"}
+    assert kinds["segcap"]["derived_weights"] == {"captioner_bf16": "c" * 64}
+    assert kinds["reward.dense"]["derived_weights"] == {}
+    assert kinds["segcap"]["stages"] == ["segment", "caption"]
+    assert kinds["segcap"]["logic_digest"] == logic.logic_digest("segcap")
+    assert doc["shared"]["decode"]["arch"] == "x86_64"
+    assert set(res.stage_hashes) == set(kinds)
+    assert len(set(res.stage_hashes.values())) == 3
     flat = res.canonical
-    for word in ("H200", "H100", "budget_usd", "max_containers", "region", "s3://"):
+    for word in ("H200", "H100", "budget_usd", "max_containers", "region", "s3://",
+                 "allow_uncertified"):
         assert word not in flat
 
 
@@ -212,3 +237,142 @@ def test_stable_across_python_runs():
                              check=True)
         outs.add(out.stdout.strip())
     assert outs == {BASE}
+
+
+# ---------------------------------------------------------------------------------------------
+# Logic digest (review A1)
+
+
+@pytest.fixture(scope="module")
+def pkg_copy(tmp_path_factory) -> Path:
+    """A copy of the flora_deploy source tree, to edit without touching the checkout."""
+    dst = tmp_path_factory.mktemp("pkg") / "flora_deploy"
+    shutil.copytree(logic.package_root(), dst, ignore=shutil.ignore_patterns("__pycache__"))
+    return dst
+
+
+class _Edit:
+    """Append a line to ``root/rel`` for the duration of a ``with`` block."""
+
+    def __init__(self, root: Path, rel: str):
+        self.path = root / rel
+
+    def __enter__(self):
+        self.original = self.path.read_bytes()
+        self.path.write_bytes(self.original + b"\n# a fix\n")
+        return self.path
+
+    def __exit__(self, *exc):
+        self.path.write_bytes(self.original)
+
+
+@pytest.mark.parametrize("rel", ["nv/capture.py", "stages/reference.py", "media/index.py",
+                                 "accel/framecache.py", "records.py", "config/hashing.py",
+                                 "stages/reward.py", "nv/segment_glue.py", "nv/session.py",
+                                 "nv/budget.py", "media/rangedecode.py", "media/cuts.py"])
+def test_editing_an_output_module_changes_the_hash(pkg_copy, rel):
+    assert h(base(), logic_root=pkg_copy) == BASE  # the copy hashes like the checkout
+    with _Edit(pkg_copy, rel):
+        assert h(base(), logic_root=pkg_copy) != BASE
+    assert h(base(), logic_root=pkg_copy) == BASE
+
+
+@pytest.mark.parametrize("rel", ["cli/init.py", "cli/plan.py", "jobs/orchestrator.py",
+                                 "planner/options.py", "observe/stdout.py", "media/synth.py",
+                                 "validate/gatec.py", "config/schema.py", "__init__.py"])
+def test_editing_a_non_output_module_keeps_the_hash(pkg_copy, rel):
+    with _Edit(pkg_copy, rel):
+        assert h(base(), logic_root=pkg_copy) == BASE
+
+
+def test_logic_digest_is_per_shard_kind(pkg_copy):
+    before = sh(base(), logic_root=pkg_copy)
+    with _Edit(pkg_copy, "stages/reward.py"):
+        after = sh(base(), logic_root=pkg_copy)
+    assert after["segcap"] == before["segcap"]
+    assert after["reward.dense"] != before["reward.dense"]
+    with _Edit(pkg_copy, "stages/reference.py"):
+        after = sh(base(), logic_root=pkg_copy)
+    assert after["segcap"] != before["segcap"]
+    assert after["reward.terminal"] == before["reward.terminal"]
+    with _Edit(pkg_copy, "records.py"):  # common: every kind
+        after = sh(base(), logic_root=pkg_copy)
+    assert all(after[k] != before[k] for k in before)
+
+
+def test_missing_logic_module_fails_closed(pkg_copy):
+    with _Edit(pkg_copy, "nv/session.py") as p:
+        p.unlink()
+        with pytest.raises(FileNotFoundError, match="nv/session.py"):
+            h(base(), logic_root=pkg_copy)
+
+
+# ---------------------------------------------------------------------------------------------
+# Per-stage hashes (review A5)
+
+
+def test_adding_a_reward_stage_keeps_finished_segcap_shards():
+    a = sh(set_(base(), "pipeline.stages", ["segment", "caption"]))
+    b = sh(base())
+    c = sh(set_(base(), "pipeline.stages", ["segment", "caption", "reward.rubric"]))
+    assert a["segcap"] == b["segcap"] == c["segcap"]
+    assert set(b) == {"segcap", "reward.terminal", "reward.dense"}
+    assert h(set_(base(), "pipeline.stages", ["segment", "caption"])) != BASE  # job hash moves
+
+
+def test_vllm_image_only_invalidates_rewards():
+    fp = hashing._default_fingerprint
+    bumped = sh(base(), image_fingerprint=lambda n: fp(n) + ("x" if n == "img_vllm" else ""))
+    ref = sh(base())
+    assert bumped["segcap"] == ref["segcap"]
+    assert bumped["reward.terminal"] != ref["reward.terminal"]
+
+
+def test_reward_pin_only_invalidates_rewards(monkeypatch):
+    ref = sh(base())
+    p = pins.PINS_BY_KEY["rewarder"]
+    monkeypatch.setitem(hashing.PINS_BY_KEY, "rewarder", replace(p, revision="f" * 40))
+    bumped = sh(base())
+    assert bumped["segcap"] == ref["segcap"] and bumped["reward.dense"] != ref["reward.dense"]
+
+
+def test_shared_inputs_change_every_stage_hash():
+    ref = sh(base())
+    for path, value in (("pipeline.embodiment", "dex"), ("input.revision", "0" * 40),
+                        ("pipeline.envelope", "enforce")):
+        other = sh(set_(base(), path, value))
+        assert all(other[k] != ref[k] for k in ref), path
+
+
+def test_balanced_caption_depends_on_segment():
+    bal = set_(set_(base(), "preset", "balanced"), "pipeline.stages",
+               ["segment", "caption", "reward.terminal"])
+    ref = sh(bal)
+    eng = presets.PRESETS["balanced"].engines["segment"]
+    seg_changed = sh(bal, engines={"segment": replace(eng, sampling={"temperature": 0.1})})
+    assert seg_changed["segment"] != ref["segment"]
+    assert seg_changed["caption"] != ref["caption"]  # it consumes segment's outputs
+    assert seg_changed["reward.terminal"] == ref["reward.terminal"]
+
+
+def test_balanced_hash_includes_required_vllm_engine_kwargs():
+    from flora_deploy.nv.capture import REQUIRED_VLLM_ENGINE_KWARGS
+
+    bal = set_(base(), "preset", "balanced")
+    doc = config_hash(parse_config(bal, allow_uncertified=True),
+                      derived_receipts=RECEIPTS).document
+    for kind in ("segment", "caption"):
+        args = doc["shard_kinds"][kind]["engine"]["engine_args"]
+        assert args == dict(REQUIRED_VLLM_ENGINE_KWARGS) and args["mm_processor_cache_gb"] == 0
+    eng = presets.PRESETS["balanced"].engines["caption"]
+    cached = replace(eng, engine_args={"mm_processor_cache_gb": 4})
+    assert h(bal, engines={"caption": cached}) != h(bal)
+
+
+def test_path_normalization_for_repo_and_local_inputs():
+    assert h(set_(base(), "input.path", "./sub")) == BASE
+    root = set_(base(), "input.path", None)
+    assert h(set_(base(), "input.path", ".")) == h(root)
+    local = {"format": "mp4_dir", "path": "./videos/"}
+    assert h(set_(base(), "input", local)) == h(set_(base(), "input",
+                                                     {**local, "path": "videos"}))

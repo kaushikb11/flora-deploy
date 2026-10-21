@@ -511,7 +511,7 @@ nvlink = [
 requires-dist = [
     { name = "av", specifier = "==16.0.1" },
     { name = "huggingface-hub", specifier = ">=1.29,<2.0" },
-    { name = "modal", specifier = ">=1.6.2" },
+    { name = "modal", specifier = "==1.6.2" },
     { name = "numpy", specifier = "<3" },
     { name = "pillow", specifier = ">=11,<13" },
     { name = "pyarrow", specifier = ">=17" },

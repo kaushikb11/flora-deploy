@@ -1,7 +1,12 @@
-"""`flora init`: write a commented ``flora.yaml`` from a template in ``examples/``."""
+"""`flora init`: write a commented ``flora.yaml`` from a template shipped in the package.
+
+The templates live in ``flora_deploy/config/templates/`` and are read with
+``importlib.resources``, so ``flora init`` works from an installed wheel."""
 
 from __future__ import annotations
 
+from importlib import resources
+from importlib.resources.abc import Traversable
 from pathlib import Path
 from typing import Annotated
 
@@ -16,17 +21,18 @@ TEMPLATES = {
 }
 
 
-def examples_dir() -> Path:
-    """``examples/`` of the source checkout (``src/flora_deploy/cli/init.py`` -> repo root)."""
-    return Path(__file__).resolve().parents[3] / "examples"
+def templates_dir() -> Traversable:
+    """The packaged templates (``flora_deploy/config/templates``)."""
+    return resources.files("flora_deploy.config").joinpath("templates")
 
 
 def template_text(name: str) -> str:
     if name not in TEMPLATES:
         raise KeyError(f"unknown template {name!r}; choose one of {', '.join(TEMPLATES)}")
-    path = examples_dir() / TEMPLATES[name]
+    path = templates_dir().joinpath(TEMPLATES[name])
     if not path.is_file():
-        raise FileNotFoundError(f"template {path} not found (is this a source checkout?)")
+        raise FileNotFoundError(f"template {TEMPLATES[name]} is missing from the installed "
+                                "package (reinstall flora-deploy)")
     return path.read_text(encoding="utf-8")
 
 

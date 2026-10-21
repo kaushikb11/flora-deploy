@@ -83,9 +83,39 @@ def test_base_is_valid():
         ("preset", "budget", "not available yet"),
         ("preset", "interactive", "not available yet"),
         ("preset", "turbo", "preset"),
+        ("preset", "balanced", "allow_uncertified: true"),
+        ("allow_uncertified", "yes", "allow_uncertified"),
         ("resources", {"segment": {"gpu": "L40S"}}, "as `segcap`"),
         ("resources", {"segcap": {"gpu": "H100!:2"}}, "gpu_count"),
         ("resources", {"segcap": {"gpu": "H 100"}}, "not a Modal GPU"),
+        ("resources", {"segcap": {"gpu": "FOO-BAR!"}}, "not a Modal GPU"),
+        ("resources", {"segcap": {"gpu": "H300"}}, "not a Modal GPU"),
+        ("resources", {"segcap": {"gpu": "L40S"}}, "segcap needs >= 81 GiB"),
+        ("resources", {"segcap": {"gpu": "T4"}}, "segcap needs >= 81 GiB"),
+        ("resources", {"segcap": {"gpu": "H100!"}}, "segcap needs >= 81 GiB"),
+        ("resources", {"segcap": {"gpu": "A100-80GB"}}, "use one of H200, B200"),
+        ("resources", {"reward.terminal": {"gpu": "L40S"}}, "reward.terminal needs >= 79"),
+        ("resources", {"reward.terminal": {"gpu": "A10G"}}, "reward.terminal needs >= 79"),
+        ("modal.budget_usd", float("inf"), "modal.budget_usd"),
+        ("modal.budget_usd", float("nan"), "modal.budget_usd"),
+        ("modal.budget_usd", 1e12, "modal.budget_usd"),
+        ("modal.max_gpus", True, "modal.max_gpus"),
+        ("modal.max_gpus", 10**9, "modal.max_gpus"),
+        ("modal.environment_budget_factor", float("inf"), "environment_budget_factor"),
+        ("pipeline.shard_target_gpu_minutes", float("inf"), "shard_target_gpu_minutes"),
+        ("observability", {"heartbeat_s": float("inf")}, "heartbeat_s"),
+        ("resources", {"segcap": {"memory": float("inf")}}, "resources.segcap.memory"),
+        ("resources", {"segcap": {"cpu": float("nan")}}, "resources.segcap.cpu"),
+        ("input.path", "", "`path` is empty"),
+        ("input.path", "  ", "`path` is empty"),
+        ("input.path", "../other", "subdirectory inside the repo"),
+        ("input.path", "/abs", "subdirectory inside the repo"),
+        ("pipeline.episode_instruction", {"source": "fixed", "text": "Fold <|video_pad|> it"},
+         "special token"),
+        ("pipeline.episode_instruction", {"source": "fixed", "text": "a <|vision_start|>"},
+         "special token"),
+        ("pipeline.episode_instruction", {"source": "fixed", "text": "<|placeholder|>"},
+         "special token"),
         ("resources", {"segcap": {"max_containers": 0}}, "max_containers"),
         ("resources", {"segcap": {"max_containers": 4}}, "can use 5 GPUs"),
     ],
@@ -109,7 +139,78 @@ def test_non_mapping_and_bad_yaml():
 
 def test_mp4_dir_path_only():
     d = with_(base(), "input", {"format": "mp4_dir", "path": "./videos"})
-    assert parse_config(d).input.dataset == "./videos"
+    assert parse_config(d).input.dataset == "videos"
+
+
+@pytest.mark.parametrize("raw,norm", [("sub", "sub"), ("./sub", "sub"), ("sub/", "sub"),
+                                      ("sub//x/./y", "sub/x/y"), (".", ".")])
+def test_paths_are_normalized(raw, norm):
+    cfg = parse_config(with_(base(), "input.path", raw))
+    assert cfg.input.path == norm
+    assert cfg.input.subdir == (None if norm == "." else norm)
+    local = parse_config(with_(base(), "input", {"format": "mp4_dir", "path": "/data//vids/"}))
+    assert local.input.dataset == "/data/vids" and local.input.subdir is None
+
+
+def test_duplicate_yaml_keys_are_an_error():
+    import yaml
+
+    text = yaml.safe_dump(base(), sort_keys=False) + "preset: balanced\n"
+    with pytest.raises(ConfigError, match="duplicate key 'preset'"):
+        loads_config(text)
+    nested = yaml.safe_dump(base(), sort_keys=False).replace(
+        "  budget_usd: 20\n", "  budget_usd: 20\n  budget_usd: 2000\n")
+    with pytest.raises(ConfigError, match="duplicate key 'budget_usd'"):
+        loads_config(nested)
+    assert loads_config(yaml.safe_dump(base())).preset == "exact"
+
+
+def test_balanced_needs_certificates_or_explicit_opt_in(monkeypatch):
+    from flora_deploy.config import presets, schema
+
+    d = with_(base(), "preset", "balanced")
+    msg = err(d)
+    assert "no Gate certificate for segment on L40S, caption on H100!" in msg
+    assert "--allow-uncertified" in msg
+    assert parse_config(with_(d, "allow_uncertified", True)).preset == "balanced"
+    assert parse_config(d, allow_uncertified=True).allow_uncertified is False  # CLI flag
+    # once matching certificates exist, no opt-in is needed
+    certs = {k: presets.Certificate(f"c-{k}", "balanced", k, "x")
+             for k in ("segment", "caption", "reward.terminal")}
+    monkeypatch.setattr(schema, "find_certificates", lambda preset, pools: certs)
+    assert parse_config(d).preset == "balanced"
+    monkeypatch.setattr(schema, "find_certificates",
+                        lambda preset, pools: {"segment": certs["segment"]})
+    assert "for caption on H100!, reward.terminal on H100!" in err(d)
+
+
+def test_exact_needs_no_certificate():
+    assert presets_needs_certificate("exact") is False
+    for name in ("balanced", "budget", "interactive"):
+        assert presets_needs_certificate(name) is True
+
+
+def presets_needs_certificate(name: str) -> bool:
+    from flora_deploy.config.presets import needs_certificate
+
+    return needs_certificate(name)
+
+
+@pytest.mark.parametrize("gpu", ["H200", "B200"])
+def test_segcap_accepts_large_gpus(gpu):
+    cfg = parse_config(with_(base(), "resources", {"segcap": {"gpu": gpu}}))
+    assert cfg.pools()["segcap"].gpu == gpu
+
+
+def test_gpu_count_counts_toward_the_minimum():
+    d = with_(base(), "resources", {"segcap": {"gpu": "H100!", "gpu_count": 2}})
+    assert parse_config(d).pools()["segcap"].gpu_count == 2
+
+
+def test_fixed_text_with_ordinary_specials_is_allowed():
+    d = with_(base(), "pipeline.episode_instruction",
+              {"source": "fixed", "text": "Fold the towel <1.0 seconds>."})
+    assert parse_config(d).pipeline.episode_instruction.text.startswith("Fold")
 
 
 def test_stages_are_canonically_ordered():
@@ -132,7 +233,7 @@ def test_exact_to_run_settings():
 
 
 def test_balanced_pools():
-    d = with_(base(), "preset", "balanced")
+    d = with_(with_(base(), "preset", "balanced"), "allow_uncertified", True)
     d = with_(d, "pipeline.stages", ["segment", "caption", "reward.terminal", "reward.dense"])
     d = with_(d, "resources", {"segment": {"max_inputs": 3}})
     rs = to_run_settings(parse_config(d), "j", derived_receipts=RECEIPTS)
