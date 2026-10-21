@@ -45,6 +45,15 @@ and the paths are re-keyed by the ``segcap`` stage hash from the config's manife
 6. ``ShardReceipt`` LAST, ``parts`` = earlier parts + this container's own, ``config_hash`` = the
    stage hash (``JobFiles.key``), ``episodes_failed`` = terminal exclusions only.
 
+G3 scheduling (``docs/exact-cost.md``; off by default, not hashed: no model input changes):
+``SegcapWorkerSettings.episode_order="longest_first"`` starts a shard's episodes longest first
+(:func:`order_episodes`); ``max_shards`` > 1 lets ``@modal.concurrent`` inputs run that many
+shards at once in one container, each with its own marker, sink, parts and receipt, over one
+``FastExactEngine(overlap=True)`` whose ``concurrency`` episode slots are shared
+(``stages.reference.EpisodeSlots``: an earlier shard's queued episodes always start first, so
+the next shard only fills the slots a draining shard frees). ``preempt`` marks every shard in
+flight before it cancels the queued episodes.
+
 Records: ``provenance.config_hash`` is the stage hash (stamped by the part sink);
 ``certified`` per the episode's envelope verdict (``EpisodeRef.envelope_ok``, D13;
 ``envelope="ignore"`` certifies regardless); ``provenance.engine`` is the engine label
@@ -703,10 +712,12 @@ class SegcapShardRunner:
         Returns True if it marked at least one."""
         with self._lock:
             actives = list(self._active.values())
+        # mark first, then cancel: a cancelled batch raises in its shard thread, and that
+        # thread's error mark must never pre-empt the preempted mark (G3: several shards)
+        marked = [self._end(a, preempted=True) for a in actives]
         cancel = getattr(self.engine, "cancel", None)
         if actives and callable(cancel):
             cancel()
-        marked = [self._end(a, preempted=True) for a in actives]
         return any(marked)
 
     def on_exit(self) -> None:

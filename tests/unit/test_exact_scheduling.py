@@ -96,9 +96,8 @@ def stored(store, shards):
 
 
 def results(st):
-    return {u: {"segments": [], "flora_reference": {"model_calls": v["calls"],
-                                                   "determinism": {"mode": "nvidia"}}}
-            for u, v in st.items()}
+    """uid -> persisted ``model_calls`` (``accel.identity.compare_runs`` input)."""
+    return {u: v["calls"] for u, v in st.items()}
 
 
 # --- ordering -------------------------------------------------------------------------------
@@ -300,7 +299,7 @@ def test_preempt_marks_every_overlapped_shard(tmp_path):
         t.join(30)
     jf = JobFiles(store, JOB, CFG)
     for sh in shards:
-        assert read_attempt(jf, "segcap", sh.shard_id, "ta-1").outcome == "preempted"
+        assert read_attempt(jf, "segcap", sh.shard_id, "ta-1").preempted
         assert not store.exists(PATHS.receipt(CFG, "segcap", sh.shard_id))
     assert eng._slots.stats()["running"] == 0 and eng._slots.stats()["waiting"] == 0
 
@@ -343,3 +342,32 @@ def test_annotate_batch_slots_need_the_concurrent_composite():
     nv = fake_nv(GpuProbe())
     with pytest.raises(RuntimeError, match="needs the resident session"):
         ref_stage.annotate_batch(nv, None, [], slots=EpisodeSlots(2))
+
+
+# --- config ---------------------------------------------------------------------------------
+
+
+def test_exact_scheduling_config_is_validated_and_not_hashed():
+    from flora_deploy.config.schema import exact_scheduling, parse_config
+    from tests.unit.test_config_hashing import base, h, set_, sh
+
+    d = base()
+    cfg = parse_config(d, allow_uncertified=True)
+    assert exact_scheduling(cfg) == {"episode_order": "plan", "max_shards": 1}
+    on = set_(set_(d, "pipeline.exact_scheduling", {"episode_order": "longest_first",
+                                                    "shard_overlap": True}),
+              "resources", {"segcap": {"max_inputs": 2}})
+    cfg_on = parse_config(on, allow_uncertified=True)
+    assert exact_scheduling(cfg_on) == {"episode_order": "longest_first", "max_shards": 2}
+    # start order and shard overlap leave every model input unchanged: not in any hash
+    assert h(on) == h(d) and sh(on) == sh(d)
+    with pytest.raises(ValueError, match="max_inputs"):
+        parse_config(set_(d, "pipeline.exact_scheduling", {"shard_overlap": True}),
+                     allow_uncertified=True)
+    with pytest.raises(ValueError):
+        parse_config(set_(d, "pipeline.exact_scheduling", {"episode_order": "random"}),
+                     allow_uncertified=True)
+    rewards_only = set_(set_(d, "pipeline.stages", ["reward.terminal"]),
+                        "pipeline.exact_scheduling", {"episode_order": "longest_first"})
+    with pytest.raises(ValueError, match="segcap worker only"):
+        parse_config(rewards_only, allow_uncertified=True)
