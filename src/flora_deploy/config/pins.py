@@ -155,6 +155,7 @@ RUNTIME = {
     "accelerate": "1.12.0",
     "safetensors": "0.7.0",
     "pillow": "12.3.0",
+    "numpy": "2.4.6",
     "pyarrow": "26.0.0",
     "huggingface_hub": ">=1.29,<2.0",
     # CUDA 13.0 matches the torch 2.11.0 PyPI wheels (cu130); Modal's host driver is CUDA 13.3.

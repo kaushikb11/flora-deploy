@@ -34,7 +34,7 @@ AV = f"av=={RUNTIME['av']}"
 
 CPU_PACKAGES = (
     AV,
-    "numpy<3",
+    f"numpy=={RUNTIME['numpy']}",  # exact: debian_slim ships numpy 1.26, which breaks pyarrow 26
     PILLOW,
     f"pyarrow=={RUNTIME['pyarrow']}",
     HF_HUB,
