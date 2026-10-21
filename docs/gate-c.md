@@ -95,9 +95,35 @@ container:
 - the vLLM ids contain exactly the frame groups the grids imply (`T` groups of
   `vision_start, video_pad*(H*W/4), vision_end` per video);
 - **per-video pixels equal**: sha256 of HF's tensor cast to vLLM's dtype (bf16 here) equals that
-  of vLLM's tensor. Any other dtype, or a missing comparison, fails;
-- `generate` saw the same ids, where it was run;
+  of vLLM's tensor. Any other dtype, or a missing comparison, fails. This is bf16 equality (the
+  engine dtype), not fp32 equality;
+- `generate` saw the same ids. For `wrapped` it must have run: a skipped `generate` is a FAIL.
+  Diagnostic variants fail only on a negative result;
+- **placeholder ranges sit on the frame runs** (`validate.gatec.placeholder_problem`): vLLM's
+  `mm_placeholders['video']` has one `[offset, length]` per video. Each one must be inside the
+  prompt, in order and non-overlapping. It must start at or before the video's first
+  `vision_start` with no special token in between, end right after its `T`-th `vision_end`, and
+  hold exactly `T*H*W/4` pads. Every pad must be inside a range. Equal ids are not enough on
+  their own, because embeddings land where the placeholder ranges say. Required for `wrapped`;
 - no stray bare `video_pad` in either sequence.
+
+**Run verdict** (`validate.gatec.gate_verdict`). The gate is decided over the whole run, not
+only over the rows that exist:
+- every (kind, part) is built, with no build-stage error and at least one request. A pool whose
+  builds all failed is a FAIL, never a silent `n/a`;
+- every built request has a `wrapped` row;
+- every builder case and golden pool has rows;
+- every `wrapped` row passes.
+
+`results.json` carries the verdict (problems, failed cases, a per-kind coverage table) and its
+provenance: `run_id`, `git rev-parse HEAD` with a dirty flag, and `image_fingerprint("img_vllm")`
+(`validate.gatec.results_provenance`).
+
+**Status of the recorded run.** The 2026-10-21 run below predates these rules (review 3, C1/C3/
+C4). It had no build errors (`errors: []` in every build), covered every pool, and ran
+`generate` on every `wrapped` row. But it did not check placeholder ranges, and its
+`results.json` has no git SHA or image fingerprint. Re-run `scripts/gatec.py` once on the
+committed SHA to confirm under the full criteria.
 
 Unit tests (`tests/unit/test_gatec_compare.py`) and nvlink tests with the real processor
 (`tests/nvlink/test_nv_link_capture_vllm_prompt.py::test_pixel_only_changes_fail_the_verdict`)

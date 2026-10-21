@@ -173,6 +173,21 @@ def test_modal_client_matches_pin():
     images._check_modal_client()
 
 
+def test_package_metadata_pins_the_modal_client_exactly():
+    """A fresh `pip install flora-deploy` must resolve the one client the image builders accept
+    (review B1): pyproject pins `modal==<RUNTIME['modal_client']>`, and uv.lock agrees."""
+    import tomllib
+
+    root = Path(__file__).resolve().parents[2]
+    deps = tomllib.loads((root / "pyproject.toml").read_text())["project"]["dependencies"]
+    modal_deps = [d for d in deps if re.match(r"^modal\b", d)]
+    assert modal_deps == [f"modal=={RUNTIME['modal_client']}"]
+    lock = (root / "uv.lock").read_text()
+    assert f'{{ name = "modal", specifier = "=={RUNTIME["modal_client"]}" }}' in lock
+    assert re.search(r'\[\[package\]\]\nname = "modal"\nversion = "'
+                     + re.escape(RUNTIME["modal_client"]) + '"', lock)
+
+
 def test_modal_client_mismatch_refused(monkeypatch):
     monkeypatch.setitem(RUNTIME, "modal_client", "0.0.1")
     with pytest.raises(RuntimeError, match="modal client"):

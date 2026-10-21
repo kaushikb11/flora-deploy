@@ -9,7 +9,11 @@ requires-python = ">=3.11"
 dependencies = [
     "av==16.0.1",
     "huggingface_hub>=1.29,<2.0",
-    "modal>=1.6.2",
+    # Exact pin, kept equal to RUNTIME["modal_client"] (tests/unit/test_modal_app_images.py).
+    # The client renders every image build step and picks add_python's standalone Python, so the
+    # image fingerprints are only meaningful for this client; modal_app/images.py refuses any
+    # other. Bump both together, deliberately (it re-fingerprints every image).
+    "modal==1.6.2",
     "numpy<3",
     "Pillow>=11,<13",
     "pyarrow>=17",

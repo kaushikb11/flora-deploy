@@ -23,8 +23,8 @@ from pathlib import Path
 
 from flora_deploy.layout import GOLDEN_VOLUME
 from flora_deploy.modal_app.gatec_app import SAMPLE_DIR, app, build_part, run_gate_c
-from flora_deploy.validate.gatec import case_verdicts, render_report
-from flora_deploy.validate.gatec_driver import GOLDEN_POOLS
+from flora_deploy.validate.gatec import gate_verdict, render_report, results_provenance
+from flora_deploy.validate.gatec_driver import CASES, GOLDEN_POOLS
 
 # Big Buck Bunny, 10 s, 640x360, H.264, 30 fps CFR (c) Blender Foundation, CC BY 3.0.
 SAMPLE_NAME = "bbb_360_10s.mp4"
@@ -61,6 +61,7 @@ def main(max_requests: int = 2, quota: int = 6, golden: bool = True,
     stage_sample()
     t0 = time.time()
     run_id = time.strftime("%Y%m%d-%H%M%S")
+    provenance = {"run_id": run_id, **results_provenance(cwd=str(Path(__file__).parent))}
     parts = ["cases:synthetic", "cases:sample"]
     if golden:
         parts += [f"golden:{pool}" for pool in GOLDEN_POOLS]
@@ -79,16 +80,25 @@ def main(max_requests: int = 2, quota: int = 6, golden: bool = True,
     gpu_s = sum(r["timings"]["total_s"] for r in results.values())
     path = Path(out).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(dict(results=results, builds=builds, wall_s=wall,
-                                    build_wall_s=build_wall), indent=1, default=str))
+    verdict = gate_verdict(
+        builds, results, expected_parts=[(kind, part) for kind in KINDS for part in parts],
+        expected_cases=[*CASES, *([f"golden-{pool}" for pool in GOLDEN_POOLS] if golden else [])])
+    path.write_text(json.dumps(dict(provenance=provenance, verdict=verdict, results=results,
+                                    builds=builds, wall_s=wall, build_wall_s=build_wall),
+                               indent=1, default=str))
     rows = [row for r in results.values() for row in r["rows"]]
     for kind, r in results.items():
         print(f"\n== {kind}: {r['gpu']} {r['versions']} timings {r['timings']} "
               f"vLLM pixel dtypes {r['vllm_pixel_dtypes']}")
         print("video processor attr diff vs NVIDIA:", r["video_processor_attr_diff"] or "none")
     print("\n" + render_report(rows))
-    verdict = case_verdicts(rows, "wrapped")
-    print("wrapped verdict:", "PASS" if verdict and all(verdict.values()) else "FAIL", verdict)
+    print("coverage:", verdict["coverage"])
+    for problem in verdict["problems"]:
+        print("problem:", problem)
+    print("wrapped verdict:", "PASS" if verdict["passed"] else "FAIL",
+          f"failed cases {verdict['failed_cases']}" if verdict["failed_cases"] else "")
+    print(f"git {provenance['git_sha']}{' (dirty)' if provenance['git_dirty'] else ''}, "
+          f"images {provenance['image_fingerprints']}")
     print(f"wall {wall:.0f}s (build {build_wall:.0f}s); in-function GPU time {gpu_s:.0f}s "
           f"(≈${gpu_s / 3600 * L40S_USD_PER_H:.2f} at ${L40S_USD_PER_H}/h, excl. container start)")
     print(f"results: {path}")

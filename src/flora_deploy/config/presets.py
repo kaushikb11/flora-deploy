@@ -12,11 +12,21 @@ A preset maps each pipeline stage to a shard kind and gives every shard kind a d
   decode/caption-cache headroom), rewards as in ``exact``.
 - ``budget`` / ``interactive``: declared (D9) but not available yet; selecting one is an error.
 
+Certification (D9, D16): ``exact`` is the reference by construction. Every other preset needs a
+Gate certificate matching (shard kind, GPU) before it may run. None exist yet
+(``find_certificates``), so ``balanced`` is refused unless the config opts in with
+``allow_uncertified: true`` (its records are then an uncertified stack).
+
+GPU overrides are checked against ``GPU_MEMORY_GIB`` (Modal GPU types) and a per-shard-kind
+minimum (``min_gpu_memory_gib``): exact ``segcap`` keeps TempSeg and Captioner resident (80.95 GiB
+HBM high-water), so it needs an H200/B200-class GPU; rewards need an 80 GB-class GPU.
+
 Memory values are the pre-P0 defaults; P0 measurements replace them (§6.7).
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from flora_deploy.jobs.settings import PoolSettings, Preset
@@ -63,6 +73,7 @@ class PresetSpec:
 
 def _engines() -> tuple[EngineIdentity, EngineIdentity, EngineIdentity]:
     from flora_deploy.config.pins import RUNTIME
+    from flora_deploy.nv.capture import REQUIRED_VLLM_ENGINE_KWARGS
 
     hf = EngineIdentity(
         name="nvidia-hf",
@@ -72,8 +83,9 @@ def _engines() -> tuple[EngineIdentity, EngineIdentity, EngineIdentity]:
     )
     nv_vllm = EngineIdentity(name="nvidia-vllm-offline", version={"vllm": RUNTIME["vllm"]},
                              image="img_vllm")
+    # Every vLLM engine that carries Flora video must use these (Gate C), so they are hashed.
     vllm = EngineIdentity(name="vllm-offline", version={"vllm": RUNTIME["vllm"]},
-                          image="img_vllm")
+                          image="img_vllm", engine_args=dict(REQUIRED_VLLM_ENGINE_KWARGS))
     return hf, nv_vllm, vllm
 
 
@@ -111,7 +123,7 @@ def _build() -> dict[str, PresetSpec]:
         engines={"segment": vllm, "caption": vllm, **reward_engines},
         pins={"segment": _SEG_PINS, "caption": _CAP_PINS, **reward_pins},
         derived_weights={"segment": ("tempseg_merged",), "caption": ("captioner_bf16",)},
-        note="certified faithful: vLLM 0.24.0, stage-separated pools",
+        note="vLLM 0.24.0, stage-separated pools; needs Gate certificates (none exist yet)",
     )
     unavailable = {
         "budget": "planned for P2 (FP8 / B200 kernels; uncertified until validated)",
@@ -153,3 +165,75 @@ def shard_kinds_for(preset: PresetSpec, stages: tuple[Stage, ...] | list[Stage])
         if k not in out:
             out.append(k)
     return out
+
+
+# ---------------------------------------------------------------------------------------------
+# GPUs and certificates
+
+# Modal GPU type -> usable memory per GPU in GiB (approximate, as the driver reports it).
+GPU_MEMORY_GIB: dict[str, float] = {
+    "T4": 15.0,
+    "L4": 22.0,
+    "A10": 22.0,
+    "A10G": 22.0,
+    "A100": 39.5,
+    "A100-40GB": 39.5,
+    "A100-80GB": 79.2,
+    "L40S": 44.5,
+    "H100": 79.6,
+    "H100!": 79.6,
+    "H200": 139.8,
+    "B200": 178.0,
+}
+
+# Minimum GPU memory per container (GiB, summed over its GPUs), per (preset, shard kind).
+# exact segcap: 80.95 GiB HBM high-water (docs/reference-smoke.md), above an H100's 79.6 GiB.
+# Rewards: NVIDIA's vLLM recipe is sized for 80 GB GPUs (README, docs/cold-start.md).
+_REWARD_MIN_GIB = 79.0
+_MIN_GPU_GIB: dict[tuple[str, str], float] = {
+    ("exact", "segcap"): 81.0,
+    ("balanced", "segment"): 44.0,  # L40S class (§6.7)
+    ("balanced", "caption"): 79.0,  # H100 class
+}
+
+
+def min_gpu_memory_gib(preset: str, kind: str) -> float:
+    if kind.startswith("reward."):
+        return _REWARD_MIN_GIB
+    return _MIN_GPU_GIB[(preset, kind)]
+
+
+def gpu_problem(preset: str, kind: str, gpu: str, gpu_count: int) -> str | None:
+    """Why ``gpu_count`` x ``gpu`` cannot run ``kind`` under ``preset``, or None if it can."""
+    mem = GPU_MEMORY_GIB.get(gpu)
+    if mem is None:
+        return f"unknown GPU {gpu!r}; use one of {', '.join(GPU_MEMORY_GIB)}"
+    need = min_gpu_memory_gib(preset, kind)
+    if mem * gpu_count < need:
+        fits = [g for g, m in GPU_MEMORY_GIB.items() if m * gpu_count >= need]
+        return (f"{kind} needs >= {need:g} GiB of GPU memory per container, but {gpu_count} x "
+                f"{gpu} has {mem * gpu_count:g} GiB (use one of {', '.join(fits)})")
+    return None
+
+
+@dataclass(frozen=True)
+class Certificate:
+    """A Gate certificate (D16): shard kind ``kind`` on ``gpu`` under ``preset`` is faithful."""
+
+    id: str
+    preset: str
+    kind: str
+    gpu: str
+
+
+def needs_certificate(preset: str) -> bool:
+    """Everything but ``exact`` (the reference by construction) needs certificates."""
+    return preset != "exact"
+
+
+def find_certificates(preset: str, pools: Mapping[str, PoolSettings]) -> dict[str, Certificate]:
+    """The certificate matching each (shard kind, GPU) of ``pools``, by shard kind.
+
+    Stub: no certificates exist yet (Gates D/E have not run), so this is always empty."""
+    del preset, pools
+    return {}

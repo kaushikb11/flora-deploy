@@ -14,8 +14,10 @@ modal:
   tags: {}                          # extra key/value tags on every Modal object
 
 # exact: NVIDIA's HF code on H200 + NVIDIA's vLLM Rewarder on H100!; outputs are the reference.
-# balanced: vLLM engines on stage-separated pools (certified faithful).
+# balanced: vLLM engines on stage-separated pools. It has no Gate certificates yet, so it is
+# refused unless you also set `allow_uncertified: true` (outputs then are not certified).
 preset: exact
+allow_uncertified: false
 
 input:
   format: lerobot_v3                # lerobot_v21 | lerobot_v3 | mp4_dir
@@ -40,7 +42,9 @@ pipeline:
 
 # Per shard kind overrides of the preset's pools: gpu, gpu_count, max_containers, max_inputs,
 # cpu (physical cores), memory (GiB). The exact preset runs segment+caption as one `segcap`
-# worker. These change cost and speed only, never outputs (nor the config hash).
+# worker, which needs >= 81 GiB of GPU memory (H200 or B200); rewards need an 80 GB GPU
+# (H100!, H100, A100-80GB, H200, B200). These change cost and speed only, never outputs (nor
+# the config hash).
 resources:
   segcap: {gpu: H200, max_containers: 1}
   reward.terminal: {max_containers: 1}

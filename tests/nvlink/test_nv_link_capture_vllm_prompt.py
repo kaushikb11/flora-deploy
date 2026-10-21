@@ -78,7 +78,9 @@ def test_wrapped_prompt_is_hf_equivalent(nv, procs, case_id):
         stamps = [G.vllm_timestamps(md["frames_indices"], md["fps"], tps)
                   for _, md in b.request.videos]
         sim = G.simulate_vllm_expansion(encode(wrapped), grids, stamps, encode, sp, merge)
-        assert sim == hf_ids
+        if sim != hf_ids:  # no `assert a == b`: pytest would print ids that decode to the prompt
+            pytest.fail(f"simulated vLLM ids differ from HF's at {G.first_diff(sim, hf_ids)} "
+                        f"(lengths {len(sim)} vs {len(hf_ids)})")
         assert G.grids_match_runs(hf_ids, grids, sp, merge)
         with pytest.raises(RuntimeError, match="Found 0 video placeholders"):
             G.simulate_vllm_expansion(encode(b.request.prompt), grids, stamps, encode, sp,
@@ -95,11 +97,20 @@ def _verdict(proc, b, out):
     vgrids = out["video_grid_thw"].tolist()
     rows = [t * h * w for t, h, w in vgrids]
     parts = list(torch.split(out["pixel_values_videos"], rows))
+    ids = out["input_ids"][0].tolist()
+    # Stand-ins for the checks only real vLLM can run: generate saw these ids, and each video's
+    # placeholder range spans its frame runs (first vision_start .. last vision_end).
+    runs, placeholders, i = G.frame_runs(ids, sp), [], 0
+    for t, _, _ in vgrids:
+        first, last = runs[i], runs[i + t - 1]
+        placeholders.append([first.start, last.start + last.pads + 2 - first.start])
+        i += t
     return G.compare(case_id="x", index=0, source="s", variant="wrapped",
                      hf_ids=b.hf["input_ids"][0].tolist(), hf_grids=grids,
-                     vllm_ids=out["input_ids"][0].tolist(), vllm_grids=vgrids, sp=sp,
+                     vllm_ids=ids, vllm_grids=vgrids, sp=sp,
                      merge_size=proc.video_processor.merge_size,
-                     pixels_equal=G.pixels_equal_per_video(digests, [p.bfloat16() for p in parts]))
+                     pixels_equal=G.pixels_equal_per_video(digests, [p.bfloat16() for p in parts]),
+                     generate_ids_equal=True, placeholders=placeholders)
 
 
 @pytest.mark.parametrize("case_id", ["caption-three-yam", "temporal-yam-3view"])

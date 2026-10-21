@@ -157,5 +157,5 @@ def test_apply_option_round_trips_config():
     assert cfg.modal.max_gpus >= o.peak_gpus and cfg.modal.budget_usd == 2500
     bal = plan_options(PlanRequest(WorkloadSummary.from_hours(100), presets=("balanced",),
                                    max_gpus=10))[0]
-    cfg2 = parse_config(apply_option(data, bal))
+    cfg2 = parse_config(apply_option(data, bal), allow_uncertified=True)  # no certificates yet
     assert cfg2.preset == "balanced" and "segcap" not in cfg2.resources
