@@ -371,3 +371,45 @@ def test_detail_table_is_well_formed():
                     pixels_equal=[False], generate_ids_equal=True,
                     placeholders=ranges(grids, [[0.0]])).to_dict()
     assert "| = | = | = | ≠ | = | = |" in G.render_report([row])
+
+
+
+def _rescore_setup():
+    grids = [[2, 4, 4]]
+    hf = expanded(grids, [[0.25, 1.25]])
+    row = G.compare(case_id="golden-human", index=0, source="s", variant="wrapped",
+                    hf_ids=hf, hf_grids=grids, vllm_ids=hf, vllm_grids=grids, sp=SP,
+                    merge_size=2, pixels_equal=[True], generate_ids_equal=True,
+                    placeholders=ranges(grids, [[0.25, 1.25]])).to_dict()
+    parts = [("tempseg", "golden:human")]
+    builds = [dict(kind="tempseg", part="golden:human", n=1, errors=[])]
+
+    def verdict(r):
+        return G.gate_verdict(builds, {"tempseg": {"rows": [r]}}, expected_parts=parts,
+                              expected_cases=["golden-human"], reference={"image": "img_hfref"},
+                              quota=1)
+    return row, verdict
+
+
+def test_rescore_recomputes_passed_from_raw_fields():
+    """Review 6 B4: a recorded row's ``passed`` is never trusted."""
+    row, verdict = _rescore_setup()
+    assert verdict(row)["passed"]
+    # the 2026-10-21 rows predate the placeholder check: no placeholders_ok at all
+    old = {k: v for k, v in row.items() if k not in ("placeholders_ok", "placeholder_error")}
+    assert old["passed"] is True
+    v = verdict(old)
+    assert not v["passed"] and v["failed_cases"] == ["golden-human"]
+    assert any("placeholders_ok" in p for p in v["problems"]), v["problems"]
+    # a stored True never overrides failing data, a stored False never hides passing data
+    assert not verdict({**row, "ids_equal": False, "passed": True})["passed"]
+    assert verdict({**row, "passed": False})["passed"]
+    # missing pixel evidence fails that criterion
+    assert not verdict({k: v for k, v in row.items() if k != "pixels_equal"})["passed"]
+
+
+def test_rescore_row_names_insufficient_evidence():
+    row, _ = _rescore_setup()
+    out = G.rescore_row({k: v for k, v in row.items() if k != "generate_ids_equal"})
+    assert out["passed"] is False and out["insufficient"] == ["generate_ids_equal"]
+    assert G.rescore_row(row)["passed"] is True and G.rescore_row(row)["insufficient"] == []

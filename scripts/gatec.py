@@ -16,7 +16,9 @@ The verdict (review 5 M-A) applies every criterion: the golden ``--quota`` per p
 reported up front and FAILS), and the HF reference image (build_part runs it in ``img_vllm``,
 so C2 needs an ``img_hfref`` cross-check, which does not exist yet: the gate FAILS on C2
 until it does). ``--rescore PATH`` re-scores a recorded results file under the same rules
-without running anything on a GPU.
+without running anything on a GPU: every row's pass/fail is recomputed from its raw fields
+(``validate.gatec.rescore_row``; a stored ``passed`` is never trusted), and a row that lacks a
+criterion's data (e.g. rows recorded before ``placeholders_ok`` existed) FAILS it.
 """
 
 from __future__ import annotations
