@@ -465,9 +465,18 @@ def run(job_id: str, factory: str, generation: int = 0, watch: bool = False) -> 
     """One orchestrator generation. Spawns its successor when the deadline is reached.
 
     ``watch=True`` registers the job with the scheduled reconciler (``reconcile_watched``)."""
+    return run_generation(job_id, factory, generation, watch, spawn_successor=run.spawn)
+
+
+def run_generation(job_id: str, factory: str, generation: int = 0, watch: bool = False, *,
+                   spawn_successor: Callable[..., Any], watch_kv: Any = None) -> dict[str, Any]:
+    """``run``'s body. ``spawn_successor(job_id, factory, generation, watch)`` starts the next
+    generation in the caller's own app; ``watch_kv`` (default ``watched``) is the reconciler's
+    watch list. The app factory (``modal_app.factory``) passes its own app's handles."""
+    watched_kv = watched if watch_kv is None else watch_kv
     deps = load_factory(factory)(job_id)
     if watch:
-        watched.put(job_id, factory)
+        watched_kv.put(job_id, factory)
     environment = os.environ.get("MODAL_ENVIRONMENT", "main")
     backstop = apply_environment_budget(environment, deps.settings)
     if generation == 0:
@@ -475,16 +484,19 @@ def run(job_id: str, factory: str, generation: int = 0, watch: bool = False) -> 
     orch = build_orchestrator(job_id, deps, lease_kv=leases, holder=_holder())
     outcome = TickDriver(orch).run_until_idle(sleep=time.sleep)  # releases the lease
     if outcome.result == "continue":
-        successor = _retry(lambda: run.spawn(job_id, factory, generation + 1, watch))
+        successor = _retry(lambda: spawn_successor(job_id, factory, generation + 1, watch))
         _print_event({"event": "continuation_spawned", "job_id": job_id,
                       "generation": generation + 1, "call_id": successor.object_id})
     elif outcome.result in TERMINAL and watch:
-        watched.pop(job_id, None)
+        watched_kv.pop(job_id, None)
     return {**asdict(outcome), "generation": generation,
             "budget": budget_summary(environment, deps.settings, backstop, gate=deps.budget)}
 
 
-def _reconcile_job(job_id: str, factory: str, revive: bool = True) -> dict[str, Any]:
+def _reconcile_job(job_id: str, factory: str, revive: bool = True, *,
+                   spawn_run: Callable[..., Any] | None = None) -> dict[str, Any]:
+    """``spawn_run(job_id, factory, generation, watch)`` (default ``run.spawn``) revives."""
+    spawn = run.spawn if spawn_run is None else spawn_run
     deps = load_factory(factory)(job_id)
     refresh = getattr(deps.store, "refresh", None)
     if callable(refresh):
@@ -497,7 +509,7 @@ def _reconcile_job(job_id: str, factory: str, revive: bool = True) -> dict[str, 
         max_starts=deps.settings.max_starts_before_quarantine,
     )
     # revive spawns ``run``; a second contender loses the lease and exits (never two loops)
-    revived = revive and revive_if_needed(status, lambda: run.spawn(job_id, factory, 0, True))
+    revived = revive and revive_if_needed(status, lambda: spawn(job_id, factory, 0, True))
     return {**asdict(status), "revived": bool(revived)}
 
 

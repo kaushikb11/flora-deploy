@@ -38,12 +38,12 @@ import modal
 from flora_deploy.modal_app.reference_app import (
     STARTUP_TIMEOUT_S,
     TIMEOUT_S,
-    ReferenceWorker,
     app,
     identity_from_volume,
     offline_check,
     stage_samples,
 )
+from flora_deploy.modal_app.reference_app import ReferenceWorkerSmoke as ReferenceWorker
 from flora_deploy.stages.reference import (
     IDENTITY_EPISODES,
     compare_runs,
