@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 from typer.testing import CliRunner
 
-from flora_deploy import cli
+from flora_deploy.cli import prepare as cli
 from flora_deploy.config.pins import RepoPin
 from flora_deploy.prep.download import plan_all, plan_snapshot
 

@@ -1,4 +1,4 @@
-"""`flora` command-line interface."""
+"""`flora version` and `flora prepare`."""
 
 from __future__ import annotations
 
@@ -6,13 +6,10 @@ import json
 from typing import Annotated
 
 import typer
-from rich.console import Console
 from rich.table import Table
 
 from flora_deploy import __version__
-
-app = typer.Typer(no_args_is_help=True, add_completion=False, help="Run NVIDIA Flora on Modal.")
-console = Console()
+from flora_deploy.cli._app import app, console  # noqa: E402,F401  (re-exported for tests)
 
 
 def _hf_api():
@@ -196,5 +193,3 @@ def prepare(
     console.print(f"Total: {_gib(sum(p.total_bytes for p in plans))}")
 
 
-if __name__ == "__main__":
-    app()
