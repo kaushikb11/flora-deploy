@@ -34,6 +34,19 @@ TEMPLATE_INFO: dict[str, tuple[str, str]] = {
 }
 TEMPLATES: dict[str, str] = {name: f for name, (f, _) in TEMPLATE_INFO.items()}
 
+# name -> the keys to edit after `flora init` (README: "set your dataset and output location")
+# and the command to run next.
+_LEROBOT = ("input.repo", "input.revision", "pipeline.embodiment", "output.sink")
+_MP4 = ("input.path", "input.stage_to", "pipeline.embodiment", "output.sink")
+NEXT_STEPS: dict[str, tuple[tuple[str, ...], str]] = {
+    "balanced_lerobot": (_LEROBOT, "flora doctor"),
+    "exact_lerobot": (_LEROBOT, "flora doctor"),
+    "balanced_mp4_dir": (_MP4, "flora doctor"),
+    "exact_mp4_dir": (_MP4, "flora doctor"),
+    "rewards_only": (_MP4, "flora doctor"),
+    "local_demo": ((), "flora run --local --fake-models --sample-data"),
+}
+
 
 def templates_dir() -> Traversable:
     """The packaged templates (``flora_deploy/config/templates``)."""
@@ -85,5 +98,9 @@ def init(
         raise typer.Exit(code=1) from None
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
-    console.print(f"Wrote {escape(str(path))} (template {template}). Edit it, then run "
-                  "`flora prepare`.")
+    keys, nxt = NEXT_STEPS.get(template, ((), "flora doctor"))
+    console.print(f"Wrote {escape(str(path))} (template {template}).", soft_wrap=True)
+    if keys:
+        console.print("Edit next: " + ", ".join(keys) + " (and project, the job's name).",
+                      soft_wrap=True, highlight=False)
+    console.print(f"Then run: {nxt}", soft_wrap=True, highlight=False)

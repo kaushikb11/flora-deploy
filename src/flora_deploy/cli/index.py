@@ -2,7 +2,8 @@
 
 Default: runs on Modal CPU containers (``modal_app/index_app.py``). ``--local`` runs in-process
 (small datasets, tests). The summary is also written locally (``--out``, default
-``summary.json``) for ``flora plan --index summary.json``.
+``summary.json`` next to the config: :func:`default_index_summary`), where ``flora plan`` reads
+it by default.
 """
 
 from __future__ import annotations
@@ -22,6 +23,15 @@ def _fail(msg: str, code: int = 2) -> typer.Exit:
 
     console.print(f"[red]{escape(msg)}[/red]")
     return typer.Exit(code=code)
+
+
+INDEX_SUMMARY_NAME = "summary.json"
+
+
+def default_index_summary(config: Path) -> Path:
+    """Where ``flora index`` writes its summary and ``flora plan`` reads it by default: next to
+    the config (``./summary.json`` for ``./flora.yaml``)."""
+    return config.parent / INDEX_SUMMARY_NAME
 
 
 def store_for_sink(sink: str) -> str:
@@ -79,8 +89,9 @@ def index(
         help="--local: where Hub files are downloaded (default: input.stage_to or "
              "~/.cache/flora-deploy/datasets).")] = None,
     force: Annotated[bool, typer.Option(help="Re-index episodes that have receipts.")] = False,
-    out: Annotated[Path, typer.Option(help="Also write the summary here.")] = Path(
-        "summary.json"),
+    out: Annotated[Path | None, typer.Option(
+        help="Also write the summary here (default: summary.json next to the config, where "
+             "`flora plan` reads it).", show_default=False)] = None,
 ) -> None:
     """Index a dataset: per-episode receipts (probe-equivalent, envelope, eligibility)."""
     from flora_deploy.config.schema import ConfigError, load_config
@@ -148,6 +159,9 @@ def index(
                 ijob.to_dict(), store_uri, cfg.input.stage_to, limit, max_episodes, force)
 
     _print_summary(summary)
+    default_out = default_index_summary(config)
+    out = out or default_out
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    console.print(f"summary: {out} (store: {store_uri}); next: flora plan --index {out}")
+    console.print(f"summary: {out} (store: {store_uri}); next: flora plan"
+                  + ("" if out == default_out else f" --index {out}"))

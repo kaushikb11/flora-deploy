@@ -34,11 +34,13 @@ import typer
 
 from flora_deploy.cli._app import app, console
 
-JobArg = Annotated[str, typer.Argument(help="Job id (default at submit: the config's project).")]
+JobArg = Annotated[str | None, typer.Argument(
+    help="Job id (default: the config's project; its fake-models run <project>.fake when "
+         "there is no real one).", show_default=False)]
 StoreOpt = Annotated[str | None, typer.Option(
     "--store", envvar="FLORA_STORE",
-    help="Job store: modal-volume://name\\[/path], s3://bucket\\[/prefix], file:///dir "
-         "(default: the config's output.sink).")]
+    help="Job store: modal-volume://name\\[/path], s3://bucket\\[/prefix], file:///dir or a "
+         "directory (default: the config's output.sink, then <config dir>/flora-local-store).")]
 ConfigOpt = Annotated[Path, typer.Option(
     "--config", "-c", help="flora.yaml (finds the store and Modal environment).")]
 EnvOpt = Annotated[str | None, typer.Option(
@@ -53,24 +55,23 @@ def fail(msg: str, code: int = 2) -> typer.Exit:
     return typer.Exit(code=code)
 
 
-def open_job_cli(job: str, store: str | None, config: Path, env: str | None):
-    """``sdk.open_job`` with CLI errors (exit 2)."""
+def open_job_cli(job: str | None, store: str | None, config: Path, env: str | None):
+    """The job a job-scoped command acts on (``cli._jobref.resolve``: the job id and store
+    default from ``flora.yaml``), opened with ``sdk.open_job_in``; CLI errors exit 2. Prints the
+    resolution's notes (fake-models run, ...) on stderr."""
     from flora_deploy import sdk
+    from flora_deploy.cli._jobref import ResolveError, print_notes, resolve
     from flora_deploy.config.schema import ConfigError
 
-    cfg = None
-    if store is None or env is None:
-        if config.exists():
-            try:
-                from flora_deploy.config.schema import load_config
-
-                cfg = load_config(config, allow_uncertified=True)
-            except ConfigError as e:
-                raise fail(str(e)) from None
-        elif store is None:
-            raise fail(f"{config} not found: pass --store (or FLORA_STORE) or --config")
     try:
-        return sdk.open_job(job, store=store, config=cfg, environment=env)
+        r = resolve(job, store, config, env)
+    except ConfigError as e:
+        raise fail(str(e)) from None
+    except ResolveError as e:
+        raise fail(str(e)) from None
+    print_notes(r)
+    try:
+        return sdk.open_job_in(r.store, r.job_id, store_uri=r.store_uri)
     except (sdk.FloraError, ValueError, ImportError) as e:
         raise fail(str(e)) from None
 
@@ -118,8 +119,8 @@ def print_view(v: Any, *, brief: bool = False) -> None:
     if v.errors:
         console.print(f"  error files: {len(v.errors)} (see `flora report {v.job_id}`)")
     if v.composed:
-        console.print(f"  composed: {v.summary_status} (read with `flora results --job "
-                      f"{v.job_id} --stage <stage>`)", soft_wrap=True)
+        console.print(f"  composed: {v.summary_status} (read with `flora results <stage> "
+                      f"--job {v.job_id}`)", soft_wrap=True)
     elif v.state in ("composing", "completed_with_errors"):
         console.print(f"  not composed yet: `flora compose --job {v.job_id}` or `flora run` / "
                       "`Job.wait()` compose it", soft_wrap=True)

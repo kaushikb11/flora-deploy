@@ -713,8 +713,9 @@ def launch_local(job: Any, *, reason: str = "resume") -> str:
     return call_id
 
 
-def summary_lines(res: LocalRunResult) -> list[str]:
-    """Human-readable result summary (the CLI prints it)."""
+def summary_lines(res: LocalRunResult, *, results_cmd: str | None = None) -> list[str]:
+    """Human-readable result summary (the CLI prints it). ``results_cmd``: how to read the
+    results back (default: the fully spelled-out `flora results` command)."""
     lines = [f"job {res.job_id} (config {res.config_hash[:12]}): {res.state.upper()} "
              f"in {res.wall_s:.1f} s (orchestrator: {res.outcome})"]
     sp = res.spawner
@@ -740,8 +741,9 @@ def summary_lines(res: LocalRunResult) -> list[str]:
         lines.append("budget stop: continue with `flora run --local --fake-models --resume "
                      "--budget USD` (or `flora resume <job> --budget-usd USD --store <store>`)")
     if res.store_root:
-        lines.append(f"store: {res.store_root}; read results with `flora results --job "
-                     f"{res.job_id} --stage caption --store {res.store_root}`")
+        cmd = results_cmd or (f"flora results caption --job {res.job_id} --store "
+                              f"{res.store_root}")
+        lines.append(f"store: {res.store_root}; read results with `{cmd}`")
     return lines
 
 

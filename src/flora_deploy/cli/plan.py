@@ -67,13 +67,14 @@ def plan(
     preset: Annotated[list[str] | None, typer.Option(
         help="Preset(s) to consider (repeatable; default: every available preset).")] = None,
     video_hours: Annotated[float | None, typer.Option(
-        help="Total video hours (until `flora index` writes a summary).")] = None,
+        help="Total video hours, instead of the `flora index` summary.")] = None,
     episodes: Annotated[int | None, typer.Option(help="Episode count (with --video-hours).")
                         ] = None,
     cameras: Annotated[int | None, typer.Option(help="Views per episode (default: config).")
                        ] = None,
     index: Annotated[Path | None, typer.Option(
-        help='Workload summary JSON: {"groups": [{pool, cameras, video_s, episodes}]}.')] = None,
+        help="Workload summary JSON (default: the summary.json `flora index` wrote next to "
+             "the config).", show_default=False)] = None,
     max_gpus: Annotated[int | None, typer.Option(help="GPU cap (default: modal.max_gpus)")
                         ] = None,
     rates_file: Annotated[Path | None, typer.Option(
@@ -115,6 +116,13 @@ def plan(
         raise _fail(str(e)) from None
 
     try:
+        if index is None and video_hours is None:
+            from flora_deploy.cli.index import default_index_summary
+
+            index = default_index_summary(config)
+            if not index.is_file():
+                raise _fail(f"no workload: {index} not found. Run `flora index` first (it "
+                            "writes it), or give --index FILE or --video-hours H")
         if index is not None:
             workload = WorkloadSummary.from_dict(json.loads(index.read_text(encoding="utf-8")))
         elif video_hours is not None:
@@ -122,8 +130,7 @@ def plan(
                 video_hours, cameras=cameras or _cameras_from_config(cfg),
                 pool=cfg.pipeline.embodiment, episodes=episodes)
         else:
-            raise _fail("give the workload: --video-hours H [--episodes N] or --index "
-                        "summary.json (`flora index` will write it once wired)")
+            raise AssertionError("unreachable: the index default is set above")
     except (ValueError, KeyError, OSError) as e:
         raise _fail(f"bad workload: {e}") from None
 

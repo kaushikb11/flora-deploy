@@ -1,9 +1,12 @@
 """README-as-test: what README.md tells a user to type must exist.
 
-Every ``flora`` command in a fenced bash block (and in an inline code span) is a real command
-whose flags it accepts and whose required options it passes; every template it names ships;
-every repo path it mentions exists; the config block uses only real keys; the SDK snippet's
-calls exist. CI also runs the "Try it locally" block verbatim (``scripts/readme_blocks.py``).
+Every ``flora`` command in a fenced bash block (in an inline code span, and in a ``# flora ...``
+comment of a Python block) is a real command that parses with the real typer signature: its
+flags exist, its positional arguments fit the command's arguments (count and values), and it
+passes every required option. Every template it names ships; every repo path it mentions
+exists; the config block uses only real keys and validates; the SDK snippet's calls exist; the
+Modal flow deploys. CI runs the quickstart ("Try it in two minutes") block verbatim from the
+built wheel (``scripts/readme_blocks.py``).
 """
 
 from __future__ import annotations
@@ -17,7 +20,15 @@ import typer
 
 from flora_deploy.cli import app
 from flora_deploy.cli.init import TEMPLATES
-from scripts.readme_blocks import blocks, commands, logical_lines, try_it_script
+from scripts.readme_blocks import (
+    TRY_IT_HEADING,
+    block_under,
+    blocks,
+    commands,
+    is_install,
+    logical_lines,
+    try_it_script,
+)
 
 REPO = Path(__file__).resolve().parents[2]
 TEXT = (REPO / "README.md").read_text(encoding="utf-8")
@@ -25,8 +36,17 @@ BLOCKS = blocks(TEXT)
 BASH = [b for b in BLOCKS if b.lang == "bash"]
 GROUP = typer.main.get_command(app)  # typer vendors click: duck-type it below
 
-# `flora ...` inside inline code spans (the "Managing jobs" table), optional parts unbracketed.
+# The blocks the tests below read, by the heading that contains them (a LookupError names the
+# headings present when one is missing).
+QUICKSTART = TRY_IT_HEADING  # "Try it in two minutes": the block CI runs
+MODAL_FLOW = "Label your own data"
+CONFIG = "Configuration"
+
+# `flora ...` inside inline code spans, optional parts unbracketed.
 INLINE = [re.sub(r"[\[\]]", "", s) for s in re.findall(r"`(flora [^`]+)`", TEXT)]
+# `# flora ...` comments in Python blocks (e.g. how to get caption.parquet).
+PY_COMMENTS = [m for b in BLOCKS if b.lang == "python"
+               for m in re.findall(r"#\s*(flora [^#\n]+)", b.code)]
 
 
 def _flora_argvs() -> list[tuple[str, list[str]]]:
@@ -35,9 +55,9 @@ def _flora_argvs() -> list[tuple[str, list[str]]]:
         for argv in commands(b.code):
             if argv and argv[0] == "flora":
                 out.append((" ".join(argv), argv[1:]))
-    for s in INLINE:
+    for s in [*INLINE, *PY_COMMENTS]:
         argv = s.split()
-        out.append((s, argv[1:]))
+        out.append((s.strip(), argv[1:]))
     return out
 
 
@@ -46,7 +66,10 @@ FLORA = _flora_argvs()
 
 def test_readme_has_the_blocks_this_test_reads():
     assert BASH and FLORA
-    assert any(b.heading.startswith("Try it locally") for b in BASH)
+    for heading in (QUICKSTART, MODAL_FLOW):
+        block_under(TEXT, heading)  # raises, naming the headings present
+    block_under(TEXT, CONFIG, "yaml")
+    assert PY_COMMENTS, "the Python blocks no longer say how to get the parquet files"
 
 
 def _command(args: list[str]):
@@ -78,6 +101,58 @@ def test_flora_commands_and_flags_exist(line, args):
     for p in cmd.params:
         if p.param_type_name == "option" and p.required and p.name not in given:
             pytest.fail(f"{line}: `flora {cmd.name}` requires {p.opts[0]}")
+    # positional arguments: as many as the command takes, every required one given
+    pos = _positionals(rest, known)
+    args = [p for p in cmd.params if p.param_type_name == "argument"]
+    if not any(p.nargs == -1 for p in args):
+        assert len(pos) <= sum(p.nargs for p in args), (
+            f"{line}: `flora {cmd.name}` takes {len(args)} positional argument(s) "
+            f"({[p.name for p in args]}), the README passes {pos}")
+    required = [p for p in args if p.required]
+    assert len(pos) >= len(required), f"{line}: `flora {cmd.name}` requires {required[0].name}"
+    # and the real parser accepts the whole line (types, choices, values of options)
+    try:
+        cmd.make_context(f"flora {cmd.name}", list(rest), resilient_parsing=False)
+    except Exception as e:  # click.UsageError / BadParameter (typer vendors click)
+        pytest.fail(f"{line}: `flora {cmd.name}` does not parse it: {e}")
+
+
+def _positionals(args: list[str], known: dict) -> list[str]:
+    """The positional tokens of ``args``: not a flag, and not the value of an option before it."""
+    out, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("-") and a not in ("-", "--"):
+            p = known.get(a.split("=", 1)[0])
+            takes_value = p is not None and not getattr(p, "is_flag", False) and \
+                not getattr(p, "count", False)
+            i += 2 if takes_value and "=" not in a else 1
+            continue
+        out.append(a)
+        i += 1
+    return out
+
+
+def test_positional_values_are_real():
+    """``flora results <stage>``: the stages the README names exist; ``flora init PATH``-style
+    positionals are checked by the parser above."""
+    from flora_deploy.export.compose import STAGES
+
+    stages = []
+    for _line, args in FLORA:
+        cmd, rest = _command(list(args))
+        if cmd.name == "results":
+            known = {o: p for p in cmd.params for o in (*p.opts, *p.secondary_opts)
+                     if o.startswith("-")}
+            stages += _positionals(rest, known)[:1]
+    assert stages, "the README never reads results back with `flora results <stage>`"
+    assert set(stages) <= set(STAGES), f"unknown stage(s) {set(stages) - set(STAGES)}"
+
+
+def test_positional_check_sees_option_values():
+    cmd, rest = _command(["results", "caption", "--format", "parquet", "--out", "x.parquet"])
+    known = {o: p for p in cmd.params for o in (*p.opts, *p.secondary_opts) if o.startswith("-")}
+    assert _positionals(rest, known) == ["caption"]
 
 
 def test_named_templates_exist():
@@ -110,8 +185,7 @@ def _paths() -> set[str]:
 
 def test_referenced_paths_exist():
     paths = _paths()
-    assert "src/flora_deploy/config/templates/" in paths or any(
-        p.startswith("src/") for p in paths)
+    assert paths, "the README references no repo path (the docs links at least)"
     missing = sorted(p for p in paths if not (REPO / p).exists())
     assert not missing, f"README references paths that do not exist: {missing}"
 
@@ -164,7 +238,7 @@ def test_config_block_uses_real_keys():
     from flora_deploy.config.presets import gpu_problem
     from flora_deploy.config.schema import FloraConfig
 
-    (cfg_block,) = [b for b in BLOCKS if b.lang == "yaml" and b.heading == "Config"]
+    cfg_block = block_under(TEXT, CONFIG, "yaml")
     data = yaml.safe_load(cfg_block.code)
     assert not _model_keys(FloraConfig, data)
     # A preset that needs certificates (none exist yet) must opt in, or the config is refused.
@@ -180,7 +254,7 @@ def test_config_block_validates_with_its_placeholders_filled():
     vs. resources, certification opt-in, ...)."""
     from flora_deploy.config.schema import loads_config
 
-    (cfg_block,) = [b for b in BLOCKS if b.lang == "yaml" and b.heading == "Config"]
+    cfg_block = block_under(TEXT, CONFIG, "yaml")
     text = re.sub(r"<full commit sha>", "a1" * 20, cfg_block.code)
     assert "<" not in text, "unknown placeholder in the README config block"
     loads_config(text, source="README.md config block")
@@ -224,18 +298,25 @@ def test_sdk_snippet_check_sees_every_keyword():
 
 
 def test_readme_modal_flow_is_deployable():
-    """The "Run on Modal" flow (`flora init --template <t>` then `flora deploy`) plans an app
-    that registers a worker class for every shard kind the template's preset runs (strict:
-    the balanced SegmentWorker / CaptionWorker are wired, P1b-1)."""
+    """The "Label your own data" flow (`flora init [--template <t>]` then `flora deploy`) plans
+    an app that registers a worker class for every shard kind the template's preset runs
+    (strict: the balanced SegmentWorker / CaptionWorker are wired, P1b-1). Without
+    ``--template`` the template is ``flora init``'s real default."""
     from flora_deploy.cli.init import template_text
     from flora_deploy.config.schema import loads_config
     from flora_deploy.modal_app.factory import PENDING_WORKERS, plan_app
 
-    (block,) = [b for b in BASH if b.heading.startswith("Run on Modal")]
+    block = block_under(TEXT, MODAL_FLOW)
     argvs = [a for a in commands(block.code) if a[:2] == ["flora", "init"]]
-    assert argvs, "the Run on Modal block runs no `flora init`"
+    assert argvs, f"the {MODAL_FLOW!r} block runs no `flora init`"
     argv = argvs[0]
-    template = argv[argv.index("--template") + 1]
+    if "--template" in argv:
+        template = argv[argv.index("--template") + 1]
+    else:
+        init = GROUP.commands["init"]
+        (tpl,) = [p for p in init.params if p.name == "template"]
+        template = tpl.default
+        assert template == "balanced_lerobot"
     assert any(a[:2] == ["flora", "deploy"] for a in commands(block.code))
     cfg = loads_config(template_text(template), source=template)
     assert not sorted(k for k in cfg.pools() if k in PENDING_WORKERS)
@@ -246,8 +327,19 @@ def test_readme_modal_flow_is_deployable():
 
 
 def test_try_it_script_is_the_readme_block():
+    """What CI runs is the quickstart block minus only its install line(s): every other line,
+    in order, including the `flora results` read-back."""
     script = try_it_script(TEXT)
-    (block,) = [b for b in BASH if b.heading.startswith("Try it locally")]
+    block = block_under(TEXT, QUICKSTART)
+    lines = logical_lines(block.code)
     body = script.splitlines()[1:]
-    assert body and all(ln in logical_lines(block.code) for ln in body)
-    assert body[0].startswith("flora init")
+    assert body == [ln for ln in lines if not is_install(ln)]
+    assert any(is_install(ln) for ln in lines), "the quickstart no longer says how to install"
+    flora = [ln.split("#")[0].split() for ln in body if ln.lstrip().startswith("flora ")]
+    assert flora[0][:2] == ["flora", "init"] and flora[-1][:2] == ["flora", "results"]
+    assert ["flora", "run", "--local", "--fake-models", "--sample-data"] in flora
+
+
+def test_block_lookup_fails_loudly():
+    with pytest.raises(LookupError, match="Try it"):
+        block_under("## Other\n\n```bash\nflora init\n```\n", "Try it")

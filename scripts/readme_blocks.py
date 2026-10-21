@@ -2,9 +2,10 @@
 
     python scripts/readme_blocks.py try-it [README.md]
 
-prints the "Try it locally" bash block as a shell script without its setup lines (clone and
-install: everything before the first ``flora`` command), so CI can run exactly the commands the
-README tells a new user to type, in a fresh directory with the package installed.
+prints the quickstart ("Try it in two minutes") bash block as a shell script without its install
+line (``uv tool install ...`` / ``pip install ...``: CI installs the built wheel instead), so CI
+runs exactly the commands the README tells a new user to type (``mkdir``, ``cd``, every
+``flora`` line) in an empty directory.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 README = Path(__file__).resolve().parents[1] / "README.md"
-TRY_IT_HEADING = "Try it locally"
+TRY_IT_HEADING = "Try it in two minutes"  # the quickstart block
 _FENCE = re.compile(r"^```(\w*)\s*$")
 _SPLIT = {"&&", "||", ";", "|"}
 
@@ -80,12 +81,31 @@ def commands(code: str) -> list[list[str]]:
     return out
 
 
+def block_under(text: str, heading: str, lang: str = "bash") -> Block:
+    """The one ``lang`` block under the heading containing ``heading``; raises ``LookupError``
+    naming the headings present when there is not exactly one."""
+    bs = blocks(text)
+    found = [b for b in bs if b.lang == lang and heading in b.heading]
+    if len(found) != 1:
+        heads = sorted({b.heading for b in bs if b.lang == lang})
+        raise LookupError(f"README: expected one {lang} block under a heading containing "
+                          f"{heading!r}, found {len(found)} (headings with {lang} blocks: {heads})")
+    return found[0]
+
+
+def is_install(line: str) -> bool:
+    """An install command of the quickstart (replaced by the built wheel in CI)."""
+    return any(argv[:3] == ["uv", "tool", "install"] or argv[:2] in (["pip", "install"],
+                                                                     ["pipx", "install"])
+               for argv in commands(line))
+
+
 def try_it_script(text: str) -> str:
-    (block,) = [b for b in blocks(text)
-                if b.lang == "bash" and b.heading.startswith(TRY_IT_HEADING)]
-    lines = logical_lines(block.code)
-    first = next(i for i, ln in enumerate(lines) if ln.lstrip().startswith("flora "))
-    return "\n".join(["set -euo pipefail", *lines[first:]]) + "\n"
+    block = block_under(text, TRY_IT_HEADING)
+    lines = [ln for ln in logical_lines(block.code) if not is_install(ln)]
+    if not any(ln.lstrip().startswith("flora ") for ln in lines):
+        raise LookupError("README quickstart block runs no flora command")
+    return "\n".join(["set -euo pipefail", *lines]) + "\n"
 
 
 def main(argv: list[str]) -> int:
