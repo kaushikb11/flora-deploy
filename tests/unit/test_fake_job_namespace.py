@@ -95,7 +95,6 @@ def test_open_job_points_at_the_fake_run_and_refuses_a_mixed_spec(both):
 def test_local_fake_runs_use_the_fake_namespace(tmp_path):
     from flora_deploy.local import run_local
     from flora_deploy.local import sample_dataset as make_sample
-
     from tests.fakes.flora_backend import TEMPLATE
 
     (tmp_path / "flora.yaml").write_text(TEMPLATE.read_text())

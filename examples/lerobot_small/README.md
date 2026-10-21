@@ -1,7 +1,10 @@
 # lerobot_small
 
 The `balanced` preset on [`lerobot/aloha_static_cups_open`](https://huggingface.co/datasets/lerobot/aloha_static_cups_open)
-(MIT; 50 episodes of about 8 s, 3 cameras, about 0.5 GB), pinned to a full commit.
+(MIT; 50 episodes of about 8 s, 4 cameras, about 0.5 GB), pinned to a full commit. Three cameras
+are used: `cam_high` as the main view and the two wrist cameras. `cam_low` is not, because the
+`yam` embodiment takes exactly three views and `cam_low`, a second low overview, has no YAM role
+(the golden set drops it the same way). ALOHA is not YAM hardware; it stands in for it here.
 Set `output.sink` to your bucket or Volume, then run `flora doctor -c flora.yaml` and follow the
 "Run on Modal" steps in the top-level README.
 
