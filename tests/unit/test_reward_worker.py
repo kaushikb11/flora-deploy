@@ -429,3 +429,18 @@ def test_part_paths_are_whole_files_under_job_layout(tmp_path):
     assert all(p.startswith(f"flora/{JOB}/{CFG}/parts/reward.terminal/") for p in rec.parts)
     # local scratch files are gone once published
     assert not any(Path(tmp_path, "c1").rglob("*.jsonl"))
+
+
+def test_worker_output_composes(tmp_path):
+    from flora_deploy.export.compose import compose
+
+    store = FakeStore()
+    t = tshard(["a", "b"])
+    d = tshard(["a"], sid="reward.dense-00000", kind="reward.dense")
+    setup(store, [ep("a", cams={"main": "/v/aaaaaa"}), ep("b")], [t, d])
+    runner = make_runner(store, tmp_path, group=2)
+    for s in (t, d):
+        runner.run_shard(JOB, s.shard_id, CFG)
+    out = compose(store, JOB)
+    assert [r.uid for r in out.records["reward.terminal"]] == [uid("a"), uid("b")]
+    assert [r.uid for r in out.records["reward.dense"]] == [uid("a")]
