@@ -41,3 +41,22 @@ FAMILY_CODE_PIN = {Family.SEGCAP: "tempseg_code", Family.REWARDER: "rewarder"}
 
 class FamilyConflictError(RuntimeError):
     """Raised when a second NVIDIA code family is loaded into a process that has one."""
+
+
+_EXPORTS = {
+    "load_family": "linker",
+    "code_dir_for": "linker",
+    "NvFamily": "linker",
+    "CachedSession": "session",
+    "CaptureProcessor": "capture",
+    "CapturedRequest": "capture",
+}
+
+
+def __getattr__(name: str):
+    # Lazy re-exports: keeps ``import flora_deploy.nv`` free of numpy and of import cycles.
+    if name in _EXPORTS:
+        import importlib
+
+        return getattr(importlib.import_module(f"{__name__}.{_EXPORTS[name]}"), name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
