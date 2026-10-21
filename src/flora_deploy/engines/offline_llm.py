@@ -328,8 +328,14 @@ class OfflineEngine:
             dt_bias_fp32.check_activation(spec.dtbias_fp32)
             from vllm import LLM
 
+            from flora_deploy.engines.worker_ext import WORKER_EXTENSION
+
+            if self.kwargs.get("worker_extension_cls", WORKER_EXTENSION) != WORKER_EXTENSION:
+                raise EngineArgsError("worker_extension_cls is flora's (engines.worker_ext)")
             t0 = time.perf_counter()
-            llm = LLM(**self.kwargs)
+            # the worker extension only adds read-only flora_* rpc methods (not hashed: it
+            # changes no numerics); it is how gdn_param_dtypes runs in vLLM's engine process
+            llm = LLM(**{**self.kwargs, "worker_extension_cls": WORKER_EXTENSION})
             self.stats["build_s"] = round(time.perf_counter() - t0, 3)
             verify = True if verify is None else verify
         self.llm = llm
@@ -434,20 +440,16 @@ def resolved_facts(llm) -> dict[str, Any]:
 
 def gdn_param_dtypes(llm) -> dict[str, Any]:
     """dtype counts of every GDN ``dt_bias`` / ``A_log`` parameter in the engine's workers
-    (``collective_rpc``; L1 / Gate A evidence)."""
+    (L1 / Gate A evidence).
 
-    def probe(worker) -> dict:
-        model = worker.model_runner.model
-        counts: dict[str, int] = {}
-        for name, p in model.named_parameters():
-            tail = name.rsplit(".", 1)[-1]
-            if tail in ("dt_bias", "A_log"):
-                k = f"{tail}:{str(p.dtype).replace('torch.', '')}"
-                counts[k] = counts.get(k, 0) + 1
-        return counts
+    Calls the worker extension's method **by name** (``collective_rpc("flora_gdn_dtypes")``,
+    :mod:`flora_deploy.engines.worker_ext`): vLLM 0.24 refuses to send a function to its engine
+    process without ``VLLM_ALLOW_INSECURE_SERIALIZATION=1`` (review 8a R5), which flora never
+    sets. The engine must be built with ``worker_extension_cls`` (:class:`OfflineEngine` does)."""
+    from flora_deploy.engines.worker_ext import GDN_DTYPES_RPC
 
     try:
-        return {"workers": llm.collective_rpc(probe)}
+        return {"workers": llm.collective_rpc(GDN_DTYPES_RPC)}
     except Exception as exc:  # pragma: no cover - diagnostics only
         return {"error": repr(exc)}
 
