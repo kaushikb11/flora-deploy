@@ -1,3 +1,4 @@
+# CI gates: what each one protects against is documented in docs/ci.md.
 name: ci
 
 on:
@@ -5,24 +6,65 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+# A newer push to the same branch / PR supersedes the running one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash  # bash --noprofile --norc -eo pipefail
+
+env:
+  UV_LOCKED: "1"  # every uv sync/run must match uv.lock exactly (never re-resolves in CI)
+  PYTHONDONTWRITEBYTECODE: "1"
+
 jobs:
   test:
+    name: test (${{ matrix.python }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
+      fail-fast: false
       matrix:
         python: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           python-version: ${{ matrix.python }}
-      - run: uv sync --group dev
-      - run: uv run ruff check .
-      - run: uv run pytest -q -m "not nvlink and not modal"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          cache-suffix: dev
+      - name: "Gate: uv.lock in sync with pyproject.toml"
+        run: uv lock --check
+      - name: Install (dev group only, no torch)
+        run: uv sync --group dev
+      - name: "Gate: ruff"
+        run: uv run ruff check .
+      - name: "Gate: license guard (no NVIDIA code/prompts/weights tracked)"
+        run: uv run pytest -q -p no:cacheprovider tests/unit/test_license_guard.py
+      - name: "Gate: logic-digest classification coverage (every module classified)"
+        run: uv run pytest -q -p no:cacheprovider tests/unit/test_config_logic.py
+      - name: "Gate: pin / lock consistency (NVIDIA pins, image locks, modal client)"
+        run: >-
+          uv run pytest -q -p no:cacheprovider tests/unit/test_pins.py
+          tests/unit/test_modal_app_images.py
+      - name: "Gate: conformance suites (ShardWorker + Store contracts)"
+        run: uv run pytest -q -p no:cacheprovider tests/conformance
+      - name: "Gate: full CPU suite"
+        run: uv run pytest -q -p no:cacheprovider -m "not nvlink and not modal"
+      - name: "Gate: test-order independence (full CPU suite, reversed)"
+        env:
+          FLORA_TEST_ORDER: reverse
+        run: uv run pytest -q -p no:cacheprovider -m "not nvlink and not modal"
       # G2: a whole multi-stage job (index -> plan -> orchestrate -> compose -> results) with the
       # real job system, fake models and injected faults; no Modal, no GPU. ep003 is
       # poison-pilled on purpose, so the job must end completed_with_errors (exit 3).
-      - name: Local end-to-end job (flora run --local --fake-models)
+      - name: "Gate: local end-to-end job (flora run --local --fake-models)"
         timeout-minutes: 2
         run: |
           demo="$RUNNER_TEMP/flora-demo"
@@ -42,13 +84,49 @@ jobs:
           uv run flora results --job local-demo --stage reward.terminal --store "$demo/faults"
 
   # Exercises NVIDIA's real code (downloaded at test time, never stored in the repo). CPU only.
+  # The NVIDIA files live only in the runner and in this repo's Actions cache; they are never
+  # uploaded as artifacts (docs/ci.md).
   nvlink:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           python-version: "3.12"
-      - run: uv sync --group dev --group nvlink
-      - run: uv run python scripts/fetch_nv_code.py --with-processor
-      - run: uv run pytest -q -m nvlink
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          cache-suffix: nvlink
+          prune-cache: true  # keep the cache small: torch wheels re-download faster than restore
+      - name: Install (dev + nvlink groups, CPU torch stack)
+        run: uv sync --group dev --group nvlink
+      - name: Resolve NVIDIA code pins (cache key)
+        id: nvpins
+        run: |
+          revs=$(uv run python -c 'from flora_deploy.config.pins import PINS_BY_KEY as P
+          print("-".join(P[k].revision for k in ("tempseg_code", "captioner_code", "rewarder")))')
+          echo "key=nv-code-v1-${revs}-${{ hashFiles('scripts/fetch_nv_code.py') }}" >> "$GITHUB_OUTPUT"
+      - name: Restore NVIDIA code cache
+        id: nvcache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/flora-deploy/nv
+          key: ${{ steps.nvpins.outputs.key }}
+      - name: Fetch NVIDIA code pins (cache miss only)
+        if: steps.nvcache.outputs.cache-hit != 'true'
+        run: uv run python scripts/fetch_nv_code.py --with-processor
+      - name: "Gate: NVIDIA code present (nvlink tests must not skip for want of code)"
+        run: |
+          uv run python - <<'PY'
+          from pathlib import Path
+          from flora_deploy.config.pins import PINS_BY_KEY
+          from flora_deploy.layout import NV_CODE_CACHE_DEFAULT, snapshot_dirname
+          root = Path(NV_CODE_CACHE_DEFAULT).expanduser()
+          for key in ("tempseg_code", "captioner_code", "rewarder"):
+              d = root / snapshot_dirname(PINS_BY_KEY[key]) / "batch_utils"
+              n = sum(1 for p in d.rglob("*") if p.is_file()) if d.is_dir() else 0
+              assert n, f"{key}: no NVIDIA code at {d}"
+              print(f"{key}: {n} files")
+          PY
+      - name: "Gate: nvlink (NVIDIA's real code, CPU; includes the suite-order test)"
+        run: uv run pytest -q -p no:cacheprovider -m nvlink -rs --durations=15

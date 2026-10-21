@@ -558,7 +558,27 @@ def test_concurrent_shard_is_refused(tmp_path):
 # --- determinism ----------------------------------------------------------------------------
 
 
-def test_determinism_label_and_drift(tmp_path):
+def _cpu_torch():
+    """A torch stand-in with torch's CPU-process defaults (deterministic algorithms off, cuDNN SDPA
+    on): what ``accel.determinism`` reads. Injected so the drift check is exercised identically
+    whether or not torch is installed (CI's test job has no torch: ``--group dev`` only)."""
+    from types import SimpleNamespace as NS
+
+    cuda = NS(matmul=NS(allow_tf32=False), flash_sdp_enabled=lambda: True,
+              mem_efficient_sdp_enabled=lambda: True, math_sdp_enabled=lambda: True,
+              cudnn_sdp_enabled=lambda: True)
+    return NS(__version__="cpu-stand-in",
+              backends=NS(cuda=cuda, cudnn=NS(deterministic=False, benchmark=False,
+                                              allow_tf32=True)),
+              are_deterministic_algorithms_enabled=lambda: False,
+              is_deterministic_algorithms_warn_only_enabled=lambda: False,
+              get_float32_matmul_precision=lambda: "highest")
+
+
+def test_determinism_label_and_drift(tmp_path, monkeypatch):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "torch", _cpu_torch())
     eps = [("e0", receipt("e0"))]
     store, shard = world(tmp_path, eps)
     eng = segcap_fake_engine(Script())
