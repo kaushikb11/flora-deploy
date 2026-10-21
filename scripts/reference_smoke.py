@@ -174,6 +174,14 @@ def concurrency_experiment(args) -> int:
             if "c1" in runs:
                 summary["identity"] = compare_runs(runs["c1"]["results"], runs[tag]["results"])
         final = worker.report.remote()
+    if args.repeat > 1:  # the same episode run K times in one batch: r0 vs r1..rK-1
+        summary["repeat_identity"] = {}
+        for k, out in runs.items():
+            res = out["results"]
+            first = {base_name(n): r for n, r in res.items() if n.endswith("-r0")}
+            for j in range(1, args.repeat):
+                other = {base_name(n): r for n, r in res.items() if n.endswith(f"-r{j}")}
+                summary["repeat_identity"][f"{k}:r0-vs-r{j}"] = compare_runs(first, other)
     summary["container_age_s"] = final["container_age_s"]
     summary["final_gpu"] = final["gpu_now"]
     summary["local_wall_s"] = round(time.monotonic() - t0, 1)
@@ -189,7 +197,7 @@ def concurrency_experiment(args) -> int:
     for k in runs:
         print(k, "batch:", json.dumps({x: y for x, y in summary[k]["batch"].items()
                                        if x != "calls"}, indent=1))
-    for key in ("identity", "cross_run", "skipped"):
+    for key in ("identity", "repeat_identity", "cross_run", "skipped"):
         if key in summary:
             print(key, json.dumps(summary[key], indent=1))
     print(f"container age {summary['container_age_s']}s; local wall {summary['local_wall_s']}s")

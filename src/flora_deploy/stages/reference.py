@@ -454,7 +454,9 @@ TIMING_FIELDS = ("elapsed_s",)  # NVIDIA result fields that are wall-clock, not 
 def locked_generate(generate: Callable, lock) -> Callable:
     """NVIDIA's ``generate`` run under ``lock`` (an ``observe.TimedLock``) and timed."""
     import functools
+    import hashlib
 
+    from flora_deploy.observe.events import current_recorder, emit_json
     from flora_deploy.observe.timers import timed
 
     inner = timed(generate, GPU_LOCK_LABEL)
@@ -462,7 +464,13 @@ def locked_generate(generate: Callable, lock) -> Callable:
     @functools.wraps(generate)
     def generate_locked(*args, **kwargs):
         with lock.held(GPU_LOCK_LABEL):
-            return inner(*args, **kwargs)
+            text = inner(*args, **kwargs)
+            if current_recorder() is not None:
+                # Printed right after NVIDIA's generation_end line (still under the lock), so a
+                # log pairs each call's input_tensor_digest with a hash of its output text.
+                emit_json({"kind": "generate_output", "sha256": hashlib.sha256(
+                    str(text).encode()).hexdigest()})
+            return text
 
     generate_locked.__flora_gpu_lock__ = lock
     return generate_locked

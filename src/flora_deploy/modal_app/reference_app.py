@@ -76,6 +76,25 @@ def _read_text(path: str) -> str | None:
         return None
 
 
+def _determinism_flags() -> dict:
+    """Process-wide torch settings that decide whether identical inputs give identical outputs."""
+    import importlib.util
+
+    import torch
+
+    return {
+        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+        "cudnn_benchmark": torch.backends.cudnn.benchmark,
+        "cudnn_deterministic": torch.backends.cudnn.deterministic,
+        "matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+        "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+        "optional_kernels": {m: importlib.util.find_spec(m) is not None
+                             for m in ("fla", "causal_conv1d", "flash_attn", "triton")},
+    }
+
+
 def _gpu_memory() -> dict:
     import subprocess
 
@@ -202,6 +221,7 @@ class ReferenceWorker:
             "cpu_count": os.cpu_count(),
             "sched_affinity": len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity")
             else None,
+            "determinism": _determinism_flags(),
             "cgroup_cpu_max": _read_text("/sys/fs/cgroup/cpu.max"),
             "cgroup_memory_max": _read_text("/sys/fs/cgroup/memory.max"),
             "nv_audit_kinds": sorted(self.session.audit),
