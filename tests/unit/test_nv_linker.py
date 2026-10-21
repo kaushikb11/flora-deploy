@@ -165,7 +165,10 @@ def test_foreign_module_conflicts(isolated, tmp_path, monkeypatch, name):
     foreign.mkdir()
     module = type(sys)(name)
     module.__file__ = str(foreign / f"{name}.py")
-    monkeypatch.setitem(sys.modules, name, module)
+    # Not monkeypatch.setitem: its undo runs after ``isolated`` restored the real family's
+    # module of this name and would delete it (order-dependent KeyError: 'adapter' in the
+    # nvlink bootstrap test). ``isolated`` removes family-named modules itself.
+    sys.modules[name] = module
     with pytest.raises(FamilyConflictError, match=name):
         load(Family.SEGCAP, make_tree(tmp_path, "a@00000000aaaaaaaa"))
     assert linker.loaded_family() is None
@@ -373,6 +376,64 @@ def test_verify_requested_later_runs(isolated, tmp_path):
         linker.load_family(Family.SEGCAP, code, pinned_digests=pinned)
     (code / "batch_utils" / "notes.txt").unlink()
     assert linker.load_family(Family.SEGCAP, code, pinned_digests=pinned).verified
+    assert nv._finder.digests is not None  # later imports are hash-checked now
+    (code / "batch_utils" / "engine.py").write_text("ENGINE = 666\n")
+    with pytest.raises(linker.CodeProvenanceError, match="changed after"):
+        nv.module("engine")
+
+
+def test_verify_later_refuses_code_that_already_ran_unverified(isolated, tmp_path):
+    """L2: verifying after unverified code ran must not claim ``verified`` for it."""
+    code = make_tree(tmp_path, "a@00000000aaaaaaaa")
+    nv = linker.load_family(Family.SEGCAP, code, verify_manifest=False)
+    assert nv.module("core").CORE == 42  # core + engine ran from the (unverified) files
+    (code / "batch_utils" / "engine.py").write_text("ENGINE = 666\n")
+    write_manifests(code)  # the files on disk now verify against new pins...
+    with pytest.raises(linker.CodeProvenanceError, match="ran before verification"):
+        linker.load_family(Family.SEGCAP, code, pinned_digests=pins_for(code))
+    assert not nv.verified and nv._finder.digests is None  # ...but what ran does not
+
+
+def _tree_with_data(tmp_path):
+    code = make_tree(tmp_path, "a@00000000aaaaaaaa")
+    (code / "batch_utils" / "models.json").write_text('{"captioner": {"revision": "x"}}')
+    write_manifests(code)
+    return code
+
+
+def test_audit_reasserts_finder_and_rechecks_data_files(isolated, tmp_path):
+    code = _tree_with_data(tmp_path)
+    nv = load(Family.SEGCAP, code)
+    report = nv.audit_report()
+    assert report["ok"] and report["verified"] and report["data_files"] >= 3  # + manifests
+
+    class Foreign:
+        def find_spec(self, name, path=None, target=None):
+            return None
+
+    sys.meta_path.insert(0, Foreign())
+    nv.audit()
+    assert sys.meta_path[0] is nv._finder and nv.audit_report()["finder_reasserted"] == 1
+    (code / "batch_utils" / "models.json").write_text('{"captioner": {"revision": "y"}}')
+    with pytest.raises(linker.CodeManifestError, match="models.json changed"):
+        nv.audit()
+    assert nv.audit(data=False)  # module checks alone still pass
+
+
+def test_audit_rejects_module_run_by_another_loader(isolated, tmp_path):
+    code = make_tree(tmp_path, "a@00000000aaaaaaaa")
+    nv = load(Family.SEGCAP, code)
+    # a module whose __file__ is the verified file, but executed by someone else's loader
+    impostor = type(sys)("lazy_mod")
+    impostor.__file__ = str(code / "batch_utils" / "vendor" / "lazy_mod.py")
+    sys.modules["lazy_mod"] = impostor
+    with pytest.raises(linker.CodeProvenanceError, match="not the family loader"):
+        nv.audit()
+    del sys.modules["lazy_mod"]
+    nv.module("lazy").get()
+    loader = sys.modules["lazy_mod"].__spec__.loader
+    assert loader.executed_source == (code / "batch_utils/vendor/lazy_mod.py").read_bytes()
+    assert "lazy_mod" in nv.audit()
 
 
 def test_nvref_pickles_and_resolves(isolated, tmp_path):

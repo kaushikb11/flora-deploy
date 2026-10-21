@@ -125,7 +125,9 @@ class ActivePatches:
         return dict(schema=PATCH_SCHEMA, patches=[p.provenance() for p in self.patches])
 
     def episode(self):
-        """Context manager bounding the per-episode caches (see ``AccelState.episode``)."""
+        """Context manager scoping caches and open decoders to one episode of the current
+        thread / task; overlapping episodes on other threads get their own scopes (see
+        ``AccelState.episode``). Enter it inside the thread that runs the episode."""
         return self.state.episode()
 
     def stats(self) -> dict:

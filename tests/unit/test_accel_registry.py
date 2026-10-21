@@ -191,10 +191,37 @@ def test_state_inline_and_pool_submit_and_episode():
         fut = st.submit(lambda: 1 / 0)
         with pytest.raises(ZeroDivisionError):
             fut.result()
-        st.frames.put("k", Image.new("RGB", (2, 2)))
+        st.frames.put("outside", Image.new("RGB", (2, 2)))  # default scope
         with st.episode():
+            assert st.frames.get("outside") is None  # an episode has its own scope
+            st.frames.put("k", Image.new("RGB", (2, 2)))
+            scope = st.scope()
             with st.episode():
-                pass
+                assert st.scope() is scope  # nested: same scope
             assert st.frames.get("k") is not None  # inner exit keeps caches
-        assert st.frames.get("k") is None  # outer exit clears
+            # pool tasks run in the submitting context: same scope
+            assert st.submit(st.scope).result() is scope
+        assert scope.closed and len(scope.frames) == 0  # outer exit clears
+        assert st.frames.get("k") is None and st.frames.get("outside") is not None
+        st.reset()
+        assert st.frames.get("outside") is None
         st.close()
+
+
+def test_byte_budget_is_shared_across_lrus():
+    from flora_deploy.accel.state import ByteBudget
+
+    budget = ByteBudget(50)
+    a, b = ByteLRU(40, sizeof=len, budget=budget), ByteLRU(40, sizeof=len, budget=budget)
+    for i in range(3):
+        a.put(f"a{i}", "x" * 10)
+    for i in range(3):
+        b.put(f"b{i}", "x" * 10)
+    assert a.nbytes + b.nbytes == budget.total <= 50 and budget.peak <= 50
+    assert b.get("b2") is not None and len(a) + len(b) == 5  # one oldest entry gave way
+    a.put("a9", "x" * 30)  # a is now the largest: it gives way first
+    assert budget.total <= 50 and a.get("a9") is not None and len(b) >= 1
+    a.close()
+    assert budget.total == b.nbytes
+    a.put("late", "x")  # closed: dropped
+    assert a.get("late") is None

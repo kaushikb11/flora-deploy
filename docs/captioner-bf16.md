@@ -87,14 +87,41 @@ module globals, and a unit test checks that against NVIDIA's bytecode.
 - `validate_manifest(derived_dir)` checks our receipt instead. Any other path goes to NVIDIA's
   function.
 
-The receipt check runs at install and again inside `Session.load`:
+The checks (review 3, H1 and M1) run at install and again inside `Session.load`:
 
-- **Fast check.** It confirms the schema, `ok`, the converter version, and that the source revision
-  and manifest digest equal `pins.py`. It confirms the files on disk are exactly the receipt's
-  files, with the recorded sizes. Small and non-shard files get a full sha256, and each shard's
-  safetensors header gets a sha256. This reads about 20 MB in 0.1–3.6 s.
-- **Full check.** `full_verify=True` or `FLORA_CAPTIONER_FULL_VERIFY=1` re-hashes all 54.7 GB,
-  once per patch.
+- **Pinned receipt.** The bytes of `derived_receipt.json` must hash to
+  `DERIVED_PINS["captioner-bf16"].receipt_sha256` in `pins.py` (the value in the table above).
+  The receipt is parsed from exactly those bytes. A pin of `None` fails closed. The schema, `ok`,
+  converter version (code = pin = receipt), source revision and NVIDIA manifest digest must
+  equal the pins.
+- **Full hash by default.** The directory must hold exactly the receipt's files, all regular
+  files: symlinks, directories and devices are refused, and files are opened with `O_NOFOLLOW`.
+  Every byte of every file is sha256-hashed on 8 threads, and a file that changes while it is
+  hashed is refused. The old default (headers only for shards ≥ 64 MiB) accepted a byte flipped
+  inside a shard (review p3). NVIDIA's `verify_gdn` cannot catch that either, because it compares
+  against the derived shards.
+- **Overlap with the TempSeg load.** `install(nv, background=True)` does the cheap checks, starts
+  the hash on its own thread and returns. `Session.load('captioner')` (or `patch.wait()`) joins
+  it and raises if it failed. A failed verification fails every later load too. The hash also
+  warms the page cache for `from_pretrained`. Once the full hash has passed, later loads re-check
+  the pinned receipt plus each file's (device, inode, size, mtime, ctime) stamp, the way NVIDIA's
+  own `validate_manifest` reuses a verification.
+- **Opt-out.** `full_verify=False` or `FLORA_CAPTIONER_FULL_VERIFY=0` falls back to the fast
+  check: sizes, full hashes of non-shard and small files, header hashes of large shards. It is
+  recorded as `full_verify_opt_out: true` in `patch.provenance()`.
+- **Toolchain (M1).** The torch, transformers and safetensors versions of the process (local
+  build tag such as `+cu128` ignored) must equal both the receipt's `tools` and
+  `DerivedPin.proven_with` (torch 2.11.0, transformers 5.8.1, safetensors 0.7.0). The dtype plan
+  is rebuilt with NVIDIA's own `_keep_native_gdn_fp32` (from the linked snapshot) and
+  transformers' `_get_dtype_plan` on the meta device, and `DtypePolicy.record()` must equal the
+  receipt's `dtype_policy`. Any difference fails closed, because the proof would no longer cover
+  the load: for example, a transformers upgrade that keeps another module in FP32.
+  - This runs synchronously in `install`, because building a meta model touches torch's
+    process-wide default dtype. Call `install` before any model load and before episode threads
+    start.
+  - `check_toolchain=False` opts out, and is recorded in provenance.
+- `patch.provenance()` records what was checked: the pinned digest, the opt-outs, the toolchain,
+  the dtype plan and every verification report (`full` / `fast` / `reuse`, bytes hashed, timing).
 
 `_keep_native_gdn_fp32`, the `from_pretrained` call, the loading-info check, residency, and
 `verify_gdn` all run unchanged. `uninstall()` restores NVIDIA's functions. No NVIDIA file is
@@ -124,9 +151,13 @@ Verdict: **identical**.
 | Step | Before (NVIDIA path) | After (patched) |
 |---|---|---|
 | Copy Volume → local disk | 172 s (109.4 GB) | none |
-| Integrity check | 101 s (`manifest_full_verification`) | 0.1 s (+3.6 s check at install) |
+| Integrity check | 101 s (`manifest_full_verification`) | 0.1 s (+3.6 s fast check at install; see below) |
 | `from_pretrained` + `verify_gdn` + processor | 27 s (from local disk) | 51 s (from the Volume) |
 | **Total** | **≈305 s** | **≈56 s** |
+
+These timings used the old fast check. The full hash that is now the default reads 54.7 GB.
+At the Volume's measured read rate, that is roughly 20–40 s on 8 threads. Run it with
+`background=True` so it overlaps the TempSeg load. Not yet measured on Modal.
 
 The copy in this run took 172 s; the earlier smoke run measured 123 s. The patched load also needs
 no 109 GB of local disk. Weights are now read from the Volume rather than from local NVMe; if
@@ -145,11 +176,14 @@ uv run modal run src/flora_deploy/modal_app/convert_app.py --step identity
 ```
 
 `convert` reuses a passing receipt of the same converter version unless `--force` is given.
-Changing the converter, torch, transformers or the pins means re-running both steps.
+Changing the converter, torch, transformers or the pins means re-running both steps. The runtime
+enforces this: after a re-run, update `DERIVED_PINS["captioner-bf16"]` in `pins.py`, setting
+`receipt_sha256` to the new receipt's sha256 and `proven_with` to the identity run's versions.
+Until then, every load fails closed.
 
 ## Not done here
 
-- Wiring `install` into `ReferenceWorker`. `reference_app.py` belongs to another owner.
-- Pinning the receipt digest in `pins.py`. Today the receipt is trusted the way NVIDIA's own
-  manifest is: it sits next to the files on the Volume, and it is bound to the pinned source
-  through the per-shard source hashes.
+- Wiring `install` into `ReferenceWorker`. `reference_app.py` belongs to another owner. Call
+  `install(nv, background=True)` once per worker, before `Session.load('tempseg')`, and record
+  `patch.provenance()`.
+- Measuring the default full hash on Modal.

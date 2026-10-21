@@ -225,3 +225,34 @@ RUNTIME = {
     "python_standalone_release": "20240107",
     "python_standalone": "3.12.1",
 }
+
+
+# Derived artifacts we build from a pinned snapshot (OPT-2, ``docs/captioner-bf16.md``). The
+# runtime refuses a derived copy whose receipt bytes do not hash to ``receipt_sha256`` (``None``
+# fails closed: nothing is trusted until a receipt is pinned here), whose converter version
+# differs, or whose recorded toolchain differs from ``proven_with`` (the versions the GPU
+# identity proof ran with; local build tags such as ``+cu130`` are not compared).
+@dataclass(frozen=True)
+class DerivedPin:
+    key: str
+    source_key: str  # PINS_BY_KEY key of the snapshot it is derived from
+    converter_version: int
+    receipt_sha256: str | None
+    proven_with: tuple[tuple[str, str], ...] = ()
+
+
+DERIVED_PINS: tuple[DerivedPin, ...] = (
+    # Receipt written 2026-10-21 by ``convert_app.py --step convert`` to
+    # flora-weights:/derived/captioner-bf16@fef0bbfe.../derived_receipt.json (value recorded in
+    # docs/captioner-bf16.md); identity proven on an H200 with torch 2.11.0+cu130,
+    # transformers 5.8.1 and safetensors 0.7.0.
+    DerivedPin(
+        key="captioner-bf16",
+        source_key="captioner",
+        converter_version=1,
+        receipt_sha256="0e91e467c7ffdb636573e779672d11b203571f7869ca94317f1005eb700d9c65",
+        proven_with=(("torch", "2.11.0"), ("transformers", "5.8.1"), ("safetensors", "0.7.0")),
+    ),
+)
+
+DERIVED_PINS_BY_KEY: dict[str, DerivedPin] = {p.key: p for p in DERIVED_PINS}

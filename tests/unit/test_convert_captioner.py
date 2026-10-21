@@ -186,6 +186,13 @@ def test_conversion_is_bit_identical_to_nvidia_load(fp32_snapshot, keep_patch, t
     assert not compare_models(a, plain)["identical"]
 
 
+def _dpin(dest: Path):
+    """A DerivedPin for this toy receipt (the real one pins the Volume's receipt)."""
+    from flora_deploy.accel.captioner_load import pinned_derived
+
+    return replace(pinned_derived(), receipt_sha256=_sha(dest / cc.DERIVED_RECEIPT))
+
+
 def test_receipt_checks(fp32_snapshot, keep_patch, tmp_path):
     src, pin = fp32_snapshot
     dest = tmp_path / "derived"
@@ -197,27 +204,53 @@ def test_receipt_checks(fp32_snapshot, keep_patch, tmp_path):
     assert receipt["converter"]["version"] == cc.CONVERTER_VERSION
     assert receipt["converter"]["module_sha256"] == _sha(Path(cc.__file__))
     assert "torch" in receipt["tools"] and receipt["source"]["pin"]["revision"] == pin.revision
+    dpin = _dpin(dest)
 
-    assert verify_derived(dest, pin=pin)["mode"] == "fast"
-    assert verify_derived(dest, pin=pin, full=True)["bytes_hashed"] == receipt["bytes"]
+    report = verify_derived(dest, pin=pin, derived_pin=dpin)
+    assert report["mode"] == "full" and report["bytes_hashed"] == receipt["bytes"]
+    assert verify_derived(dest, pin=pin, derived_pin=dpin, full=False)["mode"] == "fast"
     with pytest.raises(DerivedReceiptError, match="manifest digest"):
-        verify_derived(dest)  # the real pin's manifest digest does not match the toy one
+        verify_derived(dest, derived_pin=dpin)  # the real pin's manifest digest differs
+    with pytest.raises(DerivedReceiptError, match="!= pinned"):
+        verify_derived(dest, pin=pin)  # the real receipt pin is not this toy receipt
 
-    # Corrupt one data byte of the largest shard: only the full check sees it (by design).
+    # Corrupt one data byte of the largest shard: the default (full) check sees it.
     shard = max(dest.glob("model-*.safetensors"), key=lambda p: p.stat().st_size)
     data = bytearray(shard.read_bytes())
     data[-1] ^= 1
     shard.write_bytes(bytes(data))
-    from flora_deploy.accel.captioner_load import SMALL_FILE
-
-    assert shard.stat().st_size < SMALL_FILE  # so the fast check hashes it fully
     with pytest.raises(DerivedReceiptError, match="sha256 mismatch"):
-        verify_derived(dest, pin=pin)
+        verify_derived(dest, pin=pin, derived_pin=dpin)
     data[-1] ^= 1
     shard.write_bytes(bytes(data))
     (dest / "stray.bin").write_bytes(b"x")
     with pytest.raises(DerivedReceiptError, match="extra"):
-        verify_derived(dest, pin=pin)
+        verify_derived(dest, pin=pin, derived_pin=dpin)
+
+
+def test_dtype_plan_rebuilt_at_load_matches_receipt(fp32_snapshot, keep_patch, tmp_path):
+    """M1: what ``install`` rebuilds (NVIDIA's keep-FP32 patch + transformers' dtype plan on the
+    meta device, from the derived config) equals the receipt's plan; a changed rule does not."""
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5PreTrainedModel
+
+    from flora_deploy.accel import captioner_load as cl
+
+    src, pin = fp32_snapshot
+    dest = tmp_path / "derived"
+    receipt = cc.convert(src, dest, keep_patch, pin=pin, workers=1)
+    now = cl.nvidia_policy_record(None, dest, keep_fp32_patch=keep_patch)
+    assert cl.check_dtype_policy(receipt, now) == receipt["dtype_policy"]
+
+    def keep_more(cls):  # e.g. a transformers upgrade that keeps another module in FP32
+        keep_patch(cls)
+        cls._keep_in_fp32_modules_strict = [*cls._keep_in_fp32_modules_strict, "norm"]
+
+    changed = cl.nvidia_policy_record(None, dest, keep_fp32_patch=keep_more)
+    Qwen3_5PreTrainedModel._keep_in_fp32_modules_strict = None
+    with pytest.raises(DerivedReceiptError, match="dtype plan differs"):
+        cl.check_dtype_policy(receipt, changed)
+    # and the receipt's toolchain is this process's (convert ran here)
+    assert cl.check_toolchain(receipt, replace(_dpin(dest), proven_with=()))
 
 
 def test_large_file_fast_check_uses_header(fp32_snapshot, keep_patch, tmp_path, monkeypatch):
@@ -226,18 +259,19 @@ def test_large_file_fast_check_uses_header(fp32_snapshot, keep_patch, tmp_path, 
     src, pin = fp32_snapshot
     dest = tmp_path / "derived"
     cc.convert(src, dest, keep_patch, pin=pin, workers=1)
+    dpin = _dpin(dest)
     monkeypatch.setattr(cl, "SMALL_FILE", 1024)
-    report = verify_derived(dest, pin=pin)
+    report = verify_derived(dest, pin=pin, derived_pin=dpin, full=False)
     shards = list(dest.glob("model-*.safetensors"))
     assert report["bytes_hashed"] < sum(p.stat().st_size for p in shards)
-    # Header tamper (dtype/shape/offsets) is caught by the fast check.
+    # Header tamper (dtype/shape/offsets) is caught by the fast (opt-out) check.
     shard = shards[0]
     raw = bytearray(shard.read_bytes())
     i = raw.index(b'"BF16"')
     raw[i : i + 6] = b'"F16" '
     shard.write_bytes(bytes(raw))
     with pytest.raises(DerivedReceiptError, match="header"):
-        verify_derived(dest, pin=pin)
+        verify_derived(dest, pin=pin, derived_pin=dpin, full=False)
 
 
 def test_source_must_match_nvidia_manifest(fp32_snapshot, keep_patch, tmp_path):

@@ -204,6 +204,22 @@ class SourceDecoder:
             if self._cursor is not None:
                 self._cursor.close()
                 self._cursor = None
+        self.state.note_closed(self)
+
+    def close_if_idle(self) -> bool:
+        """Close the open file unless a request is running (``AccelState.max_open_decoders``);
+        a later request reopens it."""
+        if not self.lock.acquire(blocking=False):
+            return False
+        try:
+            if self._cursor is None:
+                return False
+            self._cursor.close()
+            self._cursor = None
+        finally:
+            self.lock.release()
+        self.state.note_closed(self)
+        return True
 
     @property
     def seekmap(self) -> SeekMap | None:
@@ -239,8 +255,14 @@ class SourceDecoder:
 
     def decode(self, missing: list[int], canonical: bool) -> dict[int, Any]:
         """Converted frames for sorted, in-range, distinct ``missing`` (NVIDIA semantics)."""
-        with self.lock:
-            return self._decode(missing, canonical)
+        try:
+            with self.lock:
+                return self._decode(missing, canonical)
+        finally:
+            if self._cursor is not None:
+                self.state.note_open(self)
+            else:
+                self.state.note_closed(self)
 
     def _decode(self, missing: list[int], canonical: bool) -> dict[int, Any]:
         crgb = self._canonical_rgb() if canonical else None
@@ -378,11 +400,13 @@ class SourceKey:
 
 
 class FrameStore:
-    """Per-``AccelState`` registry of ``SourceDecoder``s plus the frame LRU."""
+    """Per-episode-scope registry of ``SourceDecoder``s plus the scope's frame LRU
+    (``AccelState.frame_store`` hands out a router to the current scope's store)."""
 
-    def __init__(self, nv, state):
+    def __init__(self, nv, state, scope=None):
         self.nv = nv
         self.state = state
+        self.scope = scope if scope is not None else state.scope()
         self._lock = threading.Lock()
         self._keys: dict[int, tuple[Any, SourceKey]] = {}
         self._tokens: dict[tuple, SourceKey] = {}
@@ -409,11 +433,11 @@ class FrameStore:
     def decoder(self, video) -> SourceDecoder:
         key = self.key(video)
         with self._lock:
-            dec = self.state.decoders.get(key)
+            dec = self.scope.decoders.get(key)
             if dec is None:
                 errors = self.nv.media.InputError
                 dec = SourceDecoder(video, self.state, self._canonical_rgb, errors)
-                self.state.decoders[key] = dec
+                self.scope.decoders[key] = dec
                 self.state.count("sources_opened")
             return dec
 
@@ -469,7 +493,7 @@ class FrameStore:
         for i in ahead:
             if len(have) + len(extra) >= budget:
                 break
-            if i not in have and self.state.frames.get((unit, i)) is None:
+            if i not in have and self.scope.frames.get((unit, i)) is None:
                 extra.append(i)
         return extra
 
@@ -487,7 +511,7 @@ class FrameStore:
                         done.append(i)
                         del demand[i]
         for i in done:  # no announced use left: first in line for eviction
-            self.state.frames.demote((unit, i))
+            self.scope.frames.demote((unit, i))
 
     def serve(self, unit: tuple, want: set[int], unit_bytes: int,
               produce: Callable[[list[int]], dict[int, Any]]) -> dict[int, Any]:
@@ -495,7 +519,7 @@ class FrameStore:
         out: dict[int, Any] = {}
         missing = []
         for i in sorted(want):
-            hit = self.state.frames.get((unit, i))
+            hit = self.scope.frames.get((unit, i))
             if hit is None:
                 missing.append(i)
             else:
@@ -509,7 +533,7 @@ class FrameStore:
                 self.state.count("lookahead_prefetched", len(extra))
             produced = produce(todo)
             for i in todo:
-                self.state.frames.put((unit, i), produced[i])
+                self.scope.frames.put((unit, i), produced[i])
             for i in missing:
                 out[i] = produced[i]
         self._consume(unit, want)
@@ -518,7 +542,7 @@ class FrameStore:
 
 def make_frames_for(nv, original: Callable, state) -> Callable:
     """Replacement for NVIDIA ``frames_for(videos, wanted, mosaic='YAM')``."""
-    store: FrameStore = state.frame_store(nv)
+    store = state.frame_store(nv)  # routes to the current episode scope's FrameStore
     errors = nv.media.InputError
 
     def frames_for(videos, wanted, mosaic="YAM"):
@@ -599,7 +623,7 @@ def make_predict(nv, original: Callable, state) -> Callable:
     """``Predictor.predict`` (pipeline.py:21-38), unchanged, after announcing the frame plans of
     every window in the request (computed with NVIDIA's own ``window_from_payload`` and
     ``temporal_frame_plan``, which are pure)."""
-    store: FrameStore = state.frame_store(nv)
+    store = state.frame_store(nv)
 
     def predict(self, request):
         try:
@@ -644,7 +668,7 @@ def make_caption_three(original: Callable, state) -> Callable:
 def make_plans_for_episode(nv, original: Callable, state) -> Callable:
     """``plans.plans_for_episode``, unchanged; inside ``caption_three`` its plans are announced
     (caption_three builds every plan before it requests any frame, pipeline.py:119-125)."""
-    store: FrameStore = state.frame_store(nv)
+    store = state.frame_store(nv)
 
     def plans_for_episode(ep, clocks):
         plans = original(ep, clocks)

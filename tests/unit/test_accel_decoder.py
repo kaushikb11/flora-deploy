@@ -135,3 +135,86 @@ def test_decoder_errors_like_nvidia(clips):
     forged = FakeVideo(video.path, "0" * 64, video.rate, video.pts_us, 0, video.size)
     assert not SourceDecoder(forged, state, lambda: None, ValueError).trusted
     state.close()
+
+
+def test_overlapping_episodes_are_scoped_and_bounded(tmp_path):
+    """W3-A: episodes overlap on threads sharing one state. Each episode's decoders close when
+    *it* exits (not when all do), open decoders and cache bytes stay bounded across episodes,
+    and every frame still equals a decode from frame 0."""
+    import os
+    import threading
+    import types
+    from concurrent.futures import ThreadPoolExecutor
+
+    from flora_deploy.accel.framecache import make_frames_for
+
+    def clip(name, spec):
+        path = synth.encode(tmp_path / f"{name}.mp4", spec)
+        pts, digests = reference(path)
+        sha = hashlib.sha256(path.read_bytes()).hexdigest()
+        return FakeVideo(path, sha, Fraction(spec.rate), pts, 0, spec.size), digests
+
+    long_video, long_digests = clip("long", Spec(120, size=(64, 48), gop=12, seed=99))
+    shorts = [clip(f"s{i}", Spec(30, size=(48, 32), gop=10, seed=i)) for i in range(12)]
+    nv = types.SimpleNamespace(media=types.SimpleNamespace(InputError=ValueError),
+                               vendor=lambda name: None)
+    state = AccelState(workers=2, cache_bytes=60_000, max_total_cache_bytes=100_000,
+                       max_open_decoders=3)
+    frames_for = make_frames_for(nv, lambda *a, **k: pytest.fail("delegated"), state)
+
+    def nfds():
+        return len(os.listdir("/dev/fd"))
+
+    def same(got, digests):
+        return all(hashlib.sha256(im.tobytes()).hexdigest() == digests[i]
+                   for i, im in got.items())
+
+    fd0 = nfds()
+    started, release = threading.Event(), threading.Event()
+    long_errors: list = []
+
+    def long_episode():
+        try:
+            with state.episode():
+                for k, wanted in enumerate(([0, 5, 30], list(range(40, 80, 3)), [119])):
+                    assert same(frames_for({"main": long_video}, wanted), long_digests)
+                    if k == 0:
+                        started.set()
+                release.wait(60)
+                # still usable after the other episodes closed theirs
+                assert same(frames_for({"main": long_video}, [3, 100]), long_digests)
+        except BaseException as exc:  # noqa: BLE001 - reported below
+            long_errors.append(exc)
+            started.set()
+
+    def short_episode(item):
+        video, digests = item
+        with state.episode():
+            for wanted in ([1, 7, 20], list(range(0, 30, 4)), [29, 2]):
+                got = frames_for({"main": video}, wanted)
+                assert list(got) == sorted(set(wanted)) and same(got, digests)
+            return state.scope()
+
+    t = threading.Thread(target=long_episode)
+    t.start()
+    assert started.wait(60)
+    with ThreadPoolExecutor(4) as pool:
+        scopes = list(pool.map(short_episode, shorts))
+    stats = state.stats()
+    # every short episode is closed although the long one is still running
+    assert all(s.closed and not s.decoders and s.nbytes() == 0 for s in scopes)
+    assert stats["active_episodes"] == 1
+    assert stats["open_decoders"] <= 1  # only the long episode's decoder may stay open
+    assert nfds() - fd0 <= 1
+    # bounded across concurrent episodes: 3 idle + one busy decoder per running request
+    assert stats["peak_open_decoders"] <= 3 + 5
+    assert stats["cache_bytes_total_peak"] <= 100_000
+    release.set()
+    t.join(60)
+    assert not long_errors, long_errors
+    stats = state.stats()
+    assert stats["active_episodes"] == 0 and stats["open_decoders"] == 0
+    assert stats["cache_bytes_total"] == 0
+    assert stats["episodes"] == 13
+    state.close()
+    assert nfds() == fd0

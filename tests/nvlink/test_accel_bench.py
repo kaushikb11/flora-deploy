@@ -25,7 +25,7 @@ from flora_deploy.nv.session import CachedSession
 
 pytestmark = pytest.mark.nvlink
 
-TENSOR_KEYS = ("input_ids", "attention_mask", "video_grid_thw", "pixel_values_videos")
+# every tensor NVIDIA's generate() hashes (models.py:171), mm_token_type_ids included
 EPISODES = {
     # id: (spec per role, pool, caption profile)
     "1view-640x360-45s": ([Spec(1350, size=(640, 360), gop=60, seed=1)], "human", "Human"),
@@ -78,7 +78,7 @@ def _episode(nv, procs, monkeypatch, videos, pool, profile):
             pass
 
     def generate(model, proc, inputs, budget):
-        log.append({k: inputs[k].numpy().tobytes() for k in TENSOR_KEYS if k in inputs})
+        log.append({k: v.numpy().tobytes() for k, v in inputs.items() if hasattr(v, "numpy")})
         return '{"segments":[]}' if budget == 1024 else f"caption {len(log)}"
 
     monkeypatch.setattr(nv.pipeline, "generate", generate)
