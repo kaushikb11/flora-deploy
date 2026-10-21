@@ -84,3 +84,22 @@ def test_upstream_segments_reads_parent_and_bisection_children(tmp_path):
     assert up(ref(uid="ds--c"), ctx).segments[0].start_s == 0.0  # not the foreign config's
     with pytest.raises(MissingUpstream):
         up(ref(uid="ds--z"), ctx)
+
+
+def test_upstream_segments_accepts_segment_stage_hash(tmp_path):
+    """H1: real runs key segment parts and stamp records with the segment *stage* hash."""
+    from flora_deploy.workers_impl.reward import ShardPartSink
+
+    store = LocalStore(tmp_path / "s")
+    jf = A.JobFiles(store, "job", "JOBHASH",
+                    stage_hashes={"segment": "SEGHASH", "caption": "CAPHASH"})
+    sink = ShardPartSink(jf, "segment", "segment-00000", "c1", tmp_path / "loc")
+    sink.add(records=[seg("ds--a", "whatever")])
+    sink.flush()
+    shard = Shard("caption-00000", "caption", ("ds--a", "ds--b"), 1.0,
+                  depends_on=("segment-00000",))
+    # A record of another config under the same stage path is still refused.
+    P.write_part(jf, "segment", "segment-00000", "c2", 0, [seg("ds--b", "FOREIGN")])
+    loaded = UpstreamSegments.load(jf, shard)
+    assert set(loaded) == {"ds--a"}
+    assert loaded["ds--a"].provenance.config_hash == "SEGHASH"
