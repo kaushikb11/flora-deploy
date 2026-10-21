@@ -1,6 +1,9 @@
 # Phase 0 execution plan: workstreams, subagents, gates
 
-> Companion to [`PLAN.md`](PLAN.md) §10 (P0) and §15. Status: proposed, 2026-10-21.
+> **Historical (archived 2026-10-22).** Phase 0 execution log: workstreams, waves and their
+> results. Superseded by [PLAN.md](../PLAN.md) v4. Do not update this file.
+
+> Companion to [`PLAN.md`](PLAN-v3.md) (v3) §10 (P0) and §15. Status: proposed, 2026-10-21.
 
 ## Goal of Phase 0
 
