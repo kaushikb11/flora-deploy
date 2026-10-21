@@ -1,5 +1,8 @@
 """`flora run --local --fake-models`: a whole job on this machine (``flora_deploy.local``).
 
+The ``flora run`` command itself is registered by ``cli/run.py``, which dispatches ``--local``
+here (one command: Modal by default, local with ``--local``).
+
 index → plan → orchestrate → compose with the real orchestrator, stores, worker runners and
 compose, deterministic fake models, no Modal and no GPU. Results go to a ``LocalStore`` directory
 (``--store``, default ``<config dir>/flora-local-store``) and are read with ``flora results``.
@@ -16,7 +19,7 @@ from typing import Annotated
 
 import typer
 
-from flora_deploy.cli._app import app, console
+from flora_deploy.cli._app import console
 
 EXIT = {"done": 0, "failed": 1, "completed_with_errors": 3, "budget_stopped": 4}
 
@@ -28,7 +31,6 @@ def _fail(msg: str, code: int = 2) -> typer.Exit:
     return typer.Exit(code=code)
 
 
-@app.command("run")
 def run(
     config: Annotated[Path, typer.Option("--config", "-c", help="flora.yaml")] = Path("flora.yaml"),
     local: Annotated[bool, typer.Option(
