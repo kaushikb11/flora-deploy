@@ -1,6 +1,18 @@
 # G3: cutting the `exact` preset's cost without changing any model input
 
-Status: analysis plus a CPU-proven implementation, 2026-10-21. **No GPU or Modal time was used.**
+Status: analysis plus a CPU-proven implementation, 2026-10-21; revised 2026-10-22 after review
+7b. **No GPU or Modal time was used.**
+
+> **Revision (review 7b, Fix-SC merge).** Shard overlap (lever 1) was **removed**. `exact` is
+> now only the certification reference, and overlap conflicted with the segcap worker's
+> one-shard-per-container contract (review 6 H2: plan, factory and runner all use
+> `max_inputs = 1` for segcap). It also had defects of its own: an engine-wide cancel flag that
+> failed sibling shards and newcomers, crash blame shared between co-tenant shards (a healthy
+> episode could be poison-pilled), and a Volume-refresh guard that counted running shards
+> instead of live episode threads. **Longest-first (lever 2) is kept and now actually reaches
+> the worker** (`FLORA_SEGCAP_SCHEDULING`). The refresh guard is kept, keyed on live episode
+> threads. Lever 1's cost range is corrected below for the record: **$28.6–31.2**, not
+> $28.6–29.8.
 Every projection below comes from component times already measured and recorded in
 `docs/exact-worker.md` (P1a-5s), `docs/perf-1.md`, `docs/exact-concurrency.md` (W3-A) and
 `docs/cold-start.md` (W3-B). It also uses the P1a-5s per-episode results (`flora-golden:/reference_runs/p1a5s-20261021T155655Z-ba42121d-fast/`).
@@ -43,17 +55,30 @@ One H200 container, c=4, `gpu_thread` on, cold cuDNN graph cache. One 6-episode 
 |---|---|---|---|---|---|---|
 | 0 | Today, P1a-5s as measured (longest-first order) | — | 6.41 | **$36.4** | — | — |
 | 0′ | Today in production: plan order | yes | ≈7.0 (model: +9.7%) | **≈$40** | — | — |
-| 2 | Longest-first order (LPT) | yes: start order only | 6.41 (recovers 0′ → 0) | **$36.4** (−9% vs 0′) | low | **yes** (`episode_order`) |
-| 1 | Shard overlap, `max_inputs` 2, shared slots (+ LPT) | yes: start time only | 5.04–5.25 | **$28.6–29.8** (≈−20%) | medium | **yes** (`shard_overlap`) |
-| 4a | Larger shards (3× target) instead of overlap | yes | 5.25–5.50 | $29.8–31.2 | config only | no (dominated by 1) |
+| 2 | Longest-first order (LPT) | yes: start order only | 6.41 (recovers 0′ → 0) | **$36.4** (−9% vs 0′) | low | **yes, wired** (`episode_order`) |
+| 1 | Shard overlap, `max_inputs` 2, shared slots (+ LPT) | yes: start time only | 5.04–5.49 | $28.6–31.2 (for the record) | medium | **removed** (review 7b) |
+| 4a | Larger shards (3× target) instead of overlap | yes | 5.25–5.50 | $29.8–31.2 | config only | no |
 | 4b | Long-lived containers (warm cuDNN cache) + 1 + 2 | yes (Perf-1: same graph key, same heuristics) | ≈3.9–4.1 at c=4; ≈2.5 at c=8 | **≈$22–23**; ≈$14 at c=8 | config + measurement | no (needs GPU measurement) |
 | 3 | Split pools: TempSeg on L40S, Captioner on H100 | yes, *given the same TempSeg output*; but the GPU class changes the reference (below) | — | **$24.9–30.5** | high | core + CPU proof only, not wired |
 | 5a | Memory 96 → 48 GiB | yes: no input involved | ×5.30/5.68 | $33.9; **$27.3** with 1+2 | config only | no (startup to re-check) |
 | 5b | Input prefetch / per-thread resolution / decode-ahead | yes | subsumed by 1 | — | — | via 1 |
 
-### Lever 1: overlap shards inside one container
+### Lever 1: overlap shards inside one container (removed)
 
-**What changes.** `@modal.concurrent(max_inputs=2)` already delivers a second shard to a busy
+**Removed in review 7b; kept here as the analysis of record.** The code (`max_shards`,
+`FastExactEngine(overlap=True)`, `EpisodeSlots`, `pipeline.exact_scheduling.shard_overlap`) and
+its tests are gone. Why:
+- it needs `resources.segcap.max_inputs` ≥ 2, but segcap runs one shard per container, and
+  plan, factory and runner all agree on `max_inputs = 1` (review 6 H2);
+- the engine-wide cancel flag failed sibling shards and later newcomers (error marks, so
+  `shard_failed`);
+- a co-tenant's crash or `os._exit` left the sibling's marker unmarked, so D15 counted it as a
+  crash and could poison-pill a healthy episode;
+- the Volume-refresh guard counted running shards rather than live episode threads.
+
+The text below describes the removed design as it was.
+
+**What changed then.** `@modal.concurrent(max_inputs=2)` already delivers a second shard to a busy
 container, and the factory already scales the call timeout by `max_inputs`. The runner used to refuse that second shard.
 
 Now:
@@ -69,7 +94,7 @@ GPU busy. It is paid once per container, not once per shard.
 - K is shards per container lifetime: ≥4 in any multi-shard job, because the 300 s scaledown keeps containers warm between inputs;
 - d is the residual idle after the fill: 0–2%, since the measured GPU was ~100% busy after the fill.
 
-That gives **5.04–5.25**, i.e. **$28.6–29.8**. Without overlap, production pays B on every shard: (408 + 50…111)/80.97 = 5.66–6.41, i.e. $32.2–36.4.
+That gives **5.04–5.49** (the upper bound is B = 111 s, K = 4, d = 2%: (408.2 + 27.75 + 8.16)/80.97 = 5.49; the earlier 5.25 did not follow from these parameters), i.e. **$28.6–31.2**. Without overlap, production pays B on every shard: (408 + 50…111)/80.97 = 5.66–6.41, i.e. $32.2–36.4.
 
 The saving is therefore $3–7 per video-h. It depends on whether the 56 s pre-start gap is real in production (measure it).
 
@@ -179,50 +204,42 @@ Overlap gets the benefit without those costs.
 
 | Piece | Where |
 |---|---|
-| `pipeline.exact_scheduling: {episode_order: plan \| longest_first, shard_overlap: false}`, validated: overlap needs `resources.segcap.max_inputs` 2–4, segcap only. `exact_scheduling(cfg)` gives `{episode_order, max_shards}` | `config/schema.py` |
-| `SegcapWorkerSettings.episode_order` / `max_shards`; `order_episodes` (LPT, ties in plan order); `scheduling_from_env` (`FLORA_SEGCAP_SCHEDULING`); multi-shard runner; refresh guard; preempt marks before it cancels; audit lines record `runtime.scheduling` | `workers_impl/segcap.py` |
-| `FastExactEngine(overlap=True)`: shared slots, a cancel that never clears under a running batch, a lock reset only by the first batch | `workers_impl/segcap.py` |
-| `EpisodeSlots` (priority by `(batch seq, position)`, cancellable); `annotate_batch(slots=, slot_key=, cancelled=, reset_lock=)` | `stages/reference.py` |
+| `pipeline.exact_scheduling: {episode_order: plan \| longest_first}`, segcap only. `exact_scheduling(cfg)` gives `{episode_order}` | `config/schema.py` |
+| `SegcapWorkerSettings.episode_order`; `order_episodes` (LPT, ties in plan order); `scheduling_from_env` (`FLORA_SEGCAP_SCHEDULING`); Volume-refresh guard keyed on live episode threads; audit lines record `runtime.scheduling` | `workers_impl/segcap.py` |
+| Wiring: the factory writes `FLORA_SEGCAP_SCHEDULING` for the segcap class; `segcap_settings_from_env` reads it | `modal_app/factory.py`, `modal_app/reference_app.py` (two lines each) |
 | Split TempSeg/Captioner steps (proof only) | `workers_impl/exact_split.py` (classified `nvidia-hf` in `config/logic.py`) |
 
-**Hashing.** The two flags are **not hashed**. `config/hashing.py` picks fields explicitly, and `exact_scheduling` is not one of them; a test asserts that the job hash and the stage hashes are unchanged when they are toggled.
+**Hashing.** `episode_order` is **not hashed**. `config/hashing.py` picks fields explicitly, and `exact_scheduling` is not one of them; a test asserts that the job hash and the stage hashes are unchanged when they are toggled.
 
-The flags change only *when* an episode starts. They change no argument, processor state or model call, as the identity tests show. The code itself lives in `nvidia-hf` logic modules, so this change set alters the `segcap` stage hash once, like any logic edit.
-
-**Not wired (other agents' files).** Each needs about two lines:
-- `modal_app/factory.py` sets `FLORA_SEGCAP_SCHEDULING=json.dumps(schema.exact_scheduling(cfg))`;
-- `modal_app/reference_app.py` passes `**segcap.scheduling_from_env()` in `segcap_settings_from_env`, and `overlap=settings.max_shards > 1` to `FastExactEngine`;
-- `rates.json` would get a `requires: ["shard_overlap"]` row once it is measured.
+It changes only *when* an episode starts: no argument, processor state or model call, as the identity tests show. The code itself lives in `nvidia-hf` logic modules, so this change set alters the `segcap` stage hash once, like any logic edit.
 
 ### Evidence (CPU)
 
 | Test | What it proves |
 |---|---|
-| `tests/unit/test_exact_scheduling.py` (12) | LPT order; `EpisodeSlots` cap, priority and cancel. Two shards overlapped in one runner (production `FastExactEngine` composite over the fake NVIDIA family; NVIDIA-logged input digests) against sequential plan order: **identical records, strict per-call input digests, 100% paired**, cap held at 2, the second shard started while the first ran. Refusal beyond `max_shards`; preempt marks both shards; refresh guard; config validated and not hashed |
-| `tests/nvlink/test_exact_scheduling_nvlink.py` (2) | **NVIDIA's real code**, real processors, synthetic H.264/AV1 clips: two overlapped batches (shared slots, reversed order, all accel patches) against NVIDIA unmodified, giving `identity_summary` strict on 4/4 episodes and full results identical 4/4. Split TempSeg/Captioner (above) |
-| `tests/unit/test_exact_scheduling_local.py` (2) | **G2 end to end.** A whole local job (segcap + rewards) with `longest_first` and a preemption fault is `done`, keeps the same config hash, and gives byte-identical records to a clean plan-order run. Every segcap shard of G2's real index and manifest run at once in one container gives identical records and input digests to a sequential run |
-| `tests/conformance` | New `segcap-worker[overlap]` spec (overlap, `max_shards=2`, longest-first): all contract checks pass |
+| `tests/unit/test_exact_scheduling.py` | LPT order; env parsing; longest-first in the production runner (`FastExactEngine` composite over the fake NVIDIA family) against plan order: **identical records, strict per-call input digests**; refresh guard skips the reload while an earlier batch's episode threads still run; config validated, not hashed, overlap knob rejected; **wired**: config → factory env → `segcap_settings_from_env`, with segcap `max_inputs` staying 1 |
+| `tests/nvlink/test_exact_scheduling_nvlink.py` (2) | **NVIDIA's real code**, real processors, synthetic H.264/AV1 clips: one concurrent batch in reversed start order (all accel patches) against NVIDIA unmodified, `identity_summary` strict and full results identical. Split TempSeg/Captioner (above) |
+| `tests/unit/test_exact_scheduling_local.py` (1) | **G2 end to end.** A whole local job (segcap + rewards) with `longest_first` and a preemption fault is `done`, keeps the same config hash, and gives byte-identical records to a clean plan-order run |
 
 ## Recommendation
 
 1. **Turn on `episode_order: longest_first` now.** It is zero-risk, recovers ≈9% against plan order, and brings ≈$40 back to the measured $36.4.
-2. **Wire and enable `shard_overlap` with `max_inputs: 2`** after one GPU session confirms it. The expectation is **$29–30/video-h**; with 48 GiB memory, **$27–28**.
+2. Shard overlap is removed (see lever 1); `exact` is the certification reference, not the cost-optimised path.
 3. **Prioritize measuring long-lived warm containers.** That is the largest lever (≈$22–23 at c=4, ≈$14 at c=8) and needs no code near NVIDIA.
 4. **Defer split pools.** The input-identity proof is clean, but TempSeg off sm90 is a different reference. On H100+H100 the gain is small ($32) and the complexity is high.
 
 ## What to measure in the next approved GPU session (≈$3)
 
-One H200 container, `--memory-gib 96`, overlap plus longest-first, `max_inputs` 2. Three consecutive 6-episode golden shards, with 1-view and 3-view kept separate. About 25 min × $5.68 ≈ $2.4.
+One H200 container, `--memory-gib 96`, longest-first, `max_inputs` 1. Three consecutive 6-episode golden shards, with 1-view and 3-view kept separate. About 25 min × $5.68 ≈ $2.4.
 
 Record:
-1. per-shard wall, `gpu_busy_fraction` over the whole container, and `episode_slots` stats;
-   - expect ≥95% busy after the first fill and **≈5.1–5.3 container-s/video-s, i.e. $29–30**;
+1. per-shard wall and `gpu_busy_fraction` over the whole container (the per-shard fill);
 2. the first-episode start offset, timing `on_start` (`nv.audit_report`), `accel.episode()` entry and the probe separately: is the 56 s gap real without the validation prefetch?
 3. Captioner and TempSeg s/call against container age and against prompt length seen before: the warm-up curve that decides lever 4b;
 4. peak RSS and cgroup memory, to decide 48 GiB;
 5. one extra start at 48 GiB to time `@enter` without the full page-cache prefetch.
 
-Re-run the identity gate in `--determinism deterministic` on the same shards. The fast arm uses overlap, the reference arm is sequential.
+Re-run the identity gate in `--determinism deterministic` on the same shards. The fast arm uses longest-first, the reference arm is sequential plan order.
 
 ## Reproduce
 

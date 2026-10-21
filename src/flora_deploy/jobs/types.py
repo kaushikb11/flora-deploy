@@ -100,7 +100,8 @@ class AttemptMarker:
     worker rewrote its marker with ``preempted=True`` (``attempts.mark_preempted``, called from
     ``@modal.exit`` / the SIGINT handler) or with ``error`` (``attempts.mark_exception``: the
     shard raised; Modal counts that against ``modal.Retries`` and the orchestrator respawns, so
-    it is not a crash loop). OOM and SIGKILL leave no mark, so they count.
+    it is not a crash loop). OOM and SIGKILL leave no mark, so they count, and so does a start
+    marked ``crashed`` (a CUDA fault or GPU OOM the worker caught before replacing its container).
 
     ``token`` is the orchestrator's spawn idempotency token (``attempts.spawn_token``) and
     ``call_id`` the Modal FunctionCall id the container runs (``modal.current_function_call_id()``);
@@ -116,6 +117,10 @@ class AttemptMarker:
     preempted: bool = False
     ended_utc: str | None = None  # set together with ``preempted`` / ``error``
     error: str | None = None  # the exception that ended this start (python failure)
+    # the start ended in a CUDA fault / GPU OOM and the container was replaced (``nv.errors``
+    # ``cuda_fatal`` / ``oom``): a crash that left a mark. It counts toward D15 even with
+    # ``error`` set, so an input that faults every time is quarantined and isolated (review 6 M1)
+    crashed: bool = False
 
 
 @dataclass(frozen=True)

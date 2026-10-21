@@ -66,7 +66,8 @@ def test_plan_write(cfg):
     r = runner.invoke(app, ["plan", "-c", str(cfg), *ARGS, "--preset", "exact", "--write", "1"])
     assert r.exit_code == 0, r.output
     c = load_config(cfg)
-    assert c.pools()["segcap"].max_inputs == 4 and c.modal.budget_usd == 6000
+    seg = c.pools()["segcap"]  # review 6 H2: 4 episodes inside one input per container
+    assert (seg.max_inputs, seg.episode_concurrency) == (1, 4) and c.modal.budget_usd == 6000
     assert (cfg.parent / "flora.yaml.bak").read_text() == template_text("exact_mp4_dir")
 
 

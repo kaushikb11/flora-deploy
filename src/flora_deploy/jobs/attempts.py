@@ -13,6 +13,9 @@ starts never overwrite each other.
 * a start whose worker caught a python exception and rewrote its marker with ``error``
   (:func:`mark_exception`) never counts: Modal reports it through ``modal.Retries`` and the
   orchestrator respawns, then marks the shard ``shard_failed`` (never bisected);
+* except when the marker also says ``crashed`` (:func:`mark_exception` with ``crashed=True``: a
+  CUDA fault or GPU OOM after which the worker replaces its container, which Modal retries
+  forever): that start counts, so a deterministic GPU fault is isolated, not looped (review 6 M1);
 * a shard with a receipt never counts (it is done);
 * every other marker counts: OOM and SIGKILL leave no trace, so a start without a preempt mark is
   presumed to have crashed or to be crashing (the newest one may still be running; with K=3 the
@@ -211,15 +214,20 @@ def mark_preempted(jf: JobFiles, kind: ShardKind, shard_id: str, container_id: s
 
 
 def mark_exception(jf: JobFiles, kind: ShardKind, shard_id: str, container_id: str, *,
-                   ended_utc: str, error: str, marker: AttemptMarker | None = None
-                   ) -> AttemptMarker:
+                   ended_utc: str, error: str, marker: AttemptMarker | None = None,
+                   crashed: bool = False) -> AttemptMarker:
     """Worker-side, in the ``except`` around the shard (before re-raising): this start ended in a
     python exception, which Modal counts against ``modal.Retries`` and the orchestrator handles by
-    respawning (then ``shard_failed``), so it must not also count as a D15 crash."""
+    respawning (then ``shard_failed``), so it must not also count as a D15 crash.
+
+    ``crashed=True``: the exception was a CUDA fault / GPU OOM and the worker is about to replace
+    its container (``os._exit``), which Modal retries like any crash, indefinitely. That start
+    **does** count toward D15, so a deterministic fault is quarantined and bisected down to a
+    poison pill instead of looping (review 6 M1)."""
     m = marker or read_attempt(jf, kind, shard_id, container_id) or AttemptMarker(
         shard_id=shard_id, container_id=container_id, started_utc=ended_utc,
         orchestrator_attempt=0)
-    m = replace(m, error=error[:2000], ended_utc=ended_utc)
+    m = replace(m, error=error[:2000], ended_utc=ended_utc, crashed=crashed)
     jf.store.put_bytes(jf.paths.attempt(jf.config_hash, kind, shard_id, container_id), to_json(m))
     return m
 
@@ -238,7 +246,8 @@ def count_starts(jf: JobFiles, kind: ShardKind, shard_id: str, *,
 
 def counted_starts(jf: JobFiles, kind: ShardKind, shard_id: str, *, known: Iterable[str] = (),
                    limit: int | None = None) -> int:
-    """D15 count: distinct markers not flagged ``preempted`` or ``error`` (module docstring).
+    """D15 count: distinct markers not flagged ``preempted`` or ``error``, plus those flagged
+    ``crashed`` (module docstring).
 
     With ``limit``, markers are only read when the raw count reaches it (the raw count is an
     upper bound of the D15 count), so healthy shards cost one ``list`` and no ``get``.
@@ -249,7 +258,7 @@ def counted_starts(jf: JobFiles, kind: ShardKind, shard_id: str, *, known: Itera
     n = 0
     for cid in ids:
         m = read_attempt(jf, kind, shard_id, cid)
-        if m is None or not (m.preempted or m.error):
+        if m is None or m.crashed or not (m.preempted or m.error):
             n += 1
     return n
 

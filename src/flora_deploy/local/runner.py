@@ -147,6 +147,14 @@ class LocalRunResult:
         return d
 
 
+def _container_exit(exc: BaseException) -> None:
+    """``workers_app._die`` (``os._exit`` after a CUDA fault / GPU OOM) in the local model: the
+    container dies and the spawner restarts the call in a new one, as Modal does."""
+    from flora_deploy.local.faults import ContainerCrash
+
+    raise ContainerCrash(f"container exit after {type(exc).__name__}: {exc}"[:200])
+
+
 def _count(xs: Iterable[str]) -> dict[str, int]:
     out: dict[str, int] = {}
     for x in xs:
@@ -329,7 +337,8 @@ class LocalRunner:
                 certificate=FAKE_CERTIFICATE, envelope=cfg.pipeline.envelope,
                 instruction_text=instr.text, media_root=media, local_dir=local_dir,
                 container_id=container_id)
-            return SegcapShardRunner(store, FakeSegcapEngine(), s, call_id=call_id)
+            return SegcapShardRunner(store, FakeSegcapEngine(), s, call_id=call_id,
+                                     fatal=_container_exit)
         s = RewardWorkerSettings(
             terminal_mode=output_settings(cfg)["terminal_mode"], preset=cfg.preset,
             models=FAKE_MODELS["reward"], gpu=pool.gpu, certificate=FAKE_CERTIFICATE,

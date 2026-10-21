@@ -36,7 +36,7 @@ from typing import Any, Literal
 
 from flora_deploy.config.presets import AVAILABLE_PRESETS, get_preset, shard_kinds_for
 from flora_deploy.jobs.budget import Rates, pinned_rates
-from flora_deploy.jobs.settings import PoolSettings
+from flora_deploy.jobs.settings import IN_WORKER_CONCURRENCY, PoolSettings
 from flora_deploy.planner.rates import DEPLOYED_FEATURES, STATUS_RANK, RateTable
 from flora_deploy.records import Stage
 
@@ -426,7 +426,9 @@ def recommended(options: Sequence[PlanOption]) -> PlanOption | None:
 def apply_option(data: Mapping[str, Any], option: PlanOption, *,
                  budget_usd: float | None = None) -> dict[str, Any]:
     """A copy of a parsed ``flora.yaml`` with the option's preset and per-kind
-    ``max_containers`` / ``max_inputs``. Resource overrides for kinds the new preset does not
+    ``max_containers`` / ``max_inputs`` (for kinds that batch episodes in-process, segcap:
+    ``max_inputs: 1`` and the option's concurrency as ``episode_concurrency``, which is what the
+    factory deploys and the worker runs). Resource overrides for kinds the new preset does not
     use are dropped; other keys (gpu, cpu, memory overrides) are kept. ``modal.max_gpus`` is
     raised to the option's peak if needed, and ``budget_usd`` (when given) replaces
     ``modal.budget_usd``."""
@@ -444,7 +446,12 @@ def apply_option(data: Mapping[str, Any], option: PlanOption, *,
     for k in option.kinds:
         r = res.setdefault(k.kind, {})
         r["max_containers"] = k.containers
-        r["max_inputs"] = k.max_inputs
+        if k.kind in IN_WORKER_CONCURRENCY:  # review 6 H2: c episodes inside ONE input
+            r["max_inputs"] = 1
+            r["episode_concurrency"] = k.max_inputs
+        else:
+            r["max_inputs"] = k.max_inputs
+            r.pop("episode_concurrency", None)
     out["resources"] = res
     return out
 

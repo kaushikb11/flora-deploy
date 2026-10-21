@@ -1,6 +1,6 @@
-"""G3 (``docs/exact-cost.md``): exact ``segcap`` scheduling — longest-first episode order and
-shard overlap (several shards per container sharing the episode slots) — leaves every model
-input unchanged, keeps the ``ShardWorker`` contract per shard, and is off by default.
+"""G3 (``docs/exact-cost.md``): exact ``segcap`` longest-first episode order leaves every model
+input unchanged, keeps the ``ShardWorker`` contract, is off by default and reaches the worker
+(config -> factory env -> worker settings). G3's shard overlap was removed (review 7b).
 
 The engine is the production ``FastExactEngine`` composite over the fake NVIDIA family of
 ``test_reference_concurrency`` (NVIDIA's call structure; its ``generate`` logs NVIDIA's
@@ -16,14 +16,11 @@ import pytest
 
 from flora_deploy.accel.identity import compare_runs
 from flora_deploy.jobs import progress as P
-from flora_deploy.jobs.attempts import JobFiles, read_attempt
+from flora_deploy.jobs.attempts import JobFiles
 from flora_deploy.jobs.manifest import save_manifest
 from flora_deploy.jobs.stores.local import LocalStore
 from flora_deploy.jobs.types import EpisodeRef, Manifest, Shard
-from flora_deploy.stages import reference as ref_stage
-from flora_deploy.stages.reference import EpisodeNotStarted, EpisodeSlots
 from flora_deploy.workers_impl.segcap import (
-    ConcurrentShardRefused,
     SegcapShardRunner,
     SegcapWorkerSettings,
     VideoResolver,
@@ -55,12 +52,9 @@ def world(tmp_path, shards=SHARDS, store=None):
     return store, out
 
 
-def make_runner(tmp_path, store, *, order="plan", max_shards=1, overlap=False, engine=None,
-                sleeps=None, container="ta-1", starts=None):
+def make_runner(tmp_path, store, *, order="plan", engine=None, sleeps=None, container="ta-1",
+                starts=None):
     eng = engine or segcap_fake_engine(Script(), concurrency=2, sleeps=sleeps)
-    if overlap:
-        eng.overlap = True
-        eng.__post_init__()
     if starts is not None:  # record the start order NVIDIA's annotate sees
         inner = eng.nv.pipeline.annotate
 
@@ -71,7 +65,7 @@ def make_runner(tmp_path, store, *, order="plan", max_shards=1, overlap=False, e
         eng.nv.pipeline.annotate = annotate
     s = SegcapWorkerSettings(container_id=container, gpu="H200", models={"tempseg": "rev"},
                              media_root="/media", local_dir=str(tmp_path / "local"),
-                             episode_order=order, max_shards=max_shards)
+                             episode_order=order)
     resolver = VideoResolver("/media", tmp_path / "cuts", cutter=lambda src, dest: dest)
     return SegcapShardRunner(store, eng, s, call_id=lambda: "fc-1", resolver=resolver), eng
 
@@ -113,77 +107,16 @@ def test_longest_first_is_lpt_with_plan_order_ties():
 
 
 def test_scheduling_env_defaults_and_validation():
-    assert scheduling_from_env({}) == {"episode_order": "plan", "max_shards": 1}
-    env = {"FLORA_SEGCAP_SCHEDULING": json.dumps({"episode_order": "longest_first",
-                                                  "max_shards": 2})}
-    assert scheduling_from_env(env) == {"episode_order": "longest_first", "max_shards": 2}
+    assert scheduling_from_env({}) == {"episode_order": "plan"}
+    env = {"FLORA_SEGCAP_SCHEDULING": json.dumps({"episode_order": "longest_first"})}
+    assert scheduling_from_env(env) == {"episode_order": "longest_first"}
     with pytest.raises(ValueError):
-        scheduling_from_env({"FLORA_SEGCAP_SCHEDULING": '{"max_shards": 9}'})
+        scheduling_from_env({"FLORA_SEGCAP_SCHEDULING": '{"episode_order": "random"}'})
 
 
-# --- EpisodeSlots ---------------------------------------------------------------------------
-
-
-def test_slots_cap_running_and_grant_the_earliest_key_first():
-    slots = EpisodeSlots(1)
-    slots.acquire((0, 0))
-    got: list = []
-
-    def take(key):
-        slots.acquire(key)
-        got.append(key)
-        slots.release()
-
-    late = threading.Thread(target=take, args=((2, 0),))
-    late.start()
-    time.sleep(0.05)
-    early = threading.Thread(target=take, args=((1, 5),))
-    early.start()
-    time.sleep(0.05)
-    assert got == []  # capacity 1 is held
-    slots.release()
-    late.join(2)
-    early.join(2)
-    assert got == [(1, 5), (2, 0)]  # an earlier batch's episode always goes first
-    assert slots.stats()["max_running"] == 1 and slots.stats()["waiting"] == 0
-
-
-def test_slots_cancel_gives_up_and_leaves_no_waiter():
-    slots = EpisodeSlots(1)
-    slots.acquire((0, 0))
-    stop = threading.Event()
-    box = {}
-
-    def wait():
-        try:
-            slots.acquire((1, 0), stop.is_set)
-        except EpisodeNotStarted as e:
-            box["e"] = e
-
-    t = threading.Thread(target=wait)
-    t.start()
-    stop.set()
-    t.join(2)
-    assert isinstance(box.get("e"), EpisodeNotStarted)
-    assert slots.stats()["waiting"] == 0
-    slots.release()
-    slots.acquire((2, 0))  # still usable
-    slots.release()
-
-
-# --- runner ---------------------------------------------------------------------------------
-
-
-def test_defaults_are_off_and_overlap_needs_an_overlap_engine(tmp_path):
+def test_defaults_are_off_and_overlap_is_gone():
     assert SegcapWorkerSettings().episode_order == "plan"
-    assert SegcapWorkerSettings().max_shards == 1
-    store, _ = world(tmp_path)
-    with pytest.raises(ValueError, match="max_shards=2"):
-        make_runner(tmp_path, store, max_shards=2)  # engine without overlap
-    with pytest.raises(ValueError, match="concurrency >= 2"):
-        eng = segcap_fake_engine(Script(), concurrency=1)
-        eng.overlap = True
-        eng.__post_init__()
+    assert not hasattr(SegcapWorkerSettings(), "max_shards")
 
 
 def test_longest_first_starts_longest_and_keeps_inputs(tmp_path):
@@ -209,99 +142,7 @@ def test_longest_first_starts_longest_and_keeps_inputs(tmp_path):
     assert all(v["scheduling"]["episode_order"] == "longest_first" for v in b.values())
 
 
-def test_overlapped_shards_share_slots_and_keep_every_input(tmp_path):
-    """Baseline: one shard after the other, plan order, no overlap. Overlap: both shards in one
-    container at once (two ``run_shard`` threads, as ``@modal.concurrent`` delivers them),
-    longest first, two shared episode slots. Same records, same model-call input digests; the
-    second shard's episodes start while the first one is still running; never more than two
-    episodes at once."""
-    base_store, shards = world(tmp_path / "base")
-    r, _ = make_runner(tmp_path / "base", base_store)
-    for sh in shards:
-        r.run_shard(JOB, sh.shard_id, CFG)
-
-    store, _ = world(tmp_path / "ov")
-    starts: list = []
-    # a1 (the longest, so first) runs long: shard b's episodes must take the freed slot
-    r2, eng = make_runner(tmp_path / "ov", store, order="longest_first", max_shards=2,
-                          overlap=True, sleeps={"a1-": 0.6}, starts=starts)
-    out: dict = {}
-
-    def go(sid):
-        out[sid] = r2.run_shard(JOB, sid, CFG)
-
-    ta = threading.Thread(target=go, args=("segcap-a",))
-    ta.start()
-    time.sleep(0.05)
-    tb = threading.Thread(target=go, args=("segcap-b",))
-    tb.start()
-    ta.join(30)
-    tb.join(30)
-    assert out["segcap-a"] is not None and out["segcap-b"] is not None
-    assert len(out["segcap-a"].episodes_done) == 3 and len(out["segcap-b"].episodes_done) == 4
-    # overlap happened: some b episode started before shard a's last episode finished
-    first_b = min(t for t, p in starts if "/b" in p)
-    a_end = max(t for t, p in starts if "/a" in p)
-    assert first_b < a_end + 0.6
-    assert eng._slots.stats()["max_running"] == 2  # the cap held across both shards
-    assert r2.skipped_refreshes == 0  # LocalStore: nothing to reload
-
-    a, b = stored(base_store, shards), stored(store, shards)
-    assert set(a) == set(b) and len(a) == 7
-    assert {u: v["records"] for u, v in a.items()} == {u: v["records"] for u, v in b.items()}
-    ident = compare_runs(results(a), results(b))
-    assert ident["ok"] and ident["paired"] == sum(len(v["calls"]) for v in a.values()), ident
-    for u in a:  # strict, call by call
-        assert [c["input_digest"] for c in a[u]["calls"]] == \
-            [c["input_digest"] for c in b[u]["calls"]]
-
-
-def test_more_shards_than_max_shards_are_refused(tmp_path):
-    store, _ = world(tmp_path)
-    r, _ = make_runner(tmp_path, store, max_shards=2, overlap=True, sleeps={"a": 0.3})
-    errs: list = []
-    gate = threading.Barrier(3)
-
-    def go(sid):
-        gate.wait()
-        try:
-            r.run_shard(JOB, sid, CFG)
-        except ConcurrentShardRefused as e:
-            errs.append(e)
-
-    threads = [threading.Thread(target=go, args=(s,)) for s in ("segcap-a", "segcap-a",
-                                                                "segcap-b")]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(30)
-    assert len(errs) == 1
-
-
-def test_preempt_marks_every_overlapped_shard(tmp_path):
-    store, shards = world(tmp_path)
-    r, eng = make_runner(tmp_path, store, max_shards=2, overlap=True,
-                         sleeps={"a": 0.4, "b": 0.4})
-    excs: dict = {}
-
-    def go(sid):
-        try:
-            r.run_shard(JOB, sid, CFG)
-        except BaseException as e:  # noqa: BLE001 - the cancelled batch raises
-            excs[sid] = e
-
-    ts = [threading.Thread(target=go, args=(s.shard_id,)) for s in shards]
-    for t in ts:
-        t.start()
-    time.sleep(0.2)
-    assert r.preempt()
-    for t in ts:
-        t.join(30)
-    jf = JobFiles(store, JOB, CFG)
-    for sh in shards:
-        assert read_attempt(jf, "segcap", sh.shard_id, "ta-1").preempted
-        assert not store.exists(PATHS.receipt(CFG, "segcap", sh.shard_id))
-    assert eng._slots.stats()["running"] == 0 and eng._slots.stats()["waiting"] == 0
+# --- Volume refresh guard -------------------------------------------------------------------
 
 
 class _VolumeLike(LocalStore):
@@ -317,31 +158,27 @@ class _VolumeLike(LocalStore):
         return True
 
 
-def test_refresh_is_skipped_while_another_shard_reads_media_from_the_store_volume(tmp_path):
+def test_refresh_is_skipped_while_episode_threads_still_read_store_media(tmp_path):
+    """Review 7b G3-5: the guard keys on live episode threads (a cancelled or interrupted
+    shard's in-flight episodes outlive its run_shard), not on running shards."""
     store = _VolumeLike(tmp_path / "vol")
     store, shards = world(tmp_path, store=store)
-    eng = segcap_fake_engine(Script(), concurrency=2, sleeps={"a": 0.3})
-    eng.overlap = True
-    eng.__post_init__()
+    eng = segcap_fake_engine(Script(), concurrency=2)
     s = SegcapWorkerSettings(container_id="ta-1", gpu="H200", models={"tempseg": "rev"},
                              media_root=str(tmp_path / "vol" / "media"),
-                             local_dir=str(tmp_path / "local"), max_shards=2)
+                             local_dir=str(tmp_path / "local"))
     resolver = VideoResolver(s.media_root, tmp_path / "cuts", cutter=lambda src, dest: dest)
     r = SegcapShardRunner(store, eng, s, call_id=lambda: "fc", resolver=resolver)
-    ta = threading.Thread(target=r.run_shard, args=(JOB, "segcap-a", CFG))
-    ta.start()
-    time.sleep(0.1)
-    r.run_shard(JOB, "segcap-b", CFG)
-    ta.join(30)
+    release = threading.Event()
+    zombie = threading.Thread(target=release.wait, name="flora-batch", daemon=True)
+    zombie.start()
+    eng._thread = zombie  # an earlier batch's episodes are still running
+    threading.Timer(0.5, release.set).start()  # ... and finish while this shard waits
+    r.run_shard(JOB, "segcap-a", CFG)
+    assert store.reloads == 0 and r.skipped_refreshes == 1
+    zombie.join(5)
+    r.run_shard(JOB, "segcap-b", CFG)  # no live episodes: reload as usual
     assert store.reloads == 1 and r.skipped_refreshes == 1
-
-
-def test_annotate_batch_slots_need_the_concurrent_composite():
-    from tests.unit.test_reference_concurrency import GpuProbe, fake_nv
-
-    nv = fake_nv(GpuProbe())
-    with pytest.raises(RuntimeError, match="needs the resident session"):
-        ref_stage.annotate_batch(nv, None, [], slots=EpisodeSlots(2))
 
 
 # --- config ---------------------------------------------------------------------------------
@@ -353,16 +190,17 @@ def test_exact_scheduling_config_is_validated_and_not_hashed():
 
     d = base()
     cfg = parse_config(d, allow_uncertified=True)
-    assert exact_scheduling(cfg) == {"episode_order": "plan", "max_shards": 1}
-    on = set_(set_(d, "pipeline.exact_scheduling", {"episode_order": "longest_first",
-                                                    "shard_overlap": True}),
-              "resources", {"segcap": {"max_inputs": 2}})
+    assert exact_scheduling(cfg) == {"episode_order": "plan"}
+    on = set_(d, "pipeline.exact_scheduling", {"episode_order": "longest_first"})
     cfg_on = parse_config(on, allow_uncertified=True)
-    assert exact_scheduling(cfg_on) == {"episode_order": "longest_first", "max_shards": 2}
-    # start order and shard overlap leave every model input unchanged: not in any hash
+    assert exact_scheduling(cfg_on) == {"episode_order": "longest_first"}
+    # start order leaves every model input unchanged: not in any hash
     assert h(on) == h(d) and sh(on) == sh(d)
-    with pytest.raises(ValueError, match="max_inputs"):
+    with pytest.raises(ValueError):  # overlap is gone (review 7b), and so is its knob
         parse_config(set_(d, "pipeline.exact_scheduling", {"shard_overlap": True}),
+                     allow_uncertified=True)
+    with pytest.raises(ValueError, match="episode_concurrency"):  # H2: one input/container
+        parse_config(set_(d, "resources", {"segcap": {"max_inputs": 2}}),
                      allow_uncertified=True)
     with pytest.raises(ValueError):
         parse_config(set_(d, "pipeline.exact_scheduling", {"episode_order": "random"}),
@@ -371,3 +209,19 @@ def test_exact_scheduling_config_is_validated_and_not_hashed():
                         "pipeline.exact_scheduling", {"episode_order": "longest_first"})
     with pytest.raises(ValueError, match="segcap worker only"):
         parse_config(rewards_only, allow_uncertified=True)
+
+
+def test_longest_first_reaches_the_worker():
+    """Wired end to end: config -> factory env -> worker settings; segcap max_inputs stays 1."""
+    from flora_deploy.config.schema import parse_config
+    from flora_deploy.modal_app import factory as f
+    from flora_deploy.modal_app import reference_app as ra
+    from tests.unit.test_factory import RECEIPTS, template
+
+    d = template("exact_mp4_dir.yaml")
+    d["pipeline"]["exact_scheduling"] = {"episode_order": "longest_first"}
+    plan = f.plan_app(parse_config(d), derived_receipts=RECEIPTS)
+    (spec,) = [o for o in plan.objects if o.kind == "cls" and "segcap" in o.shard_kinds]
+    assert spec.max_inputs is None  # no @modal.concurrent: one shard per container
+    assert ra.segcap_settings_from_env(spec.env, gpu="H200").episode_order == "longest_first"
+    assert ra.segcap_settings_from_env({}, gpu=None).episode_order == "plan"

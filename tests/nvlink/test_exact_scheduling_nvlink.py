@@ -4,10 +4,10 @@ Same harness as ``test_reference_entry`` (NVIDIA's real ``api.DataEnginePipeline
 real ``models.generate`` logging ``input_tensor_digest``, real Flora processors, synthetic
 H.264/AV1 clips, a deterministic fake model):
 
-1. **Shard overlap + longest-first**: two batches run at once in one process, sharing two
-   ``EpisodeSlots`` (as two overlapped shards in one container), episodes started in reverse
-   plan order, against NVIDIA unmodified (fresh sessions, sequential, plan order). Every
-   model call's input digest and every full NVIDIA result must be identical.
+1. **Longest-first** (start order): one concurrent batch, episodes started in reverse plan
+   order, against NVIDIA unmodified (fresh sessions, sequential, plan order). Every model
+   call's input digest and every full NVIDIA result must be identical. (G3's shard overlap
+   was removed, review 7b.)
 2. **Split TempSeg / Captioner** (``workers_impl.exact_split``): NVIDIA's ``annotate`` run as a
    TempSeg step, its segment result persisted as bytes, and a separate Captioner step (own
    fresh NVIDIA ``Session``, own probe) fed from those bytes. The Captioner calls' input
@@ -16,8 +16,6 @@ H.264/AV1 clips, a deterministic fake model):
 """
 
 from __future__ import annotations
-
-import threading
 
 import pytest
 
@@ -34,7 +32,7 @@ def digests(result, model=None):
             if model is None or c["model"] == model]
 
 
-def test_overlapped_batches_longest_first_identical_to_unmodified(harness, clips):  # noqa: F811
+def test_reordered_episodes_identical_to_unmodified(harness, clips):  # noqa: F811
     from flora_deploy.accel import ALL_PATCHES, apply_patches
 
     nv, fresh = harness
@@ -46,26 +44,15 @@ def test_overlapped_batches_longest_first_identical_to_unmodified(harness, clips
     ref.install_gpu_lock(nv, lock, patcher)
     ref.install_nvidia_entry(nv, patcher, request_lock=False)
     accel = apply_patches(nv, ALL_PATCHES)
-    slots, clones, session = ref.EpisodeSlots(2), ref.ProcessorClones(), CachedSession(fresh)
-    shards = [list(reversed(eps[:2])), list(reversed(eps[2:]))]  # not plan order
-    out: dict[int, dict] = {}
-    try:
-        def run(i):
-            out[i] = ref.annotate_batch(nv, session, shards[i], concurrency=2, gpu_lock=lock,
-                                        accel=accel, clones=clones, slots=slots,
-                                        slot_key=i, reset_lock=i == 0)
-
-        ts = [threading.Thread(target=run, args=(i,)) for i in (0, 1)]
-        for t in ts:
-            t.start()
-        for t in ts:
-            t.join(600)
+    clones, session = ref.ProcessorClones(), CachedSession(fresh)
+    try:  # one shard, episodes started in reverse plan order (as longest-first may)
+        out = ref.annotate_batch(nv, session, list(reversed(eps)), concurrency=2, gpu_lock=lock,
+                                 accel=accel, clones=clones)
     finally:
         accel.restore()
         patcher.restore()
-    fast = {**out[0]["results"], **out[1]["results"]}
-    assert not out[0]["errors"] and not out[1]["errors"]
-    assert slots.stats()["max_running"] <= 2 and slots.stats()["grants"] == len(eps)
+    fast = out["results"]
+    assert not out["errors"], out["errors"]
     ident = ref.identity_summary(unmodified["results"], fast)
     assert ident["gate_ok"] and ident["strict_episodes"] == len(eps), ident
     assert ident["output_identical_episodes"] == len(eps), ident

@@ -62,8 +62,9 @@ class InjectedFailure(RuntimeError):
     """The ``fail`` fault: a Python exception in user code."""
 
 
-class FakeNvidiaInputError(ValueError):
-    """The ``nverr`` fault: NVIDIA's ``ValueError`` semantics for a bad episode."""
+# The ``nverr`` fault: NVIDIA's ``ValueError`` semantics for a bad episode. Defined in the fake
+# models' stand-in for NVIDIA's code, so ``nv.errors`` classifies it as NVIDIA's verdict.
+from flora_deploy.local.fake_nvidia import FakeNvidiaInputError  # noqa: E402,F401
 
 
 @dataclass

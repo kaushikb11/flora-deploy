@@ -541,6 +541,17 @@ def plan_app(
                "FLORA_SHARD_KINDS": ",".join(kinds),
                "FLORA_STAGE_HASHES": json.dumps({k: ch.stage_hashes[k] for k in kinds},
                                                 sort_keys=True)}
+        if ref.recipe == "segcap":  # review 6 H2: one input per container, c episodes inside
+            from flora_deploy.jobs.settings import EPISODE_CONCURRENCY_ENV, episode_concurrency
+
+            if pool.max_inputs > 1:
+                raise DeployError(f"{cls_name}: max_inputs {pool.max_inputs} > 1, but the segcap "
+                                  "worker runs one shard per container; use episode_concurrency")
+            env[EPISODE_CONCURRENCY_ENV] = str(episode_concurrency(kinds[0], pool))
+            from flora_deploy.config.schema import exact_scheduling
+            from flora_deploy.workers_impl.segcap import SCHEDULING_ENV
+
+            env[SCHEDULING_ENV] = json.dumps(exact_scheduling(cfg), sort_keys=True)  # G3 order
         timeout = worker_timeout_s(rs.shard_target_gpu_minutes, preset=cfg.preset,
                                    kinds=tuple(kinds), max_inputs=pool.max_inputs,
                                    startup_s=float(ref.startup_timeout_s) / 2)

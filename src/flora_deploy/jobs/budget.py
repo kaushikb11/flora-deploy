@@ -425,7 +425,8 @@ class RateTableEstimator:
     """Estimates from ``planner/rates.json`` (:class:`~flora_deploy.planner.rates.RateTable`).
 
     Shard cost = video seconds × ``container_s_per_video_s`` for (preset, kind, cameras,
-    concurrency = the pool's ``max_inputs``, features = the deployed configuration's,
+    concurrency = ``jobs.settings.episode_concurrency``: the pool's ``max_inputs``, or for segcap
+    its in-worker ``episode_concurrency``; features = the deployed configuration's,
     ``planner.rates.DEPLOYED_FEATURES``), e.g. exact segcap 6.4 container-s per video-s (c=4,
     gpu_thread; the only usable cu128 row, so c=1 uses it too). Video seconds come from
     ``durations`` (uid -> seconds, from the manifest's ``EpisodeRef.duration_s``) or, without
@@ -467,8 +468,11 @@ class RateTableEstimator:
         return max((self.cameras.get(u, 1) for u in shard.episodes), default=1)
 
     def container_seconds(self, shard: Shard, pool: PoolSettings) -> float:
-        try:
-            e = self.table.rate(self.preset, shard.kind, self._cameras(shard), pool.max_inputs)
+        from flora_deploy.jobs.settings import episode_concurrency
+
+        try:  # the concurrency the rate was measured at (segcap: episodes in one input, H2)
+            e = self.table.rate(self.preset, shard.kind, self._cameras(shard),
+                                episode_concurrency(shard.kind, pool))
         except KeyError:
             return self.fallback.container_seconds(shard, pool)
         k = 1.0 + e.uncertainty if self.quantile == "upper" else 1.0
