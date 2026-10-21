@@ -564,13 +564,14 @@ def plan_episode(
     if scan.discard_cum[last + 1] - scan.discard_cum[first]:
         reasons.append(EDIT_LIST)
 
+    # Where source decoding starts for production range decode: the range's own start when it is
+    # a clean random-access point, else the last random-access point strictly before it (None:
+    # the file has none, so the decoder's real output must be measured from packet 0).
     if rap and not leading:
         preroll: int | None = first
     else:
-        k = int(np.searchsorted(scan.rap_index, first, side="left"))  # RAPs strictly before
+        k = int(np.searchsorted(scan.rap_index, first, side="left"))
         preroll = int(scan.rap_index[k - 1]) if k else None
-        if preroll is not None and leading:
-            preroll = preroll if preroll < first else None
     return EpisodePlan(sel, first, last, contiguous, frames, preroll, tuple(reasons))
 
 
