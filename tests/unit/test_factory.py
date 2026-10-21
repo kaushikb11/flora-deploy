@@ -159,10 +159,16 @@ def test_rewards_only_share_one_worker_class(fake_workers_app):
 
 
 def test_gpu_count_is_rendered_as_type_count(fake_workers_app):
-    cfg = rewards_cfg({"reward.terminal": {"gpu": "H100!", "gpu_count": 2, "max_containers": 1},
-                       "reward.dense": {"gpu": "H100!", "gpu_count": 2, "max_containers": 1}},
-                      modal={"max_gpus": 4, "budget_usd": 5})
-    assert f.plan_app(cfg).object("RewardWorker").gpu == "H100!:2"
+    from flora_deploy.config.schema import ConfigError
+    from flora_deploy.jobs.settings import PoolSettings
+
+    assert f.gpu_string(PoolSettings(gpu="H100!", gpu_count=2)) == "H100!:2"
+    assert f.gpu_string(PoolSettings(gpu="H100!")) == "H100!"
+    # review 4 M7: terminal/dense engines use one device, so a second GPU is refused up front
+    with pytest.raises(ConfigError, match="single-device"):
+        rewards_cfg({"reward.terminal": {"gpu": "H100!", "gpu_count": 2, "max_containers": 1},
+                     "reward.dense": {"gpu": "H100!", "gpu_count": 2, "max_containers": 1}},
+                    modal={"max_gpus": 4, "budget_usd": 5})
 
 
 def test_shared_class_pools_must_agree(fake_workers_app):

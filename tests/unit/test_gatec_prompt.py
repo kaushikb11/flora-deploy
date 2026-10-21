@@ -80,6 +80,51 @@ def test_engine_kwargs_must_disable_processor_cache():
         assert_engine_kwargs({"mm_processor_cache_gb": 4})
 
 
+@pytest.mark.parametrize("value", [0, 0.0])
+def test_engine_kwargs_accept_numeric_zero(value):
+    assert assert_engine_kwargs({"mm_processor_cache_gb": value})
+
+
+@pytest.mark.parametrize("value", [False, True, None, "0", 0.5, float("nan"), [0]])
+def test_engine_kwargs_reject_non_numbers_and_nonzero(value):
+    """Review 3 C5: ``False == 0`` must not pass, nor anything that is not the number 0."""
+    with pytest.raises(CaptureError, match="mm_processor_cache_gb"):
+        assert_engine_kwargs({"mm_processor_cache_gb": value})
+
+
+# Files allowed to construct a vLLM engine directly; each must pass its kwargs through
+# nv.capture.assert_engine_kwargs. NVIDIA's Rewarder builds its own engine via load_llm (no
+# Flora video through our capture layer).
+ENGINE_BUILDERS = {"modal_app/gatec_app.py"}
+ENGINE_CALLS = {"LLM", "AsyncLLM", "EngineArgs", "AsyncEngineArgs", "AsyncLLMEngine",
+                "LLMEngine"}
+
+
+def test_no_unchecked_vllm_engine_construction():
+    """Review 3 C5: scan src/ for ``LLM(`` / ``EngineArgs(`` style calls; any outside the allowed
+    builders fails, and every allowed builder calls ``assert_engine_kwargs``."""
+    import ast
+
+    from flora_deploy.config import logic
+
+    root = logic.package_root()
+    found: dict[str, list[int]] = {}
+    for rel in sorted(logic.package_modules()):
+        tree = ast.parse((root / rel).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            f = node.func
+            name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(
+                f, ast.Attribute) else None
+            if name in ENGINE_CALLS:
+                found.setdefault(rel, []).append(node.lineno)
+    assert set(found) <= ENGINE_BUILDERS, {k: v for k, v in found.items()
+                                           if k not in ENGINE_BUILDERS}
+    for rel in ENGINE_BUILDERS:
+        assert "assert_engine_kwargs(" in (root / rel).read_text(encoding="utf-8"), rel
+
+
 def test_gatec_engine_builder_asserts_cache_off():
     pytest.importorskip("modal")
     from flora_deploy.modal_app.gatec_app import engine_kwargs

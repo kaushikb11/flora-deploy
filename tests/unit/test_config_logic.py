@@ -1,4 +1,4 @@
-"""config/logic.py: every module on the output path is classified, and the digest is sound."""
+"""config/logic.py: every module of the package is classified, and the digest is sound."""
 
 from __future__ import annotations
 
@@ -8,32 +8,35 @@ from flora_deploy.config import logic
 from flora_deploy.config.presets import PRESETS
 
 
-def _modules_in(rel_dir: str) -> set[str]:
-    base = logic.package_root() / rel_dir if rel_dir else logic.package_root()
-    prefix = f"{rel_dir}/" if rel_dir else ""
-    return {prefix + p.name for p in base.glob("*.py")}
-
-
 def _output() -> set[str]:
     return {m for mods in logic.OUTPUT_MODULES.values() for m in mods}
 
 
-@pytest.mark.parametrize("rel_dir", logic.CLASSIFIED_DIRS)
+def _package_dirs() -> list[str]:
+    root = logic.package_root()
+    return sorted({p.parent.relative_to(root).as_posix()
+                   for p in root.rglob("*.py") if "__pycache__" not in p.parts})
+
+
+@pytest.mark.parametrize("rel_dir", _package_dirs())
 def test_every_module_is_classified(rel_dir):
-    """A new module under nv/, accel/, stages/, media/ (or the package root, config/) must be
-    declared output-affecting or not in config/logic.py before the tests pass."""
-    unclassified = sorted(_modules_in(rel_dir) - _output() - set(logic.NON_OUTPUT_MODULES))
+    """Review 4 M2: walk **every** package directory (found on disk, not listed by hand), so a
+    new module anywhere must be declared output-affecting or not before the tests pass."""
+    prefix = "" if rel_dir == "." else f"{rel_dir}/"
+    mods = {m for m in logic.package_modules()
+            if m.startswith(prefix) and "/" not in m[len(prefix):]}
+    assert mods
+    unclassified = sorted(mods - _output() - set(logic.NON_OUTPUT_MODULES))
     assert not unclassified, (f"classify {unclassified} in config/logic.py (OUTPUT_MODULES or "
                               "NON_OUTPUT_MODULES)")
 
 
-def test_classified_dirs_cover_the_output_path():
-    for d in ("nv", "accel", "stages", "media"):
-        assert d in logic.CLASSIFIED_DIRS
-    subdirs = {p.relative_to(logic.package_root()).as_posix()
-               for p in (logic.package_root() / "media").rglob("*") if p.is_dir()
-               and p.name != "__pycache__"}
-    assert subdirs <= set(logic.CLASSIFIED_DIRS)
+def test_walk_covers_every_module():
+    assert logic.package_modules() <= _output() | set(logic.NON_OUTPUT_MODULES)
+    dirs = _package_dirs()
+    for d in ("workers_impl", "jobs", "jobs/stores", "media/sources", "modal_app", "nv",
+              "accel", "stages", "export", "prep", "observe", "validate", "cli", "planner"):
+        assert d in dirs, d
 
 
 def test_lists_are_consistent():
@@ -44,6 +47,7 @@ def test_lists_are_consistent():
         assert (root / rel).is_file(), rel
     for group, mods in logic.OUTPUT_MODULES.items():
         assert len(set(mods)) == len(mods), group
+    assert len(set(logic.NON_OUTPUT_MODULES)) == len(logic.NON_OUTPUT_MODULES)
     assert set(logic.KIND_GROUPS.values()) | {"common"} == set(logic.OUTPUT_MODULES)
 
 
@@ -55,16 +59,23 @@ def test_every_shard_kind_has_a_logic_group():
 
 
 def test_named_output_modules_are_hashed():
-    """The modules review A1 names, for the kinds that run them."""
+    """The modules reviews 3 (A1) and 4 (M2) name, for the kinds that run them."""
     seg = set(logic.modules_for("segcap"))
     for rel in ("nv/capture.py", "nv/session.py", "nv/segment_glue.py", "nv/budget.py",
                 "media/index.py", "media/rangedecode.py", "media/cuts.py",
-                "stages/reference.py", "records.py", "config/hashing.py"):
+                "stages/reference.py", "records.py", "config/hashing.py",
+                "jobs/indexing.py", "media/sources/lerobot_v3.py"):
         assert rel in seg, rel
-    accel = {p for p in _modules_in("accel")} - set(logic.NON_OUTPUT_MODULES)
+    accel = {m for m in logic.package_modules() if m.startswith("accel/")} - set(
+        logic.NON_OUTPUT_MODULES)
     assert accel <= seg and accel <= set(logic.modules_for("caption"))
-    assert "stages/reward.py" in logic.modules_for("reward.dense")
+    for kind in ("reward.terminal", "reward.dense"):
+        mods = set(logic.modules_for(kind))
+        for rel in ("stages/reward.py", "workers_impl/reward.py", "modal_app/workers_app.py",
+                    "jobs/indexing.py", "jobs/manifest.py", "media/sources/mp4_dir.py"):
+            assert rel in mods, (kind, rel)
     assert "stages/reward.py" not in seg
+    assert "workers_impl/reward.py" not in seg
     assert "cli/init.py" not in set(logic.modules_for("segcap")) | set(
         logic.modules_for("reward.dense"))
 

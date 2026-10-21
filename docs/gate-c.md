@@ -1,7 +1,15 @@
 # Gate C: vLLM 0.24.0 model inputs vs NVIDIA's HF processor
 
-**Verdict: PASS with a capture-layer fix, under a required engine setting
-(`mm_processor_cache_gb=0`).** NVIDIA's prompts, as captured, are **rejected** by vLLM 0.24.0
+**Verdict: not yet decided under the current criteria. The recorded 2026-10-21 run passed
+(PASS, pre-criteria run; re-run pending)** with a capture-layer fix, under a required engine
+setting (`mm_processor_cache_gb=0`). That run predates the run-verdict rules below: it did not
+check placeholder ranges, its `results.json` has no `verdict` or `provenance` keys, the HF side
+ran in `img_vllm` rather than the `exact` reference image `img_hfref` (review 3 C2), and its
+`tianji` pool built 5 of the 6 TempSeg requests of the quota, which is now a FAIL (review 4 L3).
+Re-run `scripts/gatec.py` on a committed SHA, with the quota and the `img_hfref` cross-check
+passed to `validate.gatec.gate_verdict`, to decide it.
+
+NVIDIA's prompts, as captured, are **rejected** by vLLM 0.24.0
 (0/56 builder-case requests render). With the fix (`nv.capture.vllm_prompt`, which wraps each bare
 `<|video_pad|>` as `<|vision_start|><|video_pad|><|vision_end|>`), three things are **identical**
 to NVIDIA's own processor call for **all 127 requests**:
@@ -111,6 +119,12 @@ container:
 only over the rows that exist:
 - every (kind, part) is built, with no build-stage error and at least one request. A pool whose
   builds all failed is a FAIL, never a silent `n/a`;
+- every golden pool reaches its request quota (`quota=`, or the build's own `quota`): a
+  shortfall is a FAIL, not a smaller sample (review 4 L3). Without a quota the verdict carries
+  a warning;
+- the HF reference ran in `img_hfref`, or a passing `validate.gatec.reference_cross_check`
+  shows that the stage-1 HF ids and pixel digests built in `img_vllm` equal those built in
+  `img_hfref` (review 3 C2). Without this information the verdict carries a warning;
 - every built request has a `wrapped` row;
 - every builder case and golden pool has rows;
 - every `wrapped` row passes.
@@ -121,9 +135,12 @@ provenance: `run_id`, `git rev-parse HEAD` with a dirty flag, and `image_fingerp
 
 **Status of the recorded run.** The 2026-10-21 run below predates these rules (review 3, C1/C3/
 C4). It had no build errors (`errors: []` in every build), covered every pool, and ran
-`generate` on every `wrapped` row. But it did not check placeholder ranges, and its
-`results.json` has no git SHA or image fingerprint. Re-run `scripts/gatec.py` once on the
-committed SHA to confirm under the full criteria.
+`generate` on every `wrapped` row. But it did not check placeholder ranges, its
+`results.json` has no git SHA or image fingerprint, its HF side ran in `img_vllm`, and `tianji`
+built 5 of 6 TempSeg requests (episode 75 has only 2 TempSeg windows), which the quota rule now
+fails. Re-run `scripts/gatec.py` once on the committed SHA to decide it under the full
+criteria; `modal_app/gatec_app.py` still has to pass `quota=` and the `img_hfref`
+cross-check to `gate_verdict`.
 
 Unit tests (`tests/unit/test_gatec_compare.py`) and nvlink tests with the real processor
 (`tests/nvlink/test_nv_link_capture_vllm_prompt.py::test_pixel_only_changes_fail_the_verdict`)

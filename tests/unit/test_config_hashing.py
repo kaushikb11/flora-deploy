@@ -38,7 +38,7 @@ def base() -> dict:
         "input": {"format": "lerobot_v3", "repo": "org/ds", "revision": SHA, "path": "sub",
                   "cameras": {"top": "main", "l": "left_wrist", "r": "right_wrist"}},
         "pipeline": {"stages": ["segment", "caption", "reward.terminal", "reward.dense"],
-                     "embodiment": "human"},
+                     "embodiment": "yam"},
         "output": {"sink": "s3://b/p"},
     }
 
@@ -69,7 +69,6 @@ BASE = h(base())
     "path,value",
     [
         ("resources", {"segcap": {"gpu": "B200"}}),
-        ("resources", {"segcap": {"gpu_count": 2}}),
         ("resources", {"segcap": {"max_containers": 4}, "reward.dense": {"max_containers": 2}}),
         ("resources", {"reward.terminal": {"max_inputs": 3, "cpu": 16, "memory": 200}}),
         ("resources", {"reward.terminal": {"gpu": "A100-80GB"}}),
@@ -269,7 +268,10 @@ class _Edit:
 @pytest.mark.parametrize("rel", ["nv/capture.py", "stages/reference.py", "media/index.py",
                                  "accel/framecache.py", "records.py", "config/hashing.py",
                                  "stages/reward.py", "nv/segment_glue.py", "nv/session.py",
-                                 "nv/budget.py", "media/rangedecode.py", "media/cuts.py"])
+                                 "nv/budget.py", "media/rangedecode.py", "media/cuts.py",
+                                 "jobs/indexing.py", "workers_impl/reward.py",
+                                 "modal_app/workers_app.py", "media/sources/lerobot_v3.py",
+                                 "observe/stdout.py"])
 def test_editing_an_output_module_changes_the_hash(pkg_copy, rel):
     assert h(base(), logic_root=pkg_copy) == BASE  # the copy hashes like the checkout
     with _Edit(pkg_copy, rel):
@@ -278,7 +280,7 @@ def test_editing_an_output_module_changes_the_hash(pkg_copy, rel):
 
 
 @pytest.mark.parametrize("rel", ["cli/init.py", "cli/plan.py", "jobs/orchestrator.py",
-                                 "planner/options.py", "observe/stdout.py", "media/synth.py",
+                                 "planner/options.py", "observe/aggregate.py", "media/synth.py",
                                  "validate/gatec.py", "config/schema.py", "__init__.py"])
 def test_editing_a_non_output_module_keeps_the_hash(pkg_copy, rel):
     with _Edit(pkg_copy, rel):
@@ -326,6 +328,76 @@ def test_vllm_image_only_invalidates_rewards():
     ref = sh(base())
     assert bumped["segcap"] == ref["segcap"]
     assert bumped["reward.terminal"] != ref["reward.terminal"]
+
+
+# ---------------------------------------------------------------------------------------------
+# Review 4: output-affecting run modes are config fields, hashed per kind (H3, M4)
+
+
+def test_determinism_is_hashed_into_segcap_only():
+    ref = sh(base())
+    det = sh(set_(base(), "pipeline.determinism", "deterministic"))
+    assert det["segcap"] != ref["segcap"]
+    assert det["reward.terminal"] == ref["reward.terminal"]
+    assert det["reward.dense"] == ref["reward.dense"]
+    assert h(set_(base(), "pipeline.determinism", "deterministic")) != BASE  # job hash too
+    assert h(set_(base(), "pipeline.determinism", "nvidia")) == BASE  # the default
+    doc = config_hash(parse_config(base()), derived_receipts=RECEIPTS).document
+    assert doc["shard_kinds"]["segcap"]["modes"] == {"determinism": "nvidia"}
+
+
+def test_determinism_needs_the_segcap_worker():
+    from flora_deploy.config.schema import ConfigError
+
+    rewards = set_(base(), "pipeline.stages", ["reward.terminal"])
+    with pytest.raises(ConfigError, match="determinism"):
+        parse_config(set_(rewards, "pipeline.determinism", "deterministic"))
+    with pytest.raises(ConfigError, match="determinism"):
+        parse_config(set_(base(), "pipeline.determinism", "fast"))
+
+
+def test_terminal_rationale_is_hashed_into_reward_terminal_only():
+    ref = sh(base())
+    rat = sh(set_(base(), "pipeline.terminal_rationale", True))
+    assert rat["reward.terminal"] != ref["reward.terminal"]
+    assert rat["reward.dense"] == ref["reward.dense"]
+    assert rat["segcap"] == ref["segcap"]
+    doc = config_hash(parse_config(base()), derived_receipts=RECEIPTS).document
+    assert doc["shard_kinds"]["reward.terminal"]["modes"] == {"terminal_mode": "terminal"}
+    assert doc["shard_kinds"]["reward.dense"]["modes"] == {}
+
+
+def test_cli_override_goes_through_the_config():
+    from flora_deploy.config.schema import output_settings, with_pipeline
+
+    cfg = parse_config(base())
+    assert output_settings(cfg) == {"determinism": "nvidia", "terminal_mode": "terminal"}
+    det = with_pipeline(cfg, determinism="deterministic", terminal_rationale=True)
+    assert output_settings(det) == {"determinism": "deterministic",
+                                    "terminal_mode": "terminal_rationale"}
+    assert config_hash(det, derived_receipts=RECEIPTS).hash != BASE
+    assert cfg.pipeline.determinism == "nvidia"  # the original is unchanged
+
+
+def test_input_content_digest_is_hashed():
+    assert h(base(), input_digest="a" * 64) != BASE
+    assert h(base(), input_digest="a" * 64) != h(base(), input_digest="b" * 64)
+    assert h(base(), input_digest=None) == BASE
+
+
+def test_gpu_type_is_not_hashed_but_gpu_count_is_checked():
+    """M7: GPU type stays out of the hash (D11; recorded in provenance.gpu), and memory is
+    checked per device: a second GPU does not make a single-device engine fit."""
+    from flora_deploy.config.schema import ConfigError
+
+    assert h(set_(base(), "resources", {"segcap": {"gpu": "B200"}})) == BASE
+    for res in ({"segcap": {"gpu": "L40S", "gpu_count": 2}},
+                {"segcap": {"gpu": "H100", "gpu_count": 2}},
+                {"segcap": {"gpu_count": 2}},
+                {"reward.terminal": {"gpu": "L40S", "gpu_count": 2}},
+                {"reward.terminal": {"gpu": "A100-40GB", "gpu_count": 2}}):
+        with pytest.raises(ConfigError, match="GPU"):
+            parse_config(set_(base(), "resources", res))
 
 
 def test_reward_pin_only_invalidates_rewards(monkeypatch):

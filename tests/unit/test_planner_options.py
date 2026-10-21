@@ -68,26 +68,58 @@ def test_episode_cap_limits_containers():
     assert o.kinds[0].containers == 2  # ceil(5 episodes / 4 per container)
 
 
-def test_100_video_hours_matches_w3a_dollars_per_hour():
+def test_100_video_hours_matches_s1_dollars_per_hour():
     wl = WorkloadSummary.from_hours(100)
-    req = PlanRequest(wl, presets=("exact",), max_gpus=10)
+    req = PlanRequest(wl, presets=("exact",), stages=("segment", "caption"), max_gpus=10)
     o = build_option(req, RateTable.load(), pinned_rates(), "exact", 4)
-    assert o.cost_usd / 100 == pytest.approx(23.2, abs=0.6)  # ~$23 per video-hour
+    assert o.cost_usd / 100 == pytest.approx(40.0, abs=1.0)  # S1 on cu128: ~$40 per video-h
+    assert o.rate_status == "measured" and o.requires == ()
+    assert not any(f.startswith("warning:") for f in o.flags)
+    g = build_option(req, RateTable.load(), pinned_rates(), "exact", 4,
+                     extra_features=("gpu_thread",))
+    assert g.cost_usd / 100 == pytest.approx(25.0, abs=1.0)  # Perf-1 projection, ~$25
+    assert g.requires == ("gpu_thread",) and g.name == "exact x4 +gpu_thread"
+    assert any("projection only" in f for f in g.flags)
+    assert any(f.startswith("warning:") and "segcap (projected)" in f for f in g.flags)
 
 
 def test_options_deterministic_and_bounded():
-    req = PlanRequest(WorkloadSummary.from_hours(100), deadline_s=48 * 3600, budget_usd=3000,
+    req = PlanRequest(WorkloadSummary.from_hours(100), deadline_s=96 * 3600, budget_usd=6000,
                       max_gpus=10)
     a, b = plan_options(req), plan_options(req)
     assert a == b
     assert 2 <= len(a) <= 4
     assert {o.preset for o in a} == {"exact", "balanced"}
-    assert [o.name for o in a] == ["exact x8", "exact x4", "balanced x1", "exact x8 fastest"]
+    assert [o.name for o in a] == ["exact x4", "balanced x1", "exact x8 +gpu_thread",
+                                   "exact x4 +gpu_thread"]
     best = recommended(a)
-    assert best is not None and best.certification == "reference"
+    assert best is not None and best.name == "exact x4" and best.certification == "reference"
     bal = next(o for o in a if o.preset == "balanced")
     assert bal.certification == "needs certificates"
     assert any("placeholder" in f for f in bal.flags)
+
+
+def test_recommended_never_picks_a_projection_and_prefers_measured():
+    """Review 4 M5's case: 10 video-h used to recommend exact x8 ($164) on a gpu_thread
+    projection; the runnable exact x4 on the measured cu128 rate is ~$414."""
+    req = PlanRequest(WorkloadSummary.from_hours(10, episodes=1200), budget_usd=2000,
+                      max_gpus=3, stages=("segment", "caption", "reward.terminal",
+                                          "reward.dense"))
+    opts = plan_options(req)
+    best = recommended(opts)
+    assert best.name == "exact x4" and best.requires == ()
+    assert best.cost_usd == pytest.approx(414, abs=5)
+    cheaper = [o for o in opts if o.cost_usd < best.cost_usd and o.preset == "exact"]
+    assert cheaper and all(o.requires == ("gpu_thread",) for o in cheaper)
+    # with gpu_thread enabled (once wired), its rates are used and the options are runnable,
+    # still flagged as resting on projected rates
+    req_g = PlanRequest(req.workload, budget_usd=2000, max_gpus=3, stages=req.stages,
+                        features=("gpu_thread",))
+    opts_g = plan_options(req_g)
+    assert all(not o.requires for o in opts_g)
+    best_g = recommended(opts_g)
+    assert best_g.preset == "exact" and best_g.rate_status == "projected"
+    assert any(f.startswith("warning:") for f in best_g.flags)
 
 
 def test_sequential_dominated_option_dropped():
@@ -129,7 +161,8 @@ def test_mixed_cameras_and_rewards():
                       max_gpus=6)
     o = build_option(req, RateTable.load(), pinned_rates(), "exact", 4)
     seg = next(k for k in o.kinds if k.kind == "segcap")
-    assert seg.work_s == pytest.approx(3600 * 4.08 + 3600 * 2.39)  # 3-view falls back to x2
+    # the cu130 3-view rows are stale: both groups use the 1-view cu128 rate
+    assert seg.work_s == pytest.approx(3600 * 7.0 + 3600 * 7.0)
     assert {k.kind for k in o.kinds} == {"segcap", "reward.dense"}
     assert o.peak_gpus <= 6
 

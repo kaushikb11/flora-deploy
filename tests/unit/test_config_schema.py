@@ -202,9 +202,53 @@ def test_segcap_accepts_large_gpus(gpu):
     assert cfg.pools()["segcap"].gpu == gpu
 
 
-def test_gpu_count_counts_toward_the_minimum():
-    d = with_(base(), "resources", {"segcap": {"gpu": "H100!", "gpu_count": 2}})
-    assert parse_config(d).pools()["segcap"].gpu_count == 2
+def test_gpu_memory_is_per_device_not_summed():
+    """Review 4 M7: 2 x H100 does not hold the exact segcap models (single-device engines);
+    rubric is the one tensor-parallel kind (TP=2)."""
+    for res in ({"segcap": {"gpu": "H100!", "gpu_count": 2}},
+                {"reward.terminal": {"gpu": "L40S", "gpu_count": 2}}):
+        with pytest.raises(ConfigError, match="GPU"):
+            parse_config(with_(base(), "resources", res))
+    rubric = with_(base(), "pipeline.stages", ["reward.rubric"])
+    assert parse_config(rubric).pools()["reward.rubric"].gpu_count == 2
+    with pytest.raises(ConfigError, match="tensor-parallel"):
+        parse_config(with_(rubric, "resources", {"reward.rubric": {"gpu_count": 1}}))
+    with pytest.raises(ConfigError, match="each GPU"):
+        parse_config(with_(rubric, "resources", {"reward.rubric": {"gpu": "L40S"}}))
+    assert parse_config(with_(base(), "resources", {"segcap": {"gpu": "B200"}}))
+
+
+@pytest.mark.parametrize("sink", ["s3:// ", "s3://", "s3:///x", "gs://a b", "volume:// x"])
+def test_sink_needs_a_target(sink):
+    with pytest.raises(ConfigError, match="sink"):
+        parse_config(with_(base(), "output.sink", sink))
+
+
+@pytest.mark.parametrize("repo", ["not a repo id!!", "noslash", "a/b/c", "/x", "org/"])
+def test_repo_must_be_a_repo_id(repo):
+    with pytest.raises(ConfigError, match="repo"):
+        parse_config(with_(base(), "input.repo", repo))
+
+
+def test_embodiment_camera_count_matches_nvidia():
+    three = {"top": "main", "l": "left_wrist", "r": "right_wrist"}
+    with pytest.raises(ConfigError, match="human"):
+        parse_config(with_(base(), "input.cameras", three))
+    yam32 = with_(base(), "pipeline.embodiment", "yam32")
+    with pytest.raises(ConfigError, match="yam32"):
+        parse_config(with_(yam32, "input.cameras", {"top": "main"}))
+    assert parse_config(with_(yam32, "input.cameras", three))
+    assert parse_config(with_(with_(base(), "pipeline.embodiment", "yam"), "input.cameras",
+                              three))
+
+
+def test_output_modes_are_config_fields():
+    cfg = parse_config(base())
+    assert cfg.pipeline.determinism == "nvidia"
+    assert cfg.pipeline.terminal_rationale is False  # NVIDIA's terminal_reward.py default
+    with pytest.raises(ConfigError, match="terminal_rationale"):
+        parse_config(with_(base(), "pipeline.terminal_rationale", "yes"))
+    assert parse_config(with_(base(), "pipeline.terminal_rationale", True))
 
 
 def test_fixed_text_with_ordinary_specials_is_allowed():
