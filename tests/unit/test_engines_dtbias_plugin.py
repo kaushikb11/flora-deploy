@@ -10,6 +10,7 @@ import pytest
 from flora_deploy.engines.offline_llm import EngineSpec
 from flora_deploy.engines.patches import dt_bias_fp32 as D
 
+pytestmark = pytest.mark.torch  # CI runs these in the nvlink job (docs/ci.md)
 torch = pytest.importorskip("torch")
 
 

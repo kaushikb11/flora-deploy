@@ -318,6 +318,7 @@ def test_patch_reaches_nvidias_session_load(nv_code, tmp_path):
     nv.audit()
 
 
+@pytest.mark.torch
 def test_compare_models_detects_one_bit(tmp_path):
     torch = pytest.importorskip("torch")
     a = torch.nn.Linear(3, 2).to(torch.bfloat16)
