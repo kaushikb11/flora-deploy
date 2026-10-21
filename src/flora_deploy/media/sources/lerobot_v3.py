@@ -59,9 +59,14 @@ class LeRobotV3Source:
         also carry per-feature ``stats/*`` arrays, which are large)."""
         import pyarrow.parquet as pq
 
-        files = sorted((self.root / "meta" / "episodes").glob("chunk-*/file-*.parquet"))
+        # LeRobot writes ``file-000.parquet``; some converted datasets (e.g. jnogga/droid_success)
+        # write ``file_000.parquet``. Accept both.
+        ep_dir = self.root / "meta" / "episodes"
+        files = sorted(
+            {*ep_dir.glob("chunk-*/file-*.parquet"), *ep_dir.glob("chunk-*/file_*.parquet")}
+        )
         if not files:
-            raise SourceError(f"{self.root}: no meta/episodes/chunk-*/file-*.parquet")
+            raise SourceError(f"{self.root}: no meta/episodes/chunk-*/file[-_]*.parquet")
         want = self._columns()
         rows: list[dict] = []
         for f in files:

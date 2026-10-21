@@ -199,3 +199,11 @@ def test_mp4_dir_camera_stem_collision(tmp_path):
     synth.encode(tmp_path / "ep" / "main.mov", Spec(4))
     with pytest.raises(SourceError, match="two files"):
         Mp4DirSource(tmp_path).list_episodes()
+
+
+def test_v3_accepts_underscore_episode_meta_names(tmp_path):
+    root = synth.lerobot_v3_tree(tmp_path / "ds", _episodes([10, 14]), ["t"])
+    for f in (root / "meta" / "episodes").glob("chunk-*/file-*.parquet"):
+        f.rename(f.with_name(f.name.replace("file-", "file_")))
+    eps = list(open_source(root, camera_map=CMAP).list_episodes())
+    assert len(eps) == 2
