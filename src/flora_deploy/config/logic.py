@@ -54,6 +54,7 @@ OUTPUT_MODULES: dict[str, tuple[str, ...]] = {
         "nv/capture.py",
         "accel/__init__.py",
         "accel/captioner_load.py",
+        "accel/determinism.py",  # opt-in kernel selection (D-1) changes outputs
         "accel/framecache.py",
         "accel/geometry.py",
         "accel/patches.py",
@@ -74,6 +75,7 @@ OUTPUT_MODULES: dict[str, tuple[str, ...]] = {
         "nv/capture.py",
         "accel/__init__.py",
         "accel/captioner_load.py",
+        "accel/determinism.py",  # opt-in kernel selection (D-1) changes outputs
         "accel/framecache.py",
         "accel/geometry.py",
         "accel/patches.py",
