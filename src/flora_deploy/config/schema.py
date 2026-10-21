@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import posixpath
 import re
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal, get_args
@@ -337,10 +338,12 @@ class FloraConfig(_Model):
             raise ValueError("; ".join(bad_gpu))
         allow = self.allow_uncertified or bool((info.context or {}).get("allow_uncertified"))
         if needs_certificate(self.preset) and not allow:
-            from flora_deploy.config.hashing import kind_modes
+            from flora_deploy.validate.certkey import lookup_context
 
-            certs = find_certificates(self.preset, pools,
-                                      modes={k: kind_modes(self, k) for k in pools})
+            # Fail closed: without derived-weight content digests (context
+            # ``derived_content``), a kind that needs derived weights matches no certificate.
+            certs = find_certificates(self.preset, pools, **lookup_context(
+                self, pools, derived_content=(info.context or {}).get("derived_content")))
             missing = [f"{k} on {p.gpu}" for k, p in pools.items() if k not in certs]
             if missing:
                 raise ValueError(
@@ -504,15 +507,18 @@ def _format_errors(err: ValidationError, source: str) -> str:
 
 
 def parse_config(data: Any, *, source: str = "flora.yaml",
-                 allow_uncertified: bool = False) -> FloraConfig:
+                 allow_uncertified: bool = False,
+                 derived_content: Mapping[str, str] | None = None) -> FloraConfig:
     """Validate a parsed YAML/JSON document. Raises ``ConfigError`` listing every problem.
 
     ``allow_uncertified`` (the CLI's ``--allow-uncertified``) has the effect of the config's
-    ``allow_uncertified: true``."""
+    ``allow_uncertified: true``. ``derived_content``: derived-weight content digests, needed to
+    match a certificate for a kind with derived weights (``validate.certkey.matching``)."""
     if not isinstance(data, dict):
         raise ConfigError(f"{source}: expected a mapping at the top level")
     try:
-        return FloraConfig.model_validate(data, context={"allow_uncertified": allow_uncertified})
+        return FloraConfig.model_validate(data, context={"allow_uncertified": allow_uncertified,
+                                                         "derived_content": derived_content})
     except ValidationError as e:
         raise ConfigError(_format_errors(e, source)) from None
 

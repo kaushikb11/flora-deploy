@@ -30,7 +30,7 @@ Everything is deterministic: same inputs, same options in the same order.
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Literal
 
@@ -406,15 +406,18 @@ def plan_options(req: PlanRequest, *, table: RateTable | None = None,
     return out
 
 
-def recommended(options: Sequence[PlanOption]) -> PlanOption | None:
+def recommended(options: Sequence[PlanOption],
+                certified: Collection[str] = ()) -> PlanOption | None:
     """The option to suggest: never a projection that needs an unwired feature; ``ok`` before
-    ``at risk``; then the reference preset before uncertified ones; then measured rates before
-    projected before placeholders (review 4 M5); then the cheapest. ``None`` when no option is
-    feasible and runnable."""
+    ``at risk``; then the reference preset, or an option named in ``certified`` (every pool has
+    a ``certified`` Gate certificate), before uncertified ones; then measured rates before
+    projected before placeholders (review 4 M5); then the cheapest. So a certified ``balanced``
+    that is cheaper wins over ``exact``. ``None`` when no option is feasible and runnable."""
     live = [o for o in options if o.status != "infeasible" and not o.requires]
     if not live:
         return None
-    return min(live, key=lambda o: (o.status != "ok", o.certification != "reference",
+    return min(live, key=lambda o: (o.status != "ok",
+                                    o.certification != "reference" and o.name not in certified,
                                     STATUS_RANK[o.rate_status], o.cost_usd, o.wall_s, o.name))
 
 

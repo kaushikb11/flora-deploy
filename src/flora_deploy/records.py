@@ -35,6 +35,11 @@ class Provenance:
     gpu: str | None = None  # from nvidia-smi; not part of config_hash (D11)
     certificate: str | None = None  # None for `exact` (reference by construction)
     source: dict[str, dict[str, Any]] = field(default_factory=dict)  # role -> {uri, range_s}
+    # Certification binding (docs/certification.md, "Provenance a record must carry"): the
+    # job's embodiment pool, and ``validate.certkey.key_document`` of the stack that produced
+    # the record. ``flora certify`` refuses records without them.
+    embodiment: str | None = None
+    cert_key: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)

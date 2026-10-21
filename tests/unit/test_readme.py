@@ -186,14 +186,63 @@ def test_config_block_validates_with_its_placeholders_filled():
     loads_config(text, source="README.md config block")
 
 
+def _sdk_calls(code: str) -> tuple[list[tuple[str, list[str]]], list[str]]:
+    """``([(sdk function, [every keyword]), ...], [job method, ...])`` of the snippet (ast)."""
+    import ast
+
+    funcs, methods = [], []
+    for node in ast.walk(ast.parse(code)):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and isinstance(
+                node.func.value, ast.Name):
+            if node.func.value.id == "sdk":
+                funcs.append((node.func.attr, [k.arg for k in node.keywords]))
+            elif node.func.value.id == "job":
+                methods.append(node.func.attr)
+    return funcs, methods
+
+
 def test_sdk_snippet_calls_exist():
     from flora_deploy import sdk
 
     (py,) = [b for b in BLOCKS if b.lang == "python"]
-    for kw in re.findall(r"sdk\.submit\([^)]*?(\w+)=", py.code):
-        assert kw in inspect.signature(sdk.submit).parameters
-    for meth in re.findall(r"job\.(\w+)\(", py.code):
+    funcs, methods = _sdk_calls(py.code)
+    assert funcs, "the SDK snippet calls no sdk function"
+    for name, kws in funcs:
+        fn = getattr(sdk, name, None)
+        assert callable(fn), f"sdk has no {name}()"
+        params = inspect.signature(fn).parameters
+        bad = [k for k in kws if k is None or k not in params]  # None: a **kwargs splat
+        assert not bad, f"sdk.{name}() has no keyword(s) {bad}"
+    for meth in methods:
         assert callable(getattr(sdk.Job, meth, None)), f"sdk.Job has no {meth}()"
+
+
+def test_sdk_snippet_check_sees_every_keyword():
+    """Review 7 T2: the regex saw only the first keyword of a call."""
+    funcs, _ = _sdk_calls('job = sdk.submit("f", job_id="x", bogus_kw=1)\n')
+    assert funcs == [("submit", ["job_id", "bogus_kw"])]
+
+
+def test_readme_modal_flow_is_deployable(request):
+    """The "Run on Modal" flow (`flora init --template <t>` then `flora deploy`) plans an app.
+    xfail while a kind it needs has no worker (P1b-1); once wired it must pass (strict)."""
+    from flora_deploy.cli.init import template_text
+    from flora_deploy.config.schema import loads_config
+    from flora_deploy.modal_app.factory import PENDING_WORKERS, WorkerUnavailable, plan_app
+
+    (block,) = [b for b in BASH if b.heading.startswith("Run on Modal")]
+    argvs = [a for a in commands(block.code) if a[:2] == ["flora", "init"]]
+    assert argvs, "the Run on Modal block runs no `flora init`"
+    argv = argvs[0]
+    template = argv[argv.index("--template") + 1]
+    assert any(a[:2] == ["flora", "deploy"] for a in commands(block.code))
+    cfg = loads_config(template_text(template), source=template)
+    pending = sorted(k for k in cfg.pools() if k in PENDING_WORKERS)
+    if pending:
+        request.applymarker(pytest.mark.xfail(reason="P1b-1 factory wiring pending",
+                                              raises=WorkerUnavailable, strict=True))
+    receipts = {"tempseg_merged": "a" * 64, "captioner_bf16": "b" * 64}
+    assert plan_app(cfg, store="s3://bucket/labels", derived_receipts=receipts)
 
 
 def test_try_it_script_is_the_readme_block():

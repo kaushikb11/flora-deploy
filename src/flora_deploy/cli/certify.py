@@ -2,8 +2,9 @@
 
 Compares the candidate run's records with the ``exact`` oracle's, against the ``exact`` noise
 run, and writes one content-addressed certificate per stage into ``config/certificates/`` (or
-``--out-dir``). Metrics only: no captions, prompts or other record text are written. Runs on
-CPU; contacts nothing.
+``--out-dir``). The certificate is bound to the records' own provenance; the candidate's key
+must be the stack this checkout would run. Metrics only: no captions, prompts or other record
+text are written. Runs on CPU; contacts nothing.
 """
 
 from __future__ import annotations
@@ -55,7 +56,8 @@ def certify(
         "--config", "-c", help="The candidate run's flora.yaml (preset, pools, modes).")
     ] = Path("flora.yaml"),
     noise: Annotated[Path | None, typer.Option(
-        help="Second exact run (default mode) of a subset, JSONL: the noise floor.")] = None,
+        help="The oracle run repeated on a subset of its episodes, JSONL: the noise floor.")
+    ] = None,
     l0: Annotated[list[Path] | None, typer.Option(
         help="balanced_lab result JSON (L0 / Gate A), repeatable (one per model kind).")
     ] = None,
@@ -64,18 +66,19 @@ def certify(
     ] = None,
     gpu: Annotated[str | None, typer.Option(
         help="GPU type certified (default: the config's pool GPU for the stage).")] = None,
-    pools: Annotated[Path | None, typer.Option(
-        help='uid -> embodiment class JSON ({"<uid>": "yam", ...}); default: one class.')
-    ] = None,
-    tolerance: Annotated[float, typer.Option(help="Allowed multiple of the noise floor.")] = 1.5,
+    tolerance: Annotated[float, typer.Option(
+        help="Allowed multiple of the noise floor, in [1, 2].")] = 1.5,
     min_samples: Annotated[int, typer.Option(
-        help="Episodes needed per (stage, embodiment class).")] = 5,
-    min_noise_samples: Annotated[int, typer.Option(help="Noise-run episodes per stage.")] = 2,
+        help="Episodes needed per (stage, embodiment pool); at least 10.")] = 10,
+    min_noise_samples: Annotated[int, typer.Option(
+        help="Noise-run episodes per stage; at least 5.")] = 5,
     slack: Annotated[list[str] | None, typer.Option(
-        help="Absolute slack METRIC=VALUE added to the threshold (repeatable; default 0).")
+        help="Absolute slack METRIC=VALUE added to the threshold (repeatable; default 0; at "
+             "most the metric's noise floor).")] = None,
+    derived_content: Annotated[list[str] | None, typer.Option(
+        help="Derived-weight content digest NAME=SHA256 (DerivedPin.content_sha256) of the "
+             "weights the candidate ran with (repeatable; required for segment/caption).")
     ] = None,
-    receipt: Annotated[list[str] | None, typer.Option(
-        help="Derived-weight receipt NAME=HASH the candidate ran with (repeatable).")] = None,
     similarity: Annotated[str | None, typer.Option(
         help="Optional caption text-similarity hook module:function -> [0,1] (off by default).")
     ] = None,
@@ -86,12 +89,11 @@ def certify(
                        ] = False,
 ) -> None:
     """Certify a balanced stack against exact, within NVIDIA's own run-to-run noise."""
-    from flora_deploy import LOGIC_VERSION
     from flora_deploy.config.hashing import kind_modes
     from flora_deploy.config.presets import get_preset
     from flora_deploy.config.schema import ConfigError, load_config
     from flora_deploy.validate import certify as C
-    from flora_deploy.validate.certkey import engine_spec_document
+    from flora_deploy.validate.certkey import CertKeyError, key_document
 
     try:
         cfg = load_config(config, allow_uncertified=True)
@@ -106,20 +108,18 @@ def certify(
         ex, bal = C.read_records(exact), C.read_records(balanced)
         nz = C.read_records(noise) if noise else None
         labs = [json.loads(p.read_text(encoding="utf-8")) for p in l0 or ()]
-        classes = json.loads(pools.read_text(encoding="utf-8")) if pools else None
         slacks = {k: float(v) for k, v in _pairs(slack, "--slack").items()}
     except (OSError, ValueError) as e:
         raise _fail(f"bad input: {e}") from None
-    stale = sorted({r.provenance.logic_version for r in bal} - {LOGIC_VERSION})
-    if stale:
-        raise _fail(f"candidate records were made with logic version(s) {stale}, but this "
-                    f"checkout is {LOGIC_VERSION}: certify from the commit that ran them")
     lab_by_kind = {lab.get("kind"): lab for lab in labs}
     stages = stage or [s for s in C.STAGE_METRICS if any(r.stage == s for r in bal)]
     sim = _similarity(similarity)
-    th = C.Thresholds(tolerance=tolerance, min_samples=min_samples,
-                      min_noise_samples=min_noise_samples, slack=slacks)
-    receipts = _pairs(receipt, "--receipt")
+    try:
+        th = C.Thresholds(tolerance=tolerance, min_samples=min_samples,
+                          min_noise_samples=min_noise_samples, slack=slacks)
+    except C.CertifyError as e:
+        raise _fail(str(e)) from None
+    contents = _pairs(derived_content, "--derived-content")
     pool_map = cfg.pools()
     certs, worst = [], 0
     for st in stages:
@@ -127,16 +127,23 @@ def certify(
         if kind is None or kind not in pool_map:
             raise _fail(f"stage {st!r} is not run by this config")
         g = gpu or pool_map[kind].gpu
-        doc = engine_spec_document(cfg.preset, kind, modes=kind_modes(cfg, kind))
-        want = {r: receipts[r] for r in spec.derived_weights.get(kind, ()) if r in receipts}
+        try:
+            doc = key_document(cfg.preset, kind, g, modes=kind_modes(cfg, kind),
+                               derived_content=contents)
+        except CertKeyError as e:
+            raise _fail(f"{st}: {e} (pass --derived-content NAME=SHA256)") from None
         try:
             cert = C.certify_stage(
                 st, exact=ex, balanced=bal, noise=nz, engine_spec=doc, gpu=g,
-                preset=cfg.preset, kind=kind, classes=classes,
-                l0=lab_by_kind.get(C.L0_STAGES.get(st)), thresholds=th, similarity=sim,
-                similarity_name=similarity, derived_weights=want)
+                preset=cfg.preset, kind=kind, l0=lab_by_kind.get(C.L0_STAGES.get(st)),
+                thresholds=th, similarity=sim, similarity_name=similarity)
+        except C.CertifyRefused as e:
+            raise _fail(f"{st}: certified: false ({e.reason}): {e}", 1) from None
         except C.CertifyError as e:
             raise _fail(f"{st}: {e}") from None
+        if cert["covered_pools"] != [cfg.pipeline.embodiment]:
+            raise _fail(f"{st}: the records are for embodiment {cert['covered_pools']}, the "
+                        f"config for {cfg.pipeline.embodiment!r}")
         path = None
         if cert["verdict"] != "fail" or out_dir is not None:
             path = C.write_certificate(cert, out_dir)
@@ -148,9 +155,9 @@ def certify(
         colour = {"certified": "green", "provisional": "yellow", "fail": "red"}
         for cert, path in certs:
             v = cert["verdict"]
-            console.print(f"{cert['stage']} on {cert['gpu']}: [{colour[v]}]{v}[/{colour[v]}] "
-                          f"{cert['id']}" + (f" ({', '.join(cert['reasons'])})"
-                                             if cert["reasons"] else ""))
+            console.print(f"{cert['stage']} on {cert['gpu']} for {cert['covered_pools']}: "
+                          f"[{colour[v]}]{v}[/{colour[v]}] {cert['id']}"
+                          + (f" ({', '.join(cert['reasons'])})" if cert["reasons"] else ""))
             for ch in cert["checks"]:
                 if ch["pass"] is False:
                     console.print(f"  {ch['class']} {ch['metric']}: {ch['value']} > "

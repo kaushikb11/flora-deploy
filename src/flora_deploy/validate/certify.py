@@ -3,11 +3,17 @@
 Inputs, all ``flora_labels_v1`` records (JSONL):
 
 - ``exact``: the oracle run (NVIDIA's own HF code; model inputs proven identical);
-- ``noise`` (optional): a second ``exact`` run of a subset in NVIDIA's default mode. ``exact``
-  vs ``noise`` is NVIDIA's own run-to-run divergence (``docs/determinism.md``: the H200 default
-  path is not deterministic), the **noise floor**;
+- ``noise`` (optional): the oracle run repeated on a subset of its episodes (same stack, stage
+  hash, GPU and determinism mode). ``exact`` vs ``noise`` is NVIDIA's own run-to-run divergence
+  (``docs/determinism.md``: the H200 default path is not deterministic), the **noise floor**;
 - ``balanced``: the candidate stack on the same episodes;
 - optional L0 / Gate A JSON from ``modal_app/balanced_lab.py``.
+
+**Bound to the records** (fail closed): every record must carry its stage hash, GPU, embodiment
+and ``provenance.cert_key`` (the ``validate.certkey.key_document`` of the stack that made it).
+Each set must be uniform in them; the candidate's key must be the stack this checkout would run;
+the noise run must repeat the oracle's. Fake-model records are refused outright
+(:class:`CertifyRefused`, ``fake_models``).
 
 Per stage, every metric below is a *divergence* (0 = identical; definitions in
 ``docs/certification.md``), computed per episode and averaged:
@@ -18,17 +24,19 @@ Per stage, every metric below is a *divergence* (0 = identical; definitions in
   (normalized Levenshtein), and ``caption_similarity_divergence`` when a text-similarity hook is
   given (default off; nothing here touches the network);
 - ``reward.terminal``: ``expected_score_abs_delta``, ``score_mismatch``;
-- ``reward.dense``: ``per_step_abs_delta``, ``rank_divergence`` (1 - Spearman rho),
-  ``length_mismatch``.
+- ``reward.dense``: ``per_step_abs_delta``, ``rank_divergence`` (1 - Spearman rho; mean
+  ``|delta|`` when a side is constant), ``length_mismatch``.
 
-Pass rule, per (stage, embodiment class) and metric: ``mean(balanced vs exact) <= tolerance x
-mean(noise vs exact) + slack`` (defaults 1.5 and 0). Verdict: ``fail`` if any check fails or a
-present L0 fails; else ``provisional`` if there is no noise run, too few samples (per class, or
-in the noise run), incomplete coverage, or (video stages) no L0; else ``certified``.
+Pass rule, per (stage, embodiment pool) and metric: ``mean(balanced vs exact) <= min(cap,
+tolerance x max(noise, floor) + slack)`` (``certkey.metric_threshold``; knobs bounded by
+``certkey.POLICY``). Verdict: ``fail`` if any check fails or a present L0 fails; else
+``provisional`` if there is no noise run, too few samples (per pool, or in the noise run),
+incomplete coverage, or (video stages) no L0; else ``certified``.
 
 The certificate holds metrics only: no record string ever goes in (no captions, prompts,
-rationales, ids, dataset names). Episode ids are sha256-hashed. The one record value carried
-is the certified stage hash (``provenance.config_hash``), a hex digest of our own config.
+rationales, ids, dataset names). Episode ids are sha256-hashed. The record values carried are
+our own: stage hashes (validated hex), the key's contents (equal to this checkout's), the
+normalized GPU, the embodiment pool and the determinism mode (validated enums).
 """
 
 from __future__ import annotations
@@ -43,15 +51,29 @@ from typing import Any
 
 from flora_deploy.records import Segment, StageRecord
 from flora_deploy.validate.certkey import (
+    _HEX64,
+    _STAMP,
+    ABSOLUTE_CAPS,
     CERT_DIR,
     CERT_SCHEMA,
+    FAKE_CERTIFICATES,
+    GENERATOR,
+    MIN_NOISE_SAMPLES_FLOOR,
+    MIN_SAMPLES_FLOOR,
+    NOISE_FLOOR,
     canonical,
     certificate_id,
+    document_problems,
+    metric_threshold,
     sha256_hex,
+    threshold_problems,
 )
 
-GENERATOR = "flora-certify"
-CERTIFY_VERSION = "1"
+CERTIFY_VERSION = "2"
+# Provenance every record must carry to be certified against (docs/certification.md).
+REQUIRED_PROVENANCE = ("config_hash", "gpu", "embodiment", "cert_key")
+EMBODIMENTS = ("human", "yam", "yam32", "dex", "tianji")  # config.schema.Embodiment
+DETERMINISM_MODES = ("nvidia", "deterministic")  # accel.determinism.MODES
 
 Similarity = Callable[[str, str], float]
 
@@ -64,20 +86,35 @@ STAGE_METRICS: dict[str, tuple[str, ...]] = {
 SIMILARITY_METRIC = "caption_similarity_divergence"
 # Stages whose balanced engine differs from exact's, so L0 input parity must be shown.
 L0_STAGES = {"segment": "tempseg", "caption": "captioner"}
-DEFAULT_CLASS = "all"
 
 
 class CertifyError(ValueError):
     pass
 
 
+class CertifyRefused(CertifyError):
+    """The records cannot be certified at all (``certified: false`` with ``reason``)."""
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 @dataclass(frozen=True)
 class Thresholds:
+    """The pass-rule knobs, bounded by ``certkey.POLICY`` (out of bounds: ``CertifyError``)."""
+
     tolerance: float = 1.5  # PLAN.md §9: <= 1.5x oracle noise
-    min_samples: int = 5  # balanced-vs-exact episodes per (stage, embodiment class)
-    min_noise_samples: int = 2  # exact-vs-exact episodes per stage
+    min_samples: int = MIN_SAMPLES_FLOOR  # balanced-vs-exact episodes per (stage, pool)
+    min_noise_samples: int = MIN_NOISE_SAMPLES_FLOOR  # exact-vs-exact episodes per stage
     min_coverage: float = 1.0  # share of exact episodes the balanced run labelled
     slack: Mapping[str, float] = field(default_factory=dict)  # metric -> absolute slack
+
+    def __post_init__(self) -> None:
+        bad = threshold_problems(self.tolerance, self.min_samples, self.min_noise_samples,
+                                 self.min_coverage, self.slack)
+        if bad:
+            raise CertifyError("thresholds outside policy (certkey.POLICY): " + "; ".join(bad))
 
     def as_dict(self) -> dict[str, Any]:
         return {"tolerance": self.tolerance, "min_samples": self.min_samples,
@@ -246,6 +283,9 @@ def spearman(a: Sequence[float], b: Sequence[float]) -> float | None:
 
 
 def dense_metrics(ref: StageRecord, cand: StageRecord) -> dict[str, float | None] | None:
+    """``rank_divergence`` is ``1 - rho``; when rho is undefined (a side is constant, or fewer
+    than 2 steps) it is the mean ``|delta|`` instead, so equal constant series score 0 and one
+    differing step in a constant series scores ``1/n``, not the maximum (M6)."""
     if ref.dense is None or cand.dense is None:
         return None
     a, b = list(ref.dense.per_step), list(cand.dense.per_step)
@@ -257,7 +297,7 @@ def dense_metrics(ref: StageRecord, cand: StageRecord) -> dict[str, float | None
     else:
         delta = sum(abs(x - y) for x, y in zip(a, b, strict=True)) / n
         rho = spearman(a, b) if n >= 2 else None
-        rank = (1.0 - rho) if rho is not None else (0.0 if a == b else 1.0)
+        rank = (1.0 - rho) if rho is not None else delta
     return {"per_step_abs_delta": delta, "rank_divergence": rank,
             "length_mismatch": float(len(ref.dense.per_step) != len(cand.dense.per_step))}
 
@@ -339,7 +379,7 @@ def gate_a_summary(lab: Mapping[str, Any] | None) -> dict[str, Any] | None:
 
 
 # ---------------------------------------------------------------------------------------------
-# Certificate
+# Binding the certificate to the records (H1, H2, H5)
 
 
 def _uid_hash(uid: str) -> str:
@@ -351,11 +391,98 @@ def episode_set(uids: Iterable[str]) -> dict[str, Any]:
     return {"count": len(hashes), "digest": sha256_hex(hashes), "uid_sha256": hashes}
 
 
-def _gpu_matches(pool_gpu: str, reported: str | None) -> bool:
-    if not reported:
-        return True
-    base = pool_gpu.rstrip("!").split("-")[0].lower()
-    return base in reported.lower()
+def normalized_gpu(name: str | None, side: str = "records") -> str:
+    """``engines.offline_llm.normalize_gpu``; an unknown GPU is refused (exact names only)."""
+    from flora_deploy.engines.offline_llm import EngineArgsError, normalize_gpu
+
+    try:
+        return normalize_gpu(str(name))
+    except EngineArgsError:
+        raise CertifyError(f"{side}: unknown GPU {name!r}") from None
+
+
+def is_fake(p) -> bool:
+    """Records made by fake engines (``flora run --local --fake-models``)."""
+    return (p.certificate in FAKE_CERTIFICATES
+            or str(p.engine).startswith(("flora-local-fake", "fake"))
+            or any(str(v).startswith(("fake", "flora-local-fake")) for v in p.models.values()))
+
+
+def missing_provenance(p) -> list[str]:
+    """The binding fields (docs/certification.md) a record's provenance lacks."""
+    out = [f for f in REQUIRED_PROVENANCE if not getattr(p, f, None)]
+    if p.config_hash and not _HEX64.match(p.config_hash):
+        out.append("config_hash (a 64-hex stage hash)")
+    if p.cert_key is not None:
+        out += [f"cert_key: {x}" for x in document_problems(p.cert_key)]
+    return out
+
+
+def bind(records: Mapping[str, StageRecord], stage: str, side: str) -> dict[str, Any]:
+    """The identity a set of records was produced under, derived from their provenance:
+    ``{key, doc, stage_hash, gpu, embodiment, determinism}``. Fake-model records are refused
+    outright (:class:`CertifyRefused` ``fake_models``); a record missing a binding field
+    (``missing_provenance``) or a set that is not uniform in one is refused (fail closed)."""
+    from flora_deploy.config.presets import get_preset
+
+    provs = [r.provenance for r in records.values()]
+    if any(is_fake(p) for p in provs):
+        raise CertifyRefused("fake_models", f"{side} {stage} records come from fake models "
+                             "(provenance.certificate / engine / models); they certify nothing")
+    missing = sorted({m for p in provs for m in missing_provenance(p)})
+    if missing:
+        raise CertifyRefused("missing_provenance", f"{side} {stage} records lack provenance "
+                             f"{missing}: workers must stamp them before their records can be "
+                             "certified (docs/certification.md)")
+
+    def one(what: str, values: set) -> Any:
+        if len(values) != 1:
+            raise CertifyError(f"{side} {stage} records must share one {what} "
+                               f"(found {len(values)})")
+        return next(iter(values))
+
+    key = one("certificate key (provenance.cert_key)", {sha256_hex(p.cert_key) for p in provs})
+    doc = provs[0].cert_key
+    stage_hash = one("stage hash", {p.config_hash for p in provs})
+    gpu = one("GPU", {normalized_gpu(p.gpu, f"{side} {stage} records") for p in provs})
+    emb = one("embodiment", {p.embodiment for p in provs})
+    if emb not in EMBODIMENTS:
+        raise CertifyError(f"{side} {stage} records: unknown embodiment {emb!r}")
+    preset = one("preset", {p.preset for p in provs})
+    if doc["preset"] != preset:
+        raise CertifyError(f"{side} {stage} records: cert_key is for preset {doc['preset']!r}, "
+                           f"provenance says {preset!r}")
+    want_kind = get_preset(preset).stage_kinds.get(stage)
+    if doc["kind"] != want_kind:
+        raise CertifyError(f"{side} {stage} records: cert_key is for kind {doc['kind']!r}, "
+                           f"not {want_kind!r}")
+    revs = {k: (v or {}).get("revision") for k, v in (doc.get("nvidia_pins") or {}).items()}
+    if any(k in revs and revs[k] != v for p in provs for k, v in p.models.items()):
+        raise CertifyError(f"{side} {stage} records: provenance.models disagree with the "
+                           "cert_key's NVIDIA pins")
+    vllm = doc.get("vllm_engine")
+    if vllm and any(p.engine != vllm.get("label") for p in provs):
+        raise CertifyError(f"{side} {stage} records: provenance.engine is not the cert_key's "
+                           f"engine {vllm.get('label')!r}")
+    det = (doc.get("modes") or {}).get("determinism")
+    if det is not None and det not in DETERMINISM_MODES:
+        raise CertifyError(f"{side} {stage} records: unknown determinism mode {det!r}")
+    return {"key": key, "doc": doc, "stage_hash": stage_hash, "gpu": gpu, "embodiment": emb,
+            "determinism": det}
+
+
+def _key_diff(a: Mapping[str, Any], b: Mapping[str, Any]) -> list[str]:
+    return sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
+
+
+# ---------------------------------------------------------------------------------------------
+# Certificate
+
+
+def now_stamp() -> str:
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def certify_stage(
@@ -368,18 +495,19 @@ def certify_stage(
     gpu: str,
     preset: str = "balanced",
     kind: str | None = None,
-    classes: Mapping[str, str] | None = None,
     l0: Mapping[str, Any] | None = None,
     thresholds: Thresholds | None = None,
     similarity: Similarity | None = None,
     similarity_name: str | None = None,
-    derived_weights: Mapping[str, str] | None = None,
+    generated_at: str | None = None,
 ) -> dict[str, Any]:
     """The certificate body (with its content-addressed ``id``) for one stage.
 
-    ``engine_spec``: ``validate.certkey.engine_spec_document`` of the stack the balanced records
-    came from; its hash is the certificate's match key. ``classes``: uid -> embodiment class
-    (pool); episodes without one are class ``all``."""
+    ``engine_spec``: ``validate.certkey.key_document`` of the stack as this checkout would run
+    it. The candidate records' own key (``provenance.cert_key``) must equal it; the
+    certificate's key is the records'. The embodiment pool comes from the records.
+    ``generated_at``: ``YYYY-MM-DDTHH:MM:SSZ`` (default: now); the newest certificate for a key
+    decides (``certkey.matching``)."""
     from flora_deploy import __version__
 
     if stage not in STAGE_METRICS:
@@ -393,29 +521,49 @@ def certify_stage(
         raise CertifyError(f"no exact {stage} records")
     if not cand:
         raise CertifyError(f"no {preset} {stage} records")
-    hashes = {r.provenance.config_hash for r in cand.values()}
-    if len(hashes) != 1 or not next(iter(hashes)):
-        raise CertifyError(f"{preset} {stage} records must share one stage hash "
-                           f"(found {len(hashes)})")
-    if not all(_gpu_matches(gpu, r.provenance.gpu) for r in cand.values()):
+    stamp = generated_at or now_stamp()
+    if not _STAMP.match(stamp):
+        raise CertifyError(f"generated_at {stamp!r}: use YYYY-MM-DDTHH:MM:SSZ")
+
+    # H1: the key is the records'; it must be the stack this checkout would run.
+    b = bind(cand, stage, preset)
+    if b["key"] != sha256_hex(dict(engine_spec)):
+        raise CertifyError(f"{preset} {stage} records were made by another stack than this "
+                           f"checkout's (cert_key differs in {_key_diff(b['doc'], engine_spec)})"
+                           "; certify from the commit, image and weights that ran them")
+    if b["doc"]["kind"] != kind:
+        raise CertifyError(f"{preset} {stage} records are for kind {b['doc']['kind']!r}")
+    if b["gpu"] != normalized_gpu(gpu, "certified GPU"):
         raise CertifyError(f"{preset} {stage} records were not produced on {gpu}")
+    # H2: the oracle is one exact run; the noise run repeats it (same stack, stage hash, GPU,
+    # determinism mode) on a subset of its episodes.
+    o = bind(ref, stage, "exact")
+    if o["embodiment"] != b["embodiment"]:
+        raise CertifyError(f"exact and {preset} {stage} records are for different embodiments")
+    if nz is not None:
+        n = bind(nz, stage, "noise")
+        for what in ("stage_hash", "key", "gpu", "determinism"):
+            if n[what] != o[what]:
+                raise CertifyError(f"noise {stage} records differ from the oracle's in {what}: "
+                                   "the noise run must repeat the oracle run")
+        if not set(nz) <= set(ref):
+            raise CertifyError(f"noise {stage} episodes are not a subset of the oracle's")
+        if any(r.audit_ref and r.audit_ref == ref[u].audit_ref for u, r in nz.items()):
+            raise CertifyError(f"noise {stage} records are copies of the oracle's (audit_ref)")
     names = metric_names(stage, similarity)
+    pool = b["embodiment"]
 
     per_ep = compare(stage, ref, cand, similarity)
-    by_class: dict[str, list[str]] = {}
-    for uid in per_ep:
-        by_class.setdefault((classes or {}).get(uid, DEFAULT_CLASS), []).append(uid)
-    candidate = {c: {"n": len(uids), "means": {m: _r(_mean(per_ep[u][m] for u in uids))
-                                               for m in names}}
-                 for c, uids in sorted(by_class.items())}
+    candidate = ({pool: {"n": len(per_ep), "means": {
+        m: _r(_mean(per_ep[u][m] for u in per_ep)) for m in names}}} if per_ep else {})
     coverage = len(per_ep) / len(ref)
 
     noise_block = None
     noise_means: dict[str, float | None] = {}
     if nz is not None:
         nz_ep = compare(stage, ref, nz, similarity)
-        noise_means = {m: _mean(nz_ep[u][m] for u in nz_ep) for m in names}
-        noise_block = {"n": len(nz_ep), "means": {m: _r(v) for m, v in noise_means.items()},
+        noise_means = {m: _r(_mean(nz_ep[u][m] for u in nz_ep)) for m in names}
+        noise_block = {"n": len(nz_ep), "means": noise_means,
                        "episodes": {k: v for k, v in episode_set(nz_ep).items()
                                     if k != "uid_sha256"}}
 
@@ -423,9 +571,10 @@ def certify_stage(
     for m in names:
         slack = float(th.slack.get(m, 0.0))
         base = noise_means.get(m) if nz is not None else None
-        per_metric[m] = {"slack": slack,
-                         "threshold": _r(th.tolerance * base + slack) if base is not None
-                         else None}
+        per_metric[m] = {"slack": slack, "floor": NOISE_FLOOR.get(m, 0.0),
+                         "cap": ABSOLUTE_CAPS.get(m),
+                         "threshold": metric_threshold(m, base, th.tolerance, slack)
+                         if base is not None else None}
     checks = []
     for c, block in candidate.items():
         for m in names:
@@ -443,7 +592,7 @@ def certify_stage(
         provisional.append("no_noise_run")
     elif noise_block["n"] < th.min_noise_samples:
         provisional.append("too_few_noise_samples")
-    if any(b["n"] < th.min_samples for b in candidate.values()) or not candidate:
+    if any(blk["n"] < th.min_samples for blk in candidate.values()) or not candidate:
         provisional.append("too_few_samples")
     if coverage < th.min_coverage:
         provisional.append("incomplete_coverage")
@@ -453,11 +602,13 @@ def certify_stage(
         provisional.append("metric_not_evaluable")
     verdict = "fail" if failures else ("provisional" if provisional else "certified")
 
-    eng = engine_spec.get("engine", {})
+    doc = b["doc"]
+    eng = doc.get("engine") or {}
     body: dict[str, Any] = {
         "schema": CERT_SCHEMA,
         "generator": {"name": GENERATOR, "version": CERTIFY_VERSION,
                       "framework": f"flora-deploy {__version__}"},
+        "generated_at": stamp,
         "verdict": verdict,
         "reasons": sorted(failures) + sorted(set(provisional)),
         "unlocks": verdict == "certified",
@@ -465,16 +616,19 @@ def certify_stage(
         "stage": stage,
         "kind": kind,
         "gpu": gpu,
-        "stage_hash": next(iter(hashes)),
-        "engine_spec_hash": sha256_hex(dict(engine_spec)),
-        "engine": {k: eng.get(k) for k in ("name", "version", "image", "image_fingerprint",
-                                           "patches")},
-        "modes": dict(engine_spec.get("modes") or {}),
-        "logic": {"version": engine_spec.get("logic_version"),
-                  "digest": engine_spec.get("logic_digest")},
+        "covered_pools": [pool],
+        "stage_hash": b["stage_hash"],
+        "engine_spec_hash": b["key"],
+        "engine": {**{k: eng.get(k) for k in ("name", "version", "image", "image_fingerprint",
+                                              "patches")},
+                   "vllm": doc.get("vllm_engine")},
+        "modes": dict(doc.get("modes") or {}),
+        "logic": {"version": doc.get("logic_version"), "digest": doc.get("logic_digest")},
         "pins": {k: v.get("revision") for k, v in sorted(
-            (engine_spec.get("nvidia_pins") or {}).items())},
-        "derived_weights": dict(sorted((derived_weights or {}).items())),
+            (doc.get("nvidia_pins") or {}).items())},
+        "derived_weights": dict(sorted((doc.get("derived_weights") or {}).items())),
+        "oracle": {"stage_hash": o["stage_hash"], "engine_spec_hash": o["key"],
+                   "gpu": o["gpu"], "determinism": o["determinism"]},
         "episodes": episode_set(per_ep),
         "metrics": {"candidate": candidate, "noise": noise_block, "coverage": _r(coverage),
                     "similarity_hook": similarity_name if similarity else None},
