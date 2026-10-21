@@ -30,6 +30,7 @@ flora = "flora_deploy.cli:main"
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.24",
+    "pytest-xdist>=3.6",
     "ruff>=0.6",
 ]
 # CPU-only stack needed to exercise NVIDIA's code in `-m nvlink` tests; mirrors the pins in
@@ -64,5 +65,6 @@ asyncio_mode = "auto"
 markers = [
     "nvlink: needs NVIDIA's code pins fetched via scripts/fetch_nv_code.py (CPU only)",
     "modal: runs on the Modal account (costs money; never in CI)",
+    "torch: needs the CPU torch stack (`--group nvlink`); CI runs these in the nvlink job",
 ]
 addopts = "-m 'not modal'"

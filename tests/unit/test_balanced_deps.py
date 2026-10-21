@@ -27,7 +27,6 @@ from flora_deploy.local import sample_dataset as make_sample
 from flora_deploy.local.runner import digest_outputs
 
 TEMPLATE = Path(__file__).resolve().parents[2] / "src/flora_deploy/config/templates/local_demo.yaml"
-JOB = "local-demo"
 STAGES = ("segment", "caption", "reward.terminal", "reward.dense")
 
 
@@ -138,7 +137,7 @@ def test_preempted_segment_and_caption_shards_resume_identically(demo, clean, tm
     assert res.state == "done", res.as_dict()
     assert res.spawner["preemptions"] == 2
     assert records(res) == records(clean)
-    jf = A.JobFiles(LocalStore(res.store_root), JOB, res.config_hash)
+    jf = A.JobFiles(LocalStore(res.store_root), res.job_id, res.config_hash)
     for kind in ("segment", "caption"):
         marks = A.markers(jf, kind, first(clean, kind))
         assert any(m.preempted for m in marks)
@@ -164,7 +163,7 @@ def test_poison_at_segment_is_excluded_at_caption_once(demo, clean, tmp_path):
     # the caption shard holding ep003 ran (bisection of the segment shard resolved it)
     # and reported it with a reason, without touching the model
     st = LocalStore(res.store_root)
-    jf = A.JobFiles(st, JOB, res.config_hash)
+    jf = A.JobFiles(st, res.job_id, res.config_hash)
     cap = next(c for c in manifest(res).shards if c.kind == "caption" and u3 in c.episodes)
     path = jf.paths.errors(res.config_hash, "caption", cap.shard_id, A.UPSTREAM_CONTAINER, 0)
     (err,) = P.read_errors(jf, path)
@@ -197,7 +196,7 @@ def test_nv_failure_at_segment_is_terminal_downstream_not_retried(demo, clean, t
     assert res.summary["errors"]["by_kind"] == {"nv_failure": 2}
     assert [p.split(":")[0] for p in res.summary["problems"]] == ["segment"]
     st = LocalStore(res.store_root)
-    jf = A.JobFiles(st, JOB, res.config_hash)
+    jf = A.JobFiles(st, res.job_id, res.config_hash)
     u3 = uid_of(res, "ep003")
     cap = next(c for c in manifest(res).shards if c.kind == "caption" and u3 in c.episodes)
     r = P.read_receipt(jf, "caption", cap.shard_id)
@@ -322,7 +321,7 @@ def test_deterministic_engine_death_is_quarantined_not_looped(demo, clean, tmp_p
     assert res.state == "completed_with_errors", res.as_dict()
     assert res.summary["poison_pills"] == [f"{u3}/{kind}"]
     assert res.spawner["crashes"] >= 3  # the container was replaced each time (fatal)
-    jf = A.JobFiles(LocalStore(res.store_root), JOB, res.config_hash)
+    jf = A.JobFiles(LocalStore(res.store_root), res.job_id, res.config_hash)
     (poisoned,) = [e["shard_id"] for e in res.events if e["event"] == "poisoned"]
     marks = A.markers(jf, kind, poisoned)
     crashed = [m for m in marks if m.crashed]  # D15-counted (a cancel at quarantine may add

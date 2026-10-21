@@ -1,5 +1,9 @@
 # flora.yaml: the balanced preset on a small public LeRobot dataset.
-# lerobot/aloha_static_cups_open (MIT): 50 episodes of ~8 s each, 3 cameras, ~0.5 GB.
+# lerobot/aloha_static_cups_open (MIT): 50 episodes of ~8 s each, 4 cameras, ~0.5 GB.
+# 3 of the 4 cameras are used. cam_low is not: the `yam` embodiment takes exactly 3 views
+# (a main view and the two wrists, as YAM's front/left/right), and cam_low is a second, low
+# overview with no YAM role. The golden set drops it the same way (docs/PLAN.md section 9).
+# ALOHA is not YAM hardware; this is a stand-in.
 # tests/unit/test_examples.py validates this file.
 
 project: lerobot-small
@@ -18,7 +22,7 @@ input:
   format: lerobot_v3
   repo: lerobot/aloha_static_cups_open
   revision: d793c969cf716001dcca18a0842c3d7e9de9e41b
-  cameras:                          # cam_low is not used
+  cameras:                          # cam_low (the 4th camera) is not used; see the top
     observation.images.cam_high: main
     observation.images.cam_left_wrist: left_wrist
     observation.images.cam_right_wrist: right_wrist

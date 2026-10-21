@@ -125,7 +125,9 @@ class LoraSpec:
                 "target_modules": len(self.targets),
                 "targets_sha256": hashlib.sha256("\n".join(sorted(self.targets)).encode())
                 .hexdigest(),
-                "rule": "bf16(fp32(W) + scale * (fp32(B) @ fp32(A)))"}
+                # merger v2 (``merge_weight``); enters the content digest (review 8b L2)
+                "rule": "bf16(fp32(fp64(W) + scale * sum_{k=0..r-1} fp64(B[:,k]) * "
+                        "fp64(A[k,:]))), k in fixed order"}
 
     def matches(self, module: str) -> bool:
         """PEFT's rule for a list of names: exact name or a ``.``-separated suffix (PEFT may

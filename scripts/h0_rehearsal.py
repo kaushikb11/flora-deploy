@@ -15,10 +15,10 @@ preemption of a ``caption`` shard, poisoned at ``caption`` only). ``--preset exa
 runs one family; the default runs both:
 
 1. fetch the episodes from the golden Volume (``flora-golden``, ``golden/v1/``) into a local
-   ``mp4_dir`` dataset (task text next to each video) and upload it to a dedicated media Volume
-   (``flora-h0-media``), which the config names as ``input.stage_to``;
-2. ``flora index --local`` (receipts into a local store, mirrored into the job store on the
-   dedicated Volume ``flora-h0``: ``flora index --local`` cannot write a ``modal-volume://``
+   ``mp4_dir`` dataset (task text next to each video) and upload it to this run's media Volume
+   (``flora-h0-media-<run_id>``), which the config names as ``input.stage_to``;
+2. ``flora index --local`` (receipts into a local store, mirrored into the job store on this
+   run's Volume ``flora-h0-<run_id>``: ``flora index --local`` cannot write a ``modal-volume://``
    store from a laptop, and ``flora index`` on Modal refuses a local ``input.path``);
 3. ``flora plan --index``, ``flora deploy --fake-models --determinism deterministic``;
 4. fault specs (``workers_app.fake_faults_path``): ``simulate_preemption()`` before the 2nd
@@ -27,8 +27,12 @@ runs one family; the default runs both:
    kind), then ``flora run --fake-models --determinism deterministic`` for every job in parallel;
 5. ``flora status``, ``flora results`` and the SDK's ``Job.results`` / store listing;
 6. assertions (printed as PASS/FAIL), then ``modal app stop`` for the apps it deployed and
-   deletion of the two dedicated Volumes and this run's lease/watch entries (``--keep`` skips
-   the Volume deletion).
+   deletion of this run's two Volumes and its lease/watch entries (``--keep`` skips the Volume
+   deletion). The Volumes are named per run, so a cleanup never touches another H0 run's
+   (review 8b L3).
+
+Job ids are fake-models job ids (``h0-<run_id>-<job>.fake``, ``jobs.store.fake_job_id``), the
+ones ``flora run --fake-models`` submits under.
 
 ``--dry-run`` plans everything offline (configs, fake app plans, the real-vs-fake hashes) and
 contacts Modal only to read the golden manifest (nothing is deployed or written).
@@ -54,7 +58,7 @@ from typing import Any
 
 GOLDEN_VOLUME = "flora-golden"
 GOLDEN_ROOT = "golden/v1"
-STORE_VOLUME = "flora-h0"
+STORE_VOLUME = "flora-h0"  # name prefixes: each run has its own Volumes (store_volume(run_id))
 MEDIA_VOLUME = "flora-h0-media"
 DETERMINISM = "deterministic"
 POISON_ID = "zz_h0_poison"  # sorts last: the preemption lands before it
@@ -204,6 +208,23 @@ def upload_dir(volume: str, local: Path, remote: str) -> int:
 # Config
 
 
+def store_volume(run_id: str) -> str:
+    """This run's job-store Volume (deleted at cleanup unless --keep)."""
+    return f"{STORE_VOLUME}-{run_id}"
+
+
+def media_volume(run_id: str) -> str:
+    """This run's media Volume (``input.stage_to``; deleted at cleanup unless --keep)."""
+    return f"{MEDIA_VOLUME}-{run_id}"
+
+
+def job_id_for(run_id: str, job: str) -> str:
+    """The job id ``flora run --fake-models`` submits under (``<project>.fake``)."""
+    from flora_deploy.jobs.store import fake_job_id
+
+    return fake_job_id(f"h0-{run_id}-{job}")
+
+
 def config_text(*, project: str, data_dir: str, embodiment: str, stages: tuple[str, ...],
                 store_volume: str, media_volume: str, run_id: str, budget_usd: float = 20.0,
                 resources: dict[str, str] | None = None, tag: str = "flora-h0",
@@ -257,8 +278,9 @@ retries:
 def write_config(work: Path, job: str, run_id: str) -> Path:
     spec = JOB_SPECS[job]
     text = config_text(project=f"h0-{run_id}-{job}", data_dir=spec.data,
-                       embodiment=spec.embodiment, stages=STAGES, store_volume=STORE_VOLUME,
-                       media_volume=MEDIA_VOLUME, run_id=run_id, preset=spec.preset)
+                       embodiment=spec.embodiment, stages=STAGES,
+                       store_volume=store_volume(run_id), media_volume=media_volume(run_id),
+                       run_id=run_id, preset=spec.preset)
     path = work / f"flora-{job}.yaml"
     path.write_text(text, encoding="utf-8")
     return path
@@ -343,7 +365,7 @@ def remote_store(run_id: str):
 
     from flora_deploy.sdk import RemoteVolumeStore
 
-    return RemoteVolumeStore(modal.Volume.from_name(STORE_VOLUME, version=2), run_id)
+    return RemoteVolumeStore(modal.Volume.from_name(store_volume(run_id), version=2), run_id)
 
 
 def poison_uid(local_store: Path, job_id: str) -> str:
@@ -472,7 +494,7 @@ def assert_job(r: JobRun, run_id: str, poison: str | None) -> None:
             reward_audits >= len(want("reward.terminal")) and reward_tasks_ok,
             f"{reward_audits} terminal audit rows")
     r.check("media root resolved", env.get("FLORA_MEDIA_ROOT") ==
-            f"/media/{MEDIA_VOLUME}/{run_id}/{spec.data}" and bool(records.get("segment")),
+            f"/media/{media_volume(run_id)}/{run_id}/{spec.data}" and bool(records.get("segment")),
             f"FLORA_MEDIA_ROOT={env.get('FLORA_MEDIA_ROOT')}")
     if spec.preempt:
         markers = [f for f in files if "/attempts/" in f and f"/{spec.preempt}/" in f]
@@ -512,7 +534,7 @@ def cleanup(app_names: list[str], run_id: str, job_ids: list[str], watch_dicts: 
     try:
         leases = modal.Dict.from_name("flora-orchestrator-leases", environment_name=env)
         for key in list(leases.keys()):
-            if any(str(key).startswith(f"orchestrator/{j}") for j in job_ids):
+            if str(key) in {f"orchestrator/{j}" for j in job_ids}:  # this run's only
                 leases.pop(key)
                 notes.append(f"lease {key} removed")
     except Exception as e:  # noqa: BLE001
@@ -522,7 +544,7 @@ def cleanup(app_names: list[str], run_id: str, job_ids: list[str], watch_dicts: 
                            capture_output=True, text=True)
         notes.append(f"modal dict delete {d}: rc={p.returncode}")
     if not keep:
-        for vol in (STORE_VOLUME, MEDIA_VOLUME):
+        for vol in (store_volume(run_id), media_volume(run_id)):
             p = subprocess.run(["modal", "volume", "delete", vol, "--yes", "--env", env],
                                capture_output=True, text=True)
             notes.append(f"modal volume delete {vol}: rc={p.returncode} "
@@ -536,7 +558,7 @@ def cleanup(app_names: list[str], run_id: str, job_ids: list[str], watch_dicts: 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--dry-run", action="store_true", help="plan only; deploy nothing")
-    ap.add_argument("--keep", action="store_true", help="keep the two H0 Volumes")
+    ap.add_argument("--keep", action="store_true", help="keep this run's two Volumes")
     ap.add_argument("--work", type=Path, help="work directory (default: a temp dir)")
     ap.add_argument("--run-id", default=None)
     ap.add_argument("--max-wall-s", type=float, default=1500.0,
@@ -563,7 +585,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.preset != "both" and spec.preset != args.preset:
             continue
         cfg_path = write_config(work, spec.name, run_id)
-        runs.append(JobRun(spec.name, cfg_path, f"h0-{run_id}-{spec.name}", eps[spec.data]))
+        runs.append(JobRun(spec.name, cfg_path, job_id_for(run_id, spec.name),
+                           eps[spec.data]))
     if args.dry_run:
         for r in runs:
             pl = plans(r.cfg_path) if (work / r.spec.data).is_dir() else None
@@ -585,16 +608,18 @@ def main(argv: list[str] | None = None) -> int:
     try:
         # media to its own Volume (input.stage_to), as Wave H stages it
         for data in sorted({r.spec.data for r in runs}):
-            n = upload_dir(MEDIA_VOLUME, work / data, f"{run_id}/{data}")
-            print(f"[{data}] uploaded {n} files to {MEDIA_VOLUME}:/{run_id}/{data}", flush=True)
+            n = upload_dir(media_volume(run_id), work / data, f"{run_id}/{data}")
+            print(f"[{data}] uploaded {n} files to {media_volume(run_id)}:/{run_id}/{data}",
+                  flush=True)
         fl = flora_bin()
         for r in runs:
             local_store = work / f"store-{r.job}"
             sh([fl, "index", "--local", "--config", str(r.cfg_path), "--job", r.job_id,
                 "--store", f"file://{local_store}", "--out", str(work / f"summary-{r.job}.json")],
                cwd=work, log=log)
-            n = mirror_index(local_store, r.job_id, run_id)
-            print(f"[{r.job}] mirrored {n} index files into {STORE_VOLUME}:/{run_id}", flush=True)
+            n = mirror_index(local_store, r.job_id, run_id, store_volume(run_id))
+            print(f"[{r.job}] mirrored {n} index files into {store_volume(run_id)}:/{run_id}",
+                  flush=True)
             sh([fl, "plan", "--config", str(r.cfg_path), "--index",
                 str(work / f"summary-{r.job}.json")], cwd=work, log=log)
             pl = plans(r.cfg_path)

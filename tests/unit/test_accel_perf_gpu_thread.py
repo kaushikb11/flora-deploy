@@ -123,6 +123,7 @@ def test_closed_thread_refuses_calls():
     assert g.disabled_provenance() == {"schema": g.SCHEMA, "enabled": False}
 
 
+@pytest.mark.torch
 def test_real_torch_default_modes_pass():
     torch = pytest.importorskip("torch")
     gt = g.GpuThread()

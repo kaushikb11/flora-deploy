@@ -29,7 +29,7 @@ from flora_deploy.local.runner import digest_outputs
 
 TEMPLATE = Path(__file__).resolve().parents[2] / "src/flora_deploy/config/templates/local_demo.yaml"
 STAGES = ("segment", "caption", "reward.terminal", "reward.dense")
-JOB = "local-demo"
+JOB = "local-demo.fake"  # local runs are fake-models jobs (review 8b M5)
 cli = CliRunner()
 
 
@@ -251,7 +251,7 @@ def test_cli_run_local_with_faults_and_sample_data(clean, tmp_path):
     # Fix-W1: `flora results` warns about a completed_with_errors job; then the 5 records
     other = [x for x in lines if not x.startswith("{")]
     assert len(other) == 1 and other[0].startswith(
-        "warning: job local-demo is completed_with_errors"), other
+        "warning: job local-demo.fake is completed_with_errors"), other
     assert len([x for x in lines if x.startswith("{")]) == 5
     js = cli.invoke(app, ["run", "--local", "--fake-models", "--json", "--config",
                           str(tmp_path / "flora.yaml")])

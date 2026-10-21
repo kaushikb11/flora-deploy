@@ -5,8 +5,10 @@ Every check reports ``pass``, ``warn`` or ``fail`` with a one-line fix:
 * **config**: ``flora.yaml`` validates and carries ``license_ack``;
 * **modal**: client installed at the pinned version, a token configured and accepted, the
   config's Environment exists;
-* **hf**: a Hugging Face token is present and can read every pinned ``nvidia/Flora-*`` repo at
-  its pinned revision (no token / gated access not granted / revision missing / repo missing);
+* **hf**: every pinned ``nvidia/Flora-*`` repo is readable at its pinned revision, with the
+  token if there is one and anonymously otherwise (the repos are not gated; a token only raises
+  rate limits). Access is tested with ``auth_check``, since ``model_info`` succeeds on a gated
+  repo without access (review 8b M1);
 * **store**: the output sink is reachable and writable (a tiny probe object, deleted again); the
   ``flora-bucket`` Secret exists for ``s3://`` / ``gs://`` / ``r2://`` sinks, the Volume for
   ``volume://`` sinks;
@@ -25,7 +27,6 @@ Exit code 0 when nothing failed, else 2 (a refusal, as in the rest of the CLI).
 
 from __future__ import annotations
 
-import inspect
 import json
 import os
 import uuid
@@ -144,7 +145,10 @@ class RealProbes:
         api = HfApi()
         info = api.dataset_info if repo_type == "dataset" else api.model_info
         try:
+            # ``*_info`` checks the revision exists (its metadata is public even on a gated
+            # repo); ``auth_check`` checks this token (or anonymous) can read the files.
             info(repo, revision=revision, token=token or False)
+            api.auth_check(repo, repo_type=repo_type, token=token or False)
         except hfe.GatedRepoError:
             return "gated" if token else "no_token"
         except hfe.RevisionNotFoundError:
@@ -204,13 +208,16 @@ class RealProbes:
             from flora_deploy.validate import certkey  # type: ignore[attr-defined]
         except ImportError:
             return None
-        fn = getattr(certkey, "status", None)
-        if fn is None:
-            return None
-        res = fn(cfg) if inspect.signature(fn).parameters else fn()
-        if isinstance(res, dict):
-            return {str(k): str(v) for k, v in res.items()}
-        return None
+        from flora_deploy.config.pins import DERIVED_PINS
+
+        # The workers load only the pinned derived content, so the pins are the digests a
+        # certificate must match (the same lookup as ``plan_app``; review 8b M2).
+        pools = cfg.pools()
+        pinned = {p.key.replace("-", "_"): p.content_sha256 for p in DERIVED_PINS
+                  if p.content_sha256}
+        res = certkey.status(cfg.preset, pools,
+                             **certkey.lookup_context(cfg, pools, derived_content=pinned))
+        return {str(k): str(v["status"]) for k, v in res.items()}
 
 
 def _probe_local(root: Path, key: str, data: bytes) -> str:
@@ -343,10 +350,12 @@ def check_hf(p: Probes) -> tuple[list[Check], str | None]:
     from flora_deploy.config.pins import PINS
 
     token = p.hf_token()
-    if not token:
-        return [Check("hf.token", "fail", "no Hugging Face token (nvidia/Flora-* is gated)",
-                      "run `hf auth login` or set HF_TOKEN")], None
-    out = [Check("hf.token", "pass", "a Hugging Face token is present")]
+    if token:
+        out = [Check("hf.token", "pass", "a Hugging Face token is present")]
+    else:
+        out = [Check("hf.token", "warn", "no Hugging Face token: anonymous access works "
+                     "(nvidia/Flora-* is not gated); a token raises rate limits",
+                     "run `hf auth login` or set HF_TOKEN")]
     for pin in PINS:
         if not pin.repo.startswith("nvidia/Flora-"):
             continue
@@ -449,16 +458,20 @@ def check_weights(p: Probes, cfg: Any) -> list[Check]:
         return out
     have = dict(have)
     missing = [d for d in derived if not have.get(d)]
-    if missing:
+    if len(missing) == len(derived):
+        out.append(Check("weights.derived", "warn", "no derived-weight receipts recorded yet "
+                         f"({', '.join(missing)})", "run `flora prepare` (it builds them and "
+                         "records them under weights.derived), or pass --receipt name=<sha>"))
+    elif missing:
         out.append(Check("weights.derived", "fail", f"missing derived-weight receipts: "
-                         f"{', '.join(missing)}", "run the conversions (README, Run on Modal) "
-                         "and add each receipt under weights.derived"))
+                         f"{', '.join(missing)}", "run `flora prepare` (it builds them and "
+                         "records them under weights.derived)"))
     else:
         out.append(Check("weights.derived", "pass", f"receipts for {', '.join(derived)}"))
     return out
 
 
-_CERT_OK = {"certified", "ok", "valid", "pass", "true"}
+_CERT_OK = {"certified", "reference", "ok", "valid", "pass", "true"}
 
 
 def check_certificates(p: Probes, cfg: Any) -> list[Check]:
