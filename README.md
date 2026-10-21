@@ -4,13 +4,6 @@ Label robot and human-demo videos with NVIDIA's [Flora](https://research.nvidia.
 models on [Modal](https://modal.com): temporal segmentation, captions, and terminal / dense rewards.
 Point it at a LeRobot dataset or a folder of MP4s and get JSONL + Parquet labels back.
 
-> **Pre-release.** Nothing is on PyPI yet. Local mode works end to end. The Modal GPU path is
-> being validated.
-
-> **License.** This repo is Apache-2.0, but the Flora models are **research-only** (NVIDIA OneWay
-> Noncommercial License). Weights are downloaded into your own Modal workspace and never ship with
-> this repo. Every config must set `license_ack: research-only`. See [`NOTICE.md`](NOTICE.md).
-
 ## Try it locally (no GPU, no Modal account)
 
 ```bash
