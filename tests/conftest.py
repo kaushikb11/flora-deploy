@@ -10,13 +10,18 @@ os.environ["NO_COLOR"] = "1"
 os.environ["TERM"] = "dumb"
 os.environ["COLUMNS"] = "200"
 os.environ["TERMINAL_WIDTH"] = "200"
-import re
-from pathlib import Path
 
-import pytest
+import re  # noqa: E402  (after the environment above, on purpose)
+from pathlib import Path  # noqa: E402
 
-from flora_deploy.config.pins import PINS_BY_KEY
-from flora_deploy.layout import NV_CODE_CACHE_DEFAULT, NV_CODE_CACHE_ENV, snapshot_dirname
+import pytest  # noqa: E402
+
+from flora_deploy.config.pins import PINS_BY_KEY  # noqa: E402
+from flora_deploy.layout import (  # noqa: E402
+    NV_CODE_CACHE_DEFAULT,
+    NV_CODE_CACHE_ENV,
+    snapshot_dirname,
+)
 
 
 def _nv_root() -> Path:
