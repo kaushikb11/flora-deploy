@@ -33,8 +33,9 @@ from typing import Any
 from flora_deploy.config.hashing import MissingReceiptError
 from flora_deploy.config.pins import DERIVED_PINS_BY_KEY
 
-__all__ = ["MissingReceiptError", "ReceiptPinMismatch", "check_pinned", "derived_content",
-           "load_certified", "needed", "pin_key", "record", "resolve", "set_derived_text"]
+__all__ = ["MissingReceiptError", "ReceiptPinMismatch", "check_overrides", "check_pinned",
+           "derived_content", "load_certified", "needed", "pin_key", "record", "resolve",
+           "set_derived_text"]
 
 YAML_PATH = "weights.derived"
 
@@ -86,6 +87,7 @@ def resolve(cfg: Any, overrides: Mapping[str, str] | None = None) -> dict[str, s
     Raises ``MissingReceiptError`` naming what to run when one the config needs is missing."""
     recorded = dict(cfg.weights.derived)
     over = {k: v for k, v in (overrides or {}).items() if v}
+    check_overrides(over)
     out = {**recorded, **over}
     missing = [n for n in needed(cfg) if not out.get(n)]
     if missing:
@@ -133,6 +135,22 @@ def load_certified(path: str | os.PathLike[str], *, allow_uncertified: bool = Fa
         return first, content
     return parse_config(data, source=str(p), allow_uncertified=False,
                         derived_content=content, base_dir=base), content
+
+
+def check_overrides(overrides: Mapping[str, str]) -> None:
+    """``--receipt NAME=HASH`` / ``receipts=``: the same rules as ``weights.derived`` (a known
+    receipt name, a 64-hex sha256), so a typo is refused instead of hashed into a config
+    (review 8b L1). Raises ``ValueError``."""
+    from flora_deploy.config.schema import _SHA256, DERIVED_WEIGHT_NAMES
+
+    unknown = sorted(set(overrides) - set(DERIVED_WEIGHT_NAMES))
+    if unknown:
+        raise ValueError(f"--receipt: unknown derived weight(s) {unknown}; known: "
+                         f"{', '.join(DERIVED_WEIGHT_NAMES)}")
+    bad = sorted(f"{k}={v}" for k, v in overrides.items() if not _SHA256.match(v))
+    if bad:
+        raise ValueError(f"--receipt {', '.join(bad)}: each receipt is the 64-hex sha256 of a "
+                         "derived_receipt.json (`flora prepare --show-receipt` prints them)")
 
 
 # --- recording in flora.yaml ------------------------------------------------------------------

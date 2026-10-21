@@ -25,7 +25,7 @@ from flora_deploy.local import LocalRunError, LocalRunner, run_local
 from flora_deploy.local import sample_dataset as make_sample
 
 TEMPLATE = Path(__file__).resolve().parents[2] / "src/flora_deploy/config/templates/local_demo.yaml"
-JOB = "local-demo"
+JOB = "local-demo.fake"  # local runs are fake-models jobs (review 8b M5)
 STAGES = ("segment", "caption", "reward.terminal", "reward.dense")
 cli = CliRunner()
 
@@ -251,16 +251,16 @@ def test_flora_resume_and_cancel_drive_local_jobs(tmp_path, videos):
     assert refused.exit_code == 2 and "--budget-usd" in refused.output
     ok = invoke("resume", JOB, "--store", store, "--budget-usd", "20")
     assert ok.exit_code == 0, ok.output
-    assert "resumed local-demo" in ok.output and "done" in ok.output
+    assert "resumed local-demo.fake" in ok.output and "done" in ok.output
     assert len(sdk.open_job(JOB, store=store).results("reward.dense")) == 6
     # another job in the same store: budget-stopped, then cancelled for good
     out = invoke("run", "--local", "--fake-models", "--config", str(cfg), "--store", store,
                  "--budget", "0.2", "--job", "other")
     assert out.exit_code == 4, out.output
-    c = invoke("cancel", "other", "--store", store, "--yes")
+    c = invoke("cancel", "other.fake", "--store", store, "--yes")
     assert c.exit_code == 0, c.output
-    assert invoke("status", "other", "--store", store).exit_code == 5
-    assert invoke("resume", "other", "--store", store, "--budget-usd", "20").exit_code == 2
+    assert invoke("status", "other.fake", "--store", store).exit_code == 5
+    assert invoke("resume", "other.fake", "--store", store, "--budget-usd", "20").exit_code == 2
     again = invoke("run", "--local", "--fake-models", "--config", str(cfg), "--store", store,
                    "--job", "other", "--resume", "--budget", "20")
     assert again.exit_code == 2 and "cancelled" in again.output

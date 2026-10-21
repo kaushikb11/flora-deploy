@@ -288,7 +288,11 @@ class LocalRunner:
         self.cfg = cfg
         self.config_path = Path(config_path) if config_path is not None else None
         base = self.config_path.parent if self.config_path is not None else Path.cwd()
-        self.job_id = job_id or cfg.project
+        from flora_deploy.jobs.store import fake_job_id
+
+        # Default: the fake-models job id (review 8b M5). An explicit id is used as given
+        # (``run_local`` passes a fake one; the deployed-app test harness the real one).
+        self.job_id = job_id or fake_job_id(cfg.project)
         try:
             safe_key(self.job_id)
         except ValueError as e:
@@ -643,6 +647,13 @@ def run_local(cfg: Any, *, config_path: str | Path | None = None,
     """Run one job end to end in this process (module docstring). ``cfg``: ``FloraConfig`` or a
     ``flora.yaml`` path. ``faults``: e.g. ``"preempt:segcap-00000,oom:ep003"``
     (``local.faults``). Other keywords go to :class:`LocalRunner`."""
+    from flora_deploy.config.schema import load_config
+    from flora_deploy.jobs.store import fake_job_id
+
+    if isinstance(cfg, str | Path):
+        config_path, cfg = Path(cfg), load_config(cfg)
+    # Local runs are fake-models runs: their own job namespace (review 8b M5).
+    job_id = fake_job_id(job_id or cfg.project)
     runner = LocalRunner(cfg, config_path=config_path, store=store, job_id=job_id,
                          fake_models=fake_models, faults=faults, budget_usd=budget_usd,
                          log=log, verbose=verbose, **kw)

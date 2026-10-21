@@ -59,7 +59,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from flora_deploy.jobs.store import JobPaths, Store
+from flora_deploy.jobs.store import JobPaths, Store, fake_job_id, is_fake_job_id
 from flora_deploy.jobs.stores.client_volume import ClientVolumeStore
 
 RUN_SPEC_SCHEMA = "flora_run_v1"
@@ -237,6 +237,41 @@ def read_run_spec(store: Store, job_id: str, config_hash: str | None = None) -> 
     if spec.get("schema") != RUN_SPEC_SCHEMA:
         raise FloraError(f"{path}: unknown run spec schema {spec.get('schema')!r}")
     return spec
+
+
+def spec_is_fake(spec: Mapping[str, Any]) -> bool:
+    """Whether a run spec is a fake-models run: ``fake_models`` (``submit``), or a local run
+    (``flora run --local`` always runs the fake models)."""
+    return bool(spec.get("fake_models") or (spec.get("local") or {}).get("fake_models"))
+
+
+def check_job_namespace(job_id: str, spec: Mapping[str, Any]) -> None:
+    """Refuse a run spec whose fake-ness disagrees with its job id (review 8b M5): fake-models
+    runs live under ``<job>.fake`` (``jobs.store.fake_job_id``), real ones never do. A spec
+    written before the namespace existed can be a fake run under the real id."""
+    fake = spec_is_fake(spec)
+    if fake == is_fake_job_id(job_id):
+        return
+    if fake:
+        raise FloraError(f"job {job_id!r} holds a fake-models run (config "
+                         f"{spec.get('config_hash')}), not real outputs; fake-models runs now "
+                         f"use the job id {fake_job_id(job_id)!r}. Rerun it there, or submit "
+                         "the real job under another --job")
+    raise FloraError(f"job {job_id!r} is a fake-models job id but holds a real run (config "
+                     f"{spec.get('config_hash')}); refusing to mix them")
+
+
+def check_results_namespace(store: Store, job_id: str, config_hash: str | None = None) -> None:
+    """``flora results`` / ``flora compose``: refuse a job whose run spec is the other kind
+    (:func:`check_job_namespace`), and point a real job id with no run at its fake-models run.
+    A job with no run spec at all (composed by hand) passes."""
+    path = run_spec_path(job_id, config_hash) if config_hash else run_pointer_path(job_id)
+    if store.exists(path):
+        check_job_namespace(job_id, json.loads(store.get_bytes(path)))
+        return
+    if not is_fake_job_id(job_id) and store.exists(run_pointer_path(fake_job_id(job_id))):
+        raise JobNotFound(f"job {job_id!r} has no run in this store; its fake-models run is "
+                          f"job {fake_job_id(job_id)!r} (pass --job {fake_job_id(job_id)})")
 
 
 def _container_store(env: Mapping[str, str]) -> Store:
@@ -756,7 +791,9 @@ def open_job(job_id: str, *, store: str | None = None, config: Any = None,
         store = store_uri_for(cfg)
     env = environment or (cfg.modal.environment if cfg is not None else None)
     st = be.store(store, environment=env)
+    check_results_namespace(st, job_id, config_hash)
     spec = read_run_spec(st, job_id, config_hash)
+    check_job_namespace(job_id, spec)
     return Job(job_id, spec["config_hash"], spec.get("store", store), st, spec, be)
 
 
@@ -799,6 +836,12 @@ def submit(cfg: Any, *, job_id: str | None = None, store: str | None = None,
     except (DeployError, MissingReceiptError, ValueError) as e:
         raise FloraError(str(e)) from None
     job_id = job_id or cfg.project
+    fake = bool(getattr(plan, "fake_models", False))
+    if fake:  # review 8b M5: never the real job's manifest, run spec, index or lease
+        job_id = fake_job_id(job_id)
+    elif is_fake_job_id(job_id):
+        raise FloraError(f"job id {job_id!r} is reserved for fake-models runs (`flora run "
+                         "--fake-models`); pick another --job for a real run")
     st = be.store(plan.store.uri, environment=plan.environment)
 
     rec_path = deployment_path(plan.app_name)
@@ -834,6 +877,7 @@ def submit(cfg: Any, *, job_id: str | None = None, store: str | None = None,
     spec_path = run_spec_path(job_id, plan.config_hash)
     if st.exists(spec_path):
         spec = read_run_spec(st, job_id, plan.config_hash)
+        check_job_namespace(job_id, spec)
         job = Job(job_id, plan.config_hash, plan.store.uri, st, spec, be)
         v = job.status()
         if v.state in STOPPED:
@@ -860,6 +904,7 @@ def submit(cfg: Any, *, job_id: str | None = None, store: str | None = None,
         "deployment": {"app_id": record.get("app_id"),
                        "deployed_utc": record.get("deployed_utc")},
         "settings": settings_to_dict(settings), "submitted_utc": now, "launches": [],
+        "fake_models": fake,
     }
     write_run_spec(st, spec)
     job = Job(job_id, plan.config_hash, plan.store.uri, st, spec, be)

@@ -57,10 +57,23 @@ reasons:
 4. **Integer cast.** FP32 → BF16 is torch's integer round-to-nearest-even, identical in its
    scalar and SIMD code (see `docs/captioner-bf16.md`).
 
-The FP64 result is also at least as accurate as v1's FP32 delta. It is not guaranteed to be bit-identical to v1
-or to PEFT's FP32 `merge_and_unload`: an element can differ in the last BF16 bit wherever v1's
-FP32 rounding crossed a boundary. That is why the merger version is 2 and a v1 receipt is not
-reused.
+v2 is also the more accurate of the two. It is not bit-identical to v1 or to PEFT's FP32
+`merge_and_unload`, and the difference is not bounded by 1 BF16 ulp. Where `W + Δ` nearly
+cancels, the result is tiny, so its BF16 ulp is tiny too, while the FP32 delta's rounding error
+scales with the operands. There the two can differ by several ulps. Measured on CPU (review 8b,
+six random 1024 × 1024 targets, r = 32, `W ~ 0.02·N(0,1)` in BF16, `A, B ~ 0.01·N(0,1)` in FP32):
+
+| | Result |
+|---|---|
+| Elements where v2 ≠ PEFT (`bf16(fp32(W) + 2·(B @ A))`) | 61 of 6,291,456 (about 1e-5) |
+| Largest distance per target | 1, 1, 1, 3, 1, 10 ulps |
+| Worst case (seed 15) | exact −1.35079e-9, v2 −1.35333e-9, PEFT −1.28057e-9 (10 ulps apart) |
+| Elements where v2 ≠ `bf16(exact FP64 sum)` | 0 |
+| Elements where PEFT ≠ `bf16(exact FP64 sum)` | 61 |
+
+So every difference is PEFT's FP32 rounding, not v2's. The honest bound is absolute, not in ulps
+of the result: |v2 − PEFT| is at most the FP32 rounding error of `Δ` plus half a BF16 ulp. That
+is why the merger version is 2 and a v1 receipt is not reused.
 
 The cost is about `r` = 32 FP64 passes over the 6.92 G merged elements in cache-sized tiles.
 Locally, one 4096 × 12288 target (50 M elements) takes 0.9 s on 4 threads. That projects to
@@ -114,7 +127,9 @@ against.
 
 A unit test merges a tiny Qwen3.5 with a real PEFT adapter. The test checks four things:
 
-- Each merged weight is bit-identical to PEFT's own FP32 `merge_and_unload`, rounded once.
+- Each merged weight is within 1 BF16 ulp of PEFT's own FP32 `merge_and_unload`, rounded once.
+  That holds for the tiny model; on full-size targets the distance can reach about 10 ulps where
+  the sum cancels, with v2 the more accurate (see "Determinism" above).
 - Non-target tensors are untouched.
 - `A_log`/`dt_bias` are FP32 and equal the base values.
 - The directory loads through NVIDIA's call with no missing or unexpected keys.

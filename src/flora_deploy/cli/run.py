@@ -11,6 +11,10 @@
   ``flora deploy --fake-models`` deployed (the H0 CPU rehearsal: the real deployed path with
   G2's fake engines; its own config hash, so it never touches real outputs).
 
+Fake-models jobs (both modes) run under the job id ``<job>.fake`` (``jobs.store.fake_job_id``),
+so they never share a manifest pointer, run spec, index or lease with the real job of the same
+id; ``flora status`` / ``flora results`` refuse to read one as the other (review 8b M5).
+
 Exit codes (both paths, and ``flora status`` / ``flora report``): 0 ``done`` (or still running
 with ``--detach``), 1 ``failed``, 3 ``completed_with_errors``, 4 ``budget_stopped``, 5 any
 other stop (``cancelled``); 2 usage errors and refusals (not deployed, config mismatch, nothing

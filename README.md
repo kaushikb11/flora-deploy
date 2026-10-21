@@ -12,10 +12,11 @@ uv sync && source .venv/bin/activate        # or: pip install -e .   (Python >= 
 
 flora init --template local_demo            # writes flora.yaml
 flora run --local --fake-models --sample-data
-flora results --job local-demo --stage caption --store flora-local-store
+flora results --job local-demo.fake --stage caption --store flora-local-store
 ```
 
-This runs the real job system with fake models, so the labels are placeholders. Use it to see the
+This runs the real job system with fake models, so the labels are placeholders. Fake-models
+jobs run under the job id `<project>.fake`, apart from real jobs. Use it to see the
 output format and how jobs behave.
 
 ## Run on Modal

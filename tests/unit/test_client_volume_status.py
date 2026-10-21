@@ -16,7 +16,7 @@ from flora_deploy.local.sample import sample_dataset
 from tests.fakes.client_volume import FakeClientVolume
 
 TEMPLATE = Path(__file__).resolve().parents[2] / "src/flora_deploy/config/templates/local_demo.yaml"
-JOB = "local-demo"
+JOB = "local-demo.fake"  # local fake-models runs get their own job id (jobs.store.fake_job_id)
 
 
 def _job_on_volume(tmp_path, episodes: int):

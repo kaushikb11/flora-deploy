@@ -31,6 +31,24 @@ def _fan(key: str) -> str:
     return f"{h[:2]}/{h[2:4]}"
 
 
+# Fake-models jobs (``flora run --fake-models``, the H0 rehearsal, and ``flora run --local
+# --fake-models``) run under their own job id, ``<job>.fake`` (review 8b M5). The suffix is part
+# of the job id itself, so every path under ``flora/<job>/`` (``manifest.json``, ``run.json``,
+# ``job.json``, ``index/``, ``control/``, ``containers/``) and the ``orchestrator/<job>`` lease
+# are separate from the real job's, with no flag to forget anywhere that builds a ``JobPaths``.
+FAKE_JOB_SUFFIX = ".fake"
+
+
+def is_fake_job_id(job_id: str) -> bool:
+    """Whether ``job_id`` is in the fake-models namespace."""
+    return job_id.endswith(FAKE_JOB_SUFFIX)
+
+
+def fake_job_id(job_id: str) -> str:
+    """The fake-models job id of ``job_id`` (idempotent: ``x.fake`` stays ``x.fake``)."""
+    return job_id if is_fake_job_id(job_id) else f"{job_id}{FAKE_JOB_SUFFIX}"
+
+
 class JobPaths:
     """Relative paths of every job file under ``flora/<job_id>/``.
 
