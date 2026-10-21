@@ -18,6 +18,7 @@ TEMPLATES = {
     "exact_lerobot": "exact_lerobot.yaml",
     "exact_mp4_dir": "exact_mp4_dir.yaml",
     "rewards_only": "rewards_only.yaml",
+    "local_demo": "local_demo.yaml",
 }
 
 

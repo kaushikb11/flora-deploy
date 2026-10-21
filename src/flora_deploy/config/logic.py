@@ -139,6 +139,7 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     "cli/plan.py",
     "cli/prepare.py",
     "cli/results.py",
+    "cli/run_local.py",  # local runs only (fake models)
     "config/__init__.py",
     "config/pins.py",  # hashed by value (nvidia_pins, decode)
     "config/presets.py",  # hashed by value (engine identity); pools are deliberately unhashed
@@ -162,6 +163,14 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     "jobs/stores/bucket.py",
     "jobs/stores/local.py",
     "jobs/stores/volume.py",
+    # local: the in-process runner, spawner, fault injection and fake engines (G2). Never on a
+    # real run's path; fake outputs carry their own hash (fake receipts, local.runner)
+    "local/__init__.py",
+    "local/engines.py",
+    "local/faults.py",
+    "local/runner.py",
+    "local/sample.py",
+    "local/spawner.py",
     "media/synth.py",  # synthetic test media
     # modal_app: deployment and labs. Images are hashed by value (image_fingerprint); the modes
     # the factory forwards are config fields, hashed by value (config/hashing.kind_modes).

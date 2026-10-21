@@ -19,6 +19,27 @@ jobs:
       - run: uv sync --group dev
       - run: uv run ruff check .
       - run: uv run pytest -q -m "not nvlink and not modal"
+      # G2: a whole multi-stage job (index -> plan -> orchestrate -> compose -> results) with the
+      # real job system, fake models and injected faults; no Modal, no GPU. ep003 is
+      # poison-pilled on purpose, so the job must end completed_with_errors (exit 3).
+      - name: Local end-to-end job (flora run --local --fake-models)
+        timeout-minutes: 2
+        run: |
+          demo="$RUNNER_TEMP/flora-demo"
+          mkdir -p "$demo"
+          cp src/flora_deploy/config/templates/local_demo.yaml "$demo/flora.yaml"
+          uv run flora run --local --fake-models --sample-data --config "$demo/flora.yaml" \
+            --store "$demo/clean"
+          set +e
+          uv run flora run --local --fake-models --config "$demo/flora.yaml" \
+            --store "$demo/faults" \
+            --inject preempt:segcap-00000,oom:ep003@segcap,fail:reward.terminal-00000 \
+            --inject infra:reward.dense-00000,spawnerr:segcap-00002,nverr:ep005@reward.dense
+          code=$?
+          set -e
+          test "$code" -eq 3
+          uv run flora results --job local-demo --stage caption --store "$demo/faults"
+          uv run flora results --job local-demo --stage reward.terminal --store "$demo/faults"
 
   # Exercises NVIDIA's real code (downloaded at test time, never stored in the repo). CPU only.
   nvlink:
