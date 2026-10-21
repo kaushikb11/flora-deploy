@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -366,6 +366,37 @@ def sanitize_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: [message elided]" if msg else type(exc).__name__
 
 
+# The raw fields ``Comparison.passed`` reads. A recorded row without one of them cannot show
+# that criterion holds: insufficient evidence, the criterion FAILS (review 6 B4).
+EVIDENCE_FIELDS = ("variant", "error", "ids_equal", "grids_equal", "runs_match_grid",
+                   "pixels_equal", "hf_grids", "generate_ids_equal", "placeholders_ok", "hf",
+                   "vllm")
+
+
+def rescore_row(row: Mapping[str, Any]) -> dict:
+    """``row`` with ``passed`` / ``pixels_ok`` recomputed from its raw fields under the current
+    criteria (``Comparison.passed``); a stored ``passed`` is never trusted. Missing fields are
+    listed in ``insufficient`` and make the row FAIL."""
+    missing = [f for f in EVIDENCE_FIELDS if f not in row]
+    out = dict(row)
+    out["insufficient"] = missing
+    if missing:
+        out["passed"] = False
+        out["pixels_ok"] = False if "pixels_equal" in missing else out.get("pixels_ok")
+        return out
+    c = Comparison(case_id=str(row.get("case_id")), index=int(row.get("index") or 0),
+                   source=str(row.get("source")), variant=row["variant"],
+                   ids_equal=bool(row["ids_equal"]), grids_equal=bool(row["grids_equal"]),
+                   runs_match_grid=bool(row["runs_match_grid"]), hf=dict(row["hf"] or {}),
+                   vllm=dict(row["vllm"] or {}), hf_grids=list(row["hf_grids"] or []),
+                   vllm_grids=list(row.get("vllm_grids") or []), error=row["error"],
+                   pixels_equal=row["pixels_equal"],
+                   generate_ids_equal=row["generate_ids_equal"],
+                   placeholders_ok=row["placeholders_ok"])
+    out["passed"], out["pixels_ok"] = c.passed, c.pixels_ok
+    return out
+
+
 def case_verdicts(rows: Sequence[dict], variant: str) -> dict[str, bool]:
     """Per case id: True iff every request of that case passed in ``variant``."""
     out: dict[str, bool] = {}
@@ -455,9 +486,21 @@ def gate_verdict(builds: Sequence[dict], results: dict[str, dict], *,
     ``reference``: ``{"image": <where the HF reference ran>, "cross_check":
     reference_cross_check(...)}`` (review 3 C2). If the HF side ran anywhere but ``img_hfref``,
     a passing cross-check against ``img_hfref`` is required. Without ``reference`` the verdict
-    FAILS (review 5 M-A) unless ``allow_unverified_reference`` (then a warning)."""
+    FAILS (review 5 M-A) unless ``allow_unverified_reference`` (then a warning).
+
+    Every row is re-scored from its raw fields (:func:`rescore_row`, review 6 B4), so a live run
+    and ``--rescore`` of a recorded file apply exactly the same criteria; a ``variant`` row that
+    lacks a criterion's data fails it (insufficient evidence)."""
     problems: list[str] = []
     warnings: list[str] = []
+    results = {kind: {**(res or {}), "rows": [rescore_row(r) for r in
+                                              (res or {}).get("rows", [])]}
+               for kind, res in results.items()}
+    for kind, res in sorted(results.items()):
+        for r in res["rows"]:
+            if r["insufficient"] and r.get("variant") == variant:
+                problems.append(f"{kind} {r.get('case_id')}#{r.get('index')} {variant}: "
+                                f"insufficient evidence (no {', '.join(r['insufficient'])})")
     by_part = {(b["kind"], b["part"]): b for b in builds}
     for kind, part in expected_parts:
         b = by_part.get((kind, part))

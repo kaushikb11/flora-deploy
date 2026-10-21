@@ -89,6 +89,7 @@ class Collector:
     """The generate calls one NVIDIA function made in the current context, in call order."""
 
     calls: list[TappedCall] = field(default_factory=list)
+    procs: list[Any] = field(default_factory=list)  # CaptureProcessors seen by the tap
 
     def add(self, captured: CapturedRequest, budget: int) -> str:
         sentinel = f"{SENTINEL_PREFIX}{next(_SENTINEL_IDS)}\x00"
@@ -101,12 +102,20 @@ _COLLECTOR: contextvars.ContextVar[Collector | None] = contextvars.ContextVar(
 
 
 def run_collecting(collector: Collector, fn: Callable[..., Any], *args, **kwargs) -> Any:
-    """Run ``fn`` with ``pipeline.generate`` calls recorded into ``collector`` (this context)."""
+    """Run ``fn`` with ``pipeline.generate`` calls recorded into ``collector`` (this context).
+    Every processor call must have been paired with a ``generate`` (review 6 L2): a leftover
+    captured request means FIFO pairing could put the wrong prompt under a caption, so it
+    raises ``CaptureError``."""
     token = _COLLECTOR.set(collector)
     try:
-        return fn(*args, **kwargs)
+        result = fn(*args, **kwargs)
     finally:
         _COLLECTOR.reset(token)
+    left = sum(len(p.requests) for p in collector.procs)
+    if left:
+        raise CaptureError(f"{left} unpaired processor call(s) left after "
+                           f"{len(collector.calls)} generate call(s)")
+    return result
 
 
 class GenerateTap:
@@ -131,6 +140,8 @@ class GenerateTap:
                 raise CaptureError("tapped generate: the processor is not a CaptureProcessor")
             if type(inputs).__name__ != "_CapturedInputs":
                 raise CaptureError(f"tapped generate: unexpected inputs {type(inputs)!r}")
+            if not any(p is proc for p in collector.procs):
+                collector.procs.append(proc)
             return collector.add(proc.pop_request(), budget)
 
         generate.__flora_tap__ = True  # type: ignore[attr-defined]
@@ -252,10 +263,15 @@ async def run_tapped(nv, batcher, fn: Callable[[], Any], *, tokenizer, eos: int,
     ``batcher`` together, accept the completions in call order. Returns ``(fn's result,
     {sentinel: text})``; raises the first NVIDIA failure."""
     collector = Collector()
-    result = await asyncio.to_thread(run_collecting, collector, fn)
+
+    def collect() -> tuple[Any, list[VllmRequest]]:
+        out = run_collecting(collector, fn)
+        # building the requests hashes every frame (request_digest): off the loop (review 6 L5)
+        return out, [to_vllm_request(c.captured, i) for i, c in enumerate(collector.calls)]
+
+    result, requests = await asyncio.to_thread(collect)
     if not collector.calls:
         return result, {}
-    requests = [to_vllm_request(c.captured, i) for i, c in enumerate(collector.calls)]
     if sampling_for is None:
         samplings = [nvidia_sampling(c.budget, eos) for c in collector.calls]
     else:

@@ -141,7 +141,8 @@ def test_offline_engine_batches_and_isolates():
     llm = FakeLLM(bad={"p1"})
     eng = O.OfflineEngine(spec(), llm, params_cls=Params)
     out = eng.generate_batch([vreq("p0"), vreq("p1"), vreq("p2")], [Sampling(8)] * 3)
-    assert llm.calls == [["p0", "p1", "p2"], ["p0"], ["p1"], ["p2"]]
+    # review 6 M5: bisection, not one request at a time
+    assert llm.calls == [["p0", "p1", "p2"], ["p0"], ["p1", "p2"], ["p1"], ["p2"]]
     assert [o.ok for o in out] == [True, False, True]
     assert out[1].too_long and "maximum model length" in out[1].error
     assert out[0].token_ids == (9, 7) and out[0].prompt_tokens == 3
@@ -166,3 +167,109 @@ def test_dtbias_spec_needs_the_plugin_env(monkeypatch):
     monkeypatch.setenv("FLORA_DTBIAS_FP32", "1")
     with pytest.raises(DtBiasActivationError):
         O.OfflineEngine(spec())  # plugin env on, spec off: refused too
+
+
+
+def test_batch_failure_bisects_instead_of_running_every_request_alone():
+    """Review 6 M5: one over-long prompt in a 64-request round costs O(log n) generates, not
+    64 serial ones."""
+    llm = FakeLLM(bad={"p37"})
+    eng = O.OfflineEngine(spec(), llm, params_cls=Params)
+    out = eng.generate_batch([vreq(f"p{i}") for i in range(64)], [Sampling(8)] * 64)
+    assert [o.ok for o in out] == [i != 37 for i in range(64)]
+    assert out[37].too_long
+    assert len(llm.calls) <= 1 + 2 * 6, len(llm.calls)
+    assert max(len(c) for c in llm.calls[1:]) == 32  # batch-mates stay batched
+
+
+class DeadLLM(FakeLLM):
+    def generate(self, prompts, params, use_tqdm=True):
+        self.calls.append([p["prompt"] for p in prompts])
+        raise RuntimeError("EngineDeadError: EngineCore encountered an issue. See stack trace "
+                           "(above) for the root cause.")
+
+
+@pytest.mark.parametrize("msg_cls", [DeadLLM])
+def test_dead_engine_fails_fast(msg_cls):
+    llm = msg_cls()
+    eng = O.OfflineEngine(spec(), llm, params_cls=Params)
+    with pytest.raises(O.EngineDead):
+        eng.generate_batch([vreq(f"p{i}") for i in range(8)], [Sampling(8)] * 8)
+    assert len(llm.calls) == 1  # no per-request retries on a dead engine
+    with pytest.raises(O.EngineDead):
+        eng.generate_batch([vreq("q")], [Sampling(8)])
+    assert len(llm.calls) == 1  # later rounds fail without touching the engine
+
+
+def test_cuda_fault_in_a_batch_is_a_dead_engine():
+    class CudaLLM(FakeLLM):
+        def generate(self, prompts, params, use_tqdm=True):
+            self.calls.append(1)
+            raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    eng = O.OfflineEngine(spec(), CudaLLM(), params_cls=Params)
+    with pytest.raises(O.EngineDead):
+        eng.generate_batch([vreq("a"), vreq("b")], [Sampling(8)] * 2)
+
+
+def test_dead_engine_classifies_as_cuda_fatal():
+    from flora_deploy.engines.microbatch import EngineBatchError
+    from flora_deploy.workers_impl.segment import _classify
+
+    exc = EngineBatchError("EngineDead: EngineDeadError: EngineCore encountered an issue")
+    assert _classify(exc) == "cuda_fatal"
+
+
+
+class RpcLLM(FakeLLM):
+    """A fake engine whose workers report GDN parameter dtypes (``collective_rpc``)."""
+
+    def __init__(self, dt_bias="bfloat16", a_log="float32", n=48):
+        super().__init__()
+        self.params = [(f"model.layers.{i}.linear_attn.dt_bias", dt_bias) for i in range(n)] + \
+            [(f"model.layers.{i}.linear_attn.A_log", a_log) for i in range(n)]
+
+    def collective_rpc(self, fn):
+        params = [(name, SimpleNamespace(dtype=f"torch.{dt}")) for name, dt in self.params]
+        worker = SimpleNamespace(model_runner=SimpleNamespace(
+            model=SimpleNamespace(named_parameters=lambda: iter(params))))
+        return [fn(worker)]
+
+
+@pytest.mark.parametrize(("dtbias", "dt", "a_log", "n", "ok"), [
+    (False, "bfloat16", "float32", 48, True),
+    (True, "float32", "float32", 48, True),
+    (True, "bfloat16", "float32", 48, False),  # plugin load failed silently in vLLM
+    (False, "float32", "float32", 48, False),  # stray plugin
+    (False, "bfloat16", "bfloat16", 48, False),
+    (True, "float32", "float32", 0, False),  # no GDN parameter found at all
+])
+def test_engine_build_verifies_gdn_dtypes(monkeypatch, dtbias, dt, a_log, n, ok):
+    """Review 6 M6: vLLM swallows plugin load errors, so the built engine's dtypes are
+    checked against the spec."""
+    from flora_deploy.engines.patches import dt_bias_fp32
+
+    monkeypatch.setattr(dt_bias_fp32, "check_activation", lambda want: None)
+    llm = RpcLLM(dt, a_log, n)
+    if ok:
+        eng = O.OfflineEngine(spec(dtbias_fp32=dtbias), llm, params_cls=Params, verify=True)
+        assert eng.gdn_dtypes["workers"][0][f"dt_bias:{dt}"] == n
+    else:
+        with pytest.raises(O.EngineVerifyError):
+            O.OfflineEngine(spec(dtbias_fp32=dtbias), llm, params_cls=Params, verify=True)
+
+
+def test_rpc_failure_fails_verification():
+    with pytest.raises(O.EngineVerifyError):
+        O.verify_gdn_dtypes(spec(), {"error": "RuntimeError('no rpc')"})
+
+
+def test_extra_state_under_vision_tower_fails_preflight():
+    """Review 6 Q5: vLLM's vision loader does a bare ``params_dict[name]``: any
+    ``model.visual.*._extra_state`` key would KeyError at load."""
+    lm = {"model.language_model.layers.0.mlp.down_proj._extra_state": "a.safetensors",
+          "model.language_model.layers.0.mlp.down_proj.weight": "a.safetensors"}
+    assert O.check_extra_state(lm) == ["model.language_model"]
+    bad = {**lm, "model.visual.blocks.0.mlp.fc1._extra_state": "b.safetensors"}
+    with pytest.raises(O.EngineVerifyError, match="model.visual"):
+        O.check_extra_state(bad)

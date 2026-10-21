@@ -27,6 +27,14 @@ Failure isolation: the engine reports per-request failures in ``Completion.error
 ``Exception`` (``KeyboardInterrupt`` on SIGINT, ``SystemExit``) fails that batch's calls and is
 re-raised from the pump task, which ends the event loop: the caller's preemption handling runs.
 
+Closing never waits for an in-flight ``generate`` (review 6 M4): on cancel / SIGINT the
+caller must reach its preemption mark within Modal's grace window, and a 128 x 1024-token round
+can take tens of seconds. ``close()`` fails the in-flight calls with ``BatcherClosed`` and shuts
+the worker thread down without waiting; the abandoned ``generate`` finishes in the background
+while holding the engine's lock (:func:`engine_lock`), so a later batcher on the same engine
+waits for it instead of calling ``llm.generate`` from two threads at once (vLLM's ``LLM`` is
+not thread-safe).
+
 Batch composition is deterministic given the order of submissions (FIFO), but it is not
 NVIDIA's (batch size 1): vLLM batch grouping changes numerics (``docs/rewarder-smoke.md``), which
 is why ``balanced`` needs a certificate.
@@ -37,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import itertools
+import threading
 import time
 from collections import Counter, deque
 from collections.abc import Callable, Sequence
@@ -50,6 +59,19 @@ from flora_deploy.engines.base import BatchEngine, Completion, Sampling, VllmReq
 GiB = 1 << 30
 _EPISODE: contextvars.ContextVar[_Episode | None] = contextvars.ContextVar(
     "flora_microbatch_episode", default=None)
+
+
+_LOCKS_GUARD = threading.Lock()
+_ENGINE_LOCKS: dict[int, tuple[Any, threading.Lock]] = {}
+
+
+def engine_lock(engine: Any) -> threading.Lock:
+    """One lock per engine object: every ``generate_batch`` of every batcher runs under it."""
+    with _LOCKS_GUARD:
+        got = _ENGINE_LOCKS.get(id(engine))
+        if got is None or got[0] is not engine:
+            got = _ENGINE_LOCKS[id(engine)] = (engine, threading.Lock())
+        return got[1]
 
 
 class EngineBatchError(RuntimeError):
@@ -138,6 +160,8 @@ class MicroBatcher:
         self._executor: ThreadPoolExecutor | None = None
         self._closed = False
         self._fatal: BaseException | None = None
+        self._inflight: list[_Item] = []
+        self._lock = engine_lock(engine)
 
     # -- lifecycle ---------------------------------------------------------------------------
     async def start(self) -> MicroBatcher:
@@ -149,8 +173,10 @@ class MicroBatcher:
         return self
 
     async def close(self) -> None:
+        """Fail pending and in-flight calls and stop; never waits for an in-flight
+        ``generate`` (module docstring), so it never blocks the event loop."""
         self._closed = True
-        for item in self._pending:
+        for item in [*self._pending, *self._inflight]:
             if not item.future.done():
                 item.future.set_exception(BatcherClosed("micro-batcher closed"))
         self._pending.clear()
@@ -167,7 +193,7 @@ class MicroBatcher:
                 except (asyncio.CancelledError, Exception):
                     pass
         if self._executor is not None:
-            self._executor.shutdown(wait=True)
+            self._executor.shutdown(wait=False, cancel_futures=True)
 
     async def __aenter__(self) -> MicroBatcher:
         return await self.start()
@@ -325,9 +351,9 @@ class MicroBatcher:
             reqs = [i.request for i in batch]
             sps = [i.sampling for i in batch]
             t0 = time.perf_counter()
+            self._inflight = batch
             try:
-                outs = await loop.run_in_executor(self._executor, self.engine.generate_batch,
-                                                  reqs, sps)
+                outs = await loop.run_in_executor(self._executor, self._generate, reqs, sps)
                 if len(outs) != len(batch):
                     raise EngineBatchError(f"engine returned {len(outs)} completions for "
                                            f"{len(batch)} requests")
@@ -346,6 +372,8 @@ class MicroBatcher:
                     if not item.future.done():
                         item.future.set_exception(BatcherClosed(repr(exc)))
                 raise
+            finally:
+                self._inflight = []
             self.stats.generate_s += time.perf_counter() - t0
             if self.observer is not None:
                 try:
@@ -355,6 +383,10 @@ class MicroBatcher:
             for item, out in zip(batch, outs, strict=True):
                 if not item.future.done():
                     item.future.set_result(out)
+
+    def _generate(self, reqs: list[VllmRequest], sps: list[Sampling]) -> list[Completion]:
+        with self._lock:  # an abandoned generate of an earlier batcher may still be running
+            return self.engine.generate_batch(reqs, sps)
 
     def audit(self) -> dict[str, Any]:
         engine_audit = getattr(self.engine, "audit", None)

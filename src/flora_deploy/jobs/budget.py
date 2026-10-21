@@ -722,6 +722,12 @@ class ProjectionBudgetGate:
                 continue
             warm = any(c.spawned_at - self.scaledown_s <= t <= c.spawned_at
                        for t in ended.get(c.kind, ()))
+            if not warm and self.settings.pools[s.kind].max_inputs > 1:
+                # review 6 B3: a sibling still running at spawn time has a container with
+                # free input slots; assume the call landed there (errs high, never optimistic)
+                warm = any(o is not c and o.kind == c.kind and o.spawned_at < c.spawned_at
+                           and (o.ended_at is None or o.ended_at >= c.spawned_at)
+                           for o in self._state.calls)
             startup = 0.0 if warm else self._startup(s.kind)
             work = max(c.ended_at - c.spawned_at - startup, 0.0)
             ratios.setdefault(s.kind, []).append(work / est)

@@ -232,3 +232,75 @@ def test_config_hash_changes_with_engine_and_ignores_gpu():
     h = [S.config_hash("tempseg", spec=s.hashed(), models={"m": "1"}, budget=1024)
          for s in (a, b, c)]
     assert h[0] == h[1] != h[2]
+
+
+
+def _two_calls_one_generate(nv, real):
+    """NVIDIA calling its processor twice but generate once: FIFO pairing would silently
+    pair the wrong prompt with a caption if a leftover were not detected."""
+    def nvidia_fn():
+        proc = CaptureProcessor(real, budget=8)
+        md = [{"total_num_frames": 1, "fps": 1.0, "frames_indices": [0]}]
+        proc(text=["extra\n<|video_pad|>"], videos=[np.zeros((1, 2, 2, 3), np.uint8)],
+             video_metadata=md, do_sample_frames=False)
+        inputs = proc(text=["real\n<|video_pad|>"], videos=[np.zeros((1, 2, 2, 3), np.uint8)],
+                      video_metadata=md, do_sample_frames=False)
+        return nv.pipeline.generate(None, proc, inputs, 8)
+    return nvidia_fn
+
+
+def test_leftover_processor_call_is_refused():
+    """Review 6 L2."""
+    from flora_deploy.nv.capture import CaptureError
+
+    nv = SimpleNamespace(pipeline=FakePipeline(), models=NV.models)
+    real = SimpleNamespace(tokenizer=Tok())
+    tap = S.GenerateTap.acquire(nv)
+    eng = EchoEngine({"extra\n<|video_pad|>": "a", "real\n<|video_pad|>": "b"})
+
+    async def main():
+        async with MicroBatcher(eng, max_wait_s=30) as mb, mb.episode():
+            return await S.run_tapped(nv, mb, _two_calls_one_generate(nv, real),
+                                      tokenizer=Tok(), eos=EOS)
+
+    try:
+        with pytest.raises(CaptureError, match="unpaired"):
+            asyncio.run(main())
+        assert eng.batches == []  # nothing sent
+    finally:
+        tap.release()
+
+
+def test_request_building_runs_off_the_event_loop(monkeypatch):
+    """Review 6 L5: hashing every frame (``request_digest``) must not run on the loop."""
+    import threading
+
+    nv = SimpleNamespace(pipeline=FakePipeline())
+    real = SimpleNamespace(tokenizer=Tok())
+    tap = S.GenerateTap.acquire(nv)
+    threads = []
+    orig = S.request_digest
+
+    def spy(prompt, videos):
+        threads.append(threading.current_thread() is threading.main_thread())
+        return orig(prompt, videos)
+
+    monkeypatch.setattr(S, "request_digest", spy)
+
+    def nvidia_fn():
+        proc = CaptureProcessor(real, budget=8)
+        inputs = proc(text=["p\n<|video_pad|>"], videos=[np.zeros((1, 2, 2, 3), np.uint8)],
+                      video_metadata=[{"total_num_frames": 1, "fps": 1.0,
+                                       "frames_indices": [0]}], do_sample_frames=False)
+        return nv.pipeline.generate(None, proc, inputs, 8)
+
+    async def main():
+        async with MicroBatcher(EchoEngine({"p\n<|video_pad|>": "t"}), max_wait_s=30) as mb, \
+                mb.episode():
+            return await S.run_tapped(nv, mb, nvidia_fn, tokenizer=Tok(), eos=EOS)
+
+    try:
+        asyncio.run(main())
+    finally:
+        tap.release()
+    assert threads == [False]

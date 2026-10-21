@@ -8,9 +8,10 @@ segment metadata), probes the cameras with NVIDIA's code and runs
 
 Upstream records (``UpstreamSegments``): every part under the shard's ``depends_on`` segment
 shards and under their single-episode bisection children (``attempts.child_shard_id``), filtered
-to this job's config hash; read once per shard. An episode without one is an ``infra``
-``EpisodeError`` (the orchestrator chains caption shards on segment receipts, so this means a
-lost or foreign part). Upstream-poisoned episodes never get here (runner step 3).
+to this config (``JobFiles.accepts("segment")``: the segment stage hash or the job hash); read
+once per shard. An episode without one is an ``infra`` ``EpisodeError`` (the orchestrator
+chains caption shards on segment receipts, so this means a lost or foreign part).
+Upstream-poisoned episodes never get here (runner step 3).
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from flora_deploy.workers_impl.segment import (
     EpisodeOutcome,
     ShardContext,
     StageInfo,
+    phase,
 )
 
 
@@ -52,11 +54,14 @@ class UpstreamSegments:
     def load(jf: A.JobFiles, shard: Shard) -> dict[str, StageRecord]:
         ids = list(shard.depends_on) + [A.child_shard_id("segment", u) for u in shard.episodes]
         out: dict[str, StageRecord] = {}
+        # The sink stamps segment records with the segment *stage* hash (``JobFiles.key``);
+        # accept exactly what ``progress.shard_parts`` accepts (review 6 H1).
+        accepted = jf.accepts("segment")
         for sid in dict.fromkeys(ids):
             prefix = P.part_prefix(jf, Shard(sid, "segment", (), 0.0))
             for path in sorted(p for p in jf.store.list(prefix) if p.endswith(".jsonl")):
                 for rec in P.read_part(jf, path):
-                    if (rec.stage == "segment" and rec.provenance.config_hash == jf.config_hash
+                    if (rec.stage == "segment" and rec.provenance.config_hash in accepted
                             and rec.uid in shard.episodes):
                         out.setdefault(rec.uid, rec)
         return out
@@ -82,18 +87,26 @@ class CaptionEpisodeJob:
         self.budget = budget
 
     async def run(self, ref: EpisodeRef, batcher, ctx: ShardContext) -> EpisodeOutcome:
+        from flora_deploy.stages import segment as S
+
+        with phase("inputs"):
+            seg_record = await asyncio.to_thread(self.segments, ref, ctx)
+            rows = S.rows_from_record(seg_record)
+            inp = await asyncio.to_thread(self.inputs, ref)
+        t0 = time.perf_counter()
+        with phase("nvidia"):
+            ep = await asyncio.to_thread(S.prepare_videos, self.nv, inp.paths, inp.profile,
+                                         yam32=inp.yam32, instruction=inp.instruction)
+            t1 = time.perf_counter()
+            res = await self.cap.caption(batcher, ep, rows)
+        t2 = time.perf_counter()
+        with phase("records"):
+            return self._outcome(ref, inp, ep, res, t0, t1, t2)
+
+    def _outcome(self, ref, inp, ep, res, t0, t1, t2) -> EpisodeOutcome:
         from flora_deploy.stages import caption as C
         from flora_deploy.stages import segment as S
 
-        seg_record = await asyncio.to_thread(self.segments, ref, ctx)
-        rows = S.rows_from_record(seg_record)
-        inp = await asyncio.to_thread(self.inputs, ref)
-        t0 = time.perf_counter()
-        ep = await asyncio.to_thread(S.prepare_videos, self.nv, inp.paths, inp.profile,
-                                     yam32=inp.yam32, instruction=inp.instruction)
-        t1 = time.perf_counter()
-        res = await self.cap.caption(batcher, ep, rows)
-        t2 = time.perf_counter()
         prov = S.provenance("captioner", engine_label=self.info.engine_label,
                             spec=self.info.engine_spec, models=self.info.models,
                             gpu=self.info.gpu, budget=self.budget,

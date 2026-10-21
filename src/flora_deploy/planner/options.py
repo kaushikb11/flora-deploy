@@ -23,6 +23,9 @@ and on by default since P1a-5s), the same rates ``jobs.budget`` charges. Rates t
 feature outside it (e.g. ``long_lived_container``) only appear in *projection* options
 (``requires`` set, named ``... +long_lived_container``), which ``recommended`` never picks; among
 runnable options it prefers measured rates over projected over placeholder, then the cheapest.
+An option that is uncertified, priced from placeholder rates or uses a shard kind the deploy
+factory refuses (``modal_app.factory.PENDING_WORKERS``) is shown with ``unavailable`` reasons
+and never recommended (review 6 M2).
 
 Everything is deterministic: same inputs, same options in the same order.
 """
@@ -164,6 +167,9 @@ class PlanOption:
     flags: tuple[str, ...]
     rate_status: str  # worst status among the kinds' rates
     requires: tuple[str, ...] = ()  # worker features this option needs that are not deployed
+    # Why this option cannot be run (and is never recommended) today: uncertified, priced
+    # from placeholder rates, or a shard kind the deploy factory refuses (review 6 M2).
+    unavailable: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -259,6 +265,14 @@ def _hours(s: float) -> str:
     return f"{s / 3600:.1f} h"
 
 
+def factory_refusals(kinds: Iterable[str]) -> dict[str, str]:
+    """Shard kind -> why ``modal_app.factory`` refuses to deploy it (no registered worker)."""
+    from flora_deploy.modal_app.factory import PENDING_WORKERS, WORKERS
+
+    return {k: PENDING_WORKERS.get(k, "no worker class is registered for it")
+            for k in kinds if k not in WORKERS}
+
+
 def build_option(req: PlanRequest, table: RateTable, rates: Rates, preset: str, conc: int, *,
                  fill: bool = False, name: str | None = None,
                  extra_features: tuple[str, ...] = ()) -> PlanOption:
@@ -321,6 +335,18 @@ def build_option(req: PlanRequest, table: RateTable, rates: Rates, preset: str, 
     if cert == "needs certificates":
         flags.append(f"{preset}: uncertified until its certificates exist "
                      "(`flora run` needs --allow-uncertified)")
+    unavailable: list[str] = []
+    if cert != "reference":
+        unavailable.append(f"uncertified ({preset} has no certificates)")
+    if worst == "placeholder":
+        unavailable.append("priced from placeholder rates: "
+                           + ", ".join(k.kind for k in kinds if k.status == "placeholder"))
+    refused = factory_refusals(k.kind for k in kinds)
+    if refused:
+        unavailable.append("refused by the deploy factory: "
+                           + "; ".join(f"{k} ({why})" for k, why in refused.items()))
+    if unavailable:
+        flags.append("unavailable: " + "; ".join(unavailable))
     plans = tuple(KindPlan(
         kind=k.kind, gpu=k.pool.gpu, gpu_count=k.pool.gpu_count, containers=k.n,
         max_inputs=k.conc, cpu_cores=k.pool.cpu_cores, memory_gib=k.pool.memory_gib,
@@ -334,7 +360,7 @@ def build_option(req: PlanRequest, table: RateTable, rates: Rates, preset: str, 
         kinds=plans, cost_usd=round(c_mid, 2), cost_low_usd=round(c_lo, 2),
         cost_high_usd=round(c_hi, 2), wall_s=round(wall, 1), wall_high_s=round(wall_hi, 1),
         peak_gpus=peak, certification=cert, status=status, flags=tuple(flags),
-        rate_status=worst, requires=missing)
+        rate_status=worst, requires=missing, unavailable=tuple(unavailable))
 
 
 def _gpus_for_deadline(kinds: list[_Kind], deadline_s: float) -> int | None:
@@ -407,11 +433,13 @@ def plan_options(req: PlanRequest, *, table: RateTable | None = None,
 
 
 def recommended(options: Sequence[PlanOption]) -> PlanOption | None:
-    """The option to suggest: never a projection that needs an unwired feature; ``ok`` before
+    """The option to suggest: never a projection that needs an unwired feature, never an
+    ``unavailable`` one (uncertified, placeholder-priced or refused by the factory); ``ok`` before
     ``at risk``; then the reference preset before uncertified ones; then measured rates before
     projected before placeholders (review 4 M5); then the cheapest. ``None`` when no option is
     feasible and runnable."""
-    live = [o for o in options if o.status != "infeasible" and not o.requires]
+    live = [o for o in options
+            if o.status != "infeasible" and not o.requires and not o.unavailable]
     if not live:
         return None
     return min(live, key=lambda o: (o.status != "ok", o.certification != "reference",

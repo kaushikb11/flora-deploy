@@ -36,6 +36,10 @@ class Provenance:
     gpu: str | None = None  # from nvidia-smi; not part of config_hash (D11)
     certificate: str | None = None  # None for `exact` (reference by construction)
     source: dict[str, dict[str, Any]] = field(default_factory=dict)  # role -> {uri, range_s}
+    # The producing stage's own hash (e.g. the balanced engine spec + sampling + pins hash of
+    # ``stages.segment.config_hash``), kept when the part sink stamps ``config_hash`` with the
+    # job's stage key (review 6 M3). ``None`` when the stage set none.
+    engine_hash: str | None = None
 
 
 @dataclass(frozen=True)

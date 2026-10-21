@@ -74,13 +74,19 @@ episode coroutines (one event loop, ≤ max_inflight_episodes)
   event loop and their records are flushed every `flush_every` episodes. Index receipts give
   NVIDIA's arguments (profile, yam32, instruction source). Caption shards read their episodes'
   `segment` records from the upstream shard's parts, including bisection children, filtered to the
-  job's config hash. The full NVIDIA segment metadata travels in `Segment.nv_metadata`, and
+  segment stage key (`JobFiles.accepts("segment")`). The full NVIDIA segment metadata travels in `Segment.nv_metadata`, and
   `rows_from_record` turns it back into NVIDIA's rows. Both workers are registered in
   `tests/conformance/registry.py` and pass all 10 conformance checks.
 - **Provenance.** The engine label is `vllm-0.24.0-offline` or `…+dtbias`. Records carry the
-  model pins, the GPU and the per-camera source. The stage config hash covers the engine spec
-  without the GPU (D11; the per-GPU scheduler limits stay in), NVIDIA's sampling, the logic version
-  and the `vllm-video` logic digest. The job hash is stamped by the sink, as for rewards. All new
+  model pins, the GPU and the per-camera source. The job's segment / caption **stage hashes**
+  (`config/hashing.py`, which key the shard files) cover the worker's full `EngineSpec.hashed()`
+  on the configured GPU (`engine.spec`: every engine kwarg incl. the per-GPU scheduler limits and
+  `dtbias_fp32`; the GPU name stays out, D11), so a GPU override with other limits gets a new
+  key instead of resuming into old shards. The stage's own hash (engine spec, NVIDIA's sampling,
+  model pins, the logic version and the `vllm-video` logic digest) is kept in
+  `provenance.engine_hash`; the sink stamps the stage key as `provenance.config_hash`, as for
+  rewards. A `dtbias_fp32` deploy knob does not exist yet; when one lands it must reach
+  `hashed_spec_for(..., dtbias_fp32=...)` in the hash. All new
   modules are classified in `config/logic.py` under `vllm-video`. `engines/` and
   `engines/patches/` are now classified directories.
 

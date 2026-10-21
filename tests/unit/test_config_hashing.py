@@ -477,3 +477,25 @@ def test_path_normalization_for_repo_and_local_inputs():
     local = {"format": "mp4_dir", "path": "./videos/"}
     assert h(set_(base(), "input", local)) == h(set_(base(), "input",
                                                      {**local, "path": "videos"}))
+
+
+
+def test_balanced_stage_hash_covers_the_engine_spec():
+    """Review 6 M3: the per-GPU scheduler limits (L40S 32 seqs vs H100 48) change batching,
+    hence numerics, so they must key the balanced segment shards; the exact path is not
+    affected by a GPU override."""
+    from flora_deploy.engines.offline_llm import EngineSpec
+
+    bal = set_(set_(base(), "preset", "balanced"), "pipeline.stages",
+               ["segment", "caption", "reward.terminal"])
+    ref = sh(bal)
+    h100 = sh(set_(bal, "resources", {"segment": {"gpu": "H100"}}))
+    assert h100["segment"] != ref["segment"] and h100["caption"] != ref["caption"]
+    assert h100["reward.terminal"] == ref["reward.terminal"]
+    doc = config_hash(parse_config(bal, allow_uncertified=True),
+                      derived_receipts=RECEIPTS).document
+    want = EngineSpec.for_gpu("tempseg", "m", "L40S").hashed()
+    assert doc["shard_kinds"]["segment"]["engine"]["spec"] == want
+    exact = config_hash(parse_config(base(), allow_uncertified=True),
+                        derived_receipts=RECEIPTS).document
+    assert "spec" not in exact["shard_kinds"]["segcap"]["engine"]  # exact unchanged
