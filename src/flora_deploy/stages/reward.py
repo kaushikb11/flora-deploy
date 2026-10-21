@@ -1,44 +1,102 @@
 """Terminal and dense rewards, batched across episodes, on NVIDIA's offline-``LLM`` recipe.
 
-PLAN.md §6.4 step 4 and D14. Every prompt, frame sample, collage, regex, parser and stitcher
-comes from NVIDIA's Rewarder ``batch_utils`` (linked at runtime, never copied): this module only
-changes *how requests are grouped*. NVIDIA's scripts call ``llm.generate`` once per
-``max_num_seqs`` episodes (terminal) or once per ``max_num_seqs`` clips of one episode (dense);
-here one ``llm.generate`` call carries every request of a mode for the whole episode list, and
-the engine's own scheduler (``max_num_seqs``) does the batching.
+PLAN.md §6.4 step 4 and D14. Prompts, frame sampling, collage, regexes, parsers, probability
+renormalization and dense stitching all come from NVIDIA's Rewarder ``batch_utils``, linked at
+runtime. This module changes *how requests are grouped*, isolates failures per episode and
+persists results per round:
 
-The module is Modal-agnostic. ``nv`` is the handle from
-``load_family(Family.REWARDER, code_dir)`` (it needs ``.core``, ``.engine`` and
-``.dense_reward``), ``processor`` is NVIDIA's ``engine.load_processor(path)`` and ``llm`` is the
-engine built by :func:`build_engine` (NVIDIA's ``engine.load_llm``). ``vllm`` is imported lazily,
-only for ``SamplingParams``.
+- NVIDIA's scripts call ``llm.generate`` once per ``max_num_seqs`` episodes (terminal) or once
+  per ``max_num_seqs`` clips of one episode (dense). Here the requests of the whole episode list
+  are cut into **size-bounded rounds** (:class:`RoundLimits`: estimated frame + processed-tensor
+  bytes and a request count), one ``llm.generate`` per round. By default (``align="nvidia"``)
+  each round is exactly one of NVIDIA's ``generate`` calls, because on the real engine batch
+  composition changes logprobs (H100: terminal ``P(1..5)`` up to 0.03 apart); ``"packed"``
+  rounds fill across episodes for throughput, outside ``exact``. Rounds never change the
+  requests themselves, and with a content-keyed fake LLM every grouping gives the same records
+  (tested); only numerics can tell groupings apart.
+- Video decoding (NVIDIA's ``Collage``) runs on a thread pool or a spawn process pool
+  (``nv.pool_initializer()``), a bounded number of episodes ahead, so round k+1 decodes while
+  round k generates.
+- **Per-episode isolation.** A failure to read one episode's videos is recorded before
+  ``generate``. A failure to parse one output (NVIDIA's ``parse_terminal`` /
+  ``score_probabilities`` raising, e.g. a rationale cut off by ``max_tokens``) or to stitch one
+  dense episode becomes an :class:`~flora_deploy.jobs.types.EpisodeError` of kind
+  ``nv_failure`` carrying NVIDIA's message and the ``finish_reason``. Every other record is kept.
+  An input error raised by ``generate`` for a whole round is retried one episode at a time
+  (``kind="infra"`` for the episode that still fails).
+- **Partial persistence.** After each round its records, audits and errors are handed to a
+  :class:`PartSink` (local part file, then a whole-file copy), so a timeout or preemption loses at
+  most the round in flight.
 
-Records follow PLAN.md §6.6: ``terminal{score, expected_score, probabilities[5], rationale?}``
-and ``dense{segments, per_step}``, plus ``nv``, the record NVIDIA's script would have written
-for the episode (kept for parity checks and for users of NVIDIA's format).
+Records are ``records.StageRecord`` (stage ``reward.terminal`` / ``reward.dense``). NVIDIA's full
+output line for the episode (what its script would have written) goes into a separate *audit*
+entry, for parity checks and for users of NVIDIA's format.
+
+What is ours rather than NVIDIA's. No prompt text, regex or parser is copied. About 20 lines are
+*re-expressions of NVIDIA's script glue* (its ``batch_utils`` is under NVIDIA's license, so they
+are written to its interface, not copied): the ``SamplingParams`` construction
+(:func:`sampling_params`), the ``(token, logprob, candidates)`` list given to
+``score_probabilities`` (:func:`token_positions`), the field names / rounding of NVIDIA's terminal
+output line (:func:`terminal_record`), and :func:`per_step`, which reads NVIDIA's stitched
+per-frame scores at the middle of each 0.5 s step (the convention NVIDIA's ``per_second`` uses
+per second). ``tests/nvlink/test_reward_parity.py`` runs NVIDIA's real scripts and is the drift
+guard for all of them.
+
+Rubric rewards are **deferred** (PLAN.md P2: TP=2, ``max_model_len`` 98304, one video per camera):
+``check_mode("rubric")`` raises ``NotImplementedError``.
+
+Prefix caching. NVIDIA's engine has ``enable_prefix_caching=True`` (hybrid "align" mode, where a
+hit can change numerics). The shared text before the video is 104-413 tokens, below one KV block
+(784), so only *identical* requests can hit. :func:`run` rejects duplicate episodes and calls
+``llm.reset_prefix_cache()`` before every round (and checks it returned True), so a re-run or a
+retry in a warm container never hits. ``reset_mm_cache`` is not needed: it does not change numerics.
+
+The module is Modal-agnostic. ``nv`` is the handle from ``load_family(Family.REWARDER, code_dir)``
+(``.core``, ``.engine``, ``.dense_reward``), ``processor`` is NVIDIA's
+``engine.load_processor(path)`` and ``llm`` is the engine from :func:`build_engine` (NVIDIA's
+``engine.load_llm``). ``vllm`` is imported lazily, only for ``SamplingParams``.
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
+import hashlib
 import json
 import math
+import os
+import shutil
 import time
+from collections import deque
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass, field
+from concurrent.futures import Executor, Future, ProcessPoolExecutor, ThreadPoolExecutor
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
+
+from flora_deploy.jobs.types import EpisodeError, episode_uid
+from flora_deploy.records import DenseReward, Provenance, StageRecord, TerminalReward
 
 SCHEMA = "flora_labels_v1"
 MODES = ("terminal", "terminal_rationale", "dense")
+DEFERRED_MODES = ("rubric",)
+STAGES = {"terminal": "reward.terminal", "terminal_rationale": "reward.terminal",
+          "dense": "reward.dense"}
 # ``--max-model-len`` default of both NVIDIA scripts (terminal_reward.py, dense_reward.py).
 # The reference run re-checks it: NVIDIA's ``load_llm`` call is compared to ours.
 MAX_MODEL_LEN = 16384
 ENGINE_LABEL = "vllm-0.24.0-offline"
+MiB = 1 << 20
+GiB = 1 << 30
 
 
 def check_mode(mode: str) -> str:
+    if mode in DEFERRED_MODES:
+        raise NotImplementedError(
+            "rubric rewards are deferred (PLAN.md P2: TP=2, max_model_len 98304, one video per "
+            "camera); stages.reward implements terminal, terminal_rationale and dense only"
+        )
     if mode not in MODES:
         raise ValueError(f"unknown reward mode {mode!r}; expected one of {MODES}")
     return mode
@@ -50,24 +108,68 @@ def with_rationale(mode: str) -> bool:
 
 @dataclass(frozen=True)
 class Episode:
-    """One episode: camera videos in NVIDIA's collage order (2 views L/R, 3 views L/C/R)."""
+    """One episode: camera videos in NVIDIA's collage order (2 views L/R, 3 views L/C/R).
+
+    ``envelope_ok`` is the EpisodeIndex's verdict on NVIDIA's reference envelope (``None``: no
+    verdict, e.g. an ad-hoc jobs file); it decides ``certified`` on the record.
+    """
 
     id: str
     task: str
     videos: tuple[str, ...]
+    dataset: str = "local"
+    envelope_ok: bool | None = None
+
+    @property
+    def uid(self) -> str:
+        return episode_uid(self.dataset, self.id)
 
     @classmethod
-    def from_job(cls, job: dict[str, Any]) -> Episode:
-        return cls(id=str(job["id"]), task=job["task"], videos=tuple(job["videos"]))
+    def from_job(cls, job: dict[str, Any], *, root: str | Path | None = None,
+                 dataset: str = "local", envelope_ok: bool | None = None) -> Episode:
+        """A jobs-file line. Relative video paths resolve against ``root`` (NVIDIA resolves them
+        against the jobs file's directory); without ``root`` they must be absolute."""
+        videos = job["videos"]
+        if not isinstance(videos, (list, tuple)):
+            raise ValueError(f"episode {job.get('id')!r}: 'videos' must be a list")
+        if root is not None:
+            videos = [str((Path(root) / Path(v).expanduser()).resolve()) for v in videos]
+        return cls(id=str(job["id"]), task=job["task"], videos=tuple(str(v) for v in videos),
+                   dataset=str(job.get("dataset", dataset)),
+                   envelope_ok=job.get("envelope_ok", envelope_ok))
 
     def as_job(self) -> dict[str, Any]:
         return {"id": self.id, "task": self.task, "videos": list(self.videos)}
 
 
-def read_jobs(nv, jobs_path: str | Path) -> list[Episode]:
-    """Episodes from a jobs JSONL exactly as NVIDIA's ``engine.read_jobs`` reads it."""
+def read_jobs(nv, jobs_path: str | Path, *, dataset: str = "local") -> list[Episode]:
+    """Episodes from a jobs JSONL exactly as NVIDIA's ``engine.read_jobs`` reads it (absolute
+    paths, NVIDIA's id rules)."""
     args = argparse.Namespace(video=None, task=None, jobs=Path(jobs_path))
-    return [Episode.from_job(job) for job in nv.engine.read_jobs(args)]
+    return [Episode.from_job(job, dataset=dataset) for job in nv.engine.read_jobs(args)]
+
+
+def validate_episodes(episodes: Sequence[Episode]) -> list[Episode]:
+    """Caller-level input checks (a violation is a bug in the caller, so it raises): unique
+    uids, a non-empty task, 1-4 videos, absolute paths. A missing or unreadable video is *not*
+    checked here; it becomes that episode's error."""
+    episodes = list(episodes)
+    seen: set[str] = set()
+    for ep in episodes:
+        if not isinstance(ep, Episode):
+            raise TypeError(f"expected Episode, got {type(ep).__name__}")
+        if ep.uid in seen:
+            raise ValueError(f"duplicate episode {ep.uid!r}")
+        seen.add(ep.uid)
+        if not str(ep.task or "").strip():
+            raise ValueError(f"episode {ep.uid!r}: empty task")
+        if not 1 <= len(ep.videos) <= 4:
+            raise ValueError(f"episode {ep.uid!r}: {len(ep.videos)} videos (1-4 supported)")
+        relative = [v for v in ep.videos if not os.path.isabs(v)]
+        if relative:
+            raise ValueError(f"episode {ep.uid!r}: relative video paths {relative}; resolve them "
+                             "(Episode.from_job(root=...)) first")
+    return episodes
 
 
 # ---------------------------------------------------------------------------
@@ -172,8 +274,74 @@ _MISSING = object()
 
 
 # ---------------------------------------------------------------------------
-# Request building
+# Request building (decode side: runs in a pool worker)
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CollageFacts:
+    """What NVIDIA's record builders read from a ``Collage`` (fps, length, duration), without
+    its frames, so a prepared episode can cross a process boundary cheaply."""
+
+    fps: float
+    num_frames: int
+    duration_s: float
+    width: int
+    height: int
+
+
+@dataclass
+class Prepared:
+    """One episode's decoded inputs: per request ``(frames [T,H,W,3] uint8, metadata)``."""
+
+    facts: CollageFacts | None = None
+    plan: Any = None  # terminal: frame indices; dense: NVIDIA DenseWindow list
+    videos: list[tuple[Any, dict[str, Any]]] = field(default_factory=list)
+    error: dict[str, Any] | None = None  # {"kind", "message", "type"} when decoding failed
+    decode_s: float = 0.0
+
+
+def _failure(exc: BaseException) -> dict[str, Any]:
+    # NVIDIA's inputs/parsers signal bad data with ValueError: that is NVIDIA's own failure
+    # semantics (its script would stop on it). Anything else is infrastructure.
+    kind = "nv_failure" if isinstance(exc, ValueError) else "infra"
+    return {"kind": kind, "message": str(exc), "type": type(exc).__name__}
+
+
+def prepare_episode(core, mode: str, episode: Episode) -> Prepared:
+    """NVIDIA's collage, frame plan and decoded frames for every request of ``episode``.
+    Never raises: a failure is returned in ``Prepared.error``."""
+    t0 = time.perf_counter()
+    try:
+        collage = core.Collage(list(episode.videos))
+        if mode == "dense":
+            plan = core.dense_windows(collage.num_frames, collage.fps)
+            collage.frames(sorted({i for w in plan for i in w.frame_indices}))  # one decode pass
+            index_lists = [w.frame_indices for w in plan]
+        else:
+            plan = core.terminal_frame_indices(collage.num_frames, collage.fps)
+            index_lists = [plan]
+        videos = [(collage.frames(indices),
+                   core.video_metadata(indices, collage.fps, collage.num_frames))
+                  for indices in index_lists]
+        facts = CollageFacts(float(collage.fps), int(collage.num_frames),
+                             float(collage.duration_s), int(getattr(collage, "width", 0)),
+                             int(getattr(collage, "height", 0)))
+        collage.release()  # each request holds its own stacked copy
+    except Exception as exc:  # noqa: BLE001 - isolated per episode, reported as EpisodeError
+        return Prepared(error=_failure(exc), decode_s=time.perf_counter() - t0)
+    return Prepared(facts, plan, videos, None, time.perf_counter() - t0)
+
+
+def _prepare_in_pool_worker(mode: str, episode: Episode) -> Prepared:
+    """Process-pool entry point: the worker linked the Rewarder family in its initializer
+    (``nv.pool_initializer()``)."""
+    from flora_deploy.nv.linker import loaded_family
+
+    nv = loaded_family()
+    if nv is None:
+        raise RuntimeError("pool worker has no linked NVIDIA family; use nv.pool_initializer()")
+    return prepare_episode(nv.core, mode, episode)
 
 
 @dataclass
@@ -185,6 +353,7 @@ class Request:
     prompt: str
     multi_modal_data: dict[str, Any]
     mm_processor_kwargs: dict[str, Any]
+    est_bytes: int = 0
 
     def as_vllm(self) -> dict[str, Any]:
         return {
@@ -194,66 +363,26 @@ class Request:
         }
 
 
-@dataclass
-class Batch:
-    mode: str
-    episodes: list[Episode]
-    collages: list[Any]
-    plans: list[Any]  # terminal: frame indices per episode; dense: windows per episode
-    requests: list[Request] = field(default_factory=list)
-
-
-def _request(nv, collage, indices, prompt: str, episode: int, window: int | None) -> Request:
-    return Request(
-        episode=episode,
-        window=window,
-        prompt=prompt,
-        multi_modal_data={
-            "video": (
-                collage.frames(indices),
-                nv.core.video_metadata(indices, collage.fps, collage.num_frames),
-            )
-        },
-        mm_processor_kwargs={"do_sample_frames": False},
-    )
-
-
-def build_terminal(nv, processor, episodes: Sequence[Episode], *, rationale: bool) -> Batch:
-    """One request per episode: NVIDIA's whole-episode sampling, collage and prompt."""
+def episode_requests(nv, processor, mode: str, number: int, episode: Episode,
+                     prepared: Prepared, limits: RoundLimits) -> list[Request]:
+    """Render NVIDIA's prompts (main process) for a prepared episode."""
     core, render = nv.core, nv.engine.render
-    batch = Batch("terminal_rationale" if rationale else "terminal", list(episodes), [], [])
-    for number, episode in enumerate(episodes):
-        collage = core.Collage(list(episode.videos))
-        indices = core.terminal_frame_indices(collage.num_frames, collage.fps)
-        prompt = render(processor, core.terminal_messages(episode.task, rationale), thinking=False)
-        batch.collages.append(collage)
-        batch.plans.append(indices)
-        batch.requests.append(_request(nv, collage, indices, prompt, number, None))
-        collage.release()  # the request holds its own stacked copy
-    return batch
-
-
-def build_dense(nv, processor, episodes: Sequence[Episode]) -> Batch:
-    """Every 16 s clip of every episode: NVIDIA's windows, collage and prompt."""
-    core, render = nv.core, nv.engine.render
-    batch = Batch("dense", list(episodes), [], [])
-    for number, episode in enumerate(episodes):
-        collage = core.Collage(list(episode.videos))
-        windows = core.dense_windows(collage.num_frames, collage.fps)
-        collage.frames(sorted({i for w in windows for i in w.frame_indices}))  # one decode pass
-        batch.collages.append(collage)
-        batch.plans.append(windows)
-        for window in windows:
-            prompt = render(processor, core.dense_messages(episode.task, window), thinking=False)
-            batch.requests.append(
-                _request(nv, collage, window.frame_indices, prompt, number, window.index)
-            )
-        collage.release()
-    return batch
+    if mode == "dense":
+        prompts = [(w.index, render(processor, core.dense_messages(episode.task, w),
+                                    thinking=False)) for w in prepared.plan]
+    else:
+        messages = core.terminal_messages(episode.task, with_rationale(mode))
+        prompts = [(None, render(processor, messages, thinking=False))]
+    return [
+        Request(number, window, prompt, {"video": video}, {"do_sample_frames": False},
+                limits.estimate(video[0]))
+        for (window, prompt), video in zip(prompts, prepared.videos, strict=True)
+    ]
 
 
 def sampling_params(nv, mode: str):
-    """NVIDIA's ``SamplingParams`` for ``mode`` (greedy, regex-constrained)."""
+    """NVIDIA's ``SamplingParams`` for ``mode`` (greedy, regex-constrained); re-expressed from
+    its scripts."""
     from vllm import SamplingParams
     from vllm.sampling_params import StructuredOutputsParams
 
@@ -274,13 +403,81 @@ def sampling_params(nv, mode: str):
 
 
 # ---------------------------------------------------------------------------
+# Rounds
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RoundLimits:
+    """Bounds of one ``llm.generate`` round.
+
+    Sizing (WS-H review H2, NVIDIA's ``plan_collage`` on 640x480 views): a 3-view request holds
+    ~61 MiB of uint8 frames and the HF video processor makes ~243 MiB of float32
+    ``pixel_values_videos`` from it (4x), all resident in the engine until ``generate`` returns.
+    ``estimate`` is ``raw * (1 + processed_factor)``, ~304 MiB for 3 views. The defaults cap a
+    round at 6 GiB estimated (~20 three-view requests) and 32 requests (4x NVIDIA's
+    ``max_num_seqs`` of 8, so the engine stays full); with one prepared round waiting while
+    another generates, frame + tensor memory stays under ~12 GiB, next to the 2 x 4 GiB MM
+    processor caches, inside the 80 GiB container. A single request above the byte budget still
+    runs, alone.
+
+    ``align`` decides how requests are grouped inside those bounds:
+
+    - ``"nvidia"`` (default, the ``exact`` preset): every round is exactly one of the
+      ``generate`` calls NVIDIA's script makes: the next ``nvidia_group`` (``max_num_seqs``, 8)
+      episodes for terminal, the next ``nvidia_group`` clips *of one episode* for dense. Batch
+      composition changes numerics on the real engine (measured on H100: greedy text and
+      scores equal, terminal ``P(1..5)`` up to 0.03 apart between a 3-request call and calls of
+      2 + 1), so only NVIDIA's own grouping reproduces NVIDIA's outputs. 8 four-view requests
+      are ~3.2 GiB estimated, inside the default byte budget, so the budget never splits an
+      NVIDIA group in practice; if it does, the round is counted in ``stats["budget_splits"]``.
+    - ``"packed"``: fill each round up to ``max_requests`` / ``max_bytes`` across episodes, for
+      throughput (dense packs clips of several episodes). Outputs then match NVIDIA's only up to
+      batch-composition numerics: not ``exact``.
+    """
+
+    max_requests: int = 32
+    max_bytes: int = 6 * GiB
+    processed_factor: float = 4.0
+    align: str = "nvidia"
+    nvidia_group: int = 8
+
+    def __post_init__(self) -> None:
+        if (self.max_requests < 1 or self.max_bytes < 1 or self.processed_factor < 0
+                or self.nvidia_group < 1 or self.align not in ("nvidia", "packed")):
+            raise ValueError(f"invalid round limits {self}")
+
+    def estimate(self, frames) -> int:
+        raw = int(getattr(frames, "nbytes", 0))
+        return int(raw * (1.0 + self.processed_factor))
+
+    def fits(self, count: int, size: int, request: Request) -> bool:
+        """Size bounds only (count, bytes)."""
+        if count == 0:
+            return True
+        return count + 1 <= self.max_requests and size + request.est_bytes <= self.max_bytes
+
+    def boundary(self, mode: str, batch: Sequence[Request], request: Request) -> bool:
+        """NVIDIA's call boundary before ``request`` (``align="nvidia"``)."""
+        if self.align != "nvidia" or not batch:
+            return False
+        if mode == "dense":
+            return request.episode != batch[0].episode or len(batch) >= self.nvidia_group
+        return len(batch) >= self.nvidia_group
+
+
+UNBOUNDED = RoundLimits(max_requests=1 << 30, max_bytes=1 << 62, align="packed")
+
+
+# ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
 
 
 def token_positions(tokenizer, completion) -> list[tuple[str, float, list[tuple[str, float]]]]:
     """``(token text, logprob, top candidates)`` per generated token, the input format of
-    NVIDIA's ``core.score_probabilities`` (texts via ``tokenizer.decode([id])``)."""
+    NVIDIA's ``core.score_probabilities`` (texts via ``tokenizer.decode([id])``); re-expressed
+    from NVIDIA's terminal script."""
     return [
         (
             tokenizer.decode([token]),
@@ -291,28 +488,26 @@ def token_positions(tokenizer, completion) -> list[tuple[str, float, list[tuple[
     ]
 
 
-def _usage(output) -> dict[str, int]:
+def _usage(output) -> dict[str, Any]:
     completion = output.outputs[0]
     return {
         "prompt_tokens": len(output.prompt_token_ids or ()),
         "output_tokens": len(completion.token_ids),
+        "finish_reason": getattr(completion, "finish_reason", None),
     }
 
 
 def terminal_record(nv, episode: Episode, collage, indices, completion, tokenizer,
-                    rationale: bool) -> dict[str, Any]:
+                    rationale: bool) -> tuple[TerminalReward, dict[str, Any]]:
+    """NVIDIA's parse + probabilities. Raises NVIDIA's ``ValueError`` on a bad answer."""
     core = nv.core
     score, text = core.parse_terminal(completion.text, rationale)
     probabilities, expected = core.score_probabilities(
         token_positions(tokenizer, completion), score
     )
-    terminal: dict[str, Any] = {
-        "score": score,
-        "expected_score": expected,
-        "probabilities": [probabilities[str(k)] for k in range(1, 6)],
-    }
-    if rationale:
-        terminal["rationale"] = text
+    terminal = TerminalReward(score=score, expected_score=expected,
+                              probabilities=tuple(probabilities[str(k)] for k in range(1, 6)),
+                              rationale=text if rationale else None)
     # The line NVIDIA's terminal_reward.py writes for this episode (same fields and rounding).
     nv_record = {
         "id": episode.id,
@@ -326,23 +521,175 @@ def terminal_record(nv, episode: Episode, collage, indices, completion, tokenize
         "sampled_frames": len(indices),
         "output": completion.text,
     }
-    return {"terminal": terminal, "nv": nv_record}
+    return terminal, nv_record
+
+
+def per_step(nv, frame_scores: Sequence[int], fps: float, num_frames: int) -> list[int]:
+    """One 1-3 score per 0.5 s of the episode, the dense model's group length
+    (``2 / core.DENSE_FPS``): NVIDIA's stitched per-frame score read at the middle of each step,
+    the convention NVIDIA's ``per_second`` uses per second."""
+    step_s = 2.0 / nv.core.DENSE_FPS
+    steps = math.ceil(num_frames / fps / step_s - 1e-9)
+    return [int(frame_scores[min(num_frames - 1, int((k + 0.5) * step_s * fps))])
+            for k in range(steps)]
 
 
 def dense_record(nv, episode: Episode, collage, windows, texts: list[str],
-                 tail_trim_s: float) -> dict[str, Any]:
+                 tail_trim_s: float) -> tuple[DenseReward, dict[str, Any]]:
+    """NVIDIA's ``parse_dense`` + ``summarize`` (an unparseable clip is NVIDIA's all-normal,
+    ``valid=False``). Raises NVIDIA's ``ValueError`` if stitching fails."""
+    answers = [nv.core.parse_dense(text) for text in texts]
+    nv_record = nv.dense_reward.summarize(episode.as_job(), collage, windows, answers, texts,
+                                          tail_trim_s, True)
+    dense = DenseReward(segments=tuple(nv_record["segments"]),
+                        per_step=tuple(per_step(nv, nv_record["frame_scores"], collage.fps,
+                                                collage.num_frames)))
+    return dense, nv_record
+
+
+# ---------------------------------------------------------------------------
+# Provenance and certification
+# ---------------------------------------------------------------------------
+
+
+def config_hash(nv, mode: str, *, spec: EngineSpec | None, models: dict[str, str],
+                tail_trim_s: float | None, extra: dict[str, Any] | None = None) -> str:
+    """sha256 over everything that changes this stage's outputs (D11): engine arguments,
+    sampling (max tokens, regex), tail trim, model pins, logic version, ``extra`` (e.g. the
+    image fingerprint). Round limits and the decoder are excluded: they never change outputs."""
+    from flora_deploy import LOGIC_VERSION
+
     core = nv.core
-    answers = [core.parse_dense(text) for text in texts]
-    job = episode.as_job()
-    nv_record = nv.dense_reward.summarize(job, collage, windows, answers, texts, tail_trim_s, True)
-    dense = {
-        "segments": nv_record["segments"],
-        "per_step": nv_record["frame_scores"],  # one 1-3 score per source frame
-        "fps": nv_record["fps"],
-        "num_frames": nv_record["num_frames"],
-        "invalid_clips": nv_record["invalid_clips"],
-    }
-    return {"dense": dense, "nv": nv_record}
+    if mode == "dense":
+        sampling = {"max_tokens": core.DENSE_MAX_TOKENS, "regex": core.dense_regex()}
+    else:
+        r = with_rationale(mode)
+        sampling = {"max_tokens": core.terminal_max_tokens(r), "regex": core.terminal_regex(r),
+                    "logprobs": core.TERMINAL_TOP_LOGPROBS}
+    blob = {"stage": STAGES[mode], "mode": mode, "engine_label": ENGINE_LABEL,
+            "engine": spec.as_json() if spec else None, "sampling": sampling,
+            "tail_trim_s": tail_trim_s if mode == "dense" else None, "models": models,
+            "logic_version": LOGIC_VERSION, "extra": extra or {}}
+    text = json.dumps(blob, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def base_provenance(nv, mode: str, *, spec: EngineSpec | None = None,
+                    models: dict[str, str] | None = None, gpu: str | None = None,
+                    preset: str = "exact", certificate: str | None = None,
+                    tail_trim_s: float | None = None,
+                    extra: dict[str, Any] | None = None) -> Provenance:
+    from flora_deploy import LOGIC_VERSION, __version__
+
+    models = dict(models or {})
+    return Provenance(
+        models=models, engine=ENGINE_LABEL, preset=preset,
+        config_hash=config_hash(nv, mode, spec=spec, models=models, tail_trim_s=tail_trim_s,
+                                extra=extra),
+        logic_version=LOGIC_VERSION, framework=f"flora-deploy {__version__}", gpu=gpu,
+        certificate=certificate,
+    )
+
+
+def certification(episode: Episode) -> tuple[bool, str | None]:
+    """certified only inside NVIDIA's reference envelope, per the EpisodeIndex verdict."""
+    if episode.envelope_ok is True:
+        return True, None
+    if episode.envelope_ok is False:
+        return False, "outside_reference_envelope"
+    return False, "oracle_ineligible_source"
+
+
+# ---------------------------------------------------------------------------
+# Partial persistence
+# ---------------------------------------------------------------------------
+
+
+def _jsonl(rows: Sequence[Any]) -> bytes:
+    lines = []
+    for row in rows:
+        if isinstance(row, StageRecord):
+            lines.append(row.to_json())
+        else:
+            obj = asdict(row) if dataclasses.is_dataclass(row) else row
+            lines.append(json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                                    ensure_ascii=False, allow_nan=False, default=str))
+    return "".join(line + "\n" for line in lines).encode()
+
+
+@dataclass
+class RoundOutput:
+    k: int
+    config_hash: str
+    records: list[StageRecord]
+    audits: list[dict[str, Any]]
+    errors: list[EpisodeError]
+
+
+class PartSink(Protocol):
+    def write(self, out: RoundOutput) -> list[str]:
+        """Persist one round whole; return the published paths."""
+        ...
+
+
+def _write_whole(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
+class LocalPartSink:
+    """Part files per round in ``local_dir`` (``part-<k>.jsonl``, ``.audit.jsonl``,
+    ``.errors.jsonl``), each copied whole to ``dest_dir`` (temp name + rename) when given."""
+
+    def __init__(self, local_dir: str | Path, dest_dir: str | Path | None = None,
+                 prefix: str = "part"):
+        self.local_dir, self.prefix = Path(local_dir), prefix
+        self.dest_dir = Path(dest_dir) if dest_dir is not None else None
+        self.written: list[str] = []
+
+    def write(self, out: RoundOutput) -> list[str]:
+        paths = []
+        for suffix, rows in (("", out.records), (".audit", out.audits),
+                             (".errors", out.errors)):
+            if not rows:
+                continue
+            name = f"{self.prefix}-{out.k:05d}{suffix}.jsonl"
+            local = self.local_dir / name
+            _write_whole(local, _jsonl(rows))
+            if self.dest_dir is not None:
+                target = self.dest_dir / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                tmp = target.with_name(f".{name}.tmp")
+                shutil.copyfile(local, tmp)
+                os.replace(tmp, target)
+                local = target
+            paths.append(str(local))
+        self.written += paths
+        return paths
+
+
+class StorePartSink:
+    """Local part file per round, then a whole-file ``store.put_bytes`` to the job layout
+    (``JobPaths.part`` / ``audit`` / ``errors``)."""
+
+    def __init__(self, store, paths, *, kind: str, shard_id: str, container_id: str,
+                 local_dir: str | Path):
+        self.store, self.paths, self.kind = store, paths, kind
+        self.shard_id, self.container_id = shard_id, container_id
+        self.local = LocalPartSink(local_dir, prefix=f"{shard_id}-{container_id}")
+
+    def write(self, out: RoundOutput) -> list[str]:
+        local = self.local.write(out)
+        targets = {".audit.jsonl": self.paths.audit, ".errors.jsonl": self.paths.errors}
+        published = []
+        for path in local:
+            maker = next((m for s, m in targets.items() if path.endswith(s)), self.paths.part)
+            dest = maker(out.config_hash, self.kind, self.shard_id, self.container_id, out.k)
+            self.store.put_bytes(dest, Path(path).read_bytes())
+            published.append(dest)
+        return published
 
 
 # ---------------------------------------------------------------------------
@@ -353,8 +700,21 @@ def dense_record(nv, episode: Episode, collage, windows, texts: list[str],
 @dataclass
 class RewardRun:
     mode: str
-    records: list[dict[str, Any]]
+    records: list[StageRecord]
+    audits: list[dict[str, Any]]
+    errors: list[EpisodeError]
     stats: dict[str, Any]
+    parts: list[str] = field(default_factory=list)
+
+    def as_json(self) -> dict[str, Any]:
+        return json.loads(json.dumps({
+            "mode": self.mode,
+            "records": [json.loads(r.to_json()) for r in self.records],
+            "audits": self.audits,
+            "errors": [asdict(e) for e in self.errors],
+            "stats": self.stats,
+            "parts": self.parts,
+        }, default=str))
 
 
 def throughput(stats: dict[str, Any]) -> dict[str, float]:
@@ -367,70 +727,250 @@ def throughput(stats: dict[str, Any]) -> dict[str, float]:
     }
 
 
-def run(llm, nv, processor, episodes: Sequence[Episode], mode: str, *,
-        tail_trim_s: float | None = None, provenance: dict[str, Any] | None = None,
-        clock: Callable[[], float] = time.perf_counter) -> RewardRun:
-    """Score ``episodes`` in ``mode`` with exactly one ``llm.generate`` call."""
-    check_mode(mode)
-    episodes = list(episodes)
-    t0 = clock()
-    if mode == "dense":
-        batch = build_dense(nv, processor, episodes)
+def _reset_prefix_cache(llm) -> None:
+    if llm.reset_prefix_cache() is False:
+        raise RuntimeError("llm.reset_prefix_cache() returned False (requests still running?)")
+
+
+@contextlib.contextmanager
+def _decoder(nv, kind: str, workers: int) -> Iterator[Executor | None]:
+    if kind == "inline":
+        yield None
+    elif kind == "thread":
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="flora-decode") as pool:
+            yield pool
+    elif kind == "process":
+        import multiprocessing
+
+        with ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context(
+                "spawn"), **nv.pool_initializer()) as pool:
+            yield pool
     else:
-        batch = build_terminal(nv, processor, episodes, rationale=with_rationale(mode))
-    params = sampling_params(nv, mode)
-    t1 = clock()
-    outputs = llm.generate([r.as_vllm() for r in batch.requests], params, use_tqdm=False)
-    t2 = clock()
-    if len(outputs) != len(batch.requests):
-        raise RuntimeError(f"{len(outputs)} outputs for {len(batch.requests)} requests")
-    for request in batch.requests:  # drop frame arrays as soon as the engine is done
-        request.multi_modal_data = {}
+        raise ValueError(f"unknown decoder {kind!r}; expected inline, thread or process")
 
-    pairs = zip(batch.requests, outputs, strict=True)
-    usage = [{"window": r.window, **_usage(o)} for r, o in pairs]
-    per_episode: list[list[int]] = [[] for _ in episodes]
-    for position, request in enumerate(batch.requests):
-        per_episode[request.episode].append(position)
 
-    records = []
-    tokenizer = llm.get_tokenizer() if mode != "dense" else None
+def _prepared_stream(nv, mode: str, episodes: Sequence[Episode], pool: Executor | None,
+                     kind: str, lookahead: int) -> Iterator[Prepared]:
+    """Prepared episodes in input order, at most ``lookahead`` decoding ahead of the consumer."""
+    if pool is None:
+        for ep in episodes:
+            yield prepare_episode(nv.core, mode, ep)
+        return
+    if kind == "process":
+        def submit(ep):
+            return pool.submit(_prepare_in_pool_worker, mode, ep)
+    else:
+        def submit(ep):
+            return pool.submit(prepare_episode, nv.core, mode, ep)
+    queue: deque[Future] = deque()
+    todo = iter(episodes)
+    for ep in todo:
+        queue.append(submit(ep))
+        if len(queue) >= lookahead:
+            break
+    while queue:
+        future = queue.popleft()
+        nxt = next(todo, None)
+        if nxt is not None:
+            queue.append(submit(nxt))
+        try:
+            yield future.result()
+        except Exception as exc:  # noqa: BLE001 - e.g. a crashed pool worker
+            yield Prepared(error={**_failure(exc), "kind": "infra"})
+
+
+def run(llm, nv, processor, episodes: Sequence[Episode], mode: str, *,
+        tail_trim_s: float | None = None, spec: EngineSpec | None = None,
+        models: dict[str, str] | None = None, gpu: str | None = None, preset: str = "exact",
+        certificate: str | None = None, config_extra: dict[str, Any] | None = None,
+        limits: RoundLimits | None = None, decoder: str = "thread", workers: int = 4,
+        lookahead: int | None = None, sink: PartSink | None = None,
+        audit_ref: Callable[[Episode], str] | None = None, shard_id: str = "adhoc",
+        container_id: str = "local", clock: Callable[[], float] = time.perf_counter
+        ) -> RewardRun:
+    """Score ``episodes`` in ``mode`` in size-bounded ``llm.generate`` rounds (module doc)."""
+    check_mode(mode)
+    episodes = validate_episodes(episodes)
+    limits = limits or RoundLimits()
+    if spec is not None and limits.align == "nvidia":  # NVIDIA's group is its max_num_seqs
+        limits = dataclasses.replace(limits, nvidia_group=int(spec.args["max_num_seqs"]))
+    lookahead = lookahead or max(2, 2 * workers)
+    stage = STAGES[mode]
     trim = nv.core.DENSE_TAIL_TRIM_S if tail_trim_s is None else tail_trim_s
-    for number, episode in enumerate(episodes):
-        collage, plan = batch.collages[number], batch.plans[number]
-        positions = per_episode[number]
-        if mode == "dense":
-            texts = [outputs[p].outputs[0].text for p in positions]
-            body = dense_record(nv, episode, collage, plan, texts, trim)
-        else:
-            (p,) = positions
-            body = terminal_record(nv, episode, collage, plan, outputs[p].outputs[0], tokenizer,
-                                   with_rationale(mode))
-        records.append({
-            "schema": SCHEMA,
-            "episode_id": episode.id,
-            "stage": "reward",
-            "mode": mode,
-            **body,
-            "requests": [usage[p] for p in positions],
-            "provenance": {"engine": ENGINE_LABEL, **(provenance or {})},
-        })
-    t3 = clock()
-    stats = {
-        "mode": mode,
-        "generate_calls": 1,
-        "num_episodes": len(episodes),
-        "num_requests": len(batch.requests),
-        "prompt_tokens": sum(u["prompt_tokens"] for u in usage),
-        "output_tokens": sum(u["output_tokens"] for u in usage),
-        "build_s": t1 - t0,
-        "generate_s": t2 - t1,
-        "parse_s": t3 - t2,
-        "requests": [{"episode_id": episodes[r.episode].id, **u}
-                     for r, u in zip(batch.requests, usage, strict=True)],
+    base = base_provenance(nv, mode, spec=spec, models=models, gpu=gpu, preset=preset,
+                           certificate=certificate, tail_trim_s=trim, extra=config_extra)
+    rationale = mode == "terminal_rationale"
+    stats: dict[str, Any] = {
+        "mode": mode, "generate_calls": 0, "rounds": [], "num_episodes": len(episodes),
+        "num_requests": 0, "prompt_tokens": 0, "output_tokens": 0, "decode_s": 0.0,
+        "decode_wait_s": 0.0, "generate_s": 0.0, "parse_s": 0.0, "retries": 0,
+        "budget_splits": 0,
+        "requests": [], "flagged": {}, "limits": asdict(limits), "decoder": decoder,
+        "workers": workers if decoder != "inline" else 0, "config_hash": base.config_hash,
     }
+    out = RewardRun(mode, [], [], [], stats)
+    if not episodes:
+        stats["throughput"] = throughput(stats)
+        return out
+    t_start = clock()
+    params = sampling_params(nv, mode)
+    tokenizer = llm.get_tokenizer() if mode != "dense" else None
+
+    facts: dict[int, CollageFacts] = {}
+    plans: dict[int, Any] = {}
+    expected: dict[int, int] = {}
+    answers: dict[int, dict[int, Any]] = {}  # episode -> {position: (output | None, usage)}
+    failed: dict[int, dict[str, Any]] = {}
+    pending = {"records": [], "audits": [], "errors": []}
+
+    def error(number: int, kind: str, message: str, **diagnostics) -> None:
+        ep = episodes[number]
+        pending["errors"].append(EpisodeError(
+            uid=ep.uid, stage=stage, shard_id=shard_id, container_id=container_id, kind=kind,
+            message=message, diagnostics={"episode_id": ep.id, "mode": mode, **diagnostics}))
+
+    def finish(number: int) -> None:
+        ep, got = episodes[number], answers.pop(number)
+        if number in failed:
+            error(number, **failed.pop(number))
+            return
+        outs = [got[p] for p in sorted(got)]
+        usage = [u for _, u in outs]
+        finish_reasons = [u.get("finish_reason") for u in usage]
+        flags: dict[str, Any] = {}
+        try:
+            if mode == "dense":
+                texts = [o.outputs[0].text for o, _ in outs]
+                dense, nv_record = dense_record(nv, ep, facts[number], plans[number], texts, trim)
+                truncated = [i for i, r in enumerate(finish_reasons) if r == "length"]
+                if truncated:
+                    flags["truncated_clips"] = truncated
+                if nv_record.get("invalid_clips"):
+                    flags["invalid_clips"] = nv_record["invalid_clips"]
+                body = {"dense": dense}
+            else:
+                completion = outs[0][0].outputs[0]
+                terminal, nv_record = terminal_record(nv, ep, facts[number], plans[number],
+                                                      completion, tokenizer, rationale)
+                if finish_reasons[0] == "length":
+                    flags["truncated"] = True
+                body = {"terminal": terminal}
+        except ValueError as exc:  # NVIDIA's parser/stitcher rejected the answer
+            error(number, "nv_failure", str(exc), finish_reasons=finish_reasons,
+                  outputs=[o.outputs[0].text for o, _ in outs])
+            return
+        certified, reason = certification(ep)
+        provenance = dataclasses.replace(base, source={
+            f"camera_{i}": {"uri": v, "range_s": [0.0, round(facts[number].duration_s, 6)]}
+            for i, v in enumerate(ep.videos)})
+        pending["records"].append(StageRecord(
+            uid=ep.uid, dataset=ep.dataset, episode_id=ep.id, stage=stage,
+            provenance=provenance, certified=certified, uncertified_reason=reason,
+            audit_ref=audit_ref(ep) if audit_ref else None, **body))
+        pending["audits"].append({"uid": ep.uid, "episode_id": ep.id, "stage": stage,
+                                  "mode": mode, "config_hash": base.config_hash,
+                                  "nv": nv_record, "requests": usage, "flags": flags})
+        if flags:
+            stats["flagged"][ep.uid] = flags
+
+    def generate(batch: list[Request]) -> list[tuple[Request, Any]]:
+        """``llm.generate`` on ``batch``; on an exception, retry per episode (isolation)."""
+        _reset_prefix_cache(llm)
+        stats["generate_calls"] += 1
+        try:
+            outputs = llm.generate([r.as_vllm() for r in batch], params, use_tqdm=False)
+            if len(outputs) != len(batch):
+                raise RuntimeError(f"{len(outputs)} outputs for {len(batch)} requests")
+            for r, o in zip(batch, outputs, strict=True):
+                prompt = getattr(o, "prompt", None)
+                if prompt is not None and prompt != r.prompt:
+                    raise RuntimeError("vLLM returned outputs out of input order")
+            return list(zip(batch, outputs, strict=True))
+        except Exception as exc:
+            groups: dict[int, list[Request]] = {}
+            for r in batch:
+                groups.setdefault(r.episode, []).append(r)
+            if len(groups) == 1:
+                number = batch[0].episode
+                failed.setdefault(number, {"kind": "infra", "message": f"generate: {exc!r}"})
+                return [(r, None) for r in batch]
+            stats["retries"] += 1
+            results, ok = [], 0
+            for group in groups.values():
+                part = generate(group)
+                ok += any(o is not None for _, o in part)
+                results += part
+            if ok == 0:  # every episode fails alone too: systemic (dead engine), not one input
+                raise
+            return results
+
+    def flush(k: int, batch: list[Request], wait_s: float) -> None:
+        t0 = clock()
+        pairs = generate(batch) if batch else []
+        t1 = clock()
+        for r, o in pairs:
+            r.multi_modal_data = {}  # drop frame arrays as soon as the engine is done
+            usage = {"window": r.window, **(_usage(o) if o is not None else {})}
+            answers[r.episode][len(answers[r.episode])] = (o, usage)
+            stats["requests"].append({"episode_id": episodes[r.episode].id, **usage})
+            if o is not None:
+                stats["num_requests"] += 1
+                stats["prompt_tokens"] += usage["prompt_tokens"]
+                stats["output_tokens"] += usage["output_tokens"]
+            if len(answers[r.episode]) == expected[r.episode]:
+                finish(r.episode)
+        t2 = clock()
+        stats["generate_s"] += t1 - t0
+        stats["parse_s"] += t2 - t1
+        stats["rounds"].append({"k": k, "requests": len(batch),
+                                "est_mib": round(sum(r.est_bytes for r in batch) / MiB, 1),
+                                "decode_wait_s": wait_s, "generate_s": t1 - t0})
+        round_out = RoundOutput(k, base.config_hash, pending["records"], pending["audits"],
+                                pending["errors"])
+        out.records += round_out.records
+        out.audits += round_out.audits
+        out.errors += round_out.errors
+        if sink is not None and (round_out.records or round_out.errors):
+            out.parts += sink.write(round_out)
+        pending.update(records=[], audits=[], errors=[])
+
+    k, batch, size, wait = 0, [], 0, 0.0
+    with _decoder(nv, decoder, workers) as pool:
+        stream = _prepared_stream(nv, mode, episodes, pool, decoder, lookahead)
+        for number in range(len(episodes)):
+            t0 = clock()
+            prepared = next(stream)
+            wait += clock() - t0
+            stats["decode_s"] += prepared.decode_s
+            if prepared.error is not None:
+                error(number, prepared.error["kind"], prepared.error["message"],
+                      phase="decode", type=prepared.error["type"])
+                continue
+            try:
+                requests = episode_requests(nv, processor, mode, number, episodes[number],
+                                            prepared, limits)
+            except Exception as exc:  # noqa: BLE001 - e.g. NVIDIA's empty-task ValueError
+                f = _failure(exc)
+                error(number, f["kind"], f["message"], phase="prompt", type=f["type"])
+                continue
+            facts[number], plans[number] = prepared.facts, prepared.plan
+            expected[number], answers[number] = len(requests), {}
+            for request in requests:
+                aligned = limits.boundary(mode, batch, request)
+                fits = limits.fits(len(batch), size, request)
+                if aligned or not fits:
+                    if not fits and not aligned and limits.align == "nvidia":
+                        stats["budget_splits"] += 1
+                    flush(k, batch, wait)
+                    k, batch, size, wait = k + 1, [], 0, 0.0
+                batch.append(request)
+                size += request.est_bytes
+        if batch or pending["errors"]:
+            flush(k, batch, wait)
+    stats["decode_wait_s"] = sum(r["decode_wait_s"] for r in stats["rounds"])
+    stats["wall_s"] = clock() - t_start
     stats["throughput"] = throughput(stats)
-    return RewardRun(mode, records, stats)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -473,6 +1013,7 @@ class RecordingLLM:
         stats = {
             "mode": mode,
             "generate_calls": len(self.calls),
+            "call_sizes": [call["num_requests"] for call in self.calls],
             "num_episodes": num_episodes,
             "num_requests": len(usage),
             "prompt_tokens": sum(u["prompt_tokens"] for u in usage),
@@ -503,22 +1044,26 @@ def tap_score_probabilities(core) -> Iterator[list[list[float]]]:
         core.score_probabilities = original
 
 
-def compare(mode: str, reference: Sequence[dict[str, Any]], records: Sequence[dict[str, Any]],
+def compare(mode: str, reference: Sequence[dict[str, Any]], batched: dict[str, Any],
             reference_probabilities: Sequence[Sequence[float]] | None = None,
             tolerance: float = 1e-6) -> dict[str, Any]:
-    """Batched records vs NVIDIA's reference lines (same episode order)."""
+    """A batched run (``RewardRun.as_json()``) vs NVIDIA's reference lines, by episode id.
+    ``reference_probabilities[i]`` are the unrounded P(1..5) of ``reference[i]``."""
     check_mode(mode)
     ref_by_id = {line["id"]: line for line in reference}
+    ref_p = ({line["id"]: p for line, p in zip(reference, reference_probabilities, strict=True)}
+             if reference_probabilities is not None else None)
+    records = {r["episode_id"]: r for r in batched["records"]}
     episodes = []
-    for number, record in enumerate(records):
-        ref = ref_by_id.get(record["episode_id"])
+    for audit in batched["audits"]:
+        eid = audit["episode_id"]
+        ref = ref_by_id.get(eid)
         if ref is None:
-            episodes.append({"episode_id": record["episode_id"], "missing_reference": True,
-                             "identical": False})
+            episodes.append({"episode_id": eid, "missing_reference": True, "identical": False})
             continue
-        ours = record["nv"]
+        ours = audit["nv"]
         diff_keys = sorted(k for k in set(ref) | set(ours) if ref.get(k) != ours.get(k))
-        entry: dict[str, Any] = {"episode_id": record["episode_id"], "diff_keys": diff_keys}
+        entry: dict[str, Any] = {"episode_id": eid, "diff_keys": diff_keys}
         if mode == "dense":
             ref_texts = [c["output"] for c in ref["clips"]]
             our_texts = [c["output"] for c in ours["clips"]]
@@ -532,19 +1077,39 @@ def compare(mode: str, reference: Sequence[dict[str, Any]], records: Sequence[di
         else:
             entry["text_equal"] = ref["output"] == ours["output"]
             entry["score_equal"] = ref["score"] == ours["score"]
-            if reference_probabilities is not None:
-                ref_p = reference_probabilities[number]
-                our_p = record["terminal"]["probabilities"]
-                entry["max_abs_prob_diff"] = max(abs(a - b) for a, b in zip(ref_p, our_p,
+            if ref_p is not None:
+                our_p = records[eid]["terminal"]["probabilities"]
+                entry["max_abs_prob_diff"] = max(abs(a - b) for a, b in zip(ref_p[eid], our_p,
                                                                              strict=True))
             entry["identical"] = not diff_keys and (
                 entry.get("max_abs_prob_diff", 0.0) <= tolerance
             )
         episodes.append(entry)
-    extra = sorted(set(ref_by_id) - {r["episode_id"] for r in records})
+    seen = {a["episode_id"] for a in batched["audits"]}
+    extra = sorted(set(ref_by_id) - seen)
+    errors = [{"episode_id": e["diagnostics"].get("episode_id"), "kind": e["kind"],
+               "message": e["message"]} for e in batched.get("errors", [])]
     return {
         "mode": mode,
-        "identical": bool(episodes) and all(e["identical"] for e in episodes) and not extra,
+        "identical": bool(episodes) and all(e["identical"] for e in episodes) and not extra
+        and not errors,
         "episodes": episodes,
         "reference_only": extra,
+        "errors": errors,
     }
+
+
+def same_outputs(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
+    """Two batched runs (``RewardRun.as_json()``, e.g. rounds vs one unbounded call): records,
+    NVIDIA audit lines and errors must be equal, in order."""
+    def nv_lines(run):
+        return [x["nv"] for x in run["audits"]]
+
+    def errs(run):
+        return [(e["uid"], e["kind"], e["message"]) for e in run["errors"]]
+
+    result = {"records_equal": a["records"] == b["records"],
+              "nv_equal": nv_lines(a) == nv_lines(b), "errors_equal": errs(a) == errs(b),
+              "num_records": [len(a["records"]), len(b["records"])]}
+    result["identical"] = all(result[k] for k in ("records_equal", "nv_equal", "errors_equal"))
+    return result

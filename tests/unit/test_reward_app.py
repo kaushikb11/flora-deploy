@@ -21,6 +21,18 @@ def test_rewarder_app_imports_without_network():
         assert len(spec["revision"]) == 40 and spec["license"]
 
 
+def test_rewarder_startup_recipe():
+    from flora_deploy.modal_app import rewarder_app as ra
+
+    assert ra.MEMORY_MIB >= 72 * 1024  # W3-B: the prefetched 52 GiB must stay resident
+    assert len(ra.IMAGE_FP) == 64 and ra.cache_key() == ra.cache_key(ra.IMAGE_FP, ra.GPU)
+    assert ra.cache_key(gpu="H200") != ra.cache_key()
+    env = ra.cache_env(key="k")
+    assert set(env) == {"VLLM_CACHE_ROOT", "TRITON_CACHE_DIR", "CUDA_CACHE_PATH",
+                        "XDG_CACHE_HOME"}
+    assert all(v.startswith("/cache/rewarder/k/") for v in env.values())
+
+
 def test_probe_stream_reports_cfr(tmp_path):
     import av
 
