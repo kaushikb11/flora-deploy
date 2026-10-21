@@ -182,3 +182,18 @@ event schema.
 | **Chaos (coordinator + 1 subagent)** | `simulate_preemption()` ×5, OOM injection, orchestrator kill, budget stop/resume on a 1,000-episode job (≈$20–40, approval) |
 
 Review: every branch gets an independent re-review subagent before merge (as with Fix-A/C).
+
+---
+
+## After the current fixes land (plan, 2026-10-21)
+
+Budget: $50 total, $10.25 spent, **$39.75 left**. Sequence and caps:
+
+| Step | What | Parallel subagents | Cap |
+|---|---|---|---|
+| **1. Integrate the fast `exact` worker** (Fix-D) | ReferenceWorker = NVIDIA's own `annotate()` with `CachedSession` injected (no re-expressed glue) + OPT-1 patches (decode-once, in-memory PNG) + OPT-2 BF16 Captioner + W3-B no-copy layout and prefetch + W3-A GPU-lock concurrency, on the cu128 image. **Prove the composite is bit-identical to unmodified NVIDIA** on ~6 golden episodes, then measure startup and throughput. | 1 | $3 |
+| **2. Golden build → Phase 0 done** | Oracle on the 42 staged golden episodes, 2 runs (self-noise) with the proven-identical fast worker; Rewarder reference on the 12 reward episodes. Write `docs/measurements-p0.md`, decide Gate D, PLAN v4 cost model from measured rates. | 1 + coordinator | $8 |
+| **3. P1a → v0.1 `exact`** (starts in parallel with step 2; mostly CPU and fake Modal) | On contracts v2: **P1a-1** config/presets/D11 hash · **P1a-2** stores + manifest/shard packing + quarantine/bisection · **P1a-3** orchestrator (nonpreemptible, Dict lease, continuation) + reconciler · **P1a-4** budget + `flora plan` / `flora estimate` · **P1a-5** shard workers (`segcap` exact, reward) + compose/export · **P1a-6** CLI/SDK/quickstart. Every branch re-reviewed. Then end-to-end on a golden subset and a chaos run (`simulate_preemption` ×5, OOM episode, orchestrator kill, budget stop/resume). | 6 + reviewers | $7 |
+| **4. P1b → v0.2 `balanced`** (prep starts in parallel) | TempSeg FP32 merge → BF16 on CPU; vLLM engines with micro-batching; `vllm_prompt` + processor cache off + 32k budget; certify segment/caption/dense against the step-2 oracle (L0–L3, Gates A/B/E) on L40S/H100. | 3–4 | $10 |
+| **5. Upstream to NVIDIA** | Draft suggestions (BF16 Captioner, wrapped video tokens, decode reuse, apredict docs, CUDA wheel note); you post them. | 1 | $0 |
+| Reserve | Re-runs and surprises | — | ~$8 |
