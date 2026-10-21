@@ -12,7 +12,8 @@ Sizing for the largest pin (Captioner, ~102 GiB in 11 shards):
   (``local_dir`` with its ``.cache`` resume metadata). Only hf_xet's chunk cache uses local disk
   (``HF_HOME=/tmp/hf``), well inside the default 512 GiB quota. An explicit request would be
   billed as memory at 20:1.
-- ``timeout=6 h`` per pin with 2 retries. A retry resumes the partial download.
+- ``timeout=6 h`` per pin with 2 retries. A retry resumes the partial download. A pin that still
+  fails verification after its in-call repair raises, so the retries apply to it too.
 """
 
 from __future__ import annotations
@@ -39,8 +40,10 @@ TIMEOUT_S = 6 * 3600
     retries=modal.Retries(max_retries=2, initial_delay=10.0),
     env={"HF_XET_HIGH_PERFORMANCE": "1", "HF_HOME": "/tmp/hf"},
 )
-def prepare_pin(key: str) -> dict:
-    """Download, verify and receipt one pin; skips if a passing receipt for it already exists."""
+def prepare_pin(key: str, reverify: bool = False, provenance: dict | None = None) -> dict:
+    """Download, verify and receipt one pin; skips if a reusable receipt exists (unless
+    ``reverify``). ``provenance`` is the CLI's git commit info, recorded in the receipt."""
     from flora_deploy.prep.run import prepare_snapshot
 
-    return prepare_snapshot(key, root=WEIGHTS_MOUNT, commit=weights.commit)
+    return prepare_snapshot(key, root=WEIGHTS_MOUNT, commit=weights.commit, reverify=reverify,
+                            provenance=provenance)
