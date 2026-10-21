@@ -170,3 +170,28 @@ def test_reconciler_planned_and_failed_states():
     st = _status(h)
     assert st.state == "failed" and st.failed == ("segcap-001",)
     assert st.counts["segcap"]["done"] == 1
+
+
+def test_spawn_time_is_read_before_the_call_can_start():
+    """A call may start, and write its attempt marker, before ``spawn`` returns. The ledger's
+    ``spawned`` time used to be read after it, so the container's startup (marker start minus
+    spawn) came out negative and ``jobs.containers`` dropped ``startup_s`` (a wall-clock race
+    that failed ``test_wave_h_contract`` 1 run in 40 under xdist). Here every spawn takes 3 s
+    of the fake clock."""
+    from flora_deploy.jobs.containers import parse_utc
+
+    h = Harness(_spec(2))
+    spawn, asked = h.spawner.spawn, {}
+
+    def slow_spawn(kind, job_id, shard_id, cfg):  # the fake spawner takes no token
+        asked[shard_id] = h.clock()
+        h.clock.advance(3)  # the container is up and running before spawn returns
+        return spawn(kind, job_id, shard_id, cfg)
+
+    h.spawner.spawn = slow_spawn
+    o = h.orchestrator(holder="A")
+    assert o.acquire() and o.tick() == "running"
+    assert set(asked) == set(_spec(2))
+    for sid, t in asked.items():
+        (e,) = [c for c in o._ledgers[sid].calls if c["outcome"] == "spawned"]
+        assert parse_utc(e["utc"]) == t

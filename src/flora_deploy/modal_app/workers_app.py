@@ -46,6 +46,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import threading
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -354,6 +355,12 @@ def fake_fired_path(job_id: str, what: str) -> str:
     return f"{JobPaths(job_id).root}/fake_faults/fired/{safe_key(what)}.json"
 
 
+# ``preempt`` fires once per target and job: the fired-file check and claim are atomic within a
+# process (every container of a local run). Separate Modal containers have no atomic create on a
+# Volume, so there it stays at-least-once.
+_FIRED_LOCK = threading.Lock()
+
+
 class FakeFaultHook:
     """Per-episode hook of the fake workers (see the block comment above)."""
 
@@ -441,10 +448,11 @@ class FakeFaultHook:
             if seen != int(at) or not preempt_matches(target, self.shard_id):
                 continue
             fired = fake_fired_path(self.job_id, f"preempt-{target}")
-            if self.store.exists(fired):
-                continue
-            self.store.put_bytes(fired, json.dumps({"shard_id": self.shard_id, "uid": uid,
-                                                    "t": time.time()}).encode())
+            with _FIRED_LOCK:  # check-then-claim: two shards reaching it at once fired twice
+                if self.store.exists(fired):
+                    continue
+                self.store.put_bytes(fired, json.dumps({"shard_id": self.shard_id, "uid": uid,
+                                                        "t": time.time()}).encode())
             print(f"fake-models: simulate_preemption({self.preempt_wait_s}) on "
                   f"{self.shard_id} before {uid}", flush=True)
             fn = self.preempt_fn

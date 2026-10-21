@@ -1014,6 +1014,10 @@ class Orchestrator:
             n = led.spawn_n + 1
             token = spawn_token(self.job_id, self.cfg, s.shard_id, n)
             self._save(led, status="spawning", spawn_n=n, token=token)  # intent first (M1)
+            # the spawn time is read *before* spawn: the call may start (and write its attempt
+            # marker) before spawn returns, and a later read made the container's startup_s
+            # negative, so ``jobs.containers`` dropped it (a wall-clock race under load)
+            spawned_utc = utc(self.clock())
             try:
                 call_id = self._spawn(s, token)
             except Exception as exc:  # Modal API hiccup: try again next tick
@@ -1021,7 +1025,7 @@ class Orchestrator:
                 self._emit("spawn_error", shard_id=s.shard_id, error=repr(exc))
                 return True
             led.calls.append({"call_id": call_id, "outcome": "spawned", "spawn_n": led.spawn_n,
-                              "token": token, "utc": utc(self.clock())})
+                              "token": token, "utc": spawned_utc})
             self._save(led, status="active", call_id=call_id)
             self.spawned += 1
             in_flight = trial
