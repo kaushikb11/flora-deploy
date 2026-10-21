@@ -162,3 +162,57 @@ Rules:
 | **P1b-2 certification** | S2, P1b-1 | `balanced` vs oracle: L0 (input parity) and L3 (task metrics within oracle noise); certificates for the D16 matrix | $6 |
 
 **Reserve ≈ $8.** Every branch gets an independent re-review before merge. Thematic reviewers (like review 3) run at each wave boundary to catch integration seams.
+
+---
+
+## Update after review 4 (2026-10-21): the path to the internal v0.1 / v0.2 milestones
+
+**Budget:** ≈$19 spent, **≈$31 left**.
+
+### What review 4 changed
+
+1. **"Done" must mean done.** Any job outcome must be derivable from records and *legitimate* exclusions only (Fix-W1). Every later milestone is judged with this rule.
+2. **The golden build must be re-costed at the real rate.**
+   - Measured `exact` on cu128 is ≈$40/video-h before the persistent-generate-thread fix and ≈$25 projected with it, not the $14 assumed earlier.
+   - The 30 golden episodes are 928 s of video (≈0.26 h) plus 12 reward episodes.
+   - Two full default-mode oracle runs would be ≈$13–20, which doesn't fit.
+3. **Identity proofs belong in deterministic mode.** In default mode, the first output difference (routine on H200) leaves every later call unchecked. Input-identity proofs therefore run with `determinism: deterministic`. NVIDIA-as-shipped behaviour (default mode) is still what the oracle records.
+
+### Revised Phase-0 close: S2 golden build ($9 cap)
+
+| Run | What | Why | Est. |
+|---|---|---|---|
+| **S2a** | Default-mode oracle over all 30 labeling episodes, fast exact worker (inputs proven identical) | The reference outputs "NVIDIA as shipped" produces | ≈$6.5 |
+| **S2b** | Second default-mode run on a ~10-episode stratified subset | Run-to-run noise estimate for certification thresholds | ≈$2 |
+| **S2c** | Rewarder reference on the 12 reward episodes (NVIDIA grouping) | Reward oracle | ≈$0.5 |
+
+**Stop rule:** S2a halts if the measured rate after 8 episodes projects above $7. Identity proofs (fast vs unmodified, deterministic mode) are P1a-5s's job, not S2's.
+
+**Outputs:**
+- `docs/measurements-p0.md` (rates, startup, CPU breakdown, noise, per-pool timings);
+- `rates.json` marked *measured*;
+- Gate D closed;
+- PLAN v4: rewrite §0/§1/§3 for the realities found (identical-inputs semantics, cuDNN nondeterminism, cu128 thread cache, Rewarder batch-grouping sensitivity, measured costs).
+
+### Remaining work, with dependencies
+
+| ID | Depends on | Builds | Cap |
+|---|---|---|---|
+| **P1a-5s** (running) | — | SegcapWorker + full wiring; identity on the 4 remaining pools; measured rate with the persistent generate thread | $3 |
+| **Fix-W1 / Fix-W2** (running) | — | Review-4 fixes | ≈$0.2 |
+| **P1b-1 vLLM engines** | Fix-X, P1b-0, Fix-E (all merged) — **can start now** | `engines/`: offline `LLM` + micro-batcher (D14) for merged TempSeg and BF16 Captioner; `vllm_prompt` + `assert_engine_kwargs` + 32k budget; balanced `segment`/`caption` stages and workers (conformance); Gate A (`dt_bias` FP32 plugin) measured | $3 |
+| **S2 golden** | P1a-5s, W2 (rates/determinism) | As above | $9 |
+| **P1a-6c CLI/SDK** | W1 | `flora run/status/resume/cancel/report`, SDK `submit/Job`, README quickstart. **Exit criterion for v0.1 usability:** a new user goes from `flora init` to results on a sample dataset by following README alone. | $0 |
+| **S3 e2e + chaos (internal v0.1)** | W1, P1a-5s, 6c | Real deployed app via factory: `index → plan → deploy → run` on ~6 golden episodes (segcap + rewards). **Model inputs identical to S2's per call; outputs within noise; job `done` only by the new rule.** GPU chaos: `simulate_preemption()` on a GPU worker mid-shard, one injected OOM episode. | $3 |
+| **P1b-2 certification (internal v0.2)** | S2, P1b-1 | `balanced` vs oracle: L0 input parity, L2 distribution parity, L3 task metrics within S2b noise. Certificates for the D16 matrix → `balanced` unlocked by certificate, not by flag. | $6 |
+| **Review 5** | S3, P1b-2 | Final thematic review before calling the milestones done | $0 |
+
+**Reserve ≈ $6.**
+
+### Parallel schedule (≤4 agents at a time)
+
+1. **Now:** P1a-5s, W1, W2, plus **P1b-1** (independent new modules).
+2. **After W1:** P1a-6c.
+3. **After P1a-5s + W2:** S2 (coordinator-run, one tooling agent if needed).
+4. **After S2 + 6c:** S3 ∥ P1b-2.
+5. **Last:** review 5 → fixes → PLAN v4.
