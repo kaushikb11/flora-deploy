@@ -34,22 +34,21 @@ How offline loading works (NVIDIA ``batch_utils/models.py`` at nvidia/Flora-Temp
 
 from __future__ import annotations
 
-import io
 import json
 import os
 import re
 import shutil
-import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from flora_deploy.config.pins import PINS_BY_KEY, RepoPin
 from flora_deploy.layout import RECEIPT_NAME, WEIGHTS_MOUNT, snapshot_path
+from flora_deploy.observe.aggregate import token_stats
 
 OFFLINE_ROOT = PurePosixPath("/tmp/flora-offline")
 MODEL_KINDS = ("tempseg", "captioner")  # NVIDIA's ``MODEL_CACHE / kind`` names
@@ -231,48 +230,35 @@ def check_nv_models(models: dict, environ: dict[str, str] | None = None) -> None
 # --- NVIDIA runtime events -----------------------------------------------------------------
 
 
-class RuntimeEventTee(io.TextIOBase):
-    """stdout proxy that forwards everything and parses NVIDIA's ``FLORA_RUNTIME {json}`` lines
-    (printed by ``models.runtime_event``)."""
-
-    def __init__(self, inner):
-        self.inner = inner
-        self.events: list[dict] = []
-        self._buf = ""
-
-    def writable(self) -> bool:
-        return True
-
-    def write(self, s: str) -> int:
-        self.inner.write(s)
-        self._buf += s
-        *lines, self._buf = self._buf.split("\n")
-        for line in lines:
-            self._parse(line)
-        return len(s)
-
-    def _parse(self, line: str) -> None:
-        if line.startswith(RUNTIME_PREFIX):
-            try:
-                self.events.append(json.loads(line[len(RUNTIME_PREFIX) :]))
-            except ValueError:
-                pass
-
-    def flush(self) -> None:
-        if self._buf:
-            self._parse(self._buf)
-            self._buf = ""
-        self.inner.flush()
+def parse_runtime_line(line: str) -> dict | None:
+    """The JSON of one ``FLORA_RUNTIME {json}`` line (printed by NVIDIA's ``models.runtime_event``),
+    or ``None``."""
+    if line.startswith(RUNTIME_PREFIX):
+        try:
+            return json.loads(line[len(RUNTIME_PREFIX) :])
+        except ValueError:
+            return None
+    return None
 
 
 @contextmanager
 def capture_runtime_events() -> Iterator[list[dict]]:
-    tee = RuntimeEventTee(sys.stdout)
-    with redirect_stdout(tee):
-        try:
-            yield tee.events
-        finally:
-            tee.flush()
+    """Collect this context's NVIDIA runtime events while still forwarding stdout.
+
+    Thread-safe: built on ``observe.route_stdout`` (a per-context router), not
+    ``redirect_stdout``, so concurrent episode threads each see only their own events, including
+    events printed from NVIDIA's ``asyncio.to_thread`` predictor calls."""
+    from flora_deploy.observe.stdout import route_stdout
+
+    events: list[dict] = []
+
+    def sink(line: str) -> None:
+        event = parse_runtime_line(line)
+        if event is not None:
+            events.append(event)
+
+    with route_stdout(sink):
+        yield events
 
 
 def generation_stats(events: list[dict]) -> dict:
@@ -423,6 +409,10 @@ def annotate_reference(
             "segment": generation_stats(seg_events),
             "caption": generation_stats(cap_events),
         },
+        "tokens": {
+            "segment": token_stats(seg_events),
+            "caption": token_stats(cap_events),
+        },
     }
     return result
 
@@ -430,6 +420,347 @@ def annotate_reference(
 def nvidia_result(result: dict) -> dict:
     """NVIDIA's dict without our measurements (for parity comparisons)."""
     return {k: v for k, v in result.items() if k != "flora_reference"}
+
+
+# --- output-identical concurrency (docs/exact-concurrency.md) -------------------------------
+#
+# N episode threads share the resident models; one GPU lock serializes every NVIDIA
+# ``generate()`` call, so each model call is exactly NVIDIA's batch-1 call and outputs must be
+# identical to a sequential run. Thread-safety audit of what the threads share:
+#
+# - Models: only touched inside ``generate`` (``model.generate``, ``.to(device)``), which the
+#   GPU lock serializes. ``CachedSession.load`` is lock-protected and models are preloaded.
+# - HF processor/tokenizer: NOT shared. ``PreTrainedTokenizerFast`` mutates the Rust tokenizer's
+#   padding/truncation state per call (``set_truncation_and_padding``: ``caption_three`` pads,
+#   the other builders do not) while encoding releases the GIL, which can raise "Already
+#   borrowed" or race. Each worker thread therefore gets its own ``copy.deepcopy`` of each
+#   processor (``ProcessorClones``); ``generate`` receives that same clone from NVIDIA's code.
+# - NVIDIA module globals: ``pipeline``/``media``/``preprocessing`` keep no mutable state on the
+#   episode path (``models._VERIFIED_MANIFESTS``/``_MANIFEST_LOCK`` are load-time only, already
+#   locked; ``api._REQUEST_LOCK`` is unused here). Vendor code has no caches or globals. Each
+#   ``pipeline.segment`` builds its own ``Predictor`` and runs its own ``asyncio.run`` loop (fine
+#   in a non-main thread; the predictor runs in that loop's ``to_thread`` executor).
+# - ``runtime_event`` logging: ``print`` to the shared stdout; ``capture_runtime_events`` routes
+#   lines per context (``observe.route_stdout``), so episodes never see each other's events.
+#   ``generation_end.peak_allocated_gib`` is process-global CUDA state (diagnostic only).
+# - Temp dirs: ``caption_single`` uses ``tempfile.TemporaryDirectory`` (unique per call).
+# - Volume writes/commits: done after the batch, in the calling thread.
+
+GPU_LOCK_LABEL = "models.generate"
+GPU_LOCK_NAME = "gpu"
+TIMING_FIELDS = ("elapsed_s",)  # NVIDIA result fields that are wall-clock, not output
+
+
+def locked_generate(generate: Callable, lock) -> Callable:
+    """NVIDIA's ``generate`` run under ``lock`` (an ``observe.TimedLock``) and timed."""
+    import functools
+
+    from flora_deploy.observe.timers import timed
+
+    inner = timed(generate, GPU_LOCK_LABEL)
+
+    @functools.wraps(generate)
+    def generate_locked(*args, **kwargs):
+        with lock.held(GPU_LOCK_LABEL):
+            return inner(*args, **kwargs)
+
+    generate_locked.__flora_gpu_lock__ = lock
+    return generate_locked
+
+
+def install_gpu_lock(nv, lock, patcher) -> None:
+    """Route every NVIDIA model call through ``lock``.
+
+    ``pipeline.py`` does ``from .models import generate`` at import time, so the name its
+    functions call is ``pipeline.generate``; we replace that module attribute in our process
+    (NVIDIA's files are untouched)."""
+    if getattr(nv.pipeline.generate, "__flora_gpu_lock__", None) is not None:
+        raise RuntimeError("NVIDIA generate() already runs under a GPU lock")
+    patcher.patch(nv.pipeline, "generate", lambda orig: locked_generate(orig, lock))
+
+
+class ProcessorClones:
+    """One ``copy.deepcopy`` of each processor per worker thread (see the audit above)."""
+
+    def __init__(self, copier: Callable[[Any], Any] | None = None):
+        import copy
+        import threading
+
+        self._copier = copier or copy.deepcopy
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        self.clones = 0
+        self.seconds = 0.0
+
+    def get(self, kind: str, proc: Any) -> Any:
+        mine = getattr(self._local, "procs", None)
+        if mine is None:
+            mine = self._local.procs = {}
+        entry = mine.get(kind)
+        if entry is None or entry[0] is not proc:
+            t = time.perf_counter()
+            entry = mine[kind] = (proc, self._copier(proc))
+            with self._lock:
+                self.clones += 1
+                self.seconds += time.perf_counter() - t
+        return entry[1]
+
+
+class EpisodeSession:
+    """Per-episode view of a shared ``CachedSession``: same resident models, this thread's
+    processor clones. Duck-types NVIDIA ``models.Session`` like ``CachedSession`` does."""
+
+    def __init__(self, base, clones: ProcessorClones | None = None):
+        self.base, self.clones = base, clones
+
+    def load(self, kind: str):
+        model, proc = self.base.load(kind)
+        if self.clones is not None:
+            proc = self.clones.get(kind, proc)
+        return model, proc
+
+    def close(self) -> None:
+        """No-op (NVIDIA calls it per video; the models stay resident)."""
+
+    @property
+    def audit(self) -> dict:
+        return getattr(self.base, "audit", {})
+
+
+def measurement_targets(nv, processors=()) -> list[tuple[Any, str, Any]]:
+    """``(owner, attribute, label)`` for every hot-path function we time (opt-in).
+
+    Owners are the namespaces NVIDIA's code looks the name up in at call time: ``pipeline.*``
+    for names it imported at module level, the vendor modules for names imported inside
+    functions, and the HF/PIL classes for methods."""
+    import importlib
+
+    def mod(name):
+        try:
+            return importlib.import_module(name)
+        except ImportError:
+            return None
+
+    targets: list[tuple[Any, str, Any]] = [
+        (nv.media, "probe", "media.probe"),
+        (nv.media, "decode_selected", "media.decode_selected"),
+        (nv.pipeline, "frames_for", "media.frames_for"),
+        (nv.pipeline, "human_transport", "preprocessing.human_transport"),
+        (nv.pipeline, "temporal_inputs", "preprocessing.temporal_inputs"),
+        (nv.pipeline, "three_view_caption_inputs", "preprocessing.three_view_caption_inputs"),
+    ]
+    vendor = [
+        ("canonical_rgb", "canonical_rgb", "vendor.canonical_rgb"),
+        ("composers", "compose_top_dominant_mosaic", "vendor.compose_mosaic"),
+        ("composers", "compose_frame", "vendor.compose_frame"),
+        ("robot_caption_geometry", "normalized", "vendor.caption_geometry"),
+        ("flora_unified.unified_input", "processor_inputs", "unified_input.processor_inputs"),
+        ("flora_unified.unified_input", "load_frames", "unified_input.load_frames"),
+    ]
+    for module_name, attr, label in vendor:
+        module = mod(module_name)
+        if module is not None and hasattr(module, attr):
+            targets.append((module, attr, label))
+    seen = set()
+    for proc in processors:
+        cls = type(proc)
+        if cls in seen:
+            continue
+        seen.add(cls)
+        targets.append((cls, "__call__", "hf.processor"))
+        targets.append((cls, "apply_chat_template", "hf.chat_template"))
+    pil = mod("PIL.Image")
+    if pil is not None:
+
+        def save_label(image, fp=None, format=None, **kw):  # noqa: A002 - PIL's signature
+            fmt = format or (Path(str(fp)).suffix.lstrip(".") if isinstance(fp, str | Path)
+                             else "")
+            return f"pil.save.{(fmt or 'unknown').upper()}"
+
+        targets.append((pil.Image, "save", save_label))
+        targets.append((pil.Image, "resize", "pil.resize"))
+        targets.append((pil.Image, "convert", "pil.convert"))
+    return targets
+
+
+def install_measurement(nv, patcher, processors=()) -> list[str]:
+    """Wrap every ``measurement_targets`` entry with an ``observe.timed`` timer."""
+    for owner, attr, label in measurement_targets(nv, processors):
+        patcher.time(owner, attr, label)
+    return patcher.patched
+
+
+def comparable_result(result: dict) -> dict:
+    """NVIDIA's result without our measurements and without its wall-clock fields."""
+    return {k: v for k, v in nvidia_result(result).items() if k not in TIMING_FIELDS}
+
+
+def result_digest(result: dict) -> str:
+    import hashlib
+
+    return hashlib.sha256(dumps_result(comparable_result(result)).encode()).hexdigest()
+
+
+def diff_paths(a: Any, b: Any, path: str = "$", limit: int = 20) -> list[str]:
+    """JSON paths where ``a`` and ``b`` differ (no values, so no captions leak into reports)."""
+    out: list[str] = []
+
+    def walk(x, y, p):
+        if len(out) >= limit:
+            return
+        if type(x) is not type(y):
+            out.append(p)
+        elif isinstance(x, dict):
+            for k in sorted(set(x) | set(y), key=str):
+                if k not in x or k not in y:
+                    out.append(f"{p}.{k}")
+                else:
+                    walk(x[k], y[k], f"{p}.{k}")
+        elif isinstance(x, list):
+            if len(x) != len(y):
+                out.append(f"{p}[len]")
+            for i, (u, v) in enumerate(zip(x, y, strict=False)):
+                walk(u, v, f"{p}[{i}]")
+        elif x != y:
+            out.append(p)
+
+    walk(a, b, path)
+    return out[:limit]
+
+
+def compare_runs(a: dict[str, dict], b: dict[str, dict]) -> dict:
+    """Compare two ``{episode: result}`` maps on ``comparable_result``."""
+    episodes = {}
+    for ep in sorted(set(a) | set(b)):
+        if ep not in a or ep not in b:
+            episodes[ep] = {"identical": False, "missing_in": "a" if ep not in a else "b"}
+            continue
+        ca, cb = comparable_result(a[ep]), comparable_result(b[ep])
+        same = ca == cb
+        episodes[ep] = {"identical": same, "digest_a": result_digest(a[ep]),
+                        "digest_b": result_digest(b[ep]),
+                        "diff_paths": [] if same else diff_paths(ca, cb)}
+    return {"identical": bool(episodes) and all(e["identical"] for e in episodes.values()),
+            "episodes": episodes}
+
+
+def episode_observe(recorder, result: dict | None, t_batch0: float,
+                    lock_name: str = GPU_LOCK_NAME) -> dict:
+    """Per-episode measurement summary from its ``observe.Recorder``."""
+    from flora_deploy.observe.aggregate import call_table
+
+    events = recorder.events
+    table = call_table(events)
+    timed_self = sum(r.get("self_s", 0.0) for k, r in table.items() if not k.startswith("lock:"))
+    out = {"calls": table, "timed_self_s": round(timed_self, 3)}
+    lock = table.get(f"lock:{lock_name}")
+    if lock:
+        out["gpu_lock"] = {"wait_s": lock["wait_s"], "hold_s": lock["hold_s"],
+                           "max_wait_s": lock["max_wait_s"], "calls": lock["calls"]}
+    if result is not None:
+        total = result.get("flora_reference", {}).get("timings_s", {}).get("total")
+        if total is not None:
+            out["untimed_s"] = round(total - timed_self - (lock or {}).get("wait_s", 0.0), 3)
+    out["start_s"] = round(recorder.t0 - t_batch0, 3)
+    return out
+
+
+def annotate_batch(
+    nv,
+    session,
+    episodes: list[dict],
+    *,
+    concurrency: int = 1,
+    gpu_lock=None,
+    measure: bool = False,
+    clone_processors: bool | None = None,
+    sampler=None,
+    progress: Callable[[str, float, str], None] | None = None,
+) -> dict:
+    """Run ``annotate_reference`` over ``episodes`` with ``concurrency`` worker threads.
+
+    ``episodes`` items: ``{"episode", "videos", "profile", ["long_windows"], ["instruction"]}``.
+    ``concurrency=1`` runs them in order in the calling thread (the sequential baseline). With
+    ``concurrency>1`` NVIDIA's ``generate`` must already run under ``gpu_lock``
+    (``install_gpu_lock``); processors are cloned per worker unless ``clone_processors=False``.
+    Returns ``{"results": {episode: result}, "errors": {episode: str}, "batch": {...}}``; results
+    keep input order. ``measure`` attaches ``flora_reference["observe"]`` per episode.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from flora_deploy.observe.events import Recorder, recording
+
+    if concurrency < 1:
+        raise ValueError("concurrency must be >= 1")
+    names = [ep["episode"] for ep in episodes]
+    if len(set(names)) != len(names):
+        raise ValueError(f"duplicate episode names: {names}")
+    if concurrency > 1:
+        lock = getattr(nv.pipeline.generate, "__flora_gpu_lock__", None)
+        if lock is None or (gpu_lock is not None and lock is not gpu_lock):
+            raise RuntimeError("concurrency > 1 needs NVIDIA generate() under the GPU lock")
+        gpu_lock = lock
+    if clone_processors is None:
+        clone_processors = concurrency > 1
+    clones = ProcessorClones() if clone_processors else None
+    if gpu_lock is not None:
+        gpu_lock.reset()
+    t0 = time.perf_counter()
+    if sampler is not None:
+        sampler.start()
+
+    def one(ep: dict) -> tuple[dict | None, str | None]:
+        rec = Recorder(episode=ep["episode"]) if measure else None
+        report = None
+        if progress is not None:
+            def report(frac, desc="", _name=ep["episode"]):
+                progress(_name, frac, desc)
+        try:
+            with recording(rec):
+                result = annotate_reference(
+                    nv, EpisodeSession(session, clones), ep["videos"], ep["profile"],
+                    ep.get("long_windows", False), ep.get("instruction", ""), progress=report,
+                )
+        except Exception as e:  # noqa: BLE001 - one bad episode must not sink the batch
+            return None, f"{type(e).__name__}: {e}"
+        ref = result["flora_reference"]
+        ref["batch"] = {"concurrency": concurrency, "end_s": round(time.perf_counter() - t0, 3)}
+        if rec is not None:
+            ref["observe"] = episode_observe(rec, result, t0,
+                                             gpu_lock.name if gpu_lock else GPU_LOCK_NAME)
+        return result, None
+
+    if concurrency == 1:
+        outcomes = [one(ep) for ep in episodes]
+    else:
+        with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="flora-ep") as pool:
+            outcomes = list(pool.map(one, episodes))
+    wall = time.perf_counter() - t0
+    results = {ep["episode"]: r for ep, (r, _) in zip(episodes, outcomes, strict=True) if r}
+    errors = {ep["episode"]: e for ep, (_, e) in zip(episodes, outcomes, strict=True) if e}
+    video_s = sum(float(r.get("duration_s", 0.0)) for r in results.values())
+    batch: dict[str, Any] = {
+        "concurrency": concurrency,
+        "episodes": len(episodes),
+        "ok": len(results),
+        "wall_s": round(wall, 3),
+        "video_s": round(video_s, 3),
+        "video_s_per_wall_s": round(video_s / wall, 4) if wall > 0 else None,
+        "processor_clones": {"clones": clones.clones, "seconds": round(clones.seconds, 3)}
+        if clones else None,
+    }
+    if gpu_lock is not None:
+        batch["gpu_lock"] = gpu_lock.stats()
+        batch["gpu_busy_fraction"] = round(gpu_lock.busy_fraction(t0, t0 + wall), 4)
+    if sampler is not None:
+        batch["resources"] = sampler.stop()
+    if measure:
+        from flora_deploy.observe.aggregate import merge_tables
+
+        batch["calls"] = merge_tables(
+            r["flora_reference"]["observe"]["calls"] for r in results.values()
+        )
+    return {"results": results, "errors": errors, "batch": batch}
 
 
 # --- persistence ----------------------------------------------------------------------------
