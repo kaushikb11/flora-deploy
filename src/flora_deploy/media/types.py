@@ -39,6 +39,14 @@ class StreamIndex:
     starts_on_keyframe: bool  # stream-copy cut possible -> oracle-eligible
     # Exact source timestamps (seconds in the source file) of every frame, for write-back.
     source_timestamps_s: tuple[float, ...] = ()
+    # Added by WS-C (all defaulted, so existing constructors keep working). They carry what the
+    # envelope checks and decoders need without reopening the file:
+    time_base: Fraction | None = None  # source == cut time_base; pts_us are exact multiples
+    byte_size: int = 0  # sum of the episode's packet payloads (lower bound of the cut's size)
+    video_streams: int = 1  # video streams NVIDIA's probe would see (the cut: always 1)
+    missing_pts: bool = False  # a packet without a PTS was seen (probe rejects that)
+    colorspace: int | None = None  # container/bitstream tags; decide canonical_rgb eligibility
+    color_range: int | None = None
 
     @property
     def duration_s(self) -> float:
