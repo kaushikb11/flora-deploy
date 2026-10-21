@@ -25,7 +25,12 @@
 
   ``run_shard`` is the ``workers.ShardWorker`` for ``segcap`` shards
   (``workers_impl.segcap.SegcapShardRunner`` over the job store from the container env, built
-  on the first call). ``validate_shard`` runs it on golden episodes over a container-local
+  on the first call; ``fatal=workers_app._die`` replaces the container after a CUDA fault,
+  the contract's only exit; there is no timer-based kill switch). Deployed as a job worker (the
+  factory set ``FLORA_STORE_*``), ``load`` first runs ``workers_app.preflight`` (store reachable,
+  ``FLORA_MEDIA_ROOT`` readable, a fixed instruction has its text) and checks the hashed
+  determinism mode (``FLORA_DETERMINISM`` / ``FLORA_OUTPUT_SETTINGS``), all before the model
+  load. ``validate_shard`` runs it on golden episodes over a container-local
   store, then NVIDIA unmodified on a subset (P1a-5s validation, ``docs/exact-worker.md``).
 
   ``identity_proof`` runs the S1 acceptance gate in this one container: the fast composite on
@@ -205,6 +210,25 @@ class ReferenceWorker:
             raise determinism.DeterminismError(
                 f"determinism parameter {self.determinism!r} != FLORA_DETERMINISM {env_mode!r}")
         self.determinism_mode = self.determinism or env_mode or determinism.NVIDIA
+        self.runner, self.preflight, self.job_store = None, None, None
+        self._runner_lock = threading.Lock()  # @modal.concurrent inputs share one runner
+        if job_worker_env():
+            # workers.py startup: cheap preflight (store reachable, media root readable, fixed
+            # instruction set, hashed determinism mode agrees) BEFORE the ~2 min model load
+            from flora_deploy.modal_app.workers_app import preflight, store_from_env
+            from flora_deploy.workers_impl.reward import PreflightError
+
+            try:
+                self.job_store = store_from_env()
+            except Exception as exc:  # noqa: BLE001 - a misconfigured deployment: say so, early
+                raise PreflightError(f"job store: {exc}") from exc
+            self.preflight = preflight(os.environ, store=self.job_store)
+            hashed = configured_determinism()
+            if hashed != self.determinism_mode:
+                raise determinism.DeterminismError(
+                    f"determinism mode {self.determinism_mode!r} != the job's hashed mode "
+                    f"{hashed!r} (FLORA_OUTPUT_SETTINGS)")
+            mark("preflight")
         self.determinism_record = determinism.apply(self.determinism_mode)
 
         from flora_deploy.stages.reference import (
@@ -422,7 +446,6 @@ class ReferenceWorker:
             profile=self.profile.provenance(), determinism=self.determinism_record,
             image_fingerprint=_image_fingerprint(), captioner_bf16=self.bf16,
             progress=lambda ep, frac, desc="": print(f"[{ep}] {frac:.0%} {desc}", flush=True))
-        self.runner = None
 
     def _restore_nvidia(self) -> dict:
         """Undo every swap and release the resident models: NVIDIA's unmodified state."""
@@ -647,20 +670,26 @@ class ReferenceWorker:
 
         if self.state != "fast":
             raise RuntimeError(f"worker is in state {self.state!r}, not 'fast'")
-        if store is None:
-            from flora_deploy.modal_app.workers_app import store_from_env
+        from flora_deploy.modal_app.workers_app import _die, store_from_env
 
-            store = store_from_env()
-        return SegcapShardRunner(store, self.engine, settings or segcap_settings_from_env(),
-                                 call_id=modal.current_function_call_id)
+        if store is None:
+            store = self.job_store if self.job_store is not None else store_from_env()
+        if settings is None:
+            settings = segcap_settings_from_env()
+        # CUDA fault -> _die after the marker is written (the container is replaced)
+        return SegcapShardRunner(store, self.engine, settings,
+                                 call_id=modal.current_function_call_id, fatal=_die)
 
     @modal.method()
     def run_shard(self, job_id: str, shard_id: str, config_hash: str, token: str = ""):
         """``flora_deploy.workers.ShardWorker`` for ``segcap`` shards
         (``workers_impl.segcap.SegcapShardRunner``; the job store comes from the container env
-        the app factory sets: ``FLORA_STORE_KIND`` / ``FLORA_STORE_ROOT`` / ...)."""
-        if self.runner is None:
-            self.runner = self._shard_runner()
+        the app factory sets: ``FLORA_STORE_KIND`` / ``FLORA_STORE_ROOT`` / ..., checked by the
+        preflight in ``load``). One runner per container, created once under a lock; it refuses
+        a second concurrent shard (``ConcurrentShardRefused``: ``max_inputs`` must be 1)."""
+        with self._runner_lock:
+            if self.runner is None:
+                self.runner = self._shard_runner()
         return self.runner.run_shard(job_id, shard_id, config_hash, token=token)
 
     @modal.method()
@@ -731,7 +760,8 @@ class ReferenceWorker:
         from flora_deploy.modal_app.workers_app import gpu_name
 
         runner = self._shard_runner(store, segcap_settings_from_env(
-            gpu=gpu_name(), container_id="validate", local_dir=f"/tmp/flora-validate/{job}-l"))
+            gpu=gpu_name(), container_id="validate", local_dir=f"/tmp/flora-validate/{job}-l",
+            determinism=self.determinism_mode))
         # NVIDIA's unmodified arm hashes the FP32 Captioner once (_VERIFIED_MANIFESTS reuses it):
         # do that, and warm the page cache, while the shard runs (as identity_proof does).
         bg: dict = {}
@@ -888,8 +918,33 @@ def segcap_settings_from_env(env=None, **overrides):
         "models": {k: PINS_BY_KEY[k].revision for k in keys},
         "envelope": env.get("FLORA_ENVELOPE", "warn"),
         "media_root": env.get("FLORA_MEDIA_ROOT"),
-        "instruction_text": env.get("FLORA_INSTRUCTION_TEXT"),
+        "instruction_text": env.get("FLORA_INSTRUCTION_TEXT") or None,
+        "determinism": configured_determinism(env),
         **overrides})
+
+
+def configured_determinism(env=None) -> str:
+    """The D-1 mode the job was configured and hashed with (``RunSettings.determinism``):
+    ``FLORA_DETERMINISM``, which must agree with ``FLORA_OUTPUT_SETTINGS["determinism"]`` when
+    both are set (refused otherwise); ``nvidia`` when neither is."""
+    import json
+
+    from flora_deploy.accel import determinism
+
+    env = os.environ if env is None else env
+    mode = env.get("FLORA_DETERMINISM") or None
+    outputs = env.get("FLORA_OUTPUT_SETTINGS")
+    hashed = json.loads(outputs).get("determinism") if outputs else None
+    if mode and hashed and mode != hashed:
+        raise determinism.DeterminismError(
+            f"FLORA_DETERMINISM {mode!r} != FLORA_OUTPUT_SETTINGS determinism {hashed!r}")
+    return determinism.check_mode(mode or hashed or determinism.NVIDIA)
+
+
+def job_worker_env(env=None) -> bool:
+    """Deployed as a job worker (the app factory set a job store), not the smoke app."""
+    env = os.environ if env is None else env
+    return bool(env.get("FLORA_STORE_KIND") or env.get("FLORA_STORE"))
 
 
 # The smoke app's binding. ``ReferenceWorker`` itself stays undecorated at module scope so the

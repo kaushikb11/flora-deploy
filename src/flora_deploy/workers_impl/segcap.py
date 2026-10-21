@@ -1,11 +1,13 @@
 """SegcapWorker core (P1a-5s): ``workers.ShardWorker`` around the fast ``exact`` pipeline.
 
 :class:`SegcapShardRunner` processes one ``segcap`` shard per :meth:`~SegcapShardRunner.run_shard`
-call, following the worker contract in ``workers.py`` (the same structure as
-``workers_impl.reward.RewardShardRunner``, whose part sink, index-receipt reader and video
-resolver it reuses):
+call, following the worker contract in ``workers.py`` exactly as its reference implementation
+``workers_impl.reward.RewardShardRunner`` does (whose part sink, index-receipt reader, video
+resolver, infra error and CUDA-fault detection it reuses):
 
-Before step 0 a Volume store is refreshed (``store.refresh()``).
+Before step 0 a Volume store is refreshed (``store.refresh()``). Every file goes through
+``jobs.attempts.JobFiles(store, job_id, config_hash).paths``: ``config_hash`` is the **job** hash
+and the paths are re-keyed by the ``segcap`` stage hash from the config's manifest.
 
 0. ``attempts.superseded`` → return ``None`` having written nothing;
 1. ``attempts.write_attempt`` with the spawn ``token`` and the Modal call id;
@@ -16,20 +18,35 @@ Before step 0 a Volume store is refreshed (``store.refresh()``).
 4. the remaining episodes' inputs come from their index receipts (``EpisodeRef.index_ref``):
    camera roles → local files (an episode range inside a concatenated file is stream-copy cut,
    ``reward.VideoResolver``), NVIDIA's profile and ``yam32`` flag, and NVIDIA's ``instruction``
-   (the receipt's instruction source). They go through one :class:`FastExactEngine` batch:
-   NVIDIA's own ``api.DataEnginePipeline().annotate`` per episode on the resident models
-   (``stages.reference.annotate_batch``). As **each** episode finishes (in its own thread) its
-   ``segment`` and ``caption`` ``StageRecord``s and one audit line (NVIDIA's full result with our
-   measurements and the runtime provenance) are appended and flushed whole to the store. An input
-   that cannot be resolved and an episode NVIDIA rejects become ``EpisodeError`` files
-   (``nv_failure`` for NVIDIA's ``InputError`` / ``ValueError`` semantics, ``infra`` otherwise),
-   one per stage, never a crash;
+   (:func:`instruction_for`: the receipt's resolved ``instruction_text``, index receipts v2,
+   else the configured fixed text ``FLORA_INSTRUCTION_TEXT``). They go through one
+   :class:`FastExactEngine` batch: NVIDIA's own ``api.DataEnginePipeline().annotate`` per episode
+   on the resident models (``stages.reference.annotate_batch``). As **each** episode finishes (in
+   its own thread) its ``segment`` and ``caption`` ``StageRecord``s and one audit line (NVIDIA's
+   full result with our measurements and the runtime provenance) are appended and flushed whole
+   to the store. An episode NVIDIA rejects (``InputError``) and an input NVIDIA's semantics
+   reject (``ValueError``: a source-error receipt, no cameras, a cut that would not decode like
+   the source) become ``EpisodeError(kind="nv_failure")`` files, one per stage: terminal,
+   excused. **Infrastructure errors are not terminal**: an input that cannot be read (missing
+   index receipt or media, a transient store or I/O error) is retried once in-process; a
+   persistent one, and an infra failure inside NVIDIA's run (e.g. a CUDA fault), is written to
+   ``errors/`` as ``kind="infra"`` for diagnosis, the finished episodes are flushed, and the
+   shard **raises** :class:`~flora_deploy.workers_impl.reward.ShardInfraError` instead of writing
+   a receipt (``modal.Retries`` / the orchestrator's bounded respawns retry it). After a CUDA
+   fault the container is unusable: ``SegcapShardRunner(fatal=...)`` (``os._exit`` in the Modal
+   worker) is called after the marker is written. A ``fixed`` instruction with no text anywhere
+   is a configuration error (:class:`InstructionMissing`): the shard fails, nothing is excused.
+   The runner refuses (``DeterminismError``) to run when the engine's D-1 determinism mode is not
+   the configured one (``SegcapWorkerSettings.determinism``: ``RunSettings.determinism`` via
+   ``FLORA_DETERMINISM``);
 5. ``KeyboardInterrupt`` (SIGINT) or :meth:`~SegcapShardRunner.preempt` (``@modal.exit``) flushes
-   and calls ``attempts.mark_preempted``; any other exception flushes, ``mark_exception``,
-   re-raises;
-6. ``ShardReceipt`` LAST, ``parts`` = earlier parts + this container's own.
+   and calls ``attempts.mark_preempted`` for **every** shard in flight (``@modal.concurrent``
+   inputs); any other exception flushes, ``mark_exception``, re-raises;
+6. ``ShardReceipt`` LAST, ``parts`` = earlier parts + this container's own, ``config_hash`` = the
+   stage hash (``JobFiles.key``), ``episodes_failed`` = terminal exclusions only.
 
-Records: ``certified`` per the episode's envelope verdict (``EpisodeRef.envelope_ok``, D13;
+Records: ``provenance.config_hash`` is the stage hash (stamped by the part sink);
+``certified`` per the episode's envelope verdict (``EpisodeRef.envelope_ok``, D13;
 ``envelope="ignore"`` certifies regardless); ``provenance.engine`` is the engine label
 (``nvidia-hf``, ``+deterministic`` when the D-1 mode is on, since that is a different
 reference); ``provenance.source`` the camera sources. Everything else that describes how the
@@ -58,10 +75,13 @@ from flora_deploy.jobs.types import EpisodeError, EpisodeRef, ShardReceipt, safe
 from flora_deploy.media.types import SourceRef
 from flora_deploy.records import Provenance
 from flora_deploy.workers_impl.reward import (
+    INPUT_RETRIES,
+    ShardInfraError,
     ShardPartSink,
     VideoResolver,
     _Active,
     _container_ks,
+    cuda_fatal,
     default_container_id,
     parse_index_receipt,
 )
@@ -96,23 +116,137 @@ class SegcapInputs:
                 "duration_s": self.duration_s}
 
 
+class InstructionMissing(RuntimeError):
+    """A ``fixed`` instruction with no text (neither the index receipt's ``instruction_text``
+    nor ``FLORA_INSTRUCTION_TEXT``): a configuration error, never an excused episode."""
+
+
 def instruction_for(receipt: Mapping[str, Any], task: str | None,
                     fixed_text: str | None) -> str:
-    """NVIDIA's ``instruction`` for an episode (``jobs.indexing.IndexJob.instruction_for``)."""
+    """NVIDIA's ``instruction`` for an episode (``jobs.indexing.IndexJob.instruction_for``).
+
+    Index receipts v2 carry the resolved ``instruction_text`` (the fixed text, the dataset task,
+    or ``""`` for ``none``), which wins. A ``fixed`` receipt without it (v1) uses the configured
+    fixed text (``FLORA_INSTRUCTION_TEXT``); neither raises :class:`InstructionMissing`."""
     source = receipt.get("instruction", "dataset_task")
     if source == "none":
         return ""
+    text = receipt.get("instruction_text")
     if source == "fixed":
-        if fixed_text is None:
-            raise RuntimeError("index receipt asks for a fixed instruction but the worker has "
-                               "no FLORA_INSTRUCTION_TEXT")
-        return fixed_text
+        if isinstance(text, str) and text.strip():
+            return text
+        if fixed_text and fixed_text.strip():
+            return fixed_text
+        raise InstructionMissing(
+            "index receipt asks for a fixed instruction but neither it (instruction_text) nor "
+            "the worker (FLORA_INSTRUCTION_TEXT) has the text: set "
+            "pipeline.episode_instruction.text")
+    if isinstance(text, str):
+        return text
     return task or ""
 
 
 def source_provenance(sources: Mapping[str, SourceRef]) -> dict[str, dict[str, Any]]:
     return {role: {"uri": s.uri, "range_s": None if s.start_s is None and s.end_s is None
                    else [s.start_s, s.end_s]} for role, s in sorted(sources.items())}
+
+
+# ---------------------------------------------------------------------------
+# Failure taxonomy (review 5 H2)
+# ---------------------------------------------------------------------------
+
+
+class InputRejected(ValueError):
+    """An episode's index receipt says NVIDIA's input checks cannot pass (``status`` is not
+    ``indexed``: ``flora index`` recorded a source error). NVIDIA semantics: terminal."""
+
+
+# NVIDIA's ``generate`` runs with ``max_time=300`` (``batch_utils/models.py``); an incomplete call
+# whose GPU-lock hold reached this is a time stop, not an input-determined rejection.
+NVIDIA_MAX_TIME_S = 300.0
+TIME_STOP_S = NVIDIA_MAX_TIME_S - 10.0
+# The linked family's modules are imported under ``flora_nv_<family>_<rev8>``
+# (``nv.linker.ALIAS_PREFIX``): an exception class defined there is NVIDIA's own.
+NV_MODULE_PREFIX = "flora_nv_"
+# NVIDIA rejections raised as builtin RuntimeError (no class of their own): episode semantics.
+NVIDIA_EPISODE_REJECTIONS = (
+    "The pipeline returned an invalid caption interval.",  # api.py
+    "No common caption input geometry fits",  # vendor/robot_caption_geometry.py
+)
+# Never an episode verdict: the GPU, the runtime or I/O failed (retry; CUDA faults exit).
+INFRA_TYPE_NAMES = frozenset({"OutOfMemoryError", "AcceleratorError", "NotReady",
+                              "CudaError", "CUDAError"})
+INCOMPLETE_OUTPUT = "did not return a complete output"
+
+
+def _split_type(type_name: str) -> tuple[str, str]:
+    module, _, name = type_name.rpartition(".")
+    return module, name
+
+
+def _builtin_oserror(module: str, name: str) -> bool:
+    import builtins
+
+    cls = getattr(builtins, name, None) if module in ("builtins", "") else None
+    return isinstance(cls, type) and issubclass(cls, OSError)
+
+
+def classify_input_error(exc: BaseException) -> str:
+    """Inputs phase. ``nv_failure`` (terminal) only for NVIDIA-semantics rejections: a receipt
+    that records a source error (:class:`InputRejected`), a media check (``media.index.
+    MediaError``: e.g. ``NotKeyframeAligned``, a cut that would not decode like the source) and
+    NVIDIA's own ``InputError``. Everything else (a truncated / undecodable index receipt, a
+    missing file, a store error, a receipt without streams) is ``infra``: retried, never
+    excused."""
+    from flora_deploy.media.index import MediaError
+    from flora_deploy.stages.reference import NvidiaInputError
+
+    if isinstance(exc, InputRejected | MediaError | NvidiaInputError):
+        return "nv_failure"
+    return "infra"
+
+
+def classify_nvidia_error(err: BaseException, timing: Mapping[str, Any] | None = None
+                          ) -> tuple[str, dict[str, Any]]:
+    """NVIDIA phase: ``(kind, diagnostics)`` for the error an episode raised inside NVIDIA's
+    ``annotate`` (``stages.reference.transport_error``: the original qualified type name and
+    message). ``timing``: the episode's GPU-call evidence (:meth:`FastExactEngine.
+    episode_timing`). In order:
+
+    1. CUDA / torch / OOM / ``NotReady`` / ``OSError`` → ``infra``;
+    2. ``InputErrorForModel`` "did not return a complete output" whose longest call reached
+       NVIDIA's ``max_time`` → ``infra`` (``time_stop``: timing-, not input-determined);
+    3. NVIDIA's input rejections (``InputError``, ``InputErrorForModel``, ``ValueError``) →
+       ``nv_failure``;
+    4. a class defined in the linked NVIDIA family (``flora_nv_*`` modules, e.g.
+       ``FineSegmentationOutputError``, ``FineWorkerError``, ``U2WorkerError``) → ``nv_failure``;
+    5. NVIDIA's known builtin-``RuntimeError`` episode rejections → ``nv_failure``;
+    6. anything else (our code, an unknown builtin error) → ``infra``."""
+    from flora_deploy.stages.reference import NvidiaInputError
+
+    type_name = getattr(err, "type_name", None) or \
+        f"{type(err).__module__}.{type(err).__qualname__}"
+    message = str(getattr(err, "message", None) or err)
+    module, name = _split_type(type_name)
+    diag: dict[str, Any] = {}
+    if timing:
+        diag.update(timing)
+    root = module.split(".", 1)[0]
+    if (cuda_fatal(message) or "out of memory" in message.lower() or name in INFRA_TYPE_NAMES
+            or root == "torch" or _builtin_oserror(module, name)):
+        return "infra", diag
+    if name == "InputErrorForModel" and INCOMPLETE_OUTPUT in message and timing \
+            and float(timing.get("max_call_s") or 0.0) >= TIME_STOP_S:
+        diag["time_stop"] = True
+        return "infra", diag
+    if isinstance(err, NvidiaInputError | ValueError):
+        return "nv_failure", diag
+    if root.startswith(NV_MODULE_PREFIX):
+        return "nv_failure", diag
+    if module in ("builtins", "") and name == "RuntimeError" and \
+            message.strip() in NVIDIA_EPISODE_REJECTIONS:
+        return "nv_failure", diag
+    return "infra", diag
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +273,36 @@ class SegcapEngine(Protocol):
         ...
 
 
+class BatchCancelled(RuntimeError):
+    """A queued episode was not started: the batch was interrupted (preemption)."""
+
+
+def _install_call_timer(lock: Any) -> dict[int, list[float]]:
+    """Time every GPU-lock hold (one NVIDIA ``generate`` call, taken in the episode's thread)
+    per thread, so an episode that fails still has timing evidence (review 5 M4). The lock's
+    behaviour is unchanged; installed once per lock."""
+    calls = getattr(lock, "_flora_call_times", None)
+    if calls is not None:
+        return calls
+    from contextlib import contextmanager
+
+    calls = {}
+    orig = lock.held
+
+    @contextmanager
+    def held(label=None):
+        with orig(label):
+            t = time.perf_counter()
+            try:
+                yield
+            finally:
+                calls.setdefault(threading.get_ident(), []).append(time.perf_counter() - t)
+
+    lock.held = held
+    lock._flora_call_times = calls
+    return calls
+
+
 @dataclass
 class FastExactEngine:
     """The resident fast ``exact`` composite the Modal ``ReferenceWorker`` builds once per
@@ -150,7 +314,12 @@ class FastExactEngine:
     (both NVIDIA stages ran in between), so a family module imported or changed mid-run fails the
     episode's records closed. With a ``determinism`` record, ``determinism.verify`` runs before
     each episode's records are written (D-1: in the ``deterministic`` mode a drift raises; in
-    ``nvidia`` mode it is reported in the audit line)."""
+    ``nvidia`` mode it is reported in the audit line).
+
+    :meth:`annotate` runs the batch in a helper thread and waits interruptibly: on SIGINT
+    (``KeyboardInterrupt`` in the caller) it returns at once (queued episodes never start, the
+    in-flight ones finish and flush in the background), so the runner writes the preempt mark
+    within Modal's 30 s grace instead of after minutes-long episodes (review 5 H3)."""
 
     nv: Any
     session: Any
@@ -167,6 +336,12 @@ class FastExactEngine:
     sampler_factory: Callable[[], Any] | None = None
     _audits: int = 0
     _drift: str | None = None
+    _calls: dict = field(default_factory=dict, init=False, repr=False)
+    _cancel: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.gpu_lock is not None:
+            self._calls = _install_call_timer(self.gpu_lock)
 
     def _audit(self) -> dict | None:
         report = getattr(self.nv, "audit_report", None)
@@ -193,8 +368,11 @@ class FastExactEngine:
                 self._drift = str(e)  # NVIDIA's default sets nothing: report, never drop
         return report
 
+    def mode(self) -> str:
+        return str((self.determinism or {}).get("mode", "nvidia"))
+
     def label(self) -> str:
-        mode = (self.determinism or {}).get("mode", "nvidia")
+        mode = self.mode()
         return ENGINE_LABEL if mode == "nvidia" else f"{ENGINE_LABEL}+{mode}"
 
     def runtime_provenance(self) -> dict:
@@ -217,6 +395,25 @@ class FastExactEngine:
             "concurrency": self.concurrency,
         }
 
+    def episode_timing(self) -> dict[str, Any]:
+        """The calling episode thread's GPU calls so far (call from ``on_done``)."""
+        from flora_deploy.stages.reference import TIMING_FLAG_S
+
+        times = list(self._calls.get(threading.get_ident(), ()))
+        longest = max(times, default=0.0)
+        return {"gpu_calls": len(times), "max_call_s": round(longest, 3),
+                "timing_dependent": longest > TIMING_FLAG_S}
+
+    def cancel(self) -> None:
+        """Queued episodes of the running batch never start (``@modal.exit``)."""
+        self._cancel.set()
+
+    def _on_start(self, ep: dict) -> None:
+        if self._cancel.is_set():
+            raise BatchCancelled(f"episode {ep.get('episode')!r} not started: interrupted")
+        self._calls[threading.get_ident()] = []
+        self._audit()
+
     def annotate(self, items: list[dict], *, on_done: OnDone) -> dict:
         from flora_deploy.accel import gpu_thread as gt
         from flora_deploy.stages.reference import annotate_batch
@@ -225,11 +422,33 @@ class FastExactEngine:
                 is not self.gpu_thread:
             raise RuntimeError("gpu_thread is on but NVIDIA generate() does not run on it")
         self._audit()
-        return annotate_batch(
-            self.nv, self.session, items, concurrency=min(self.concurrency, max(len(items), 1)),
-            gpu_lock=self.gpu_lock, clones=self.clones, accel=self.accel,
-            sampler=self.sampler_factory() if self.sampler_factory else None,
-            progress=self.progress, on_start=lambda ep: self._audit(), on_done=on_done)
+        self._cancel.clear()
+        box: dict[str, Any] = {}
+        finished = threading.Event()
+
+        def run() -> None:
+            try:
+                box["out"] = annotate_batch(
+                    self.nv, self.session, items,
+                    concurrency=min(self.concurrency, max(len(items), 1)),
+                    gpu_lock=self.gpu_lock, clones=self.clones, accel=self.accel,
+                    sampler=self.sampler_factory() if self.sampler_factory else None,
+                    progress=self.progress, on_start=self._on_start, on_done=on_done)
+            except BaseException as exc:  # noqa: BLE001 - handed to the caller below
+                box["exc"] = exc
+            finally:
+                finished.set()
+
+        threading.Thread(target=run, name="flora-batch", daemon=True).start()
+        try:
+            while not finished.wait(0.2):  # interruptible: SIGINT lands here
+                pass
+        except BaseException:
+            self._cancel.set()  # queued episodes never start; in-flight ones flush on their own
+            raise
+        if "exc" in box:
+            raise box["exc"]
+        return box["out"]
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +465,9 @@ class SegcapWorkerSettings:
     envelope: str = "warn"  # D13: "ignore" certifies regardless of the envelope verdict
     instruction_text: str | None = None  # NVIDIA's instruction for a ``fixed`` source
     media_root: str | None = None
+    # D-1 mode the job was configured (and hashed) with: ``RunSettings.determinism``, the
+    # factory's ``FLORA_DETERMINISM``. The engine must run in exactly this mode.
+    determinism: str = "nvidia"
     local_dir: str = "/tmp/flora-segcap"
     container_id: str = field(default_factory=default_container_id)
 
@@ -259,10 +481,17 @@ def certification(ref: EpisodeRef, envelope: str = "warn") -> tuple[bool, str | 
     return False, "oracle_ineligible_source"
 
 
-def _error_kind(exc: BaseException) -> str:
-    from flora_deploy.stages.reference import NvidiaInputError
+def engine_mode(engine: Any) -> str:
+    """The D-1 determinism mode an engine runs in (``nvidia`` when it carries no record)."""
+    from flora_deploy.accel import determinism as det
 
-    return "nv_failure" if isinstance(exc, NvidiaInputError | ValueError) else "infra"
+    return str((getattr(engine, "determinism", None) or {}).get("mode", det.NVIDIA))
+
+
+class ConcurrentShardRefused(RuntimeError):
+    """A second shard arrived while one runs: the segcap worker runs one shard per container
+    (its engine and GPU-lock statistics are per batch). Use ``resources.segcap.max_inputs: 1``;
+    episode concurrency inside the shard is ``FastExactEngine.concurrency``."""
 
 
 class SegcapShardRunner:
@@ -271,17 +500,25 @@ class SegcapShardRunner:
     def __init__(self, store: Store, engine: SegcapEngine, settings: SegcapWorkerSettings, *,
                  call_id: Callable[[], str | None] = lambda: "",
                  clock: Callable[[], float] = time.time, resolver: VideoResolver | None = None,
-                 inputs: Callable[[EpisodeRef], SegcapInputs] | None = None):
+                 inputs: Callable[[EpisodeRef], SegcapInputs] | None = None,
+                 fatal: Callable[[BaseException], None] | None = None):
         """``inputs``: EpisodeRef -> :class:`SegcapInputs` (default: from the index receipt,
-        :meth:`inputs_from_index`)."""
+        :meth:`inputs_from_index`). ``fatal``: called after the marker is written when an error
+        leaves the engine unusable (a CUDA fault); the Modal worker passes ``os._exit`` so the
+        container is replaced."""
+        from flora_deploy.accel import determinism as det
+
+        det.check_mode(settings.determinism)
         self.store, self.engine, self.settings = store, engine, settings
         self.inputs_for = inputs or self.inputs_from_index
         self.call_id, self.clock = call_id, clock
         self.container_id = safe_key(settings.container_id)
         self.resolver = resolver or VideoResolver(
             settings.media_root, Path(settings.local_dir) / "cuts")
+        self.fatal = fatal
         self._lock = threading.RLock()
-        self._active: _Active | None = None
+        self._active: dict[int, _Active] = {}  # every in-flight input (marked by preempt)
+        self._busy = False  # one shard per container (ConcurrentShardRefused)
         self._next_k: dict[tuple[str, str, str], int] = {}
         self.last_batch: dict | None = None  # the last annotate batch summary (diagnostics)
 
@@ -289,10 +526,24 @@ class SegcapShardRunner:
 
     def run_shard(self, job_id: str, shard_id: str, config_hash: str,
                   token: str = "") -> ShardReceipt | None:
+        with self._lock:  # review 5 M1: refuse, before writing anything, a concurrent input
+            if self._busy:
+                raise ConcurrentShardRefused(
+                    f"shard {shard_id!r} arrived while another segcap shard runs in this "
+                    "container: set resources.segcap.max_inputs: 1")
+            self._busy = True
+        try:
+            return self._run_shard(job_id, shard_id, config_hash, token)
+        finally:
+            with self._lock:
+                self._busy = False
+
+    def _run_shard(self, job_id: str, shard_id: str, config_hash: str,
+                   token: str) -> ShardReceipt | None:
         refresh = getattr(self.store, "refresh", None)
         if callable(refresh):  # Volume stores: see current ledgers / parts in a warm container
             refresh()
-        jf = A.JobFiles(self.store, job_id, config_hash)
+        jf = A.JobFiles(self.store, job_id, config_hash)  # paths keyed by the stage hash
         manifests = StoreManifestSource(jf)
         shard = manifests.shard(shard_id)
         if A.superseded(jf, shard.kind, shard_id, token):  # step 0: write nothing
@@ -303,26 +554,35 @@ class SegcapShardRunner:
             call_id=self.call_id() or "")
         active = _Active(jf, shard, marker)
         with self._lock:
-            self._active = active
+            self._active[id(active)] = active
         try:
             return self._run(active, manifests)
-        except KeyboardInterrupt:  # SIGINT (preemption): flush, mark, let Modal retry
-            self._end(active, preempted=True)
+        except KeyboardInterrupt:  # SIGINT (preemption): mark at once, let Modal retry
+            self._end(active, preempted=True)  # in-flight episodes keep flushing (engine)
             raise
         except Exception as exc:
-            self._end(active, error=f"{type(exc).__name__}: {exc}")
+            msg = f"{type(exc).__name__}: {exc}"
+            self._end(active, error=msg)
+            infra = exc.infra.values() if isinstance(exc, ShardInfraError) else ()
+            if self.fatal is not None and (cuda_fatal(msg) or any(map(cuda_fatal, infra))):
+                self.fatal(exc)  # the engine is unusable: replace the container
             raise
         finally:
             with self._lock:
-                if self._active is active:
-                    self._active = None
+                self._active.pop(id(active), None)
 
     def preempt(self) -> bool:
-        """``@modal.exit`` / SIGINT hook: flush the shard in flight and mark it preempted.
-        Idempotent; a no-op when no shard is running. Returns True if it marked one."""
+        """``@modal.exit`` / SIGINT hook: stop queued episodes from starting, flush **every**
+        shard in flight and mark each preempted at once (never waits for running episodes, so
+        the mark lands within Modal's 30 s grace). Idempotent; a no-op when no shard is running.
+        Returns True if it marked at least one."""
         with self._lock:
-            active = self._active
-        return active is not None and self._end(active, preempted=True)
+            actives = list(self._active.values())
+        cancel = getattr(self.engine, "cancel", None)
+        if actives and callable(cancel):
+            cancel()
+        marked = [self._end(a, preempted=True) for a in actives]
+        return any(marked)
 
     def on_exit(self) -> None:
         self.preempt()
@@ -352,7 +612,9 @@ class SegcapShardRunner:
 
     def inputs_from_index(self, ref: EpisodeRef) -> SegcapInputs:
         raw = json.loads(self.store.get_bytes(ref.index_ref))
-        idx = parse_index_receipt(json.dumps(raw))  # status / dataset / sources / task
+        if raw.get("schema") == "flora_index_receipt_v1" and raw.get("status") != "indexed":
+            raise InputRejected(f"episode {ref.uid!r} was not indexed: {raw.get('error')}")
+        idx = parse_index_receipt(json.dumps(raw))  # dataset / sources
         if (idx.dataset, idx.episode_id) != (ref.dataset, ref.episode_id):
             raise RuntimeError(f"index receipt is for {idx.dataset}/{idx.episode_id}, "
                                f"manifest says {ref.uid!r}")
@@ -361,7 +623,7 @@ class SegcapShardRunner:
         profile, yam32 = POOL_PROFILES.get(ref.pool, (ref.pool, False))
         profile = str(raw.get("profile") or profile)
         long_windows = bool(raw.get("yam32", yam32))
-        task = raw.get("task") if isinstance(raw.get("task"), str) else idx.task
+        task = raw.get("task") if isinstance(raw.get("task"), str) else None
         instruction = instruction_for(raw, task, self.settings.instruction_text)
         videos = {role: self.resolver.resolve(ref.uid, role, src)
                   for role, src in sorted(idx.sources.items())}
@@ -375,27 +637,53 @@ class SegcapShardRunner:
         s = self.settings
         return Provenance(
             models=dict(s.models), engine=self.engine.label(), preset=s.preset,
-            config_hash="", logic_version=LOGIC_VERSION,  # job hash stamped by the sink
+            config_hash="", logic_version=LOGIC_VERSION,  # stage hash stamped by the sink
             framework=f"flora-deploy {__version__}", gpu=s.gpu, certificate=s.certificate,
             source=source_provenance(inputs.sources) if inputs else {})
 
-    def _errors(self, shard, uid: str, exc: BaseException, phase: str) -> list[EpisodeError]:
-        kind = _error_kind(exc)
+    def _errors(self, shard, uid: str, exc: BaseException, phase: str, kind: str,
+                **diagnostics: Any) -> list[EpisodeError]:
         type_name = getattr(exc, "type_name", None) or type(exc).__name__
-        message = getattr(exc, "message", None) or str(exc)
+        message = str(getattr(exc, "message", None) or exc)
+        if kind == "infra":
+            message = f"{type_name}: {message}"
         return [EpisodeError(uid=uid, stage=st, shard_id=shard.shard_id,
                              container_id=self.container_id, kind=kind,  # type: ignore[arg-type]
-                             message=str(message),
-                             diagnostics={"phase": phase, "type": type_name})
+                             message=message,
+                             diagnostics={"phase": phase, "type": type_name, **diagnostics})
                 for st in stages_of(shard.kind)]
 
+    def _load_inputs(self, shard, ref: EpisodeRef) -> SegcapInputs | list[EpisodeError]:
+        """One episode's inputs, or its error files: NVIDIA semantics at once (terminal), infra
+        after ``INPUT_RETRIES`` in-process retries (not terminal). A configuration error
+        (:class:`InstructionMissing`) propagates and fails the shard."""
+        attempt = 0
+        while True:
+            try:
+                return self.inputs_for(ref)
+            except InstructionMissing:
+                raise
+            except Exception as exc:  # noqa: BLE001 - becomes this episode's EpisodeError
+                kind = classify_input_error(exc)
+                if kind == "nv_failure":
+                    return self._errors(shard, ref.uid, exc, "inputs", kind)
+                if attempt >= INPUT_RETRIES:
+                    return self._errors(shard, ref.uid, exc, "inputs", kind,
+                                        attempts=attempt + 1)
+                attempt += 1
+
     def _run(self, active: _Active, manifests: StoreManifestSource) -> ShardReceipt:
+        from flora_deploy.accel import determinism as det
         from flora_deploy.stages.reference import stage_records
 
         t0 = time.perf_counter()
         jf, shard, s = active.jf, active.shard, self.settings
         if shard.kind != "segcap":
             raise ValueError(f"SegcapWorker cannot run shard kind {shard.kind!r}")
+        if engine_mode(self.engine) != s.determinism:  # never label outputs with another mode
+            raise det.DeterminismError(
+                f"the engine runs determinism mode {engine_mode(self.engine)!r} but the job "
+                f"was configured (and hashed) with {s.determinism!r} (FLORA_DETERMINISM)")
 
         prior = P.shard_parts(jf, shard)  # step 2
         done = set(prior.done)
@@ -417,23 +705,33 @@ class SegcapShardRunner:
         inputs: dict[str, SegcapInputs] = {}
         errors: list[EpisodeError] = []
         for uid in todo:  # step 4: inputs (per-episode isolation)
-            try:
-                if uid not in refs:
-                    raise KeyError(f"episode {uid!r} is not in the manifest")
-                inputs[uid] = self.inputs_for(refs[uid])
-            except Exception as exc:  # noqa: BLE001 - becomes this episode's EpisodeError
-                errors += self._errors(shard, uid, exc, "inputs")
+            if uid not in refs:
+                raise KeyError(f"episode {uid!r} is not in the manifest")
+            got = self._load_inputs(shard, refs[uid])
+            if isinstance(got, SegcapInputs):
+                inputs[uid] = got
+            else:
+                errors += got
         if errors:
             sink.add(errors=errors)
             sink.flush()
 
         def on_done(item: dict, result: dict | None, err: Exception | None) -> None:
             uid = item["episode"]
-            if err is not None:
-                sink.add(errors=self._errors(shard, uid, err, "nvidia"))
+            timing_of = getattr(self.engine, "episode_timing", None)
+            gpu_timing = timing_of() if callable(timing_of) else None
+            if err is not None:  # nv_failure: terminal; infra (CUDA, I/O, time stop): raise
+                kind, diag = classify_nvidia_error(err, gpu_timing)
+                sink.add(errors=self._errors(shard, uid, err, "nvidia", kind, **diag))
                 sink.flush()
                 return
             assert result is not None
+            # review 5 M3: the mode travels with every result, so mode checks on production
+            # audit lines (stages.reference.check_same_mode) never default to "nvidia"
+            fr = result.setdefault("flora_reference", {})
+            fr.setdefault("determinism", {
+                "schema": (getattr(self.engine, "determinism", None) or {}).get("schema"),
+                "mode": engine_mode(self.engine)})
             audit_report = self.engine.check()  # nv.audit + determinism, before records
             ref, inp = refs[uid], inputs[uid]
             certified, reason = certification(ref, s.envelope)
@@ -448,7 +746,8 @@ class SegcapShardRunner:
                 print(f"FLORA_WARN {json.dumps({'uid': uid, 'timing_dependent_calls': timing})}",
                       flush=True)
             audit = {"schema": AUDIT_SCHEMA, "uid": uid, "stage": "segcap",
-                     "timing_dependent_calls": timing,
+                     "timing_dependent_calls": timing, "gpu_timing": gpu_timing,
+                     "config_hash": jf.key(shard.kind), "job_config_hash": jf.config_hash,
                      "shard_id": shard.shard_id, "container_id": self.container_id,
                      "runtime": {**self.engine.runtime_provenance(), "nv_audit": audit_report},
                      "result": result}
@@ -464,11 +763,14 @@ class SegcapShardRunner:
 
         finished = done | sink.done
         failed = (sink.failed | poisoned) - finished
+        infra = {u: m for u, m in sink.infra.items() if u not in finished and u not in failed}
+        if infra:  # never terminal: no receipt, the shard is retried (module docstring)
+            raise ShardInfraError(shard.shard_id, infra)
         missing = [u for u in shard.episodes if u not in finished and u not in failed]
         if missing:  # never write a receipt that loses episodes
             raise RuntimeError(f"shard {shard.shard_id!r}: no record or error for {missing}")
         receipt = ShardReceipt(  # step 6: LAST
-            shard_id=shard.shard_id, kind=shard.kind, config_hash=jf.config_hash,
+            shard_id=shard.shard_id, kind=shard.kind, config_hash=jf.key(shard.kind),
             container_id=self.container_id,
             episodes_done=tuple(u for u in shard.episodes if u in finished),
             episodes_failed=tuple(u for u in shard.episodes if u in failed),

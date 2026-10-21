@@ -49,6 +49,14 @@ def clean(demo, tmp_path_factory):
     return res
 
 
+def shard(res, kind: str, n: int = 0) -> str:
+    """The id of the ``n``-th planned ``kind`` shard. Shard ids are content-addressed (Fix-W1:
+    ``<kind>-<16 hex of sha256(kind + uids)>``), so fault targets name the planned id; the plan
+    is deterministic, so a clean run's ids are every run's ids."""
+    m = load_manifest(LocalStore(res.store_root), res.job_id)
+    return [x.shard_id for x in m.shards if x.kind == kind and not x.bisected_from][n]
+
+
 def records(res) -> dict[tuple[str, str], str]:
     st = LocalStore(res.store_root)
     return {(r.uid, r.stage): r.to_json() for stage in STAGES
@@ -114,15 +122,20 @@ def test_reruns_are_deterministic_and_resumable(demo, clean, tmp_path):
 
 
 def test_preempt_oom_poison_bisection_and_episode_errors(demo, clean, tmp_path):
+    seg0 = shard(clean, "segcap", 0)
     res = run_local(demo, store=tmp_path / "store", faults=(
-        "preempt:segcap-00000,oom:ep003@segcap,nverr:ep005@reward.dense,"
-        "infra:reward.terminal-00000,spawnerr:reward.dense-00000"))
+        f"preempt:{seg0},oom:ep003@segcap,nverr:ep005@reward.dense,"
+        f"infra:{shard(clean, 'reward.terminal')},spawnerr:{shard(clean, 'reward.dense')}"))
     assert res.state == "completed_with_errors", res.as_dict()
     s = res.summary
-    assert s["complete"]
+    # Fix-W1 "done means done": ``complete`` is only for an error-free job; here every episode
+    # is accounted for (records or terminal exclusions, nothing missing) but 1 of 6 (> 10%)
+    # was excluded per stage, so the job is completed_with_errors
+    assert not s["complete"] and s["status"] == "completed_with_errors"
+    assert all(st["missing"] == 0 for st in s["stages"].values())
     uid3 = next(u for u, _ in records(clean) if u.endswith("--ep003"))
     uid5 = next(u for u, _ in records(clean) if u.endswith("--ep005"))
-    # ep003 crashed segcap-00001 every time: quarantined, bisected, then poison-pilled
+    # ep003 crashed the second segcap shard every time: quarantined, bisected, then poison-pilled
     assert s["poison_pills"] == [f"{uid3}/segcap"]
     assert s["stages"]["segment"]["excused"] == s["stages"]["caption"]["excused"] == 1
     assert s["stages"]["reward.dense"]["excused"] == 1  # the nv_failure
@@ -134,12 +147,12 @@ def test_preempt_oom_poison_bisection_and_episode_errors(demo, clean, tmp_path):
     # its batch-mate ep002 finished before the crash and was kept, not redone
     bis = next(e for e in res.events if e["event"] == "bisected")
     assert bis["children"] == [f"segcap-ep-{uid3}"] and len(bis["done"]) == 1
-    # preempted starts never count toward D15: segcap-00000 was not quarantined
+    # preempted starts never count toward D15: the first segcap shard was not quarantined
     st = LocalStore(res.store_root)
     jf = A.JobFiles(st, JOB, res.config_hash)
-    marks = A.markers(jf, "segcap", "segcap-00000")
+    marks = A.markers(jf, "segcap", seg0)
     assert any(m.preempted for m in marks)
-    assert A.counted_starts(jf, "segcap", "segcap-00000") == len(marks) - 1 == 1
+    assert A.counted_starts(jf, "segcap", seg0) == len(marks) - 1 == 1
     same_as_clean(res, clean, missing={(uid3, "segment"), (uid3, "caption"),
                                        (uid5, "reward.dense")})
 
@@ -147,14 +160,16 @@ def test_preempt_oom_poison_bisection_and_episode_errors(demo, clean, tmp_path):
 def test_python_failures_retry_then_succeed(demo, clean, tmp_path):
     # 4 failures: the first call fails 3 times (modal.Retries=2), the orchestrator respawns
     # it, and the second call succeeds after one more failure
-    res = run_local(demo, store=tmp_path / "store", faults="fail:segcap-00002x4")
+    res = run_local(demo, store=tmp_path / "store",
+                    faults=f"fail:{shard(clean, 'segcap', 2)}x4")
     assert res.state == "done", res.as_dict()
     assert res.counts("call_failed") == 1 and res.spawner["python_failures"] == 4
     same_as_clean(res, clean)
 
 
-def test_exhausted_respawns_fail_the_job(demo, tmp_path):
-    res = run_local(demo, store=tmp_path / "store", faults="fail:reward.terminal-00000x99")
+def test_exhausted_respawns_fail_the_job(demo, clean, tmp_path):
+    res = run_local(demo, store=tmp_path / "store",
+                    faults=f"fail:{shard(clean, 'reward.terminal')}x99")
     assert res.state == "failed" and res.outcome == "failed"
     assert res.counts("shard_failed") == 1
     assert res.summary["shards"]["failed"] == 1
@@ -216,12 +231,12 @@ def test_budget_stop_then_resume(demo, clean, tmp_path):
 # --- CLI -------------------------------------------------------------------------------------
 
 
-def test_cli_run_local_with_faults_and_sample_data(tmp_path):
+def test_cli_run_local_with_faults_and_sample_data(clean, tmp_path):
     shutil.copy(TEMPLATE, tmp_path / "flora.yaml")
     out = cli.invoke(app, ["run", "--local", "--fake-models", "--sample-data", "--config",
                            str(tmp_path / "flora.yaml"), "--inject",
-                           "preempt:segcap-00000,oom:ep001@segcap", "--inject",
-                           "fail:reward.dense-00000"])
+                           f"preempt:{shard(clean, 'segcap')},oom:ep001@segcap",
+                           "--inject", f"fail:{shard(clean, 'reward.dense')}"])
     assert out.exit_code == 3, out.output  # completed_with_errors
     assert "COMPLETED_WITH_ERRORS" in out.output and "poison pills 1" in out.output
     assert (tmp_path / "videos" / "ep000.mp4").is_file()
@@ -230,7 +245,12 @@ def test_cli_run_local_with_faults_and_sample_data(tmp_path):
     assert len(m.episodes) == 6
     res = results_cli(store, "segment", "--format", "jsonl")
     assert res.exit_code == 0
-    assert len([x for x in res.output.splitlines() if x.strip()]) == 5
+    lines = [x for x in res.output.splitlines() if x.strip()]
+    # Fix-W1: `flora results` warns about a completed_with_errors job; then the 5 records
+    other = [x for x in lines if not x.startswith("{")]
+    assert len(other) == 1 and other[0].startswith(
+        "warning: job local-demo is completed_with_errors"), other
+    assert len([x for x in lines if x.startswith("{")]) == 5
     js = cli.invoke(app, ["run", "--local", "--fake-models", "--json", "--config",
                           str(tmp_path / "flora.yaml")])
     assert js.exit_code == 3
@@ -287,7 +307,7 @@ def test_zero_modal_a_whole_job_runs_with_modal_unimportable(demo, tmp_path):
         "import sys; sys.modules['modal'] = None\n"  # any `import modal` now raises ImportError
         "from flora_deploy.local import run_local\n"
         f"res = run_local({str(demo)!r}, store={str(tmp_path / 'store')!r},"
-        " faults='preempt:segcap-00001')\n"
+        " faults='preempt:segcap-*x1')\n"
         "assert res.state == 'done', res.as_dict()\n"
         "assert not [m for m in sys.modules if m.startswith('flora_deploy.modal_app')]\n"
         "print('OK', res.wall_s)\n")
