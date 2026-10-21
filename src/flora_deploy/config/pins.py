@@ -10,6 +10,21 @@ The Rewarder loads weights from the same snapshot as its code, so it has one pin
 
 Checked 2026-10-21: every safetensors LFS hash at the TempSeg and Captioner weights pins equals
 the one at their code pins, and the other files' sizes match. The two pins carry the same weights.
+
+Trust anchors (PLAN.md D11). Each pin carries values pinned in this repo, so a changed Hub tree or
+a changed NVIDIA manifest fails closed instead of being trusted from the same API that serves it:
+- ``plan_digest``: ``prep.verify.plan_digest`` of the resolved file list (repo, revision,
+  allow_patterns and, per file, path, size, LFS sha256 and git blob id). Checked before anything
+  is downloaded, and again in the receipt.
+- ``expected["manifest_sha256"]``: sha256 of the bytes of NVIDIA's own manifest
+  (``SOURCE_MANIFEST.sha256`` for TempSeg/Captioner weights, ``SHA256SUMS`` for the Rewarder).
+  Every per-file manifest line is then checked against the downloaded files.
+
+How the values were obtained (2026-10-21, read-only Hub calls): ``plan_snapshot`` +
+``plan_digest`` against ``HfApi().list_repo_tree`` at each pinned revision, and
+``hf_hub_download`` of each manifest at its pinned revision, hashed with sha256. The three
+manifest digests agree with an independent computation in the WS-A review. The fetched NVIDIA code
+pins (``~/.cache/flora-deploy/nv``) contain no manifest files, so they gave no second source.
 """
 
 from __future__ import annotations
@@ -28,8 +43,10 @@ class RepoPin:
     role: Role
     # Passed to snapshot_download; None downloads the whole snapshot.
     allow_patterns: tuple[str, ...] | None = None
-    # Expected digests published by NVIDIA, verified after download.
+    # Expected digests (keys derived as documented in ``prep/verify.py``), verified after download.
     expected: tuple[tuple[str, str], ...] = ()
+    # Pinned ``prep.verify.plan_digest`` of the resolved file list; None fails closed at prepare.
+    plan_digest: str | None = None
 
 
 # File list NVIDIA's reference loader downloads for TempSeg/Captioner weights.
@@ -60,7 +77,9 @@ PINS: tuple[RepoPin, ...] = (
         allow_patterns=_NV_WEIGHT_FILES,
         expected=(
             ("adapter_sha256", "1d80fe544e4cd1a7ff6b0ea4be71e988972408dab81d4c8af72e3a628739d6c3"),
+            ("manifest_sha256", "df85ebc4be7e56bffe1100b8b623498864a6d93201282176ff47bcab66acfd0b"),
         ),
+        plan_digest="d2ca1fa2dd54a1fa38b7cec2a5f0fa7ccab541ae1660ce9a62e7d15fba59381d",
     ),
     RepoPin(
         key="tempseg_code",
@@ -68,6 +87,7 @@ PINS: tuple[RepoPin, ...] = (
         revision="78a0e4ac75d33509f077fdf985ebb51153920e7c",
         role="code",
         allow_patterns=_NV_CODE_FILES,
+        plan_digest="d409703421ecbd1510e4fd5e0148de1d4320d7c06984ff9a9dec3fc6734b0c46",
     ),
     RepoPin(
         key="tempseg_base",
@@ -75,6 +95,8 @@ PINS: tuple[RepoPin, ...] = (
         revision="c202236235762e1c871ad0ccb60c8ee5ba337b9a",
         role="base",
         allow_patterns=("*.safetensors", "*.json", "*.jinja"),
+        # No NVIDIA manifest covers the base model: this is its only repo-pinned content anchor.
+        plan_digest="199dd29d2572997cc501d0ab4ffd95c4970bfed5dde2faad52b20fc3a5c4e4f6",
     ),
     RepoPin(
         key="captioner",
@@ -83,11 +105,15 @@ PINS: tuple[RepoPin, ...] = (
         role="weights",
         allow_patterns=_NV_WEIGHT_FILES,
         expected=(
+            ("manifest_sha256", "75241af6f42d26f955f207f8cfb98ba6e6d05c303f74a7c85bde30a6cf997ad8"),
+            # Secondary consistency check only (see prep/verify.py): a field of
+            # MODEL_PROVENANCE.json, whose bytes the pinned manifest above already binds.
             (
                 "source_manifest_identity",
                 "2ab6cafd286df7f446bfb84fbc4af7c54773d5e890dd277ac5a0453d0d4fb778",
             ),
         ),
+        plan_digest="c5ae91aadfde343cc550279a3a05a7c491f647fea424f5ba0bc6d886ba68655b",
     ),
     RepoPin(
         key="captioner_code",
@@ -95,6 +121,7 @@ PINS: tuple[RepoPin, ...] = (
         revision="f736ca36925ae55d2f7915993ed1bc9f87288bb3",
         role="code",
         allow_patterns=_NV_CODE_FILES,
+        plan_digest="f40914ffff9509998c443095ca0f66a80cdc581922074f4ee50c1482755dfc28",
     ),
     RepoPin(
         key="rewarder",
@@ -102,6 +129,10 @@ PINS: tuple[RepoPin, ...] = (
         revision="7de68d22c4a9decec5ddb7f86ddcaee8f82d3367",
         role="weights+code",
         allow_patterns=None,
+        expected=(
+            ("manifest_sha256", "b20a073e6d792365248aeb29f3a1b339a434ee1309ef26a5cd2df683941ebe56"),
+        ),
+        plan_digest="1640693217ef3937b81868bff1cc7edad3e86de74e1510fb238663a26a7a6160",
     ),
 )
 

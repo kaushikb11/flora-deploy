@@ -89,3 +89,19 @@ def test_cli_dry_run_json(monkeypatch):
     assert result.exit_code == 0, result.output
     rows = json.loads(result.output)
     assert {r["key"] for r in rows} >= {"tempseg", "captioner", "rewarder"}
+
+
+def test_every_pin_has_pinned_trust_anchors():
+    import re
+
+    from flora_deploy.config.pins import PINS
+    from flora_deploy.prep.verify import required_manifest
+
+    hexdigest = re.compile(r"^[0-9a-f]{64}$")
+    for p in PINS:
+        assert p.plan_digest and hexdigest.match(p.plan_digest), p.key
+        expected = dict(p.expected)
+        if required_manifest(p):
+            assert hexdigest.match(expected["manifest_sha256"]), p.key
+        else:
+            assert "manifest_sha256" not in expected, p.key
