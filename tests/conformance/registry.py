@@ -78,9 +78,19 @@ def _reward_specs() -> list[WorkerSpec]:
             for kind in ("reward.terminal", "reward.dense")]
 
 
+def _balanced_specs() -> list[WorkerSpec]:
+    """The real balanced ``BalancedShardRunner`` + ``MicroBatcher`` (``workers_impl.segment`` /
+    ``workers_impl.caption``) with a scripted per-episode job and engine
+    (``tests/conformance/balanced_workers.py``)."""
+    from tests.conformance.balanced_workers import balanced_specs
+
+    return balanced_specs()
+
+
 WORKERS: list[WorkerSpec] = [
     fake_spec("segcap"),
     fake_spec("reward.terminal"),
     _canary_spec(),
     *_reward_specs(),
+    *_balanced_specs(),
 ]

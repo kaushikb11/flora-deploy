@@ -68,8 +68,20 @@ OUTPUT_MODULES: dict[str, tuple[str, ...]] = {
         "modal_app/reference_app.py",
     ),
     # vLLM TempSeg / Captioner (balanced): NVIDIA's input builders, captured and wrapped for vLLM
-    # (Gate C), on the same patch layer. No worker exists yet, so this is deliberately broad.
+    # (Gate C), on the same patch layer, the offline engines + micro-batcher (P1b-1) and their
+    # workers. Deliberately broad.
     "vllm-video": (
+        "engines/__init__.py",
+        "engines/base.py",
+        "engines/offline_llm.py",  # every engine argument and NVIDIA's sampling
+        "engines/microbatch.py",  # batch composition changes numerics
+        "engines/patches/__init__.py",
+        "engines/patches/dt_bias_fp32.py",  # gated FP32 dt_bias (Gate A)
+        "stages/segment.py",
+        "stages/caption.py",
+        "workers_impl/segment.py",  # index-receipt -> NVIDIA arguments (profile, instruction)
+        "workers_impl/caption.py",  # upstream segment records -> caption inputs
+        "workers_impl/reward.py",  # parse_index_receipt / VideoResolver, used by the above
         "nv/session.py",
         "nv/segment_glue.py",
         "nv/budget.py",
@@ -121,7 +133,7 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
 
 # Directories whose every module must be classified above (the output path lives here).
 CLASSIFIED_DIRS: tuple[str, ...] = ("", "nv", "accel", "stages", "media", "media/sources",
-                                    "config")
+                                    "config", "engines", "engines/patches")
 
 
 def package_root() -> Path:
