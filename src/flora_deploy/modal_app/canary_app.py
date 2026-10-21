@@ -1,4 +1,5 @@
-"""``flora-canary``: a real-Modal, CPU-only canary of the job system (C2 in docs/NEXT_EXECUTION.md).
+"""``flora-canary``: a real-Modal, CPU-only canary of the job system (C2 in
+docs/archive/NEXT_EXECUTION.md).
 
 It runs the real pieces against each other on Modal, at cents of cost:
 

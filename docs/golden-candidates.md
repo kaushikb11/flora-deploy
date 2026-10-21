@@ -312,4 +312,4 @@ Notes:
 4. Mine RoboArena `longform_feedback` for retry and regrasp language, to label hard cases.
 5. Run an L0 check that AV1 `stss` samples are true key frames and that H.264 sync samples are IDR, on one file per dataset.
 6. Decide whether NC/NC-ND sources are acceptable for the private golden Volume. If not, `human` drops to stand-ins only.
-7. If the user has their own YAM, dex or Tianji data, it takes priority (P0_EXECUTION decision 3).
+7. If the user has their own YAM, dex or Tianji data, it takes priority ([`archive/P0_EXECUTION.md`](archive/P0_EXECUTION.md), decision 3).

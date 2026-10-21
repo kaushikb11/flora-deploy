@@ -1,5 +1,5 @@
-"""H0: CPU rehearsal of Wave H on real Modal (``docs/NEXT_EXECUTION.md``, "de-risking the one
-GPU session").
+"""H0: CPU rehearsal of Wave H on real Modal (``docs/archive/NEXT_EXECUTION.md``, "de-risking
+the one GPU session").
 
 Usage::
 
