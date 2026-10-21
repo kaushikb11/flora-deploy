@@ -179,3 +179,74 @@ def test_metadata_to_dict():
     with pytest.raises(CaptureError, match="sampling"):
         metadata_to_dict(dict(total_num_frames=1, fps=1, frames_indices=[0],
                               do_sample_frames=True))
+
+
+def _captured_proxy():
+    cap = CaptureProcessor(FakeProc(), budget=512)
+    cap(text=["p"], videos=[pil_video(), pil_video(2, seed=1)], video_metadata=[md(), md(2)],
+        do_sample_frames=False, return_tensors="pt", padding=True)
+    return cap
+
+
+def _same_request(a, b):
+    assert a.prompt == b.prompt and a.call_kwargs == b.call_kwargs
+    assert a.context_budget == b.context_budget == 512
+    for (fa, ma), (fb, mb) in zip(a.videos, b.videos, strict=True):
+        assert fa.dtype == fb.dtype == np.uint8 and np.array_equal(fa, fb)
+        assert ma == mb
+
+
+@pytest.mark.parametrize("how", ["pickle", "copy", "deepcopy"])
+def test_capture_processor_pickles_and_copies(how):
+    """M2: no RecursionError; the copy keeps the real processor's state and the requests."""
+    import copy
+    import pickle
+
+    cap = _captured_proxy()
+    clone = {"pickle": lambda c: pickle.loads(pickle.dumps(c)), "copy": copy.copy,
+             "deepcopy": copy.deepcopy}[how](cap)
+    assert isinstance(clone, CaptureProcessor)
+    assert clone.video_token == "<|video_pad|>" and clone.budget == 512
+    assert clone.requests is not cap.requests
+    _same_request(clone.captured, cap.captured)
+    if how == "copy":
+        assert clone.real is cap.real
+    else:
+        assert clone.real is not cap.real and clone.real.chat_template == "t"
+    clone(text=["q"], videos=[pil_video()], video_metadata=[md()], do_sample_frames=False)
+    assert len(clone.requests) == 2 and len(cap.requests) == 1
+
+
+def test_own_state_is_never_delegated():
+    cap = CaptureProcessor.__new__(CaptureProcessor)  # what unpickling sees first
+    for name in ("_real", "requests", "_budget", "__deepcopy__", "__setstate_x__"):
+        with pytest.raises(AttributeError):
+            getattr(cap, name)
+
+
+def test_captured_request_pickles():
+    import pickle
+
+    req = _captured_proxy().captured
+    _same_request(pickle.loads(pickle.dumps(req)), req)
+
+
+def test_request_context_budget():
+    from flora_deploy.nv.budget import ContextBudgetError
+
+    req = _captured_proxy().captured
+    req.check_context(32768 - 512)
+    with pytest.raises(ContextBudgetError):
+        req.check_context(32768 - 511)
+    no_budget = CaptureProcessor(FakeProc())
+    no_budget(text=["p"], videos=[pil_video()], video_metadata=[md()], do_sample_frames=False)
+    assert no_budget.captured.context_budget is None
+    with pytest.raises(CaptureError, match="context_budget"):
+        no_budget.captured.check_context(10)
+
+
+def test_ndarray_frames_are_copied():
+    arr = np.zeros((2, 4, 4, 3), np.uint8)
+    out = frames_to_uint8(arr)
+    arr[:] = 7
+    assert not out.any()

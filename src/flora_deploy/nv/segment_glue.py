@@ -1,15 +1,26 @@
 """The two segmenter constructions NVIDIA's ``pipeline.segment()`` uses, built from NVIDIA classes.
 
-LICENSE REVIEW FLAG (PLAN.md §11): ``three_view_segmenter`` re-expresses the constructor arguments
-of NVIDIA's inline 3-view construction (``batch_utils/pipeline.py:47-49`` at
-nvidia/Flora-TempSeg@78a0e4ac). It is the only place in this package that restates NVIDIA
-configuration values; everything else calls NVIDIA's functions. The nvlink test
-``test_nv_link_segmenter.py`` proves the construction equals the one NVIDIA's own
-``pipeline.segment()`` builds, field by field.
+LICENSE REVIEW FLAG (PLAN.md §11). This module restates these NVIDIA values (from
+``batch_utils/pipeline.py`` at nvidia/Flora-TempSeg@78a0e4ac); everything else calls NVIDIA's
+functions:
+
+- ``three_view_segmenter``: the constructor arguments of NVIDIA's inline 3-view construction
+  (``pipeline.py:47-49``);
+- ``source_id_for``: the ``"upload_"`` prefix and the 24-hex-digit truncation of the main video's
+  sha256 (``pipeline.py:44``);
+- ``model_binding``: ``candidate_id="flora_final"`` and the keys of the ``bound`` dict
+  (``pipeline.py:45``).
+
+(``nv/budget.py`` restates one more value, the 32768-token context limit, flagged there.) The
+nvlink test ``test_nv_link_segmenter.py`` proves that the binding, the source and both
+constructions equal what NVIDIA's own ``pipeline.segment()`` builds: it captures the arguments
+NVIDIA passes to its own classes and compares them with ours.
 
 ``segmenter_for`` mirrors the branch in ``pipeline.py:47-51``: three camera views use the inline
 construction, anything else uses ``adapter.production_segmenter`` (``adapter.py:44-47``), including
-single-view robot episodes.
+single-view robot episodes. It does NOT apply ``pipeline.annotate``'s profile and view guards
+(``pipeline.py:142-152``; e.g. NVIDIA rejects the human pool with three views). Callers must
+enforce them.
 """
 
 from __future__ import annotations

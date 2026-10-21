@@ -24,7 +24,13 @@ How the values were obtained (2026-10-21, read-only Hub calls): ``plan_snapshot`
 ``plan_digest`` against ``HfApi().list_repo_tree`` at each pinned revision, and
 ``hf_hub_download`` of each manifest at its pinned revision, hashed with sha256. The three
 manifest digests agree with an independent computation in the WS-A review. The fetched NVIDIA code
-pins (``~/.cache/flora-deploy/nv``) contain no manifest files, so they gave no second source.
+pins (``~/.cache/flora-deploy/nv``) contain no weight manifests, so they gave no second source.
+
+``code_digests`` (2026-10-21): computed from the fetched code pins, as sha256 of the two manifest
+files (TempSeg and Captioner) and with ``nv.linker.code_tree_sha256`` for the Rewarder (11 files).
+Before hashing, every fetched ``batch_utils/`` file was compared with the object id the Hub sent
+for it at download time (the ETag in ``.cache/huggingface/download/*.metadata``, recomputed as
+sha1 of ``b"blob <len>\\0" + bytes``): 43 + 43 + 11 files, all equal.
 """
 
 from __future__ import annotations
@@ -47,6 +53,12 @@ class RepoPin:
     expected: tuple[tuple[str, str], ...] = ()
     # Pinned ``prep.verify.plan_digest`` of the resolved file list; None fails closed at prepare.
     plan_digest: str | None = None
+    # Pinned digests of NVIDIA's *code* (``batch_utils/``), checked by ``nv.linker.load_family``
+    # before any NVIDIA module runs. Keys: ``code_manifest_sha256`` / ``vendor_manifest_sha256``
+    # (sha256 of the bytes of ``batch_utils/CODE_MANIFEST.json`` / ``batch_utils/vendor/
+    # MANIFEST.json``; TempSeg and Captioner code pins) and ``code_tree_sha256`` (Rewarder, which
+    # ships no manifest: ``nv.linker.code_tree_sha256``). Not part of ``prep.verify.pin_record``.
+    code_digests: tuple[tuple[str, str], ...] = ()
 
 
 # File list NVIDIA's reference loader downloads for TempSeg/Captioner weights.
@@ -68,6 +80,12 @@ _NV_WEIGHT_FILES = (
 
 _NV_CODE_FILES = ("batch_utils/*", "third_party/*", "LICENSE*", "README.md")
 
+# TempSeg and Captioner code pins ship byte-identical batch_utils/, hence identical manifests.
+_SEGCAP_CODE_DIGESTS = (
+    ("code_manifest_sha256", "802568893397ea470156ce67b64a9beecb3d9e06f53ca8914f8c92278221681d"),
+    ("vendor_manifest_sha256", "91ce5d8a5f13a583d48384c5de7f46696f5cd896ad2c1f3ce0eead9a1acae6d8"),
+)
+
 PINS: tuple[RepoPin, ...] = (
     RepoPin(
         key="tempseg",
@@ -88,6 +106,7 @@ PINS: tuple[RepoPin, ...] = (
         role="code",
         allow_patterns=_NV_CODE_FILES,
         plan_digest="d409703421ecbd1510e4fd5e0148de1d4320d7c06984ff9a9dec3fc6734b0c46",
+        code_digests=_SEGCAP_CODE_DIGESTS,
     ),
     RepoPin(
         key="tempseg_base",
@@ -122,6 +141,7 @@ PINS: tuple[RepoPin, ...] = (
         role="code",
         allow_patterns=_NV_CODE_FILES,
         plan_digest="f40914ffff9509998c443095ca0f66a80cdc581922074f4ee50c1482755dfc28",
+        code_digests=_SEGCAP_CODE_DIGESTS,
     ),
     RepoPin(
         key="rewarder",
@@ -133,6 +153,10 @@ PINS: tuple[RepoPin, ...] = (
             ("manifest_sha256", "b20a073e6d792365248aeb29f3a1b339a434ee1309ef26a5cd2df683941ebe56"),
         ),
         plan_digest="1640693217ef3937b81868bff1cc7edad3e86de74e1510fb238663a26a7a6160",
+        code_digests=(
+            ("code_tree_sha256",
+             "a0659828417584abe63dea21df28c81e394fff16058418f17e8fc09de225629d"),
+        ),
     ),
 )
 

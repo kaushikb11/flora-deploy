@@ -167,6 +167,146 @@ def test_tampered_vendor_fails_nvidia_bootstrap(nv_code, tmp_path):
     assert out.stdout.splitlines() == ["MANIFEST", "BOOTSTRAP RuntimeError True", "[]"]
 
 
+def _copy_code(nv_code, key, tmp_path, name=None) -> Path:
+    from flora_deploy.config.pins import PINS_BY_KEY
+    from flora_deploy.layout import snapshot_dirname
+
+    src = nv_code(key)
+    dst = tmp_path / (name or snapshot_dirname(PINS_BY_KEY[key]))
+    shutil.copytree(src / "batch_utils", dst / "batch_utils",
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    return dst
+
+
+def test_pinned_code_digests_match_fetched_code(nv_code):
+    from flora_deploy.config.pins import PINS_BY_KEY
+    from flora_deploy.nv.linker import code_tree_sha256, verify_family_code
+
+    for key in ("tempseg_code", "captioner_code"):
+        pinned = dict(PINS_BY_KEY[key].code_digests)
+        pkg = nv_code(key) / "batch_utils"
+        assert hashlib.sha256((pkg / "CODE_MANIFEST.json").read_bytes()).hexdigest() == pinned[
+            "code_manifest_sha256"]
+        assert hashlib.sha256((pkg / "vendor" / "MANIFEST.json").read_bytes()).hexdigest() == (
+            pinned["vendor_manifest_sha256"])
+        assert len(verify_family_code(Family.SEGCAP, nv_code(key))) == 43
+    rewarder = nv_code("rewarder")
+    assert code_tree_sha256(rewarder) == dict(PINS_BY_KEY["rewarder"].code_digests)[
+        "code_tree_sha256"]
+    assert {Path(p).name for p in verify_family_code(Family.REWARDER, rewarder)} >= {
+        "core.py", "engine.py", "terminal_reward.py", "dense_reward.py", "rubric_reward.py"}
+
+
+PLANTED = '''
+import sys
+from flora_deploy.nv import Family
+from flora_deploy.nv.linker import CodeManifestError, load_family
+try:
+    load_family(Family(sys.argv[2]), sys.argv[1])
+except CodeManifestError as exc:
+    print("REFUSED", exc)
+else:
+    import transformers
+    print("LOADED", getattr(transformers, "HIJACKED", False))
+print(sorted(m for m in sys.modules if m.startswith("flora_nv_")))
+'''
+
+
+@pytest.mark.parametrize("planted", [
+    "vendor/support/transformers.py",
+    "vendor/production_adapter/core/transformers.py",
+    "vendor/hook.pth",
+    "vendor/support/_native.cpython-312-darwin.so",
+    "models_extra.py",
+])
+def test_planted_file_in_segcap_snapshot_is_refused(nv_code, tmp_path, planted):
+    """M3: every listed file intact, one unlisted file added on (or next to) a sys.path entry
+    bootstrap adds -> refused before any NVIDIA code runs."""
+    copy = _copy_code(nv_code, "tempseg_code", tmp_path)
+    target = copy / "batch_utils" / planted
+    target.write_text("HIJACKED = True\n")
+    out = run_isolated(PLANTED, copy, "segcap")
+    assert out.returncode == 0, out.stderr
+    lines = out.stdout.splitlines()
+    assert lines[0].startswith("REFUSED") and "not listed" in lines[0], lines
+    assert planted in lines[0] and lines[1] == "[]"
+
+
+def test_planted_file_in_rewarder_snapshot_is_refused(nv_code, tmp_path):
+    copy = _copy_code(nv_code, "rewarder", tmp_path)
+    (copy / "batch_utils" / "transformers.py").write_text("HIJACKED = True\n")
+    out = run_isolated(PLANTED, copy, "rewarder")
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.startswith("REFUSED") and "code_tree_sha256" in out.stdout
+    edited = _copy_code(nv_code, "rewarder", tmp_path / "b")
+    core = edited / "batch_utils" / "core.py"
+    core.write_text(core.read_text() + "\n# local edit\n")
+    out = run_isolated(PLANTED, edited, "rewarder")
+    assert out.stdout.startswith("REFUSED"), out.stdout + out.stderr
+
+
+def test_rewritten_manifests_are_refused(nv_code, tmp_path):
+    """Changing a vendor file *and* both manifests consistently still fails: the manifests'
+    sha256 is pinned in pins.py."""
+    copy = _copy_code(nv_code, "tempseg_code", tmp_path)
+    pkg = copy / "batch_utils"
+    target = pkg / "vendor" / "support" / "plans.py"
+    target.write_text(target.read_text() + "\n# local edit\n")
+    digest = hashlib.sha256(target.read_bytes()).hexdigest()
+    vendor = json.loads((pkg / "vendor" / "MANIFEST.json").read_text())
+    vendor["support/plans.py"] = digest
+    (pkg / "vendor" / "MANIFEST.json").write_text(json.dumps(vendor, indent=2))
+    manifest = json.loads((pkg / "CODE_MANIFEST.json").read_text())
+    for rel in ("batch_utils/vendor/support/plans.py", "batch_utils/vendor/MANIFEST.json"):
+        data = (copy / rel).read_bytes()
+        manifest["files"][rel] = dict(manifest["files"][rel], sha256=hashlib.sha256(
+            data).hexdigest(), bytes=len(data))
+    (pkg / "CODE_MANIFEST.json").write_text(json.dumps(manifest, indent=2))
+    out = run_isolated(PLANTED, copy, "segcap")
+    assert out.stdout.startswith("REFUSED") and "pinned code_manifest_sha256" in out.stdout
+
+
+def test_lazy_vendor_imports_are_verified_and_write_no_bytecode(nv_code, tmp_path):
+    """L1 + L2: modules NVIDIA imports lazily (plans, verify_gdn, production_gdn_fix, ...) come
+    from the snapshot even with same-named modules ahead on sys.path; nothing is written into the
+    snapshot (no __pycache__; the unit tests check that a stale .pyc is never executed)."""
+    copy = _copy_code(nv_code, "tempseg_code", tmp_path)
+    shadow = tmp_path / "shadow"
+    shadow.mkdir()
+    names = ["plans", "verify_gdn", "production_gdn_fix", "tempseg_fp32_loader",
+             "robot_caption_geometry", "pts_input_adapter", "canonical_rgb", "composers"]
+    for name in names:
+        (shadow / f"{name}.py").write_text("SHADOW = True\n")
+    out = run_isolated(
+        """
+        import json, sys
+        from pathlib import Path
+        from flora_deploy.nv import Family
+        from flora_deploy.nv.linker import load_family
+        nv = load_family(Family.SEGCAP, sys.argv[1])
+        sys.path.insert(0, sys.argv[2])  # e.g. a later sys.path edit by someone else
+        names = json.loads(sys.argv[3])
+        mods = {n: __import__(n) for n in names}
+        nv.pipeline, nv.api, nv.models, nv.media, nv.preprocessing  # all of batch_utils
+        import flora_runtime.video_segmentation.fine_worker
+        root = Path(sys.argv[1]).resolve()
+        print(json.dumps({
+            "shadowed": [n for n, m in mods.items() if hasattr(m, "SHADOW")],
+            "outside": [n for n, m in mods.items()
+                        if not Path(m.__file__).resolve().is_relative_to(root)],
+            "audited": len(nv.audit()),
+            "dont_write_bytecode": sys.dont_write_bytecode,
+        }))
+        """,
+        copy, shadow, json.dumps(names),
+    )
+    assert out.returncode == 0, out.stderr
+    result = json.loads(out.stdout)
+    assert result["shadowed"] == [] and result["outside"] == []
+    assert result["audited"] > 30 and result["dont_write_bytecode"] is False
+    assert not list(copy.rglob("__pycache__")) and not list(copy.rglob("*.pyc"))
+
+
 DURATIONS_S = [4.0, 7.3, 16.0, 30.0, 61.25, 120.0]
 
 
