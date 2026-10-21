@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 import pytest
 import yaml
@@ -72,13 +73,16 @@ def test_100_video_hours_matches_s1_dollars_per_hour():
     wl = WorkloadSummary.from_hours(100)
     req = PlanRequest(wl, presets=("exact",), stages=("segment", "caption"), max_gpus=10)
     o = build_option(req, RateTable.load(), pinned_rates(), "exact", 4)
-    assert o.cost_usd / 100 == pytest.approx(40.0, abs=1.0)  # S1 on cu128: ~$40 per video-h
+    # P1a-5s, the deployed worker (gpu_thread on): 6.4 at $5.68/h = ~$36.4 per video-h
+    assert o.cost_usd / 100 == pytest.approx(36.4, abs=1.0)
     assert o.rate_status == "measured" and o.requires == ()
     assert not any(f.startswith("warning:") for f in o.flags)
-    g = build_option(req, RateTable.load(), pinned_rates(), "exact", 4,
-                     extra_features=("gpu_thread",))
-    assert g.cost_usd / 100 == pytest.approx(25.0, abs=1.0)  # Perf-1 projection, ~$25
-    assert g.requires == ("gpu_thread",) and g.name == "exact x4 +gpu_thread"
+    off = build_option(replace(req, features=()), RateTable.load(), pinned_rates(), "exact", 4)
+    assert off.cost_usd / 100 == pytest.approx(40.0, abs=1.0)  # S1, gpu_thread off: ~$40
+    g = build_option(req, RateTable.load(), pinned_rates(), "exact", 8,
+                     extra_features=("long_lived_container",))
+    assert g.requires == ("long_lived_container",)
+    assert g.name == "exact x8 +long_lived_container"
     assert any("projection only" in f for f in g.flags)
     assert any(f.startswith("warning:") and "segcap (projected)" in f for f in g.flags)
 
@@ -90,8 +94,7 @@ def test_options_deterministic_and_bounded():
     assert a == b
     assert 2 <= len(a) <= 4
     assert {o.preset for o in a} == {"exact", "balanced"}
-    assert [o.name for o in a] == ["exact x4", "balanced x1", "exact x8 +gpu_thread",
-                                   "exact x4 +gpu_thread"]
+    assert [o.name for o in a] == ["exact x4", "balanced x1", "exact x8 +long_lived_container"]
     best = recommended(a)
     assert best is not None and best.name == "exact x4" and best.certification == "reference"
     bal = next(o for o in a if o.preset == "balanced")
@@ -101,25 +104,27 @@ def test_options_deterministic_and_bounded():
 
 def test_recommended_never_picks_a_projection_and_prefers_measured():
     """Review 4 M5's case: 10 video-h used to recommend exact x8 ($164) on a gpu_thread
-    projection; the runnable exact x4 on the measured cu128 rate is ~$414."""
+    projection. Review 5 M-C: the deployed worker runs gpu_thread, measured at 6.4 (P1a-5s):
+    exact x4 is ~$379 (it was ~$414 on S1's gpu_thread-off 7.0)."""
     req = PlanRequest(WorkloadSummary.from_hours(10, episodes=1200), budget_usd=2000,
                       max_gpus=3, stages=("segment", "caption", "reward.terminal",
                                           "reward.dense"))
     opts = plan_options(req)
     best = recommended(opts)
     assert best.name == "exact x4" and best.requires == ()
-    assert best.cost_usd == pytest.approx(414, abs=5)
+    assert best.cost_usd == pytest.approx(379, abs=5) and best.rate_status == "measured"
     cheaper = [o for o in opts if o.cost_usd < best.cost_usd and o.preset == "exact"]
-    assert cheaper and all(o.requires == ("gpu_thread",) for o in cheaper)
-    # with gpu_thread enabled (once wired), its rates are used and the options are runnable,
-    # still flagged as resting on projected rates
+    assert cheaper and all(o.requires == ("long_lived_container",) for o in cheaper)
+    # enabling a feature never lets a projection displace the measured row of the same
+    # configuration (equal concurrency): x4 stays on 6.4 measured
     req_g = PlanRequest(req.workload, budget_usd=2000, max_gpus=3, stages=req.stages,
-                        features=("gpu_thread",))
+                        features=("gpu_thread", "long_lived_container"))
     opts_g = plan_options(req_g)
     assert all(not o.requires for o in opts_g)
+    x4 = next(o for o in opts_g if o.name == "exact x4")
+    assert x4.rate_status == "measured" and x4.cost_usd == pytest.approx(best.cost_usd)
     best_g = recommended(opts_g)
-    assert best_g.preset == "exact" and best_g.rate_status == "projected"
-    assert any(f.startswith("warning:") for f in best_g.flags)
+    assert best_g.name == "exact x4"  # measured before projected
 
 
 def test_sequential_dominated_option_dropped():
@@ -161,8 +166,8 @@ def test_mixed_cameras_and_rewards():
                       max_gpus=6)
     o = build_option(req, RateTable.load(), pinned_rates(), "exact", 4)
     seg = next(k for k in o.kinds if k.kind == "segcap")
-    # the cu130 3-view rows are stale: both groups use the 1-view cu128 rate
-    assert seg.work_s == pytest.approx(3600 * 7.0 + 3600 * 7.0)
+    # the cu130 3-view rows are stale: both groups use the 1-/3-view-mix cu128 rate
+    assert seg.work_s == pytest.approx(3600 * 6.4 + 3600 * 6.4)
     assert {k.kind for k in o.kinds} == {"segcap", "reward.dense"}
     assert o.peak_gpus <= 6
 

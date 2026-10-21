@@ -331,6 +331,25 @@ def golden_episodes(root: str | Path, manifest: dict) -> dict[str, list[GoldenEp
     return out
 
 
+MAX_PER_EPISODE = 3  # build_golden's default: requests taken from one golden episode
+
+
+def golden_capacity(manifest: dict, quota: int, max_per_episode: int = MAX_PER_EPISODE
+                    ) -> dict[str, dict]:
+    """Per ``GOLDEN_POOLS`` pool, whether ``quota`` requests can come from the golden
+    selection (review 5 M-A): ``episodes`` (staged, oracle-eligible), ``max_requests`` (the
+    most :func:`build_golden` can take: ``episodes × max_per_episode``) and ``satisfiable``.
+    This is an upper bound: an episode can also yield fewer calls than ``max_per_episode``
+    (tianji ``episode_000075`` has 2 TempSeg windows), which only the build shows."""
+    counts = {p: 0 for p in GOLDEN_POOLS}
+    for ep in manifest.get("episodes", []):
+        if ep.get("pool") in counts and ep.get("status") == "staged" and ep.get("oracle_eligible"):
+            counts[ep["pool"]] += 1
+    return {p: {"episodes": n, "max_requests": n * max_per_episode,
+                "satisfiable": n * max_per_episode >= quota}
+            for p, n in counts.items()}
+
+
 def golden_segments(duration_s: float) -> list[dict]:
     """Three caption targets spread over the episode (10%, 40%, 70% in; 1-4 s long)."""
     length = max(1.0, min(4.0, 0.2 * duration_s))
@@ -420,7 +439,8 @@ def build_cases(nv, procs: dict, kind: str, sources: list[FrameSource],
 
 
 def build_golden(nv, procs: dict, kind: str, episodes: dict[str, list[GoldenEpisode]],
-                 quota: int, max_per_episode: int = 3) -> tuple[list[RequestRecord], list[dict]]:
+                 quota: int, max_per_episode: int = MAX_PER_EPISODE
+                 ) -> tuple[list[RequestRecord], list[dict]]:
     """Up to ``quota`` requests per pool, spread over the pool's episodes (at most
     ``ceil(quota / #episodes)`` and ``max_per_episode`` each). Every other episode carries its
     dataset task as the instruction. Errors are recorded by class name only."""
@@ -442,3 +462,35 @@ def build_golden(nv, procs: dict, kind: str, episodes: dict[str, list[GoldenEpis
             records += [compact(b) for b in built]
             remaining -= len(built)
     return records, errors
+
+
+# ---------------------------------------------------------------------------------------------
+# The whole-run verdict, as ``scripts/gatec.py`` scores it (also used to re-score a recorded run)
+
+KINDS = ("tempseg", "captioner")
+# Where build_part (``modal_app/gatec_app.py``) runs NVIDIA's HF reference processors: the
+# vLLM image, not production's img_hfref, so C2 needs a cross-check (review 3 C2).
+BUILD_REFERENCE_IMAGE = "img_vllm"
+
+
+def run_parts(golden: bool = True) -> list[str]:
+    return ["cases:synthetic", "cases:sample",
+            *([f"golden:{pool}" for pool in GOLDEN_POOLS] if golden else [])]
+
+
+def run_verdict(builds: list[dict], results: dict[str, dict], *, golden: bool, quota: int,
+                capacity: dict[str, dict] | None,
+                reference: dict | None = None) -> dict:
+    """``validate.gatec.gate_verdict`` with everything the gate requires (review 5 M-A): every
+    part of the run, every case, the golden ``quota``, the golden selection's ``capacity``
+    (``golden_capacity``) and the HF ``reference`` (default: where build_part ran it,
+    ``BUILD_REFERENCE_IMAGE``, with no cross-check: a FAIL until an img_hfref cross-check
+    exists)."""
+    from flora_deploy.validate.gatec import gate_verdict
+
+    parts = run_parts(golden)
+    return gate_verdict(
+        builds, results, expected_parts=[(k, p) for k in KINDS for p in parts],
+        expected_cases=[*CASES, *([f"golden-{pool}" for pool in GOLDEN_POOLS] if golden else [])],
+        quota=quota, capacity=capacity,
+        reference=reference if reference is not None else {"image": BUILD_REFERENCE_IMAGE})
