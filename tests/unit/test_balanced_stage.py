@@ -17,6 +17,7 @@ from flora_deploy.records import Provenance, StageRecord
 from flora_deploy.stages import caption as C
 from flora_deploy.stages import segment as S
 from flora_deploy.workers_impl.segment import classify_error
+from tests.fakes import fake_nvidia
 
 EOS = 1
 
@@ -89,20 +90,34 @@ def test_engine_error_is_infra():
     assert classify_error(None, EngineBatchError("x")) == "infra"
     assert classify_error(None, ContextBudgetError("x", prompt_tokens=1, budget=1,
                                                    limit=1)) == "nv_failure"
-    assert classify_error(None, ValueError("NVIDIA InputError")) == "nv_failure"
-    assert classify_error(None, KeyError("x")) == "infra"
+    assert classify_error(None, _raised(fake_nvidia.InputError("bad episode"))) == "nv_failure"
+    assert classify_error(None, _raised(ValueError("ours, not NVIDIA's"))) == "infra"
+    assert classify_error(None, _raised(KeyError("x"))) == "infra"
+
+
+def _raised(exc, nvidia=False):
+    """``exc`` with a traceback, raised from this test's frame (or NVIDIA's fake code)."""
+    try:
+        fake_nvidia.nvidia_raise(exc) if nvidia else _raise(exc)
+    except BaseException as e:  # noqa: BLE001
+        return e
+    raise AssertionError("unreachable")
+
+
+def _raise(exc):
+    raise exc
 
 
 def test_classify_nvidia_exception_classes():
-    nv = SimpleNamespace(alias="flora_nv_segcap_78a0e4ac", _finder=SimpleNamespace(
-        owns=lambda m: m.startswith("flora_runtime")))
-    nvidia = type("FineSegmentationOutputError", (RuntimeError,),
-                  {"__module__": "flora_runtime.video_segmentation.fine_subtask"})
-    pipeline_err = type("InputErrorForModel", (RuntimeError,),
-                        {"__module__": "flora_nv_segcap_78a0e4ac.models"})
-    assert classify_error(nv, nvidia("x")) == "nv_failure"
-    assert classify_error(nv, pipeline_err("x")) == "nv_failure"
-    assert classify_error(nv, RuntimeError("x")) == "infra"
+    """NVIDIA's classes by where they were loaded from (``nv.errors``), not by module name."""
+    assert classify_error(None, _raised(fake_nvidia.FineSegmentationOutputError("x"))) == \
+        "nv_failure"
+    assert classify_error(None, _raised(fake_nvidia.InputErrorForModel("x"))) == "nv_failure"
+    assert classify_error(None, _raised(RuntimeError("x"), nvidia=True)) == "nv_failure"
+    named = type("FineSegmentationOutputError", (RuntimeError,),
+                 {"__module__": "flora_runtime.video_segmentation.fine_subtask"})
+    assert classify_error(None, _raised(named("x"))) == "infra"
+    assert classify_error(None, _raised(RuntimeError("x"))) == "infra"
 
 
 class FakePipeline:

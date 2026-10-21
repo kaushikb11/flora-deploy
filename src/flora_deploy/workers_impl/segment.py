@@ -13,11 +13,12 @@ episode's records are added to the sink when it finishes; the sink is copied to 
 
 The per-stage work is an ``EpisodeJob``: ``SegmentEpisodeJob`` (here) and
 ``workers_impl.caption.CaptionEpisodeJob``. Errors are classified by ``_classify`` (review 6
-M1), which reuses segcap's classifiers per job phase (``phase``): ``inputs`` (index receipt,
-upstream records) by ``classify_input_error``, ``nvidia`` (NVIDIA's probe and stage) by
-``classify_nvidia_error`` (NVIDIA's classes, ``ValueError`` input checks, its builtin
-``RuntimeError`` rejections and ``ContextBudgetError`` are ``nv_failure``), ``records`` (our
-record building) never NVIDIA's. Only ``nv_failure`` is terminal; an ``infra`` / ``python`` /
+M1) per job phase (``phase``): ``inputs`` (index receipt, upstream records) by segcap's
+``classify_input_error``, ``nvidia`` (NVIDIA's probe and stage) by the shared
+``nv.errors.classify`` (NVIDIA's code identified by where it was loaded from: its classes,
+builtins its own frames raise, its builtin ``RuntimeError`` rejections and our
+``ContextBudgetError`` copy of its guard are ``nv_failure``), ``records`` (our record
+building) never NVIDIA's. Only ``nv_failure`` is terminal; an ``infra`` / ``python`` /
 ``oom`` episode error makes the shard raise ``ShardInfraError`` (no receipt, retried). A CUDA
 fault (``cuda_fatal``) stops the shard at once and calls ``fatal`` (``os._exit``) after the mark.
 
@@ -54,6 +55,7 @@ from flora_deploy.jobs.types import (
     ShardReceipt,
     safe_key,
 )
+from flora_deploy.nv import errors as nv_errors
 from flora_deploy.records import StageRecord
 from flora_deploy.workers_impl.reward import (
     ShardInfraError,
@@ -64,7 +66,7 @@ from flora_deploy.workers_impl.reward import (
     default_container_id,
     parse_index_receipt,
 )
-from flora_deploy.workers_impl.segcap import classify_input_error, classify_nvidia_error
+from flora_deploy.workers_impl.segcap import classify_input_error
 
 # Golden / index pools -> NVIDIA ``api`` profile and the yam32 flag (when a receipt lacks them).
 POOL_PROFILES: Mapping[str, tuple[str, bool]] = {
@@ -138,19 +140,6 @@ class InputResolver:
 # ---------------------------------------------------------------------------------------------
 
 
-def _nvidia_class(nv, cls: type) -> bool:
-    alias = getattr(nv, "alias", None)
-    finder = getattr(nv, "_finder", None)
-    mod = getattr(cls, "__module__", "") or ""
-    if alias and (mod == alias or mod.startswith(alias + ".")):
-        return True
-    owns = getattr(finder, "owns", None)
-    try:
-        return bool(owns and owns(mod))
-    except Exception:  # noqa: BLE001
-        return False
-
-
 PHASES = ("inputs", "nvidia", "records")
 _PLUMBING = (EngineBatchError, BatcherClosed, OSError, TimeoutError)
 
@@ -172,16 +161,16 @@ def phase(name: str) -> Iterator[None]:
 
 def _classify(exc: BaseException, nv: Any = None) -> str:
     """The single call site for the balanced failure taxonomy (review 6 M1): one of
-    ``nv_failure`` | ``infra`` | ``python`` | ``cuda_fatal`` | ``oom``. Reuses segcap's
-    classifiers (``classify_input_error`` for the ``inputs`` phase, ``classify_nvidia_error``
-    for the ``nvidia`` phase, the default), so the two paths cannot drift; the ``records``
-    phase (our record building) is never an NVIDIA verdict."""
-    from flora_deploy.nv.budget import ContextBudgetError
+    ``nv_failure`` | ``infra`` | ``python`` | ``cuda_fatal`` | ``oom``. The ``nvidia`` phase (the
+    default) is the shared classifier's verdict (``nv.errors.classify``: NVIDIA's code by where
+    it was loaded from, the same call segcap makes), the ``inputs`` phase is segcap's
+    ``classify_input_error`` and the ``records`` phase (our record building) is never an
+    NVIDIA verdict. ``nv`` is accepted for callers' symmetry and unused: the linked family is
+    found by ``nv.linker.loaded_family`` (and fakes by ``nv.errors.register_nv_root``)."""
+    from flora_deploy.engines.offline_llm import engine_dead
     from flora_deploy.stages.segment import EngineRequestError
 
     msg = f"{type(exc).__name__}: {exc}"
-    from flora_deploy.engines.offline_llm import engine_dead
-
     if cuda_fatal(msg) or engine_dead(msg):  # the engine is unusable (offline_llm.EngineDead)
         return "cuda_fatal"
     if "out of memory" in msg.lower() or type(exc).__name__ == "OutOfMemoryError":
@@ -190,19 +179,10 @@ def _classify(exc: BaseException, nv: Any = None) -> str:
     if isinstance(exc, _PLUMBING + (EngineRequestError,)):
         return "infra"
     if where == "inputs":
-        kind = classify_input_error(exc)
-    elif where == "records":
-        kind = "infra"
-    elif isinstance(exc, ContextBudgetError):  # NVIDIA's InputErrorForModel guard
-        kind = "nv_failure"
-    else:
-        kind, _ = classify_nvidia_error(exc)
-        if kind == "infra" and nv is not None and \
-                any(_nvidia_class(nv, c) for c in type(exc).__mro__):
-            kind = "nv_failure"
-    if kind == "infra" and not isinstance(exc, OSError):
-        return "infra" if where == "inputs" else "python"
-    return kind
+        return classify_input_error(exc)
+    if where == "records":
+        return "python"
+    return nv_errors.classify(exc)
 
 
 def classify_error(nv, exc: BaseException) -> str:

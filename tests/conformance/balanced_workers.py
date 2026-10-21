@@ -6,9 +6,9 @@ the per-episode job and the engine are scripted (``WorkerEnv.script``):
 
 * the job sends one model call per episode through the micro-batcher and turns the answer into
   a real ``segment`` / ``caption`` record (``stages.segment.segment_record`` /
-  ``stages.caption.caption_record``); for ``script.nv_fail`` episodes it raises a ``ValueError``
-  the way NVIDIA's code does (``media.InputError``), which the runner must classify as
-  ``nv_failure``;
+  ``stages.caption.caption_record``); for ``script.nv_fail`` episodes NVIDIA's (fake) code
+  raises its ``media.InputError`` (``tests.fakes.fake_nvidia``, registered with
+  ``nv.errors``), which the runner must classify as ``nv_failure``;
 * when the engine sees ``script.interrupt_before``'s call it delivers SIGINT to the **main**
   thread (``_thread.interrupt_main``), where a real signal lands (``asyncio.run`` turns it into a
   cancel of the shard's event loop), and keeps "generating" for a while in the batcher's worker
@@ -36,6 +36,7 @@ from flora_deploy.workers_impl.segment import (
     EpisodeOutcome,
 )
 from tests.conformance.worker_suite import WorkerSpec
+from tests.fakes import fake_nvidia
 
 
 class ScriptedEngine:
@@ -70,7 +71,8 @@ class ScriptedJob:
                                      Sampling(max_tokens=8))
         assert out.ok
         if ref.uid in self.nv_fail:
-            raise ValueError("NVIDIA rejected the input (InputError)")
+            fake_nvidia.nvidia_raise(fake_nvidia.InputError(
+                "NVIDIA rejected the input (InputError)"))
         prov = Provenance(models={"tempseg": "test"}, engine="vllm-0.24.0-offline",
                           preset="balanced", config_hash="stage", logic_version="test",
                           framework="flora-deploy test")
