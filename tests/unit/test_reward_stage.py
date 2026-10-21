@@ -535,3 +535,159 @@ def test_read_jobs_uses_nvidia_reader(tmp_path):
     assert ep == reward.Episode("e1", "t", ("/a.mp4", "/b.mp4"), dataset="lerobot/x")
     assert ep.as_job()["videos"] == ["/a.mp4", "/b.mp4"] and ep.uid == "lerobot-x--e1"
     assert seen["jobs"] == tmp_path / "jobs.jsonl"
+
+
+# ---------------------------------------------------------------------------------------------
+# Review 4 M3: NVIDIA groups follow the planned order, not the remaining list
+
+
+def _sixteen():
+    return [reward.Episode(f"{i}", f"task {i}", ("/v/vvvv",)) for i in range(16)]
+
+
+def _batches(llm):
+    return [[r["prompt"].split("'task ")[1].split("'")[0] for r in reqs]
+            for reqs, _p, _t in llm.calls]
+
+
+def test_resume_without_planned_order_shifts_groups():
+    """The reviewer's case: e3 failed to parse, the container was preempted in round 2, and
+    the resume list is [3, 8..15]. On that list alone, NVIDIA's count rule gives
+    [3, 8..14] [15]: e8-e15 get batch-mates NVIDIA never gave them."""
+    eps = _sixteen()
+    remaining = [eps[3], *eps[8:]]
+    llm = FakeLLM()
+    reward.run(llm, make_nv(), "P", remaining, "terminal")
+    assert _batches(llm) == [["3", "8", "9", "10", "11", "12", "13", "14"], ["15"]]
+
+
+def test_resume_with_planned_order_keeps_nvidia_groups():
+    eps = _sixteen()
+    planned = [e.uid for e in eps]
+    full = FakeLLM()
+    first = reward.run(full, make_nv(), "P", eps, "terminal", planned=planned)
+    assert _batches(full) == [[str(i) for i in range(8)], [str(i) for i in range(8, 16)]]
+    assert all(a["grouping"]["aligned"] for a in first.audits)
+    g0 = first.audits[0]["grouping"]
+    assert g0["grouping_id"] == "terminal:0" and g0["members"] == planned[:8]
+    assert g0["batch"] == planned[:8] and g0["anchor"] == "planned" and g0["position"] == 0
+
+    remaining = [eps[3], *eps[8:]]
+    llm = FakeLLM()
+    run = reward.run(llm, make_nv(), "P", remaining, "terminal", planned=planned)
+    assert _batches(llm) == [["3"], [str(i) for i in range(8, 16)]]  # holes, not shifts
+    by_id = {a["episode_id"]: a["grouping"] for a in run.audits}
+    assert by_id["3"]["aligned"] is False and by_id["3"]["reasons"] == ["partial_group"]
+    assert by_id["3"]["members"] == planned[:8] and by_id["3"]["batch"] == [planned[3]]
+    assert all(by_id[str(i)]["aligned"] for i in range(8, 16))
+    assert run.stats["grouping"]["unaligned"] == 1
+    assert run.stats["flagged"][planned[3]]["unaligned"] == ["partial_group"]
+    # e8..e15's records are those of the full run (content-keyed LLM; same batches on GPU)
+    full_by_id = {r.episode_id: r for r in first.records}
+    for r in run.records:
+        if r.episode_id != "3":
+            assert r.terminal == full_by_id[r.episode_id].terminal
+
+
+def test_planned_offset_and_bisection_children():
+    """A bisection child (or a shard) holding job positions 5..12 groups by job position:
+    [5, 6, 7] then [8..12], as NVIDIA's script on the whole job would."""
+    eps = _sixteen()
+    planned = [e.uid for e in eps]
+    llm = FakeLLM()
+    reward.run(llm, make_nv(), "P", eps[5:13], "terminal", planned=planned[5:13],
+               planned_offset=5)
+    assert _batches(llm) == [["5", "6", "7"], ["8", "9", "10", "11", "12"]]
+    llm2 = FakeLLM()
+    reward.run(llm2, make_nv(), "P", eps[5:13], "terminal", planned=planned)
+    assert _batches(llm2) == _batches(llm)
+
+
+def test_decode_failure_leaves_a_hole():
+    eps = _sixteen()
+    eps[2] = reward.Episode("2", "task 2", ("/v/bad",))
+    llm = FakeLLM()
+    run = reward.run(llm, make_nv(), "P", eps, "terminal")  # list anchor: same rule
+    assert _batches(llm) == [["0", "1", "3", "4", "5", "6", "7"],
+                             [str(i) for i in range(8, 16)]]
+    assert [e.uid for e in run.errors] == ["local--2"]
+
+
+def test_planned_order_is_checked():
+    eps = _sixteen()
+    planned = [e.uid for e in eps]
+    with pytest.raises(ValueError, match="not in the planned"):
+        reward.run(FakeLLM(), make_nv(), "P", eps, "terminal", planned=planned[:4])
+    with pytest.raises(ValueError, match="planned order"):
+        reward.run(FakeLLM(), make_nv(), "P", [eps[1], eps[0]], "terminal", planned=planned)
+    with pytest.raises(ValueError, match="twice"):
+        reward.run(FakeLLM(), make_nv(), "P", eps[:1], "terminal", planned=planned * 2)
+
+
+def test_budget_split_does_not_shift_later_groups():
+    """A byte-budget split inside group 0 must not move group 1's boundary."""
+    eps = _sixteen()
+    one = reward.RoundLimits().estimate(np.zeros((2, 2, 2, 3), np.uint8))
+    limits = reward.RoundLimits(max_bytes=5 * one)  # 5 requests per round at most
+    llm = FakeLLM()
+    run = reward.run(llm, make_nv(), "P", eps, "terminal", limits=limits)
+    assert _batches(llm) == [["0", "1", "2", "3", "4"], ["5", "6", "7"],
+                             ["8", "9", "10", "11", "12"], ["13", "14", "15"]]
+    assert run.stats["budget_splits"] == 2
+    assert all("budget_split" in a["grouping"]["reasons"] for a in run.audits)
+
+
+def test_retry_singletons_are_flagged():
+    eps = _sixteen()[:3]
+    llm = FakeLLM(raise_on="task 1'")
+    run = reward.run(llm, make_nv(), "P", eps, "terminal")
+    by_id = {a["episode_id"]: a["grouping"] for a in run.audits}
+    assert "retry_singleton" in by_id["0"]["reasons"] and not by_id["0"]["aligned"]
+
+
+def test_dense_chunks_follow_clip_index():
+    eps = [reward.Episode("d", "task d", ("/v/" + "v" * 20,))]  # 200 frames -> 10 windows
+    llm = FakeLLM()
+    run = reward.run(llm, make_nv(), "P", eps, "dense",
+                     limits=reward.RoundLimits(nvidia_group=4))
+    assert [len(reqs) for reqs, _p, _t in llm.calls] == [4, 4, 2]
+    g = run.audits[0]["grouping"]
+    assert g["grouping_id"] == "dense:0" and g["chunks"] == 3 and g["aligned"]
+
+
+def test_packed_is_never_aligned():
+    run = reward.run(FakeLLM(), make_nv(), "P", _sixteen()[:2], "terminal",
+                     limits=reward.RoundLimits(align="packed"))
+    assert all(a["grouping"]["reasons"] == ["packed"] for a in run.audits)
+    assert run.stats["flagged"] == {}
+
+
+# ---------------------------------------------------------------------------------------------
+# Review 4 M4 (terminal mode from the config) and L4 (source provenance)
+
+
+def test_terminal_mode_comes_from_the_config():
+    assert reward.terminal_mode(False) == "terminal"  # NVIDIA's default: score only
+    assert reward.terminal_mode(True) == "terminal_rationale"
+    assert reward.terminal_mode(False, {}) == "terminal"
+    with pytest.warns(DeprecationWarning):
+        assert reward.terminal_mode(True, {reward.TERMINAL_MODE_ENV: "terminal_rationale"}) \
+            == "terminal_rationale"
+    with pytest.raises(ValueError, match="disagrees"):
+        reward.terminal_mode(False, {reward.TERMINAL_MODE_ENV: "terminal_rationale"})
+
+
+def test_provenance_records_the_source_episode_range():
+    ep = reward.Episode("s", "task s", ("/tmp/cuts/s/main.mp4", "/tmp/cuts/s/left.mp4"),
+                        dataset="org/ds",
+                        sources=(("main", "videos/main/file-000.mp4", 12.5, 16.5),
+                                 ("left_wrist", "videos/left/file-000.mp4", None, None)))
+    run = reward.run(FakeLLM(), make_nv(), "P", [ep], "terminal")
+    src = run.records[0].provenance.source
+    assert src == {"main": {"uri": "videos/main/file-000.mp4", "range_s": [12.5, 16.5]},
+                   # whole file: [0, NVIDIA's decoded duration] (FakeCollage: 8.0 s)
+                   "left_wrist": {"uri": "videos/left/file-000.mp4", "range_s": [0.0, 8.0]}}
+    assert "/tmp/" not in json.dumps(src)
+    with pytest.raises(ValueError, match="sources"):
+        reward.validate_episodes([reward.Episode("x", "t", ("/a", "/b"),
+                                                 sources=(("main", "u", 0.0, 1.0),))])

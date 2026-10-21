@@ -3,9 +3,11 @@
 ``config_hash(cfg)`` builds a canonical JSON document and hashes it. It returns:
 - ``hash``: the **job-level** hash over the whole document (display, manifest, ``RunSettings``);
 - ``stage_hashes``: one hash **per shard kind**, over the shared inputs plus that kind's own
-  inputs (and the hashes of the kinds it consumes). Finished shards are keyed by these, so adding
-  ``reward.dense`` to ``stages`` or bumping the vLLM lock (rewards only) does not invalidate
-  finished ``segcap`` shards (review A5);
+  inputs (and the hashes of the kinds it consumes). They are meant to key finished shards, so
+  that adding ``reward.dense`` to ``stages`` or bumping the vLLM lock (rewards only) does not
+  invalidate finished ``segcap`` shards (review A5). Review 4 M1: the job store still keys parts
+  by the job hash, so until it switches, the job hash (a superset of every stage hash) decides
+  reuse;
 - the document and its exact bytes, so provenance records what was hashed and a changed hash can
   be diffed.
 
@@ -15,10 +17,18 @@ Shared (every stage hash):
   nobody bumps the label);
 - preset, embodiment pool, episode-instruction source/text, envelope policy;
 - decode pins (av, Pillow, numpy, arch);
-- input identity: format, dataset (repo or normalized path), revision, subdirectory, camera map.
+- input identity: format, dataset (repo or normalized path), revision, subdirectory, camera map,
+  and the input ``content`` digest when the caller has one (e.g. an index summary digest; for a
+  local ``mp4_dir`` the path string alone does not bind the file contents, review 3 A8). The
+  camera map is hashed as written: ``cameras: None`` and an explicit map that resolves to the
+  same views hash differently, because which map ``None`` resolves to depends on the dataset's
+  camera keys. That costs a re-run, never a mix.
 
 Per shard kind:
 - the stages it produces in this job; its logic-group digest (``config/logic.py``);
+- ``modes``: the output-affecting run modes of that kind (review 4): ``determinism`` for the
+  NVIDIA HF worker (``segcap``; D-1 "deterministic" is a different reference) and
+  ``terminal_mode`` for ``reward.terminal`` (score only, NVIDIA's default, or with rationale);
 - engine name, versions, patches, engine args (for vLLM video engines incl. the Gate C-required
   ``mm_processor_cache_gb=0``), sampling, mm_kwargs, and the ``image_fingerprint()`` of its image;
 - for each NVIDIA pin it depends on: repo, revision, role, ``plan_digest``, ``expected`` digests
@@ -32,6 +42,13 @@ Excluded (they don't change outputs; they go to provenance instead): GPU type an
 container counts, max inputs, cpu/memory, budget, max_gpus, region, tags, Modal environment,
 shard sizing, retries, output sink/formats, observability, ``stage_to``, project name,
 ``allow_uncertified``.
+
+GPU type (review 4 M7). It is excluded on purpose: the model inputs are identical on every GPU
+(the input-identity gates run on CPU-built tensors), so a GPU override is a cost/speed choice.
+But **outputs are not identical across GPU types**: an H200 (sm90) and a B200 (sm100) run
+different kernels with different numerics, just as two runs on one GPU type can differ (D-1).
+Records carry the GPU in ``provenance.gpu``; compare or resume across GPU types only knowing
+that results are input-identical, not output-identical.
 """
 
 from __future__ import annotations
@@ -44,11 +61,11 @@ from pathlib import Path
 from typing import Any
 
 from flora_deploy import LOGIC_VERSION
-from flora_deploy.config.logic import logic_digest
+from flora_deploy.config.logic import KIND_GROUPS, logic_digest
 from flora_deploy.config.pins import PINS_BY_KEY, RUNTIME
 from flora_deploy.config.presets import EngineIdentity, get_preset, shard_kinds_for
 
-HASH_SCHEMA = "flora-config-hash/v2"
+HASH_SCHEMA = "flora-config-hash/v3"  # v3: per-kind ``modes``, input ``content``
 IMAGE_ARCH = "x86_64"  # every Modal image is x86_64 (PLAN.md §7)
 
 # Shard kind -> the shard kinds whose outputs it consumes (``jobs.manifest``).
@@ -89,6 +106,17 @@ def _pin_identity(key: str) -> dict[str, Any]:
     }
 
 
+def kind_modes(cfg, kind: str) -> dict[str, Any]:
+    """The output-affecting run modes of ``kind`` (hashed in its entry, read by its worker)."""
+    modes: dict[str, Any] = {}
+    if KIND_GROUPS.get(kind) == "nvidia-hf":
+        modes["determinism"] = cfg.pipeline.determinism
+    if kind == "reward.terminal":
+        modes["terminal_mode"] = ("terminal_rationale" if cfg.pipeline.terminal_rationale
+                                  else "terminal")
+    return modes
+
+
 def _default_fingerprint(name: str) -> str:
     from flora_deploy.modal_app.images import image_fingerprint
 
@@ -102,6 +130,7 @@ def hash_document(
     engines: Mapping[str, EngineIdentity] | None = None,
     image_fingerprint: Callable[[str], str] | None = None,
     logic_root: Path | None = None,
+    input_digest: str | None = None,
 ) -> dict[str, Any]:
     """The document ``config_hash`` hashes. See the module docstring for what is in it.
 
@@ -110,7 +139,8 @@ def hash_document(
     shard kind needs must be present, or ``MissingReceiptError`` is raised.
     ``engines``: per-shard-kind engine identity overriding the preset's (for engines whose args
     are only known at deploy time). ``image_fingerprint`` and ``logic_root`` (the package
-    directory whose source is digested): injectable for tests."""
+    directory whose source is digested): injectable for tests. ``input_digest``: a digest of
+    the input's contents (e.g. the index summary), when the caller has one."""
     preset = get_preset(cfg.preset)
     fingerprint = image_fingerprint or _default_fingerprint
     receipts = dict(derived_receipts or {})
@@ -134,6 +164,7 @@ def hash_document(
         shard_kinds[kind] = {
             "stages": [s for s in cfg.pipeline.stages if preset.stage_kinds[s] == kind],
             "logic_digest": logic_digest(kind, logic_root),
+            "modes": kind_modes(cfg, kind),
             "engine": e,
             "nvidia_pins": {p: _pin_identity(p) for p in pins},
             "derived_weights": {r: receipts[r] for r in weights},
@@ -157,6 +188,7 @@ def hash_document(
             "revision": inp.revision,
             "path": inp.subdir,
             "cameras": dict(sorted(inp.cameras.items())) if inp.cameras is not None else None,
+            "content": input_digest,
         },
     }
     return {

@@ -6,78 +6,102 @@
     "startup_s": "seconds from container start to ready (@modal.enter), paid once per container",
     "uncertainty": "relative half-width of the error bar (0.35 = +/-35%)"
   },
-  "note": "Seeded from P0/W3 measurements on a handful of episodes; S2 (golden build) replaces them. `status`: measured | projected | placeholder.",
+  "note": "`status`: measured | projected | placeholder | stale. `stale` entries were measured on another image and are kept for history only: lookups skip them. `requires` names worker features a rate depends on (e.g. `gpu_thread`, not wired into the exact worker yet); such entries are used only when the feature is enabled, and `flora plan` shows them as projections. `image`: the image the entry was measured or projected on. Review 4 M5: the exact rows were re-seeded from S1 / Perf-1 on the production cu128 `img_hfref`.",
   "rates": [
     {
-      "preset": "exact", "kind": "segcap", "cameras": 1, "concurrency": 1,
-      "container_s_per_video_s": 8.62, "uncertainty": 0.35, "status": "measured",
-      "provenance": "W3-A run 1 sequential: 4 WS-D episodes (1080p HomER, 153.6 video s) in 1,322 s on H200 = 0.116 video-h per container-h (docs/exact-concurrency.md)",
+      "preset": "exact", "kind": "segcap", "cameras": 1, "concurrency": 4,
+      "container_s_per_video_s": 7.0, "uncertainty": 0.35, "status": "measured",
+      "image": "img_hfref (torch 2.11.0+cu128)", "requires": [],
+      "provenance": "S1 fast composite c=4 on H200: 6 episodes (81.0 video s) in 566 s = 0.143 video-h per GPU-h; generation is ~3x slower on cu128 (cold cuDNN graph builds), so this is the current image as is (docs/exact-worker.md, docs/perf-1.md)",
       "date": "2026-10-21"
     },
     {
       "preset": "exact", "kind": "segcap", "cameras": 1, "concurrency": 4,
-      "container_s_per_video_s": 4.08, "uncertainty": 0.35, "status": "measured",
-      "provenance": "W3-A run 1 concurrency 4: same 4 episodes in 626 s = 0.245 video-h per container-h, straggler-bound (docs/exact-concurrency.md)",
+      "container_s_per_video_s": 4.35, "uncertainty": 0.35, "status": "projected",
+      "image": "img_hfref (torch 2.11.0+cu128)", "requires": ["gpu_thread"],
+      "provenance": "Perf-1 projection with gpu_thread (persistent generate thread keeps cuDNN graphs warm): GPU bound drops from 6.3 to <= 3.9 GPU-s per video-s, W3-A's 0.245 video-h per container-h is the CPU/straggler ceiling at c=4 = ~0.23 video-h per container-h. Not measured until P1a-5s wires and runs gpu_thread (docs/perf-1.md)",
       "date": "2026-10-21"
     },
     {
       "preset": "exact", "kind": "segcap", "cameras": 1, "concurrency": 8,
-      "container_s_per_video_s": 2.5, "uncertainty": 0.5, "status": "projected",
-      "provenance": "W3-A steady-state projection: 1.9 GPU-s per video-s at ~90% lock occupancy +16% contention = ~0.40 video-h per container-h; needs a >=8-episode batch to confirm (docs/exact-concurrency.md)",
+      "container_s_per_video_s": 2.5, "uncertainty": 0.6, "status": "projected",
+      "image": "img_hfref (torch 2.11.0+cu128)", "requires": ["gpu_thread"],
+      "provenance": "W3-A steady-state projection (1.9 GPU-s per video-s at ~90% lock occupancy +16% contention = ~0.40 video-h per container-h); valid only with gpu_thread and a long-lived container with a warm Captioner, otherwise ~4 (the +60% bar) (docs/perf-1.md, docs/exact-concurrency.md)",
+      "date": "2026-10-21"
+    },
+    {
+      "preset": "exact", "kind": "segcap", "cameras": 1, "concurrency": 1,
+      "container_s_per_video_s": 8.62, "uncertainty": 0.35, "status": "stale",
+      "image": "img_hfref (torch 2.11.0+cu130, pre-Fix-images)", "requires": [],
+      "provenance": "W3-A run 1 sequential on the cu130 image: 4 WS-D episodes (1080p HomER, 153.6 video s) in 1,322 s on H200 = 0.116 video-h per container-h (docs/exact-concurrency.md). Not valid for cu128",
+      "date": "2026-10-21"
+    },
+    {
+      "preset": "exact", "kind": "segcap", "cameras": 1, "concurrency": 4,
+      "container_s_per_video_s": 4.08, "uncertainty": 0.35, "status": "stale",
+      "image": "img_hfref (torch 2.11.0+cu130, pre-Fix-images)", "requires": [],
+      "provenance": "W3-A run 1 concurrency 4 on the cu130 image: 626 s = 0.245 video-h per container-h (docs/exact-concurrency.md). Superseded by S1 on cu128 (7.0)",
       "date": "2026-10-21"
     },
     {
       "preset": "exact", "kind": "segcap", "cameras": 3, "concurrency": 1,
-      "container_s_per_video_s": 3.97, "uncertainty": 0.5, "status": "measured",
-      "provenance": "W3-A run 2 sequential: 2x ALOHA 3-view (640x480, 44.0 video s) in 175 s = 0.252 video-h per container-h; low resolution, 2 episodes (docs/exact-concurrency.md)",
+      "container_s_per_video_s": 3.97, "uncertainty": 0.5, "status": "stale",
+      "image": "img_hfref (torch 2.11.0+cu130, pre-Fix-images)", "requires": [],
+      "provenance": "W3-A run 2 sequential on the cu130 image: 2x ALOHA 3-view (640x480, 44.0 video s) in 175 s; low resolution, 2 episodes (docs/exact-concurrency.md). 3-view lookups now fall back to the 1-view cu128 rows",
       "date": "2026-10-21"
     },
     {
       "preset": "exact", "kind": "segcap", "cameras": 3, "concurrency": 2,
-      "container_s_per_video_s": 2.39, "uncertainty": 0.5, "status": "measured",
-      "provenance": "W3-A run 2 concurrency 2: 105 s = 0.418 video-h per container-h (docs/exact-concurrency.md)",
+      "container_s_per_video_s": 2.39, "uncertainty": 0.5, "status": "stale",
+      "image": "img_hfref (torch 2.11.0+cu130, pre-Fix-images)", "requires": [],
+      "provenance": "W3-A run 2 concurrency 2 on the cu130 image: 105 s (docs/exact-concurrency.md)",
       "date": "2026-10-21"
     },
     {
       "preset": "*", "kind": "reward.terminal", "cameras": "*", "concurrency": 1,
-      "container_s_per_video_s": 0.1, "uncertainty": 1.0, "status": "projected",
-      "provenance": "WS-H batched terminal: 3 episodes (76.9 video s) in 2.25-2.96 s of llm.generate = 0.03-0.04; padded ~3x for decode/collage, which was not timed separately (docs/rewarder-smoke.md)",
+      "container_s_per_video_s": 0.055, "uncertainty": 1.0, "status": "measured",
+      "image": "img_vllm (vllm 0.24.0)", "requires": [],
+      "provenance": "WS-H round 2 run B, warm H100! engine, aligned rounds with thread decode: 9 episodes (3 samples x 3 phrasings, 230.7 video s) in 11.3 s wall (terminal) / 12.7 s (with rationale) = 0.049-0.055; 3 distinct 640x480 3-view samples only (docs/rewarder-smoke.md)",
       "date": "2026-10-21"
     },
     {
       "preset": "*", "kind": "reward.dense", "cameras": "*", "concurrency": 1,
-      "container_s_per_video_s": 0.3, "uncertainty": 1.0, "status": "projected",
-      "provenance": "WS-H batched dense: 9 clips of 3 episodes (76.9 video s) in 8.62 s of llm.generate = 0.11; padded ~3x for decode/collage, not timed separately (docs/rewarder-smoke.md)",
+      "container_s_per_video_s": 0.165, "uncertainty": 1.0, "status": "measured",
+      "image": "img_vllm (vllm 0.24.0)", "requires": [],
+      "provenance": "WS-H round 2 run B, warm H100! engine, aligned rounds with thread decode: 9 episodes (230.7 video s, 27 clips) in 38.0 s wall = 0.165; 3 distinct samples only (docs/rewarder-smoke.md)",
       "date": "2026-10-21"
     },
     {
       "preset": "*", "kind": "reward.rubric", "cameras": "*", "concurrency": 1,
       "container_s_per_video_s": 0.75, "uncertainty": 1.0, "status": "placeholder",
+      "image": null, "requires": [],
       "provenance": "not measured; jobs.manifest.DEFAULT_RATES 1.5 GPU-s per video-s on a TP=2 container",
       "date": "2026-10-21"
     },
     {
       "preset": "balanced", "kind": "segment", "cameras": "*", "concurrency": 1,
       "container_s_per_video_s": 0.5, "uncertainty": 1.0, "status": "placeholder",
+      "image": null, "requires": [],
       "provenance": "not measured (vLLM TempSeg lands in P1b-1); jobs.manifest.DEFAULT_RATES",
       "date": "2026-10-21"
     },
     {
       "preset": "balanced", "kind": "caption", "cameras": "*", "concurrency": 1,
       "container_s_per_video_s": 1.0, "uncertainty": 1.0, "status": "placeholder",
+      "image": null, "requires": [],
       "provenance": "not measured (vLLM Captioner lands in P1b-1); jobs.manifest.DEFAULT_RATES",
       "date": "2026-10-21"
     }
   ],
   "startup": [
     {
-      "preset": "exact", "kind": "segcap", "startup_s": 213, "uncertainty": 0.2, "status": "measured",
-      "provenance": "W3-A @modal.enter 213 s (run 1) / 169 s (run 2) / 251 s (WS-D); W3-B recipe expects 125-140 s once applied (docs/exact-concurrency.md, docs/cold-start.md)",
+      "preset": "exact", "kind": "segcap", "startup_s": 103, "uncertainty": 1.0, "status": "measured",
+      "provenance": "S1 @modal.enter on cu128 img_hfref: 102.9 s (link farm, prefetch, BF16 Captioner from the page cache); the synchronous full BF16 hash added since is not measured, and earlier images took 169-251 s (W3-A, WS-D), hence +/-100% (docs/exact-worker.md)",
       "date": "2026-10-21"
     },
     {
-      "preset": "*", "kind": "reward.*", "startup_s": 224, "uncertainty": 0.5, "status": "measured",
-      "provenance": "W3-B fresh H100 container, warm compile cache + prefetch: 224 s; fully cold 341 s; WS-H worst case 929 s (docs/cold-start.md, docs/rewarder-smoke.md)",
+      "preset": "*", "kind": "reward.*", "startup_s": 229, "uncertainty": 0.5, "status": "measured",
+      "provenance": "WS-H round 2 run B, fresh H100! container with warm compile cache + prefetch: 229 s; cold cache 318 s; no recipe ~930 s (docs/rewarder-smoke.md, docs/cold-start.md)",
       "date": "2026-10-21"
     },
     {

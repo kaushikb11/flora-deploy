@@ -14,6 +14,15 @@ persists results per round:
   rounds fill across episodes for throughput, outside ``exact``. Rounds never change the
   requests themselves, and with a content-keyed fake LLM every grouping gives the same records
   (tested); only numerics can tell groupings apart.
+- **Stable NVIDIA groups (review 4 M3).** NVIDIA's terminal score depends on its batch-mates.
+  The default grouping is a pure function of the *planned* episode order (``run(planned=...)``:
+  the job's or shard's original episode list, as NVIDIA's script would read a jobs file):
+  episode at planned position ``p`` belongs to terminal group ``p // max_num_seqs``, and dense
+  clip ``j`` of an episode to chunk ``j // max_num_seqs``. Episodes already done, failed or
+  skipped on a resume or bisection leave *holes* in their group (a partial group) and never
+  shift the other groups' boundaries. Every audit records its ``grouping`` (group id, planned
+  members, the batch that actually ran, ``aligned`` and why not: ``partial_group``,
+  ``budget_split``, ``retry_singleton``, ``packed``).
 - Video decoding (NVIDIA's ``Collage``) runs on a thread pool or a spawn process pool
   (``nv.pool_initializer()``), a bounded number of episodes ahead, so round k+1 decodes while
   round k generates.
@@ -68,8 +77,9 @@ import math
 import os
 import shutil
 import time
+import warnings
 from collections import deque
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import Executor, Future, ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -106,12 +116,36 @@ def with_rationale(mode: str) -> bool:
     return check_mode(mode) == "terminal_rationale"
 
 
+TERMINAL_MODE_ENV = "FLORA_REWARD_TERMINAL_MODE"  # deprecated (review 4 M4)
+
+
+def terminal_mode(terminal_rationale: bool, env: Mapping[str, str] | None = None) -> str:
+    """The ``reward.terminal`` mode from the config (``pipeline.terminal_rationale``, hashed in
+    the reward.terminal stage hash). ``FLORA_REWARD_TERMINAL_MODE`` in ``env`` is a deprecated
+    override: it may only repeat the config's choice; a different value raises ``ValueError``
+    (an unhashed side channel must not change outputs)."""
+    mode = "terminal_rationale" if terminal_rationale else "terminal"
+    legacy = (env or {}).get(TERMINAL_MODE_ENV)
+    if legacy:
+        if legacy != mode:
+            raise ValueError(f"{TERMINAL_MODE_ENV}={legacy!r} disagrees with the config "
+                             f"(pipeline.terminal_rationale={terminal_rationale} -> {mode!r}); "
+                             "set pipeline.terminal_rationale instead")
+        warnings.warn(f"{TERMINAL_MODE_ENV} is deprecated; pipeline.terminal_rationale decides "
+                      "the terminal mode", DeprecationWarning, stacklevel=2)
+    return mode
+
+
 @dataclass(frozen=True)
 class Episode:
     """One episode: camera videos in NVIDIA's collage order (2 views L/R, 3 views L/C/R).
 
     ``envelope_ok`` is the EpisodeIndex's verdict on NVIDIA's reference envelope (``None``: no
     verdict, e.g. an ad-hoc jobs file); it decides ``certified`` on the record.
+
+    ``sources``: per video, in ``videos`` order, ``(role, dataset uri, start_s, end_s)`` of the
+    episode in the *source* dataset (``None`` bounds: the whole file). When set, record
+    provenance names these instead of the local (possibly cut) path NVIDIA read (review 4 L4).
     """
 
     id: str
@@ -119,6 +153,7 @@ class Episode:
     videos: tuple[str, ...]
     dataset: str = "local"
     envelope_ok: bool | None = None
+    sources: tuple[tuple[str, str, float | None, float | None], ...] = ()
 
     @property
     def uid(self) -> str:
@@ -169,6 +204,9 @@ def validate_episodes(episodes: Sequence[Episode]) -> list[Episode]:
         if relative:
             raise ValueError(f"episode {ep.uid!r}: relative video paths {relative}; resolve them "
                              "(Episode.from_job(root=...)) first")
+        if ep.sources and len(ep.sources) != len(ep.videos):
+            raise ValueError(f"episode {ep.uid!r}: {len(ep.sources)} sources for "
+                             f"{len(ep.videos)} videos")
     return episodes
 
 
@@ -354,6 +392,9 @@ class Request:
     multi_modal_data: dict[str, Any]
     mm_processor_kwargs: dict[str, Any]
     est_bytes: int = 0
+    # NVIDIA group (``align="nvidia"``): terminal ``planned_position // group``; dense
+    # ``(planned_position, clip // group)``. ``None``: count-based boundaries.
+    group: Any = None
 
     def as_vllm(self) -> dict[str, Any]:
         return {
@@ -424,8 +465,10 @@ class RoundLimits:
     ``align`` decides how requests are grouped inside those bounds:
 
     - ``"nvidia"`` (default, the ``exact`` preset): every round is exactly one of the
-      ``generate`` calls NVIDIA's script makes: the next ``nvidia_group`` (``max_num_seqs``, 8)
-      episodes for terminal, the next ``nvidia_group`` clips *of one episode* for dense. Batch
+      ``generate`` calls NVIDIA's script makes on the *planned* episode list: terminal group
+      ``planned_position // nvidia_group`` (``max_num_seqs``, 8), dense chunk
+      ``clip // nvidia_group`` *of one episode*. Missing members leave a partial group; they
+      never move the other groups' boundaries (review 4 M3). Batch
       composition changes numerics on the real engine (measured on H100: greedy text and
       scores equal, terminal ``P(1..5)`` up to 0.03 apart between a 3-request call and calls of
       2 + 1), so only NVIDIA's own grouping reproduces NVIDIA's outputs. 8 four-view requests
@@ -458,9 +501,12 @@ class RoundLimits:
         return count + 1 <= self.max_requests and size + request.est_bytes <= self.max_bytes
 
     def boundary(self, mode: str, batch: Sequence[Request], request: Request) -> bool:
-        """NVIDIA's call boundary before ``request`` (``align="nvidia"``)."""
+        """NVIDIA's call boundary before ``request`` (``align="nvidia"``): a new group starts,
+        or (without group ids) the count-based rule on the list as given."""
         if self.align != "nvidia" or not batch:
             return False
+        if request.group is not None:
+            return request.group != batch[-1].group
         if mode == "dense":
             return request.episode != batch[0].episode or len(batch) >= self.nvidia_group
         return len(batch) >= self.nvidia_group
@@ -556,7 +602,10 @@ def config_hash(nv, mode: str, *, spec: EngineSpec | None, models: dict[str, str
                 tail_trim_s: float | None, extra: dict[str, Any] | None = None) -> str:
     """sha256 over everything that changes this stage's outputs (D11): engine arguments,
     sampling (max tokens, regex), tail trim, model pins, logic version, ``extra`` (e.g. the
-    image fingerprint). Round limits and the decoder are excluded: they never change outputs."""
+    image fingerprint). The decoder is excluded (it never changes outputs). Round limits are
+    excluded too, but they are *not* output-neutral in general: ``align="packed"`` and budget
+    splits change batch composition, hence numerics. ``exact`` uses ``align="nvidia"``, whose
+    groups depend only on the planned order, and every audit records its ``grouping``."""
     from flora_deploy import LOGIC_VERSION
 
     core = nv.core
@@ -779,6 +828,34 @@ def _prepared_stream(nv, mode: str, episodes: Sequence[Episode], pool: Executor 
             yield Prepared(error={**_failure(exc), "kind": "infra"})
 
 
+def plan_positions(episodes: Sequence[Episode], planned: Sequence[str] | None, offset: int,
+                   group: int) -> tuple[list[int], Callable[[int], list[str]]]:
+    """Planned position of every episode, and ``members(g)``: the planned uids of terminal
+    group ``g`` (positions ``g*group .. (g+1)*group - 1``). ``episodes`` must be a subsequence
+    of ``planned``, in planned order (a caller bug otherwise, so it raises)."""
+    if offset < 0:
+        raise ValueError(f"planned_offset {offset} < 0")
+    uids = [e.uid for e in episodes] if planned is None else [str(u) for u in planned]
+    index: dict[str, int] = {}
+    for i, uid in enumerate(uids):
+        if uid in index:
+            raise ValueError(f"planned episode order lists {uid!r} twice")
+        index[uid] = i
+    positions = []
+    for ep in episodes:
+        if ep.uid not in index:
+            raise ValueError(f"episode {ep.uid!r} is not in the planned episode order")
+        positions.append(offset + index[ep.uid])
+    if any(b <= a for a, b in zip(positions, positions[1:], strict=False)):
+        raise ValueError("episodes are not in their planned order (NVIDIA groups follow it)")
+
+    def members(g: int) -> list[str]:
+        lo, hi = max(0, g * group - offset), max(0, (g + 1) * group - offset)
+        return uids[lo:hi]
+
+    return positions, members
+
+
 def run(llm, nv, processor, episodes: Sequence[Episode], mode: str, *,
         tail_trim_s: float | None = None, spec: EngineSpec | None = None,
         models: dict[str, str] | None = None, gpu: str | None = None, preset: str = "exact",
@@ -786,14 +863,24 @@ def run(llm, nv, processor, episodes: Sequence[Episode], mode: str, *,
         limits: RoundLimits | None = None, decoder: str = "thread", workers: int = 4,
         lookahead: int | None = None, sink: PartSink | None = None,
         audit_ref: Callable[[Episode], str] | None = None, shard_id: str = "adhoc",
-        container_id: str = "local", clock: Callable[[], float] = time.perf_counter
+        container_id: str = "local", clock: Callable[[], float] = time.perf_counter,
+        planned: Sequence[str] | None = None, planned_offset: int = 0,
         ) -> RewardRun:
-    """Score ``episodes`` in ``mode`` in size-bounded ``llm.generate`` rounds (module doc)."""
+    """Score ``episodes`` in ``mode`` in size-bounded ``llm.generate`` rounds (module doc).
+
+    ``planned``: the original planned episode uids (the job's episode order, or the shard's
+    with ``planned_offset`` = the shard's first job position), of which ``episodes`` is the
+    remaining subsequence. NVIDIA groups are taken from these positions, so a resume or a
+    bisection that drops done/failed episodes keeps every other episode's batch-mates. Without
+    it, positions are the indices of ``episodes`` (NVIDIA's script run on this list)."""
     check_mode(mode)
     episodes = validate_episodes(episodes)
     limits = limits or RoundLimits()
     if spec is not None and limits.align == "nvidia":  # NVIDIA's group is its max_num_seqs
         limits = dataclasses.replace(limits, nvidia_group=int(spec.args["max_num_seqs"]))
+    positions, members_of = plan_positions(episodes, planned, planned_offset,
+                                           limits.nvidia_group)
+    anchor = "list" if planned is None else "planned"
     lookahead = lookahead or max(2, 2 * workers)
     stage = STAGES[mode]
     trim = nv.core.DENSE_TAIL_TRIM_S if tail_trim_s is None else tail_trim_s
@@ -807,6 +894,8 @@ def run(llm, nv, processor, episodes: Sequence[Episode], mode: str, *,
         "budget_splits": 0,
         "requests": [], "flagged": {}, "limits": asdict(limits), "decoder": decoder,
         "workers": workers if decoder != "inline" else 0, "config_hash": base.config_hash,
+        "grouping": {"align": limits.align, "anchor": anchor, "group": limits.nvidia_group,
+                     "planned_offset": planned_offset, "unaligned": 0},
     }
     out = RewardRun(mode, [], [], [], stats)
     if not episodes:
@@ -822,6 +911,48 @@ def run(llm, nv, processor, episodes: Sequence[Episode], mode: str, *,
     answers: dict[int, dict[int, Any]] = {}  # episode -> {position: (output | None, usage)}
     failed: dict[int, dict[str, Any]] = {}
     pending = {"records": [], "audits": [], "errors": []}
+    batch_of: dict[int, list[str]] = {}  # episode -> uids of the generate call it ran in
+    split_groups: set[Any] = set()  # NVIDIA groups a byte-budget split cut in two
+    retried: set[int] = set()  # episodes re-run alone after a failed group call
+    group_size = limits.nvidia_group
+
+    def grouping(number: int) -> dict[str, Any]:
+        pos = positions[number]
+        reasons: list[str] = []
+        out_g: dict[str, Any] = {"anchor": anchor, "position": pos}
+        if mode == "dense":
+            out_g["grouping_id"] = f"dense:{pos}"
+            out_g["chunks"] = math.ceil(expected[number] / group_size)
+            if any(isinstance(g, tuple) and g[0] == pos for g in split_groups):
+                reasons.append("budget_split")
+        else:
+            g = pos // group_size
+            members = members_of(g)
+            out_g.update(grouping_id=f"terminal:{g}", members=members,
+                         batch=batch_of.get(number, []))
+            if out_g["batch"] != members:
+                reasons.append("partial_group")
+            if g in split_groups:
+                reasons.append("budget_split")
+        if number in retried:
+            reasons.append("retry_singleton")
+        if limits.align != "nvidia":
+            reasons = ["packed"]
+        out_g["aligned"] = not reasons
+        out_g["reasons"] = reasons
+        return out_g
+
+    def source_of(ep: Episode, number: int) -> dict[str, dict[str, Any]]:
+        duration = round(facts[number].duration_s, 6)
+        if not ep.sources:  # ad-hoc episodes: the files NVIDIA read
+            return {f"camera_{i}": {"uri": v, "range_s": [0.0, duration]}
+                    for i, v in enumerate(ep.videos)}
+        out_s = {}
+        for role, uri, start, end in ep.sources:
+            lo = 0.0 if start is None else float(start)
+            hi = lo + duration if end is None else float(end)
+            out_s[role] = {"uri": uri, "range_s": [lo, hi]}
+        return out_s
 
     def error(number: int, kind: str, message: str, **diagnostics) -> None:
         ep = episodes[number]
@@ -860,16 +991,19 @@ def run(llm, nv, processor, episodes: Sequence[Episode], mode: str, *,
                   outputs=[o.outputs[0].text for o, _ in outs])
             return
         certified, reason = certification(ep)
-        provenance = dataclasses.replace(base, source={
-            f"camera_{i}": {"uri": v, "range_s": [0.0, round(facts[number].duration_s, 6)]}
-            for i, v in enumerate(ep.videos)})
+        group_info = grouping(number)
+        if not group_info["aligned"] and limits.align == "nvidia":
+            flags["unaligned"] = group_info["reasons"]
+            stats["grouping"]["unaligned"] += 1
+        provenance = dataclasses.replace(base, source=source_of(ep, number))
         pending["records"].append(StageRecord(
             uid=ep.uid, dataset=ep.dataset, episode_id=ep.id, stage=stage,
             provenance=provenance, certified=certified, uncertified_reason=reason,
             audit_ref=audit_ref(ep) if audit_ref else None, **body))
         pending["audits"].append({"uid": ep.uid, "episode_id": ep.id, "stage": stage,
                                   "mode": mode, "config_hash": base.config_hash,
-                                  "nv": nv_record, "requests": usage, "flags": flags})
+                                  "nv": nv_record, "requests": usage, "flags": flags,
+                                  "grouping": group_info})
         if flags:
             stats["flagged"][ep.uid] = flags
 
@@ -895,6 +1029,7 @@ def run(llm, nv, processor, episodes: Sequence[Episode], mode: str, *,
                 failed.setdefault(number, {"kind": "infra", "message": f"generate: {exc!r}"})
                 return [(r, None) for r in batch]
             stats["retries"] += 1
+            retried.update(groups)  # their batch-mates change: not NVIDIA's call any more
             results, ok = [], 0
             for group in groups.values():
                 part = generate(group)
@@ -908,6 +1043,9 @@ def run(llm, nv, processor, episodes: Sequence[Episode], mode: str, *,
         t0 = clock()
         pairs = generate(batch) if batch else []
         t1 = clock()
+        uids = list(dict.fromkeys(episodes[r.episode].uid for r in batch))
+        for r in batch:
+            batch_of[r.episode] = uids
         for r, o in pairs:
             r.multi_modal_data = {}  # drop frame arrays as soon as the engine is done
             usage = {"window": r.window, **(_usage(o) if o is not None else {})}
@@ -955,12 +1093,18 @@ def run(llm, nv, processor, episodes: Sequence[Episode], mode: str, *,
                 continue
             facts[number], plans[number] = prepared.facts, prepared.plan
             expected[number], answers[number] = len(requests), {}
+            if limits.align == "nvidia":
+                pos = positions[number]
+                for j, request in enumerate(requests):
+                    request.group = (pos, j // group_size) if mode == "dense" else (
+                        pos // group_size)
             for request in requests:
                 aligned = limits.boundary(mode, batch, request)
                 fits = limits.fits(len(batch), size, request)
                 if aligned or not fits:
                     if not fits and not aligned and limits.align == "nvidia":
                         stats["budget_splits"] += 1
+                        split_groups.add(request.group)
                     flush(k, batch, wait)
                     k, batch, size, wait = k + 1, [], 0, 0.0
                 batch.append(request)

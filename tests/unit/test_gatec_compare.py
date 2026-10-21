@@ -224,6 +224,33 @@ def test_gate_verdict_needs_clean_builds_and_full_coverage():
     v = verdict(results=bad)
     assert not v["passed"] and v["failed_cases"] == ["golden-human"]
 
+    # review 4 L3: a golden pool below its request quota fails (the recorded run's tianji
+    # TempSeg had 5 of 6)
+    v = G.gate_verdict(builds, results, expected_parts=parts, expected_cases=cases, quota=2)
+    assert not v["passed"]
+    assert "tempseg golden:human: 1 of 2 requests (quota shortfall)" in v["problems"]
+    assert G.gate_verdict(builds, results, expected_parts=parts, expected_cases=cases,
+                          quota=1)["passed"]
+    own = [dict(b, quota=3) if b["part"].startswith("golden:") else b for b in builds]
+    assert not G.gate_verdict(own, results, expected_parts=parts, expected_cases=cases)["passed"]
+    assert any("no quota" in w for w in verdict()["warnings"])
+
+    # review 3 C2: an HF reference outside img_hfref needs a passing cross-check
+    def ref(image, check=None):
+        return G.gate_verdict(builds, results, expected_parts=parts, expected_cases=cases,
+                              quota=1, reference={"image": image, "cross_check": check})
+
+    assert ref("img_hfref")["passed"]
+    assert not ref("img_vllm")["passed"]
+    rec = [{"case_id": "c", "index": 0, "hf_ids_digest": "a", "hf_pixels_digest": "p"}]
+    good_check = G.reference_cross_check(rec, rec)
+    assert good_check == {"passed": True, "compared": 1, "mismatches": [], "missing": []}
+    assert ref("img_vllm", good_check)["passed"]
+    drift = G.reference_cross_check(rec, [{**rec[0], "hf_pixels_digest": "q"}])
+    assert drift["mismatches"] == ["c#0"] and not ref("img_vllm", drift)["passed"]
+    assert not G.reference_cross_check(rec, [])["passed"]
+    assert any("C2" in w for w in verdict()["warnings"])
+
 
 def test_results_provenance():
     calls = []

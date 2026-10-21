@@ -410,17 +410,47 @@ def render_report(rows: Sequence[dict], *, primary: str = "wrapped") -> str:
     return "\n".join(lines) + "\n"
 
 
+REFERENCE_IMAGE = "img_hfref"  # where NVIDIA's HF reference runs in production (`exact`)
+
+
+def reference_cross_check(primary: Sequence[dict], reference: Sequence[dict]) -> dict:
+    """Review 3 C2: stage-1 records built in two images (e.g. ``img_vllm`` and ``img_hfref``)
+    must give the same HF reference. Each record is ``{case_id, index, hf_ids_digest,
+    hf_pixels_digest}`` (digests only); returns ``{passed, compared, mismatches, missing}``."""
+    def key(r: dict) -> tuple[str, int]:
+        return str(r["case_id"]), int(r["index"])
+
+    a = {key(r): r for r in primary}
+    b = {key(r): r for r in reference}
+    fields = ("hf_ids_digest", "hf_pixels_digest")
+    mismatches = sorted(f"{k[0]}#{k[1]}" for k in set(a) & set(b)
+                        if any(a[k].get(f) != b[k].get(f) or a[k].get(f) is None
+                               for f in fields))
+    missing = sorted(f"{k[0]}#{k[1]}" for k in set(a) ^ set(b))
+    compared = len(set(a) & set(b))
+    return {"passed": compared > 0 and not mismatches and not missing, "compared": compared,
+            "mismatches": mismatches, "missing": missing}
+
+
 def gate_verdict(builds: Sequence[dict], results: dict[str, dict], *,
                  expected_parts: Sequence[tuple[str, str]], expected_cases: Sequence[str],
-                 variant: str = PRIMARY_VARIANT) -> dict:
+                 variant: str = PRIMARY_VARIANT, quota: int | None = None,
+                 reference: dict | None = None) -> dict:
     """The Gate C verdict over a whole run, not just the rows that exist.
 
-    ``builds``: ``build_part`` results (``kind``, ``part``, ``n``, ``errors``); ``results``: kind
-    -> ``run_gate_c`` result (``rows``). PASS needs every expected (kind, part) built with no
-    error and at least one request, a ``variant`` row for every built request, every expected
-    case present, and every ``variant`` row passed. A pool whose builds all failed is a FAIL,
-    never a silent ``n/a``."""
+    ``builds``: ``build_part`` results (``kind``, ``part``, ``n``, ``errors``, optionally
+    ``quota``); ``results``: kind -> ``run_gate_c`` result (``rows``). PASS needs every expected
+    (kind, part) built with no error and at least one request, every ``golden:<pool>`` part at
+    its request quota (``quota``, or the build's own ``quota``: a shortfall fails, review 4 L3),
+    a ``variant`` row for every built request, every expected case present, and every
+    ``variant`` row passed. A pool whose builds all failed is a FAIL, never a silent ``n/a``.
+
+    ``reference``: ``{"image": <where the HF reference ran>, "cross_check":
+    reference_cross_check(...)}`` (review 3 C2). If the HF side ran anywhere but ``img_hfref``,
+    a passing cross-check against ``img_hfref`` is required; without ``reference`` the verdict
+    carries a warning."""
     problems: list[str] = []
+    warnings: list[str] = []
     by_part = {(b["kind"], b["part"]): b for b in builds}
     for kind, part in expected_parts:
         b = by_part.get((kind, part))
@@ -431,6 +461,20 @@ def gate_verdict(builds: Sequence[dict], results: dict[str, dict], *,
             problems.append(f"{kind} {part}: {len(b['errors'])} build error(s) {classes}")
         elif not b.get("n"):
             problems.append(f"{kind} {part}: 0 requests")
+        elif part.startswith("golden:"):
+            want = b.get("quota", quota)
+            if want is not None and b["n"] < want:
+                problems.append(f"{kind} {part}: {b['n']} of {want} requests (quota shortfall)")
+            elif want is None:
+                warnings.append(f"{kind} {part}: no quota given; shortfalls not checked")
+    if reference is None:
+        warnings.append("HF reference image not recorded (review 3 C2)")
+    elif reference.get("image") != REFERENCE_IMAGE:
+        check = reference.get("cross_check") or {}
+        if not check.get("passed"):
+            problems.append(f"HF reference ran in {reference.get('image')!r}, not "
+                            f"{REFERENCE_IMAGE!r}, and no passing cross-check against "
+                            f"{REFERENCE_IMAGE!r} (review 3 C2)")
     coverage: dict[str, dict[str, int]] = {}
     for kind in sorted({k for k, _ in expected_parts} | set(results)):
         built = sum(b.get("n", 0) for b in builds if b["kind"] == kind)
@@ -447,7 +491,7 @@ def gate_verdict(builds: Sequence[dict], results: dict[str, dict], *,
     failed = sorted(c for c, ok in verdicts.items() if not ok)
     return {"passed": not problems and not failed and bool(verdicts), "variant": variant,
             "failed_cases": failed, "problems": problems, "coverage": coverage,
-            "cases": verdicts}
+            "cases": verdicts, "warnings": warnings}
 
 
 def _git(args: Sequence[str], cwd: str | None) -> str | None:

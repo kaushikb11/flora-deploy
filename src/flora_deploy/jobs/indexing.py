@@ -61,9 +61,11 @@ INDEX_VERSION = "1"  # bump when the receipt layout or the indexing procedure ch
 MAX_EPISODES_PER_UNIT = 64
 ENVELOPE_POLICIES = ("warn", "enforce", "ignore")
 # The code that decides every receipt value; its digest is part of the index code version.
-_CODE_FILES = ("media/index.py", "media/types.py", "media/sources/base.py",
-               "media/sources/lerobot_v21.py", "media/sources/lerobot_v3.py",
-               "media/sources/mp4_dir.py")
+# Includes this module (episode ranges, task / instruction, envelope verdict, profiles; review 4
+# M2), so an indexing fix invalidates the job-scoped receipts that ``resume_key`` reuses.
+_CODE_FILES = ("media/index.py", "media/types.py", "media/sources/__init__.py",
+               "media/sources/base.py", "media/sources/lerobot_v21.py",
+               "media/sources/lerobot_v3.py", "media/sources/mp4_dir.py", "jobs/indexing.py")
 _PROFILES = {"human": ("human", False), "yam": ("yam", False), "yam32": ("yam", True),
              "dex": ("dex", False), "tianji": ("tianji", False)}
 
