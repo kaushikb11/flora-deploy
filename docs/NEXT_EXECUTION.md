@@ -294,3 +294,31 @@ All on the same staged golden episodes, reusing containers where possible:
 4. **Balanced provisional certification** against step 2, plus a 3-episode noise run, ≈$2.
 
 **Gate to ask:** only after review 6 is clean and CI is green, so no GPU dollars are spent on bugs a CPU test could have caught.
+
+---
+
+## Update (2026-10-22): de-risking the one GPU session
+
+The biggest remaining risk is spending Wave H's GPU dollars on **deploy and plumbing bugs**:
+- media root and mounts;
+- secrets and stores;
+- worker-class names;
+- env forwarding;
+- orchestrator spawning into the deployed app;
+- `--receipt` and determinism flow.
+
+Local mode can't see these, and the canary only covers part of them. So, before any GPU:
+
+| Step | What | Cost | Subagents |
+|---|---|---|---|
+| **R6 fixes** | Fix whatever review 6 finds (e2e/README, balanced/rewards, segcap) | $0 | 2–3, by theme |
+| **H0 CPU rehearsal on real Modal** | `flora deploy --fake-models`: the **real factory app** with the real orchestrator, stores, Volumes, media staging, env and worker classes, but with the fake engines from G2 running in **CPU** containers. Then `flora index → plan → run → status → results` on 6 staged golden episodes (segcap + rewards), plus one `simulate_preemption()` and one injected poison episode. This rehearses exactly what Wave H will run, minus the models. | ≈$0.10 | 1 (builds `--fake-models` deploy mode: fake engines selectable per worker class in the factory; hashed so fake outputs never mix with real) |
+| **H runbook** | `scripts/wave_h.py`: the exact Wave H sequence (balanced preflight → exact e2e → balanced validation → provisional certification) with a spend check (`spend.py` + container-minute tracking) and a **stop rule between steps**, resumable, writing a single `docs/wave-h-report.md` | $0 to build | 1 |
+| **Ask user → Wave H** | Run the runbook | ≈$7–8 | coordinator |
+| **Post-H** | Fixes from H; certificates committed (metrics only); rates marked measured; PLAN v4 + docs (G5) with a docs-vs-code reviewer; worktree/branch cleanup | $0 | 2 |
+
+**Deferred (user decision later):**
+- full golden build (≈$9);
+- production-grade certificates over all pools;
+- a scale test;
+- posting upstream suggestions.
