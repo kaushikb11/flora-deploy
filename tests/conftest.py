@@ -1,4 +1,15 @@
 import os
+
+# CLI output must not depend on where the tests run. On GitHub Actions (GITHUB_ACTIONS) or with
+# FORCE_COLOR / PY_COLORS set, typer and rich force a colour terminal and wrap at the runner's
+# width, so plain-text assertions on --help and tables fail only in CI. Set before anything
+# imports typer/rich (they read these at import time); xdist workers load this file too.
+for _var in ("GITHUB_ACTIONS", "FORCE_COLOR", "PY_COLORS", "CLICOLOR_FORCE"):
+    os.environ.pop(_var, None)
+os.environ["NO_COLOR"] = "1"
+os.environ["TERM"] = "dumb"
+os.environ["COLUMNS"] = "200"
+os.environ["TERMINAL_WIDTH"] = "200"
 import re
 from pathlib import Path
 
