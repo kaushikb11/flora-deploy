@@ -12,9 +12,14 @@ episode's records are added to the sink when it finishes; the sink is copied to 
 ``flush_every`` finished episodes and at the end (and by ``preempt`` / ``@modal.exit``).
 
 The per-stage work is an ``EpisodeJob``: ``SegmentEpisodeJob`` (here) and
-``workers_impl.caption.CaptionEpisodeJob``. Errors are classified by ``classify_error``:
-anything raised by NVIDIA's code (its own exception classes, ``ValueError`` input errors,
-``nv.budget.ContextBudgetError``) is ``nv_failure``; engine and plumbing failures are ``infra``.
+``workers_impl.caption.CaptionEpisodeJob``. Errors are classified by ``_classify`` (review 6
+M1), which reuses segcap's classifiers per job phase (``phase``): ``inputs`` (index receipt,
+upstream records) by ``classify_input_error``, ``nvidia`` (NVIDIA's probe and stage) by
+``classify_nvidia_error`` (NVIDIA's classes, ``ValueError`` input checks, its builtin
+``RuntimeError`` rejections and ``ContextBudgetError`` are ``nv_failure``), ``records`` (our
+record building) never NVIDIA's. Only ``nv_failure`` is terminal; an ``infra`` / ``python`` /
+``oom`` episode error makes the shard raise ``ShardInfraError`` (no receipt, retried). A CUDA
+fault (``cuda_fatal``) stops the shard at once and calls ``fatal`` (``os._exit``) after the mark.
 
 Records are uncertified (``uncertified_stack``) until certificates exist; the job's config hash
 is stamped by the sink, the stage hash and the engine audit go to the audit lines.
@@ -26,7 +31,8 @@ import asyncio
 import json
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -48,12 +54,15 @@ from flora_deploy.jobs.types import (
 )
 from flora_deploy.records import StageRecord
 from flora_deploy.workers_impl.reward import (
+    ShardInfraError,
     ShardPartSink,
     VideoResolver,
     _container_ks,
+    cuda_fatal,
     default_container_id,
     parse_index_receipt,
 )
+from flora_deploy.workers_impl.segcap import classify_input_error, classify_nvidia_error
 
 # Golden / index pools -> NVIDIA ``api`` profile and the yam32 flag (when a receipt lacks them).
 POOL_PROFILES: Mapping[str, tuple[str, bool]] = {
@@ -140,21 +149,62 @@ def _nvidia_class(nv, cls: type) -> bool:
         return False
 
 
-def classify_error(nv, exc: BaseException) -> str:
-    """``nv_failure`` for NVIDIA's own semantics, ``infra`` for everything else."""
-    if isinstance(exc, EngineBatchError | BatcherClosed):
-        return "infra"
+PHASES = ("inputs", "nvidia", "records")
+_PLUMBING = (EngineBatchError, BatcherClosed, OSError, TimeoutError)
+
+
+@contextmanager
+def phase(name: str) -> Iterator[None]:
+    """Tag an exception raised inside the block with the job phase it came from
+    (``exc.flora_phase``) for :func:`_classify`. The innermost tag wins."""
+    try:
+        yield
+    except BaseException as exc:
+        if getattr(exc, "flora_phase", None) is None:
+            try:
+                exc.flora_phase = name  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001 - an exception without a __dict__
+                pass
+        raise
+
+
+def _classify(exc: BaseException, nv: Any = None) -> str:
+    """The single call site for the balanced failure taxonomy (review 6 M1): one of
+    ``nv_failure`` | ``infra`` | ``python`` | ``cuda_fatal`` | ``oom``. Reuses segcap's
+    classifiers (``classify_input_error`` for the ``inputs`` phase, ``classify_nvidia_error``
+    for the ``nvidia`` phase, the default), so the two paths cannot drift; the ``records``
+    phase (our record building) is never an NVIDIA verdict."""
+    from flora_deploy.nv.budget import ContextBudgetError
     from flora_deploy.stages.segment import EngineRequestError
 
-    if isinstance(exc, EngineRequestError):
+    msg = f"{type(exc).__name__}: {exc}"
+    if cuda_fatal(msg):
+        return "cuda_fatal"
+    if "out of memory" in msg.lower() or type(exc).__name__ == "OutOfMemoryError":
+        return "oom"
+    where = getattr(exc, "flora_phase", None) or "nvidia"
+    if isinstance(exc, _PLUMBING + (EngineRequestError,)):
         return "infra"
-    if nv is not None and any(_nvidia_class(nv, c) for c in type(exc).__mro__):
-        return "nv_failure"
-    from flora_deploy.nv.budget import ContextBudgetError
+    if where == "inputs":
+        kind = classify_input_error(exc)
+    elif where == "records":
+        kind = "infra"
+    elif isinstance(exc, ContextBudgetError):  # NVIDIA's InputErrorForModel guard
+        kind = "nv_failure"
+    else:
+        kind, _ = classify_nvidia_error(exc)
+        if kind == "infra" and nv is not None and \
+                any(_nvidia_class(nv, c) for c in type(exc).__mro__):
+            kind = "nv_failure"
+    if kind == "infra" and not isinstance(exc, OSError):
+        return "infra" if where == "inputs" else "python"
+    return kind
 
-    if isinstance(exc, ValueError | ContextBudgetError):
-        return "nv_failure"
-    return "infra"
+
+def classify_error(nv, exc: BaseException) -> str:
+    """``EpisodeError.kind`` for :func:`_classify`'s category: only ``nv_failure`` is
+    terminal; everything else is ``infra`` (retried, never excused)."""
+    return "nv_failure" if _classify(exc, nv) == "nv_failure" else "infra"
 
 
 # ---------------------------------------------------------------------------------------------
@@ -218,13 +268,21 @@ class SegmentEpisodeJob:
                   ) -> EpisodeOutcome:
         from flora_deploy.stages import segment as S
 
-        inp = await asyncio.to_thread(self.inputs, ref)
+        with phase("inputs"):
+            inp = await asyncio.to_thread(self.inputs, ref)
         t0 = time.perf_counter()
-        ep = await asyncio.to_thread(S.prepare_videos, self.nv, inp.paths, inp.profile,
-                                     yam32=inp.yam32, instruction=inp.instruction)
-        t1 = time.perf_counter()
-        res = await self.seg.segment(batcher, ep)
+        with phase("nvidia"):
+            ep = await asyncio.to_thread(S.prepare_videos, self.nv, inp.paths, inp.profile,
+                                         yam32=inp.yam32, instruction=inp.instruction)
+            t1 = time.perf_counter()
+            res = await self.seg.segment(batcher, ep)
         t2 = time.perf_counter()
+        with phase("records"):
+            return self._outcome(ref, inp, ep, res, t0, t1, t2)
+
+    def _outcome(self, ref, inp, ep, res, t0, t1, t2) -> EpisodeOutcome:
+        from flora_deploy.stages import segment as S
+
         prov = S.provenance("tempseg", engine_label=self.info.engine_label,
                             spec=self.info.engine_spec, models=self.info.models,
                             gpu=self.info.gpu, budget=self.budget,
@@ -274,8 +332,12 @@ class BalancedShardRunner:
                  settings: BalancedWorkerSettings, *,
                  call_id: Callable[[], str | None] = lambda: "",
                  clock: Callable[[], float] = time.time,
-                 observer: Callable[..., None] | None = None):
+                 observer: Callable[..., None] | None = None,
+                 fatal: Callable[[BaseException], None] | None = None):
+        """``fatal``: called after the shard is marked when a CUDA fault left the engine
+        unusable (``os._exit`` in the Modal worker, as ``RewardShardRunner``)."""
         self.store, self.engine, self.job, self.settings = store, engine, job, settings
+        self.fatal = fatal
         self.call_id, self.clock = call_id, clock
         self.observer = observer
         self.container_id = safe_key(settings.container_id)
@@ -308,7 +370,11 @@ class BalancedShardRunner:
             self._end(active, preempted=True)
             raise
         except Exception as exc:
-            self._end(active, error=f"{type(exc).__name__}: {exc}")
+            msg = f"{type(exc).__name__}: {exc}"
+            self._end(active, error=msg)
+            infra = exc.infra.values() if isinstance(exc, ShardInfraError) else ()
+            if self.fatal is not None and (cuda_fatal(msg) or any(map(cuda_fatal, infra))):
+                self.fatal(exc)  # the engine is unusable: replace the container
             raise
         finally:
             with self._lock:
@@ -345,12 +411,14 @@ class BalancedShardRunner:
                              error=error or "error", marker=active.marker)
         return True
 
-    def _error(self, uid: str, shard: Shard, exc: BaseException, phase: str) -> EpisodeError:
-        kind = classify_error(getattr(self.job, "nv", None), exc)
+    def _error(self, uid: str, shard: Shard, exc: BaseException, category: str
+               ) -> EpisodeError:
+        kind = "nv_failure" if category == "nv_failure" else "infra"
         return EpisodeError(uid=uid, stage=self.job.stage, shard_id=shard.shard_id,  # type: ignore[arg-type]
                             container_id=self.container_id, kind=kind,  # type: ignore[arg-type]
                             message=f"{type(exc).__name__}: {exc}"[:4000],
-                            diagnostics={"phase": phase, "type": type(exc).__name__,
+                            diagnostics={"phase": getattr(exc, "flora_phase", None) or "nvidia",
+                                         "category": category, "type": type(exc).__name__,
                                          "mro": [c.__name__ for c in type(exc).__mro__][:6]})
 
     def _run(self, active: _Active, manifests: StoreManifestSource) -> ShardReceipt:
@@ -383,6 +451,9 @@ class BalancedShardRunner:
 
         finished = done | sink.done
         failed = (sink.failed | poisoned) - finished
+        infra = {u: m for u, m in sink.infra.items() if u not in finished and u not in failed}
+        if infra:  # never terminal: no receipt, the shard is retried (as segcap / reward)
+            raise ShardInfraError(shard.shard_id, infra)
         missing = [u for u in shard.episodes if u not in finished and u not in failed]
         if missing:
             raise RuntimeError(f"shard {shard.shard_id!r}: no record or error for {missing}")
@@ -408,22 +479,38 @@ class BalancedShardRunner:
                                 max_pending_bytes=s.max_pending_bytes,
                                 observer=self.observer) as mb:
 
+            dead: list[BaseException] = []
+
             async def one(uid: str) -> None:
                 nonlocal finished
                 async with sem, mb.episode():
+                    if dead:  # the engine died under an earlier episode: never start
+                        return
                     try:
                         if uid not in refs:
                             raise KeyError(f"episode {uid!r} is not in the manifest")
                         out = await self.job.run(refs[uid], mb, ctx)
                     except Exception as exc:  # noqa: BLE001 - this episode's EpisodeError
-                        sink.add(errors=[self._error(uid, ctx.shard, exc, "episode")])
+                        category = _classify(exc, getattr(self.job, "nv", None))
+                        sink.add(errors=[self._error(uid, ctx.shard, exc, category)])
+                        if category == "cuda_fatal":  # the engine is dead: fail fast
+                            err = ShardInfraError(ctx.shard.shard_id,
+                                                  {uid: f"{type(exc).__name__}: {exc}"})
+                            dead.append(err)
+                            raise err from exc
                     else:
                         sink.add(records=out.records, audits=out.audits)
                 finished += 1
                 if finished % max(1, s.flush_every) == 0:
                     await asyncio.to_thread(sink.flush)
 
+            tasks = [asyncio.ensure_future(one(u)) for u in todo]
             try:
-                await asyncio.gather(*(one(u) for u in todo))
+                await asyncio.gather(*tasks)
+            except BaseException:
+                for t in tasks:
+                    t.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
             finally:
                 self.last_stats = mb.audit()["batcher"]["stats"]

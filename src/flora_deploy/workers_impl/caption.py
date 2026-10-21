@@ -28,6 +28,7 @@ from flora_deploy.workers_impl.segment import (
     EpisodeOutcome,
     ShardContext,
     StageInfo,
+    phase,
 )
 
 
@@ -88,15 +89,24 @@ class CaptionEpisodeJob:
         from flora_deploy.stages import caption as C
         from flora_deploy.stages import segment as S
 
-        seg_record = await asyncio.to_thread(self.segments, ref, ctx)
-        rows = S.rows_from_record(seg_record)
-        inp = await asyncio.to_thread(self.inputs, ref)
+        with phase("inputs"):
+            seg_record = await asyncio.to_thread(self.segments, ref, ctx)
+            rows = S.rows_from_record(seg_record)
+            inp = await asyncio.to_thread(self.inputs, ref)
         t0 = time.perf_counter()
-        ep = await asyncio.to_thread(S.prepare_videos, self.nv, inp.paths, inp.profile,
-                                     yam32=inp.yam32, instruction=inp.instruction)
-        t1 = time.perf_counter()
-        res = await self.cap.caption(batcher, ep, rows)
+        with phase("nvidia"):
+            ep = await asyncio.to_thread(S.prepare_videos, self.nv, inp.paths, inp.profile,
+                                         yam32=inp.yam32, instruction=inp.instruction)
+            t1 = time.perf_counter()
+            res = await self.cap.caption(batcher, ep, rows)
         t2 = time.perf_counter()
+        with phase("records"):
+            return self._outcome(ref, inp, ep, res, t0, t1, t2)
+
+    def _outcome(self, ref, inp, ep, res, t0, t1, t2) -> EpisodeOutcome:
+        from flora_deploy.stages import caption as C
+        from flora_deploy.stages import segment as S
+
         prov = S.provenance("captioner", engine_label=self.info.engine_label,
                             spec=self.info.engine_spec, models=self.info.models,
                             gpu=self.info.gpu, budget=self.budget,
