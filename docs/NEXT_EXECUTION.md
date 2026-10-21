@@ -322,3 +322,13 @@ Local mode can't see these, and the canary only covers part of them. So, before 
 - production-grade certificates over all pools;
 - a scale test;
 - posting upstream suggestions.
+
+**Decision (2026-10-22): Wave H-lite, ≈$3 total**, replaces the ≈$7–8 Wave H:
+1. H0 CPU rehearsal (≈$0.10);
+2. `exact` e2e on 6 short episodes, deterministic mode, one H200 container (≈$1);
+3. rewards on 3 episodes (≈$0.50);
+4. `balanced` preflight + validation on the same 6 episodes, L40S + H100, ≤10 min each (≈$1);
+5. provisional certification computed offline ($0);
+6. 2-episode default-mode noise run (≈$0.30).
+
+Each step has a projected-spend stop rule. The runbook runs only after review 6 is clean, CI is green and H0 passes.
