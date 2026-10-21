@@ -63,6 +63,7 @@ from flora_deploy.workers_impl.reward import (
     _container_ks,
     cuda_fatal,
     default_container_id,
+    end_failed_shard,
     parse_index_receipt,
 )
 from flora_deploy.workers_impl.segcap import classify_input_error, classify_nvidia_error
@@ -220,19 +221,27 @@ def classify_error(nv, exc: BaseException) -> str:
 _ENGINE_GONE = re.compile(r"engine[ _-]?core|enginedead|engine is dead|engine died", re.I)
 
 
+def is_crash(message: str) -> bool:
+    """A message meaning the container's engine is unusable: a CUDA fault or a dead vLLM
+    engine, whatever its wording (``EngineDeadError``, the engine-core process gone)."""
+    from flora_deploy.engines.offline_llm import engine_dead
+
+    return cuda_fatal(message) or engine_dead(message) or bool(_ENGINE_GONE.search(message))
+
+
 def container_fatal(exc: BaseException, engine: Any = None) -> bool:
     """Whether the container must be replaced after ``exc`` (review 8a R4): a CUDA fault, or
     the vLLM engine is dead whatever the message says (``EngineDead`` / ``EngineDeadError``,
     the engine-core process gone, ``OfflineEngine.dead`` set), in the shard error or in any of
     its episodes' infra errors."""
-    from flora_deploy.engines.offline_llm import EngineDead, engine_dead
+    from flora_deploy.engines.offline_llm import EngineDead
 
     msgs = [f"{type(exc).__name__}: {exc}"]
     if isinstance(exc, ShardInfraError):
         msgs += list(exc.infra.values())
     if isinstance(exc, EngineDead) or getattr(engine, "dead", None):
         return True
-    return any(cuda_fatal(m) or engine_dead(m) or _ENGINE_GONE.search(m) for m in msgs)
+    return any(map(is_crash, msgs))
 
 
 @dataclass
@@ -392,14 +401,12 @@ class BalancedShardRunner:
         except KeyboardInterrupt:
             self._end(active, preempted=True)
             raise
-        except Exception as exc:
-            msg = f"{type(exc).__name__}: {exc}"
-            crash = container_fatal(exc, self.engine)
-            # D15-counted (``crashed``), so a deterministic fault is bisected down to a poison
-            # pill instead of restarting forever (review 8a R4), as segcap does
-            self._end(active, error=msg, crashed=crash)
-            if self.fatal is not None and crash:
-                self.fatal(exc)  # the engine is unusable: replace the container
+        except Exception as exc:  # crash: crashed=True (D15), then fatal (review 8a R4)
+            from flora_deploy.engines.offline_llm import EngineDead
+
+            dead = isinstance(exc, EngineDead) or bool(getattr(self.engine, "dead", None))
+            end_failed_shard(exc, lambda **kw: self._end(active, **kw), self.fatal,
+                             crash="cuda_fatal" if dead else None, is_crash=is_crash)
             raise
         finally:
             with self._lock:
