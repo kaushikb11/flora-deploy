@@ -57,6 +57,7 @@ OUTPUT_MODULES: dict[str, tuple[str, ...]] = {
         "accel/determinism.py",  # opt-in kernel selection (D-1) changes outputs
         "accel/framecache.py",
         "accel/geometry.py",
+        "accel/gpu_thread.py",  # persistent generate thread (Perf-1); conservative
         "accel/patches.py",
         "accel/pngmem.py",
         "accel/registry.py",
@@ -78,6 +79,7 @@ OUTPUT_MODULES: dict[str, tuple[str, ...]] = {
         "accel/determinism.py",  # opt-in kernel selection (D-1) changes outputs
         "accel/framecache.py",
         "accel/geometry.py",
+        "accel/gpu_thread.py",  # persistent generate thread (Perf-1); conservative
         "accel/patches.py",
         "accel/pngmem.py",
         "accel/registry.py",
