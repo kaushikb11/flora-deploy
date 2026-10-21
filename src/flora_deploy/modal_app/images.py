@@ -4,29 +4,33 @@ Each builder returns a lazy ``modal.Image``: nothing is built or uploaded until 
 runs. Access ``images.img_cpu`` / ``img_hfref`` / ``img_vllm`` or call the builders directly.
 
 Reproducibility (review M3, PLAN.md D11). Each image installs from a committed, fully transitive
-lock (``locks/<image>.txt``: exact versions and sha256 hashes for linux x86_64 / CPython 3.12),
-with ``--require-hashes --no-build``, using a pinned uv binary. The ``*_PACKAGES`` tuples below
-are only the lock *inputs*; ``scripts/lock_images.py`` turns them into ``locks/<image>.in`` and
-the lock. Bases are pinned too: the Modal image builder version (which fixes ``debian_slim``'s
-Debian release and Python micro version, and ``add_python``'s build) and the CUDA base by digest.
+lock (``locks/<image>.txt``: exact versions and sha256 hashes for linux x86_64 at the base's
+CPython), with ``--require-hashes --no-build``, using the uv binary pinned by digest. The
+``*_PACKAGES`` tuples below are only the lock *inputs*; ``scripts/lock_images.py`` turns them into
+``locks/<image>.in`` and the lock. Every base is pulled by digest (``BASES``, the single source the
+builders read), and the Modal client (which renders each builder step and picks ``add_python``'s
+standalone build) and image builder version are pinned and checked before any build.
 ``image_fingerprint()`` hashes all of it for the config hash. Gate C showed why one pinned build
 matters: NVIDIA picks caption frame scales by compressed PNG size, which depends on the zlib in
 the Pillow wheel, so golden data and production must share the exact image stack.
 
 Base choices:
-- ``img_cpu``: ``debian_slim``, no apt packages. PyAV wheels bundle FFmpeg; Modal's debian_slim apt
-  index can be stale (404s on bullseye security updates), so no apt until a step needs the CLI.
-- ``img_hfref``: ``debian_slim`` plus NVIDIA's pip stack verbatim. The torch 2.11.0 PyPI wheel
-  ships its CUDA 13.0 user space as ``nvidia-*`` wheels, and Modal's host driver (CUDA 13.3)
-  supports it on H200 (SM90). NVIDIA's reference runs HF transformers with SDPA and compiles
-  nothing, so it needs no toolkit. This is also exactly what ``pip install -r requirements.txt``
-  gives on a plain host.
-- ``img_vllm``: ``nvidia/cuda`` *devel* 13.0 (toolkit at or below the host's 13.3, matching torch's
-  cu130). vLLM 0.24.0 may JIT kernels (FlashInfer, Triton), which needs ``nvcc`` and headers that
-  a slim base lacks.
+- ``img_cpu``: the official ``python:3.12.10-slim-bookworm`` by digest, no apt packages (Modal's
+  ``debian_slim`` adds unpinned ``apt-get install`` and ``pip install --upgrade`` layers). PyAV
+  wheels bundle FFmpeg.
+- ``img_hfref``: the same base plus NVIDIA's TempSeg/Captioner install recipe
+  (``batch_utils/README.md``): torch 2.11.0 / torchvision 0.26.0 from the PyTorch cu128 index
+  (CUDA 12.8 user space as ``nvidia-*-cu12`` wheels), then ``requirements.txt``. Modal's host
+  driver (CUDA 13.x) runs CUDA 12.8 user space. NVIDIA's reference runs HF transformers with SDPA
+  and compiles nothing, so it needs no toolkit.
+- ``img_vllm``: ``nvidia/cuda`` *devel* 13.0 (toolkit at or below the host's driver, matching the
+  PyPI torch cu130 that vLLM 0.24.0 and NVIDIA's Rewarder ``pip install -r`` get). vLLM may JIT
+  kernels (FlashInfer, Triton), which needs ``nvcc`` and headers. Python is Modal's
+  ``add_python`` standalone build (3.12.1 at client 1.6.2).
 
 All images set ``PYTHONDONTWRITEBYTECODE=1`` so importing NVIDIA code never writes ``.pyc`` files
-into snapshot directories (site-packages is still byte-compiled at build time).
+into snapshot directories (site-packages is still byte-compiled at build time). The lock files are
+mounted with the ``flora_deploy`` source, so ``image_fingerprint()`` also works in a container.
 """
 
 from __future__ import annotations
@@ -51,13 +55,18 @@ AV = f"av=={RUNTIME['av']}"
 # and img_hfref reads it with NVIDIA's pinned hub (review M3).
 HF_HUB = f"huggingface_hub=={RUNTIME['huggingface_hub_reference']}"
 HF_XET = f"hf_xet=={RUNTIME['hf_xet']}"
+# One numpy in every image (review A6); vLLM's mistral-common needs numpy<2.4 on CPython 3.12.
 NUMPY = f"numpy=={RUNTIME['numpy']}"
-# Tag kept for readability; the digest (multi-arch index) is what is pulled.
+# Tags kept for readability; the digest (multi-arch index) is what is pulled.
+PY_BASE = f"{RUNTIME['python_base']}@{RUNTIME['python_base_digest']}"
 CUDA_BASE = f"{RUNTIME['cuda_base_vllm']}@{RUNTIME['cuda_base_vllm_digest']}"
+# By digest only: Modal's builder (skopeo) rejects a COPY --from source with both tag and digest,
+# which is why the install step is written out below instead of using ``uv_pip_install``.
+UV_IMAGE = f"ghcr.io/astral-sh/uv@{RUNTIME['uv_image_digest']}"  # uv RUNTIME["uv"]
 
 CPU_PACKAGES = (
     AV,
-    NUMPY,  # exact: debian_slim ships numpy 1.26, which breaks pyarrow 26
+    NUMPY,  # exact: an unpinned resolution once gave numpy 1.26, which breaks pyarrow 26
     PILLOW,
     f"pyarrow=={RUNTIME['pyarrow']}",
     HF_HUB,
@@ -66,6 +75,7 @@ CPU_PACKAGES = (
 
 # NVIDIA TempSeg/Captioner batch_utils/requirements.txt at the code pin, with Pillow and numpy
 # pinned to one exact version inside NVIDIA's ranges (">=11,<13", "<3"; decode pins, PLAN.md D11).
+# torch/torchvision are overridden to the +cu128 wheels (OVERRIDES).
 HFREF_PACKAGES = (
     f"torch=={RUNTIME['torch_reference']}",
     f"torchvision=={RUNTIME['torchvision_reference']}",
@@ -80,13 +90,13 @@ HFREF_PACKAGES = (
     HF_XET,
 )
 
-# numpy is left to vLLM: its mistral-common dependency needs numpy<2.4 on CPython 3.12.
 VLLM_PACKAGES = (
     f"vllm=={RUNTIME['vllm']}",
     f"transformers=={RUNTIME['transformers']}",
     f"qwen-vl-utils=={RUNTIME['qwen_vl_utils']}",
     f"decord=={RUNTIME['decord']}",
     AV,
+    NUMPY,
     PILLOW,
     HF_HUB,
     HF_XET,
@@ -98,13 +108,37 @@ LOCK_DIR = Path(__file__).with_name("locks")
 LOCK_FILES = {"img_cpu": "cpu.txt", "img_hfref": "hfref.txt", "img_vllm": "vllm.txt"}
 # Resolution target per lock: the base's glibc (debian bookworm 2.36, ubuntu 24.04 2.39), so the
 # resolver only picks versions that have a wheel the base can install (vLLM's llguidance 1.7 has
-# no wheel older than manylinux_2_31).
+# no wheel older than manylinux_2_31), and the base's exact CPython for marker evaluation.
 LOCK_PLATFORMS = {
     "img_cpu": "x86_64-manylinux_2_36",
     "img_hfref": "x86_64-manylinux_2_36",
     "img_vllm": "x86_64-manylinux_2_39",
 }
-INSTALL_OPTIONS = "--require-hashes --no-build"
+_PY_BASE_VERSION = RUNTIME["python_base"].split(":")[1].split("-")[0]
+LOCK_PYTHON = {
+    "img_cpu": _PY_BASE_VERSION,
+    "img_hfref": _PY_BASE_VERSION,
+    "img_vllm": RUNTIME["python_standalone"],
+}
+
+
+def _cu_wheel(pkg: str, version_key: str) -> str:
+    """``pkg @ <PyTorch index wheel URL>#sha256=...`` for NVIDIA's cu128 torch/torchvision."""
+    version = RUNTIME[version_key].replace("+", "%2B")
+    sha = RUNTIME[f"{version_key}_sha256"]
+    wheel = f"{pkg}-{version}-cp312-cp312-manylinux_2_28_x86_64.whl"
+    return f"{pkg} @ {RUNTIME['torch_index_hfref']}/{wheel}#sha256={sha}"
+
+
+# ``uv pip compile --overrides`` per image (scripts/lock_images.py writes locks/<image>.overrides
+# .txt): img_hfref takes torch/torchvision from the PyPI-external cu128 index by exact URL, so the
+# lock (and hence the install) needs no extra index and every other wheel stays on PyPI.
+OVERRIDES: dict[str, tuple[str, ...]] = {
+    "img_cpu": (),
+    "img_hfref": (_cu_wheel("torch", "torch_hfref"), _cu_wheel("torchvision", "torchvision_hfref")),
+    "img_vllm": (),
+}
+INSTALL_OPTIONS = {name: "--require-hashes --no-build" for name in OVERRIDES}
 
 _ENV = {"HF_XET_HIGH_PERFORMANCE": "1", "PYTHONDONTWRITEBYTECODE": "1"}
 ENV = {
@@ -112,15 +146,24 @@ ENV = {
     "img_hfref": _ENV,
     "img_vllm": {**_ENV, "VLLM_CACHE_ROOT": str(CACHE_MOUNT)},
 }
-# debian_slim's Python micro version and Debian release follow the builder version (2025.06:
-# 3.12.10 on bookworm); add_python's standalone build follows the Modal client (3.12.1 at 1.6.2).
-BASES = {
-    "img_cpu": f"debian_slim(python={PY})",
-    "img_hfref": f"debian_slim(python={PY})",
-    "img_vllm": f"{CUDA_BASE}+add_python({PY})",
+
+# What each builder passes to ``modal.Image.from_registry`` (and ``.entrypoint``). ``_build`` reads
+# this dict, so it cannot drift from the fingerprint. At builder version 2025.06,
+# ``from_registry`` renders only ``FROM <ref>`` plus, with add_python, the standalone COPY/ENV/ln.
+_STANDALONE = f"{RUNTIME['python_standalone_release']}/{RUNTIME['python_standalone']}"
+BASES: dict[str, dict] = {
+    "img_cpu": {"from": PY_BASE, "add_python": None, "python_standalone": None, "entrypoint": None},
+    "img_hfref": {
+        "from": PY_BASE, "add_python": None, "python_standalone": None, "entrypoint": None,
+    },
+    "img_vllm": {
+        "from": CUDA_BASE, "add_python": PY, "python_standalone": _STANDALONE, "entrypoint": [],
+    },
 }
 
 _BUILDER_ENV = "MODAL_IMAGE_BUILDER_VERSION"
+# Mount the locks with the source (default is .py only) so image_fingerprint() runs in containers.
+SOURCE_PATTERNS = ("**/*.py", "**/modal_app/locks/*.txt")
 
 
 def lock_path(name: str) -> Path:
@@ -136,56 +179,105 @@ def _pin_builder_version() -> None:
         raise RuntimeError(f"{_BUILDER_ENV}={have!r}, but the images are pinned to {want!r}")
 
 
-def _install(image: modal.Image, name: str) -> modal.Image:
+def _check_modal_client() -> None:
+    """The client renders every Dockerfile step and picks add_python's build, so another client
+    could build different images under the same fingerprint. Checked where images are built
+    (locally); containers run the client Modal mounts and only import the builders."""
+    import modal
+    from modal.mount import PYTHON_STANDALONE_VERSIONS
+
+    if not modal.is_local():
+        return
+    if modal.__version__ != RUNTIME["modal_client"]:
+        raise RuntimeError(
+            f"modal client {modal.__version__}, but the images are pinned to "
+            f"{RUNTIME['modal_client']} (RUNTIME['modal_client'])"
+        )
+    release, version = PYTHON_STANDALONE_VERSIONS[PY]
+    if f"{release}/{version}" != _STANDALONE:
+        raise RuntimeError(f"add_python({PY}) is {release}/{version}, pinned {_STANDALONE}")
+
+
+def _lock_context_path(name: str) -> str:
+    return f"/.lock_{LOCK_FILES[name]}"
+
+
+def install_commands(name: str) -> list[str]:
+    """The exact Dockerfile steps that install the lock (what ``uv_pip_install`` renders, with
+    the uv image by digest)."""
+    dest = f"/.uv/{LOCK_FILES[name]}"
+    return [
+        f"COPY --from={UV_IMAGE} /uv /.uv/uv",
+        f"COPY {_lock_context_path(name)} {dest}",
+        "RUN /.uv/uv pip install --python $(command -v python) --compile-bytecode "
+        f"{INSTALL_OPTIONS[name]} --requirements {dest}",
+    ]
+
+
+def _build(name: str) -> modal.Image:
+    import modal
+
+    _pin_builder_version()
+    _check_modal_client()
+    base = BASES[name]
+    image = modal.Image.from_registry(base["from"], add_python=base["add_python"])
+    if base["entrypoint"] is not None:
+        image = image.entrypoint(base["entrypoint"])
     return (
-        image.uv_pip_install(
-            requirements=[str(lock_path(name))],
-            extra_options=INSTALL_OPTIONS,
-            uv_version=RUNTIME["uv"],
+        image.dockerfile_commands(
+            install_commands(name),
+            context_files={_lock_context_path(name): str(lock_path(name))},
         )
         .env(ENV[name])
-        .add_local_python_source("flora_deploy")
+        .add_local_python_source("flora_deploy", ignore=~modal.FilePatternMatcher(*SOURCE_PATTERNS))
     )
 
 
 @cache
 def cpu_image() -> modal.Image:
-    import modal
-
-    _pin_builder_version()
-    return _install(modal.Image.debian_slim(python_version=PY), "img_cpu")
+    return _build("img_cpu")
 
 
 @cache
 def hfref_image() -> modal.Image:
-    import modal
-
-    _pin_builder_version()
-    return _install(modal.Image.debian_slim(python_version=PY), "img_hfref")
+    return _build("img_hfref")
 
 
 @cache
 def vllm_image() -> modal.Image:
-    import modal
+    return _build("img_vllm")
 
-    _pin_builder_version()
-    base = modal.Image.from_registry(CUDA_BASE, add_python=PY).entrypoint([])
-    return _install(base, "img_vllm")
+
+def lock_digest(text: str) -> str:
+    """sha256 of a lock's requirement lines with comments, blank lines and line continuations
+    removed, so the header and ``# via`` annotations (which name paths and the compile command)
+    never change the fingerprint; only requirements, hashes and options count."""
+    lines = []
+    for raw in text.splitlines():
+        line = "" if raw.lstrip().startswith("#") else raw.split(" #", 1)[0]
+        line = line.strip().removesuffix("\\").strip()
+        if line:
+            lines.append(line)
+    return hashlib.sha256("\n".join(lines).encode()).hexdigest()
 
 
 def image_fingerprint(name: str) -> str:
-    """Stable sha256 of everything that defines image ``name``'s contents (PLAN.md D11): the lock
-    file's bytes, the base (builder version, Python series, CUDA digest), uv version, install
-    options and env. The ``flora_deploy`` source is excluded; the config hash covers it as the
-    framework logic version."""
+    """Stable sha256 of everything that defines image ``name``'s contents (PLAN.md D11): the
+    normalized lock, the base spec (digest, add_python standalone build, entrypoint), the Modal
+    client and image builder versions (which fix how every step renders), the install steps
+    (uv image digest and options), lock target and env. Uses only embedded constants and the
+    lock files, which are mounted into containers. The ``flora_deploy`` source is excluded; the
+    config hash covers it as the framework logic version."""
     spec = {
         "image": name,
         "base": BASES[name],
         "lock_platform": LOCK_PLATFORMS[name],
+        "lock_python": LOCK_PYTHON[name],
+        "modal_client": RUNTIME["modal_client"],
         "modal_image_builder_version": RUNTIME["modal_image_builder_version"],
         "uv": RUNTIME["uv"],
-        "install_options": INSTALL_OPTIONS,
-        "lock_sha256": hashlib.sha256(lock_path(name).read_bytes()).hexdigest(),
+        "install_commands": install_commands(name),
+        "lock_sha256": lock_digest(lock_path(name).read_text()),
         "env": dict(sorted(ENV[name].items())),
     }
     blob = json.dumps(spec, sort_keys=True, separators=(",", ":")).encode()

@@ -13,6 +13,8 @@ dependencies = [
     "numpy<3",
     "Pillow>=11,<13",
     "pyarrow>=17",
+    "pydantic>=2",
+    "pyyaml>=6",
     "rich>=13",
     "typer>=0.12",
 ]
@@ -53,6 +55,7 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]  # lets tests import shared fakes as `tests.fakes`
 asyncio_mode = "auto"
 markers = [
     "nvlink: needs NVIDIA's code pins fetched via scripts/fetch_nv_code.py (CPU only)",

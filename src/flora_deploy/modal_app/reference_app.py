@@ -39,9 +39,9 @@ golden = modal.Volume.from_name(GOLDEN_VOLUME, create_if_missing=True, version=2
 GPU = "H200"
 CPU_CORES = 8.0
 MEMORY_MIB = 96 * 1024  # TempSeg base is built on CPU in BF16 (~18 GiB) before .to("cuda")
-HARD_LIFETIME_S = 44 * 60  # no container of this app may live longer than this
+HARD_LIFETIME_S = 40 * 60  # no container of this app may live longer than this
 STARTUP_TIMEOUT_S = 25 * 60  # Volume hashing (~122 GiB) + both loads
-TIMEOUT_S = 20 * 60  # per annotate call
+TIMEOUT_S = 30 * 60  # per annotate / annotate_batch call
 SAMPLES_DIR = GOLDEN_MOUNT / "samples" / "wsd"
 RUNS_DIR = GOLDEN_MOUNT / "reference_runs"
 
@@ -56,6 +56,32 @@ def _watchdog(limit_s: float = HARD_LIFETIME_S) -> None:
     t = threading.Timer(limit_s, kill)
     t.daemon = True
     t.start()
+
+
+def _read_text(path: str) -> str | None:
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return None
+
+
+def _determinism_flags() -> dict:
+    """Process-wide torch settings that decide whether identical inputs give identical outputs."""
+    import importlib.util
+
+    import torch
+
+    return {
+        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+        "cudnn_benchmark": torch.backends.cudnn.benchmark,
+        "cudnn_deterministic": torch.backends.cudnn.deterministic,
+        "matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+        "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+        "optional_kernels": {m: importlib.util.find_spec(m) is not None
+                             for m in ("fla", "causal_conv1d", "flash_attn", "triton")},
+    }
 
 
 def _gpu_memory() -> dict:
@@ -160,6 +186,18 @@ class ReferenceWorker:
             }
             print(f"loaded {kind} in {loads[kind]['seconds']}s: {loads[kind]['gpu_after']}",
                   flush=True)
+        # Every NVIDIA generate() runs under one GPU lock (docs/exact-concurrency.md); with one
+        # episode at a time the lock is never contended.
+        from flora_deploy.observe import Patcher, TimedLock
+        from flora_deploy.stages.reference import GPU_LOCK_NAME, install_gpu_lock
+
+        self.gpu_lock = TimedLock(GPU_LOCK_NAME)
+        self.lock_patcher = Patcher()
+        install_gpu_lock(nv, self.gpu_lock, self.lock_patcher)
+        from flora_deploy.stages.reference import ProcessorClones
+
+        self.clones = ProcessorClones()  # per-episode processor copies, reused across batches
+        self.torch_threads_after_load = torch.get_num_threads()
         self.run_id = time.strftime("wsd-%Y%m%dT%H%M%SZ", time.gmtime())
         self.load_report = {
             "run_id": self.run_id,
@@ -171,6 +209,13 @@ class ReferenceWorker:
             "loads": loads,
             "loaded_kinds": list(self.session.loaded_kinds),
             "torch": torch.__version__,
+            "torch_threads": self.torch_threads_after_load,
+            "cpu_count": os.cpu_count(),
+            "sched_affinity": len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity")
+            else None,
+            "determinism": _determinism_flags(),
+            "cgroup_cpu_max": _read_text("/sys/fs/cgroup/cpu.max"),
+            "cgroup_memory_max": _read_text("/sys/fs/cgroup/memory.max"),
             "nv_audit_kinds": sorted(self.session.audit),
         }
 
@@ -216,6 +261,73 @@ class ReferenceWorker:
         )
         ref["stored_at"] = f"{GOLDEN_VOLUME}:{path.relative_to(GOLDEN_MOUNT)}"
         return result
+
+    @modal.method()
+    def annotate_batch(
+        self,
+        episodes: list[dict],
+        concurrency: int = 1,
+        *,
+        measure: bool = False,
+        torch_threads: int | None = None,
+        run_id: str | None = None,
+        tag: str = "batch",
+        persist: bool = True,
+    ) -> dict:
+        """Run several episodes with ``concurrency`` threads sharing the resident models
+        (``stages/reference.annotate_batch``); persist each result after the batch.
+
+        ``torch_threads`` sets torch's intra-op threads for this batch only (NVIDIA's load sets 4;
+        restored afterwards). ``measure`` turns on the observe harness (per-call timers, RSS,
+        ``/dev/shm``). Returns the full results plus per-episode digests of NVIDIA's output."""
+        import torch
+
+        from flora_deploy.observe import Patcher, Sampler
+        from flora_deploy.stages.reference import (
+            annotate_batch,
+            install_measurement,
+            persist_result,
+            result_digest,
+            safe_name,
+        )
+
+        golden.reload()
+        torch.cuda.reset_peak_memory_stats()
+        previous_threads = torch.get_num_threads()
+        if torch_threads:
+            torch.set_num_threads(int(torch_threads))
+        patcher = Patcher()
+        try:
+            patched = []
+            if measure:
+                procs = [self.session.load(kind)[1] for kind in self.session.loaded_kinds]
+                patched = install_measurement(self.nv, patcher, procs)
+            out = annotate_batch(
+                self.nv, self.session, episodes, concurrency=concurrency,
+                gpu_lock=self.gpu_lock, measure=measure, clones=self.clones,
+                sampler=Sampler(interval_s=1.0) if measure else None,
+                progress=lambda ep, frac, desc="": print(f"[{ep}] {frac:.0%} {desc}", flush=True),
+            )
+        finally:
+            patcher.restore()
+            torch.set_num_threads(previous_threads)
+        batch = out["batch"]
+        batch.update(torch_threads=torch_threads or previous_threads, measured=patched,
+                     gpu=_gpu_memory(), container_age_s=round(time.time() - self.started, 1))
+        run = safe_name(f"{run_id or self.run_id}-{tag}")
+        digests = {}
+        for name, result in out["results"].items():
+            digests[name] = result_digest(result)
+            ref = result["flora_reference"]
+            ref["run_id"], ref["digest"] = run, digests[name]
+            if persist:
+                path = persist_result(result, golden_root=GOLDEN_MOUNT, run_id=run,
+                                      episode=name, commit=lambda: None)
+                ref["stored_at"] = f"{GOLDEN_VOLUME}:{path.relative_to(GOLDEN_MOUNT)}"
+        if persist:
+            golden.commit()
+        out["digests"] = digests
+        return out
 
     @modal.exit()
     def close(self) -> None:

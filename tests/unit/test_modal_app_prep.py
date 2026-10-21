@@ -6,7 +6,7 @@ import json
 import modal
 from typer.testing import CliRunner
 
-from flora_deploy import cli
+from flora_deploy.cli import prepare as cli
 from flora_deploy.config.pins import PINS, RUNTIME
 from flora_deploy.layout import CACHE_MOUNT
 from flora_deploy.prep.run import SnapshotVerificationError

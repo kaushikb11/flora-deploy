@@ -1,0 +1,58 @@
+# flora.yaml: label a LeRobot dataset with NVIDIA's own pipeline (`exact` preset).
+# Every key is documented below. Unknown keys are an error.
+
+project: my-lerobot-labels          # names the job and its Modal tags
+
+# NVIDIA's Flora models are licensed for non-commercial research only. Required.
+license_ack: research-only
+
+modal:
+  environment: main                 # Modal Environment to deploy into
+  max_gpus: 3                       # workspace GPU cap; all pools together stay under it
+  budget_usd: 25                    # hard spend cap (a Modal Environment budget backs it up)
+  region: null                      # null = any region (pinning costs >= 1.15x)
+  tags: {}                          # extra key/value tags on every Modal object
+
+# exact: NVIDIA's HF code on H200 + NVIDIA's vLLM Rewarder on H100!; outputs are the reference.
+# balanced: vLLM engines on stage-separated pools (certified faithful).
+preset: exact
+
+input:
+  format: lerobot_v3                # lerobot_v21 | lerobot_v3 | mp4_dir
+  repo: griffinlabs/EgoDex-LeRobot-v3.0
+  revision: 41d60b449629b2181ff5b735d31c2a2cf8b3cad8   # full commit SHA, never a branch
+  path: test/make_sandwich          # subdirectory inside the repo (optional)
+  # Map dataset camera keys to NVIDIA's views: 1 view (main) or 3 (main, left_wrist,
+  # right_wrist). Leave out for a single-camera dataset.
+  # cameras:
+  #   observation.images.top: main
+  #   observation.images.left_wrist: left_wrist
+  #   observation.images.right_wrist: right_wrist
+  stage_to: null                    # where downloaded inputs are staged (null = default)
+
+pipeline:
+  # segment, caption, reward.terminal, reward.dense, reward.rubric
+  stages: [segment, caption, reward.terminal, reward.dense]
+  embodiment: human                 # human | yam | yam32 | dex | tianji
+  episode_instruction:
+    source: dataset_task            # dataset_task | fixed (then set `text`) | none
+  envelope: warn                    # warn | enforce | ignore: out-of-envelope episodes (D13)
+
+# Per shard kind overrides of the preset's pools: gpu, gpu_count, max_containers, max_inputs,
+# cpu (physical cores), memory (GiB). The exact preset runs segment+caption as one `segcap`
+# worker. These change cost and speed only, never outputs (nor the config hash).
+resources:
+  segcap: {gpu: H200, max_containers: 1}
+  reward.terminal: {max_containers: 1}
+  reward.dense: {max_containers: 1}
+
+output:
+  sink: s3://my-bucket/flora/my-lerobot-labels   # s3:// r2:// gs:// volume:// file://
+  formats: [parquet, jsonl]
+
+retries:
+  max_starts_before_quarantine: 3   # then the shard is quarantined and bisected
+
+observability:
+  log_level: info
+  heartbeat_s: 60
