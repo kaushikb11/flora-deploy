@@ -485,7 +485,13 @@ def orchestrate(job_id: str, scenario: dict[str, Any]) -> dict[str, Any]:
     for led in orch._ledgers.values():
         for e in led.calls:
             if e.get("outcome") == "cancelled_budget" and e.get("call_id"):
+                # Termination is asynchronous: a call reads "pending" until Modal finishes
+                # tearing it down. Poll until it leaves "pending" (bounded), then record it.
+                deadline = time.time() + 90.0
                 st = spawner.poll(e["call_id"])
+                while st.state == "pending" and time.time() < deadline:
+                    time.sleep(3.0)
+                    st = spawner.poll(e["call_id"])
                 probes[e["call_id"]] = {"state": st.state, "error": st.error}
     return {"job_id": job_id, "holder": holder, "outcome": asdict(outcome),
             "wall_s": round(time.time() - t0, 1), "events": dict(Counter(e["event"]
