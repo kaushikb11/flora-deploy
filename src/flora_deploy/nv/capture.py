@@ -321,13 +321,18 @@ def assert_engine_kwargs(kwargs: Mapping[str, Any]) -> Mapping[str, Any]:
     """Raise ``CaptureError`` unless ``kwargs`` (``vllm.LLM`` / ``EngineArgs`` keywords) set every
     ``REQUIRED_VLLM_ENGINE_KWARGS`` value explicitly. Every engine builder that serves Flora
     video (the Gate C harness and the production TempSeg/Captioner builders) must call this on
-    its final kwargs. Returns ``kwargs`` unchanged."""
+    its final kwargs. Returns ``kwargs`` unchanged.
+
+    The value must be a real number equal to the required one (``0`` or ``0.0`` for
+    ``mm_processor_cache_gb``); ``False`` and other non-numbers are refused even though
+    ``False == 0`` in Python (review 3 C5)."""
     for key, want in REQUIRED_VLLM_ENGINE_KWARGS.items():
         if key not in kwargs:
             raise CaptureError(f"vLLM engine kwargs must set {key}={want!r} (Gate C)")
-        if kwargs[key] != want:
-            raise CaptureError(f"vLLM engine kwargs set {key}={kwargs[key]!r}; Gate C requires "
-                               f"{want!r}")
+        got = kwargs[key]
+        if isinstance(got, bool) or not isinstance(got, (int, float)) or got != want:
+            raise CaptureError(f"vLLM engine kwargs set {key}={got!r}; Gate C requires "
+                               f"{want!r} (a number)")
     return kwargs
 
 

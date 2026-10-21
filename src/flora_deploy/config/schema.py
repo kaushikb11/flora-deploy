@@ -11,7 +11,8 @@ Layout (see ``config/templates/*.yaml`` for commented templates)::
     preset: exact | balanced             # budget / interactive: not available yet
     allow_uncertified: false             # required for balanced until its certificates exist
     input: {format, repo, revision, path, cameras, stage_to}
-    pipeline: {stages, embodiment, episode_instruction, envelope, shard_target_gpu_minutes}
+    pipeline: {stages, embodiment, episode_instruction, envelope, shard_target_gpu_minutes,
+               determinism, terminal_rationale}
     resources: {<shard kind>: {gpu, gpu_count, max_containers, max_inputs, cpu, memory}}
     output: {sink, formats}
     retries: {max_starts_before_quarantine}
@@ -55,6 +56,7 @@ InputFormat = Literal["lerobot_v21", "lerobot_v3", "mp4_dir"]
 # Embodiment pools, as in ``jobs.types.EpisodeRef.pool``.
 Embodiment = Literal["human", "yam", "yam32", "dex", "tianji"]
 OutputFormat = Literal["parquet", "jsonl", "lerobot"]
+Determinism = Literal["nvidia", "deterministic"]  # accel.determinism.MODES
 
 _SHA = re.compile(r"^[0-9a-f]{40}$")
 # Tokens an instruction must not contain: NVIDIA's processor and our vLLM wrap treat them as
@@ -177,6 +179,13 @@ class PipelineSection(_Model):
     episode_instruction: EpisodeInstruction = Field(default_factory=EpisodeInstruction)
     envelope: EnvelopePolicy = "warn"  # D13
     shard_target_gpu_minutes: float = Field(10.0, gt=0, le=24 * 60, allow_inf_nan=False)
+    # D-1 (docs/determinism.md): GPU kernel mode of the exact `segcap` worker. "nvidia" is
+    # NVIDIA's default behaviour; "deterministic" changes logits (and sometimes text): a
+    # different reproducible reference, so it is hashed into the segcap stage hash (review 4 H3).
+    determinism: Determinism = "nvidia"
+    # NVIDIA's terminal_reward.py `--with-rationale` (default off: score only). Different
+    # prompt, max_tokens and regex, so it is hashed into the reward.terminal stage hash (M4).
+    terminal_rationale: bool = Field(False, strict=True)
 
     @field_validator("stages")
     @classmethod
@@ -302,6 +311,15 @@ class FloraConfig(_Model):
                 f"{self.modal.max_gpus}; lower max_containers or raise max_gpus")
         return self
 
+    @model_validator(mode="after")
+    def _review4(self) -> FloraConfig:
+        """Review 4 checks: determinism scope, per-device GPU memory (M7), embodiment vs camera
+        count, sink and repo id syntax (review 3 A10)."""
+        problems = review4_problems(self)
+        if problems:
+            raise ValueError("; ".join(problems))
+        return self
+
     def pools(self) -> dict[ShardKind, PoolSettings]:
         """Preset defaults for the shard kinds this pipeline needs, with overrides applied."""
         preset = get_preset(self.preset)
@@ -312,6 +330,89 @@ class FloraConfig(_Model):
                 pool = self.resources[kind].apply(pool)
             out[kind] = pool
         return out
+
+
+# ---------------------------------------------------------------------------------------------
+# Review 4 additions (additive; kept apart from the validators above)
+
+# Shard kinds whose engine uses more than one GPU, and how many (tensor parallel). Every other
+# kind loads its model on one device: NVIDIA's reward `load_llm` keeps `tensor_parallel_size` 1
+# and our engine spec passes it unchanged; NVIDIA's HF loader would shard `segcap` over several
+# GPUs with `device_map="balanced"`, which is not the validated single-H200 reference.
+TP_GPUS: dict[str, int] = {"reward.rubric": 2}  # NVIDIA's rubric settings: TP=2 (PLAN.md §7)
+_REPO_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
+# A bucket/volume name right after the scheme; file:// takes an absolute path (file:///x).
+_SINK = re.compile(r"^((s3|r2|gs|volume)://[^\s/]|file:///?[^\s/])[^\s]*$")
+
+
+def per_device_gpu_problem(preset: str, kind: str, gpu: str, gpu_count: int) -> str | None:
+    """M7: memory is checked **per device** (an engine that loads on one GPU cannot use a second
+    one's memory), and ``gpu_count`` must be what the kind's engine actually uses."""
+    from flora_deploy.config.presets import min_gpu_memory_gib
+
+    want = TP_GPUS.get(kind, 1)
+    if gpu_count != want:
+        engine = "tensor-parallel" if want > 1 else "single-device"
+        return (f"{kind} runs on {want} GPU(s) per container (its engine is {engine}); "
+                f"gpu_count {gpu_count} is not supported")
+    mem = GPU_MEMORY_GIB.get(gpu)
+    if mem is None:
+        return None  # reported by gpu_problem
+    # The minimums are GPU classes (exact segcap: an H200/B200; rewards: an 80 GB GPU, which
+    # NVIDIA's recipes are sized for, also per device of the TP=2 rubric engine).
+    need = min_gpu_memory_gib(preset, kind)
+    if mem < need:
+        fits = [g for g, m in GPU_MEMORY_GIB.items() if m >= need]
+        return (f"{kind} needs >= {need:g} GiB of memory on each GPU, but {gpu} has {mem:g} "
+                f"GiB (use one of {', '.join(fits)})")
+    return None
+
+
+def review4_problems(cfg: FloraConfig) -> list[str]:
+    problems: list[str] = []
+    kinds = shard_kinds_for(get_preset(cfg.preset), cfg.pipeline.stages)
+    if cfg.pipeline.determinism != "nvidia" and "segcap" not in kinds:
+        problems.append(f"pipeline.determinism {cfg.pipeline.determinism!r} applies to the "
+                        "exact preset's segcap worker (segment + caption) only")
+    for kind, pool in cfg.pools().items():
+        p = per_device_gpu_problem(cfg.preset, kind, pool.gpu, pool.gpu_count)
+        if p:
+            problems.append(p)
+    cams = cfg.input.cameras
+    if cams is not None:
+        if cfg.pipeline.embodiment == "human" and len(cams) == 3:
+            # NVIDIA's pipeline.annotate: "Choose YAM, Dex or Tianji when uploading wrist cameras."
+            problems.append("embodiment 'human' takes 1 camera view; NVIDIA's pipeline rejects "
+                            "wrist cameras for human videos (use yam, dex or tianji)")
+        if cfg.pipeline.embodiment == "yam32" and len(cams) != 3:
+            # NVIDIA: "The 32-second profile requires three synchronized camera views."
+            problems.append("embodiment 'yam32' needs 3 camera views (main, left_wrist, "
+                            "right_wrist)")
+    if not _SINK.match(cfg.output.sink):
+        problems.append(f"output.sink {cfg.output.sink!r}: needs a bucket or path after the "
+                        "scheme, and no whitespace")
+    if cfg.input.repo is not None and not _REPO_ID.match(cfg.input.repo):
+        problems.append(f"input.repo {cfg.input.repo!r} is not a Hugging Face repo id "
+                        "('namespace/name')")
+    return problems
+
+
+def output_settings(cfg: FloraConfig) -> dict[str, Any]:
+    """The hashed, output-affecting run modes a worker must apply, taken from the config (never
+    from a side channel): ``determinism`` (exact segcap) and ``terminal_mode``
+    (reward.terminal). Deploy code forwards exactly these; workers record what they applied."""
+    return {"determinism": cfg.pipeline.determinism,
+            "terminal_mode": ("terminal_rationale" if cfg.pipeline.terminal_rationale
+                              else "terminal")}
+
+
+def with_pipeline(cfg: FloraConfig, **fields: Any) -> FloraConfig:
+    """``cfg`` with ``pipeline`` fields replaced, re-validated. ``flora deploy --determinism
+    deterministic`` is ``with_pipeline(cfg, determinism="deterministic")``: the override changes
+    the config, and with it the hash, the app name and the store paths."""
+    data = cfg.model_dump(mode="python")
+    data["pipeline"] = {**data["pipeline"], **fields}
+    return parse_config(data, allow_uncertified=cfg.allow_uncertified)
 
 
 def _format_errors(err: ValidationError, source: str) -> str:

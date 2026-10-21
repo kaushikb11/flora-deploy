@@ -16,6 +16,12 @@ Model, per option (one preset at one episode concurrency per container):
 Not modelled: queueing for GPUs beyond the cap, a single long episode's critical path, idle
 ``scaledown_window`` time and Volume/egress costs. ``flora estimate`` calibrates the rates.
 
+Rate status (review 4 M5): an option whose cost rests on rates that are not ``measured`` carries
+a ``warning:`` flag naming them. Rates that need a worker feature that is not enabled
+(``PlanRequest.features``; e.g. ``gpu_thread``, not wired yet) only appear in *projection*
+options (``requires`` set, named ``... +gpu_thread``), which ``recommended`` never picks; among
+runnable options it prefers measured rates over projected over placeholder, then the cheapest.
+
 Everything is deterministic: same inputs, same options in the same order.
 """
 
@@ -136,6 +142,7 @@ class PlanOption:
     status: Status
     flags: tuple[str, ...]
     rate_status: str  # worst status among the kinds' rates
+    requires: tuple[str, ...] = ()  # worker features this option needs that are not enabled
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -152,6 +159,9 @@ class PlanRequest:
     # per preset: shard kind -> pool overriding the preset default (e.g. from flora.yaml)
     pools: Mapping[str, Mapping[str, PoolSettings]] = field(default_factory=dict)
     max_options: int = 4
+    # Worker features that are wired and enabled (rates.json ``requires``). None yet:
+    # ``gpu_thread`` rates are shown as projections only.
+    features: tuple[str, ...] = ()
 
 
 def _pool(req: PlanRequest, preset: str, kind: str) -> PoolSettings:
@@ -171,21 +181,24 @@ class _Kind:
     status: str
     provenance: str
     n: int = 1
+    requires: tuple[str, ...] = ()
 
     def finish(self, which: int = 1, n: int | None = None) -> float:
         return self.startup[which] + self.work[which] / (n or self.n)
 
 
-def _kinds(req: PlanRequest, table: RateTable, rates: Rates, preset: str, conc: int
-           ) -> list[_Kind]:
+def _kinds(req: PlanRequest, table: RateTable, rates: Rates, preset: str, conc: int,
+           features: tuple[str, ...] = ()) -> list[_Kind]:
     spec = get_preset(preset)
     out = []
     for kind in shard_kinds_for(spec, req.stages):
         pool = _pool(req, preset, kind)
         lo = mid = hi = 0.0
         worst, prov, used_c = "measured", [], 1
+        needs: set[str] = set()
         for g in req.workload.groups:
-            e = table.rate(preset, kind, g.cameras, conc)
+            e = table.rate(preset, kind, g.cameras, conc, features)
+            needs.update(e.requires)
             w = g.video_s * e.container_s_per_video_s
             lo += w / (1 + e.uncertainty)
             mid += w
@@ -200,7 +213,8 @@ def _kinds(req: PlanRequest, table: RateTable, rates: Rates, preset: str, conc: 
         startup = (st.startup_s / (1 + u), st.startup_s, st.startup_s * (1 + u))
         cap = max(1, math.ceil(req.workload.episodes / used_c))
         out.append(_Kind(kind, pool, used_c, (lo, mid, hi), startup, cap,
-                         rates.pool_per_second(pool), worst, " | ".join(prov)))
+                         rates.pool_per_second(pool), worst, " | ".join(prov),
+                         requires=tuple(sorted(needs))))
     return out
 
 
@@ -225,9 +239,14 @@ def _hours(s: float) -> str:
 
 
 def build_option(req: PlanRequest, table: RateTable, rates: Rates, preset: str, conc: int, *,
-                 fill: bool = False, name: str | None = None) -> PlanOption:
-    """One option. ``fill``: ignore the deadline and use every GPU (the fastest variant)."""
-    kinds = _kinds(req, table, rates, preset, conc)
+                 fill: bool = False, name: str | None = None,
+                 extra_features: tuple[str, ...] = ()) -> PlanOption:
+    """One option. ``fill``: ignore the deadline and use every GPU (the fastest variant).
+    ``extra_features``: also use rates that need these (not enabled) features: a projection
+    option, with ``requires`` set."""
+    features = tuple(sorted(set(req.features) | set(extra_features)))
+    kinds = _kinds(req, table, rates, preset, conc, features)
+    missing = tuple(sorted({f for k in kinds for f in k.requires} - set(req.features)))
     base_gpus = sum(k.pool.gpu_count for k in kinds)
     _allocate(kinds, req.max_gpus, None if fill else req.deadline_s)
     peak = sum(k.n * k.pool.gpu_count for k in kinds)
@@ -269,10 +288,14 @@ def build_option(req: PlanRequest, table: RateTable, rates: Rates, preset: str, 
             flags.append(f"budget at risk: up to ${c_hi:,.0f}")
             worse("at risk")
     worst = max((k.status for k in kinds), key=lambda s: STATUS_RANK[s])
-    if worst == "placeholder":
-        flags.append("placeholder rates (not measured yet)")
-    elif worst == "projected":
-        flags.append("includes projected (unconfirmed) rates")
+    if missing:
+        flags.append(f"projection only: needs {', '.join(missing)}, which is not wired into "
+                     "the worker yet (not runnable today)")
+    unmeasured = [f"{k.kind} ({k.status})" for k in kinds if k.status != "measured"]
+    if unmeasured:
+        what = ("placeholder rates (not measured yet)" if worst == "placeholder"
+                else "includes projected (unconfirmed) rates")
+        flags.append(f"warning: {what}: {', '.join(unmeasured)}")
     cert: Certification = "reference" if preset == "exact" else "needs certificates"
     if cert == "needs certificates":
         flags.append(f"{preset}: uncertified until its certificates exist "
@@ -284,11 +307,13 @@ def build_option(req: PlanRequest, table: RateTable, rates: Rates, preset: str, 
         cost_usd=round(k.per_s * (k.work[1] + k.n * k.startup[1]), 4), rate_status=k.status,
         rate_provenance=k.provenance) for k in kinds)
     main_c = max(k.conc for k in kinds)
+    suffix = "".join(f" +{f}" for f in missing)
     return PlanOption(
-        name=name or f"{preset} x{main_c}", preset=preset, concurrency=main_c, kinds=plans,
-        cost_usd=round(c_mid, 2), cost_low_usd=round(c_lo, 2), cost_high_usd=round(c_hi, 2),
-        wall_s=round(wall, 1), wall_high_s=round(wall_hi, 1), peak_gpus=peak,
-        certification=cert, status=status, flags=tuple(flags), rate_status=worst)
+        name=name or f"{preset} x{main_c}{suffix}", preset=preset, concurrency=main_c,
+        kinds=plans, cost_usd=round(c_mid, 2), cost_low_usd=round(c_lo, 2),
+        cost_high_usd=round(c_hi, 2), wall_s=round(wall, 1), wall_high_s=round(wall_hi, 1),
+        peak_gpus=peak, certification=cert, status=status, flags=tuple(flags),
+        rate_status=worst, requires=missing)
 
 
 def _gpus_for_deadline(kinds: list[_Kind], deadline_s: float) -> int | None:
@@ -311,7 +336,7 @@ def _dominated(a: PlanOption, b: PlanOption) -> bool:
           and rank(b.status) <= rank(a.status)
           and STATUS_RANK[b.rate_status] <= STATUS_RANK[a.rate_status])
     lt = b.cost_usd < a.cost_usd or b.wall_s < a.wall_s
-    return a.preset == b.preset and le and lt
+    return a.preset == b.preset and a.requires == b.requires and le and lt
 
 
 def plan_options(req: PlanRequest, *, table: RateTable | None = None,
@@ -323,20 +348,33 @@ def plan_options(req: PlanRequest, *, table: RateTable | None = None,
     presets = tuple(dict.fromkeys(req.presets))
     for p in presets:
         get_preset(p)  # clear error for unknown / unavailable presets
-    cands: list[PlanOption] = []
+    runnable: list[PlanOption] = []
+    projections: list[PlanOption] = []
+    extra_sets = [()] + [(f,) for f in sorted(table.features() - set(req.features))]
     for preset in presets:
-        concs: set[int] = set()
-        for kind in shard_kinds_for(get_preset(preset), req.stages):
-            for g in req.workload.groups:
-                concs.update(table.concurrencies(preset, kind, g.cameras))
-        opts = [build_option(req, table, rates, preset, c) for c in sorted(concs or {1})]
-        uniq: dict[tuple, PlanOption] = {}
-        for o in opts:  # different requested concurrencies can resolve to the same rates
-            uniq.setdefault(tuple((k.kind, k.max_inputs) for k in o.kinds), o)
-        opts = list(uniq.values())
-        opts = [o for o in opts if not any(_dominated(o, b) for b in opts if b is not o)]
-        cands.extend(sorted(opts, key=lambda o: (o.cost_usd, o.wall_s, o.concurrency)))
-    out = cands[: req.max_options]
+        for extra in extra_sets:
+            feats = tuple(sorted(set(req.features) | set(extra)))
+            concs: set[int] = set()
+            for kind in shard_kinds_for(get_preset(preset), req.stages):
+                for g in req.workload.groups:
+                    concs.update(table.concurrencies(preset, kind, g.cameras, feats))
+            opts = [build_option(req, table, rates, preset, c, extra_features=extra)
+                    for c in sorted(concs or {1})]
+            if extra:  # only options that actually use the extra feature's rates
+                opts = [o for o in opts if o.requires]
+            uniq: dict[tuple, PlanOption] = {}
+            for o in opts:  # different requested concurrencies can resolve to the same rates
+                uniq.setdefault((tuple((k.kind, k.max_inputs) for k in o.kinds), o.requires),
+                                o)
+            opts = list(uniq.values())
+            opts = [o for o in opts if not any(_dominated(o, b) for b in opts if b is not o)]
+            (projections if extra else runnable).extend(
+                sorted(opts, key=lambda o: (o.cost_usd, o.wall_s, o.concurrency)))
+    # Runnable options first; projections fill the remaining slots (at least one is shown when
+    # there are any, so the user sees what an unwired feature would buy).
+    keep = req.max_options - (1 if projections and len(runnable) >= req.max_options else 0)
+    out = runnable[:keep]
+    out += projections[: max(0, req.max_options - len(out))]
     if len(out) < req.max_options and req.deadline_s is not None:
         base = recommended(out)
         if base is not None:
@@ -348,14 +386,15 @@ def plan_options(req: PlanRequest, *, table: RateTable | None = None,
 
 
 def recommended(options: Sequence[PlanOption]) -> PlanOption | None:
-    """The option to suggest: ``ok`` before ``at risk``; then the reference preset before
-    uncertified ones, measured/projected rates before placeholders; then the cheapest.
-    ``None`` when every option is infeasible."""
-    live = [o for o in options if o.status != "infeasible"]
+    """The option to suggest: never a projection that needs an unwired feature; ``ok`` before
+    ``at risk``; then the reference preset before uncertified ones; then measured rates before
+    projected before placeholders (review 4 M5); then the cheapest. ``None`` when no option is
+    feasible and runnable."""
+    live = [o for o in options if o.status != "infeasible" and not o.requires]
     if not live:
         return None
     return min(live, key=lambda o: (o.status != "ok", o.certification != "reference",
-                                    o.rate_status == "placeholder", o.cost_usd, o.wall_s, o.name))
+                                    STATUS_RANK[o.rate_status], o.cost_usd, o.wall_s, o.name))
 
 
 # ----------------------------------------------------------------------------------------------

@@ -2,12 +2,17 @@
 
 A rate is *container-seconds per second of video* for one shard kind of one preset, at a given
 episode concurrency per container and camera count, plus the per-container startup time. Every
-entry carries ``status`` (measured | projected | placeholder), ``provenance``, ``date`` and a
-relative ``uncertainty``. ``flora estimate`` (later) writes a file of the same shape.
+entry carries ``status`` (measured | projected | placeholder | stale), ``provenance``, ``date``
+and a relative ``uncertainty``, plus optionally the ``image`` it was measured on and the worker
+features it ``requires`` (e.g. ``gpu_thread``). ``flora estimate`` (later) writes a file of the
+same shape.
 
 Lookup is most-specific-first: an exact ``preset`` beats ``"*"``, exact ``cameras`` beats
 ``"*"``, and among concurrencies the largest one not above the request is used (so a kind
 without concurrency entries, like the batched rewarder, just uses its ``concurrency: 1`` rate).
+``stale`` entries (measured on another image) are never used, and an entry that ``requires``
+a feature is used only when the caller enables it (``features=``); when both apply, the entry
+with the feature wins (review 4 M5).
 """
 
 from __future__ import annotations
@@ -18,7 +23,8 @@ from importlib import resources
 from pathlib import Path
 from typing import Any
 
-STATUS_RANK = {"measured": 0, "projected": 1, "placeholder": 2}
+STATUS_RANK = {"measured": 0, "projected": 1, "placeholder": 2, "stale": 3}
+Features = frozenset[str] | set[str] | tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -32,6 +38,11 @@ class RateEntry:
     status: str
     provenance: str
     date: str
+    image: str | None = None  # the image it was measured / projected on
+    requires: tuple[str, ...] = ()  # worker features the rate depends on
+
+    def usable(self, features: Features = ()) -> bool:
+        return self.status != "stale" and set(self.requires) <= set(features)
 
 
 @dataclass(frozen=True)
@@ -69,7 +80,7 @@ class RateTable:
         rates, startup = [], []
         for i, r in enumerate(data.get("rates", [])):
             try:
-                e = RateEntry(**r)
+                e = RateEntry(**{**r, "requires": tuple(r.get("requires") or ())})
             except TypeError as exc:
                 raise RatesFileError(f"{source}: rates[{i}]: {exc}") from None
             _check(e.container_s_per_video_s > 0, f"{source}: rates[{i}] must be positive")
@@ -100,8 +111,14 @@ class RateTable:
         return cls.from_dict(data, source=str(p))
 
     # lookup ------------------------------------------------------------------------------
-    def _candidates(self, preset: str, kind: str, cameras: int) -> list[RateEntry]:
-        out = [e for e in self.rates if e.kind == kind and e.preset in (preset, "*")]
+    def features(self) -> set[str]:
+        """Every feature some entry requires."""
+        return {f for e in self.rates for f in e.requires}
+
+    def _candidates(self, preset: str, kind: str, cameras: int,
+                    features: Features = ()) -> list[RateEntry]:
+        out = [e for e in self.rates if e.kind == kind and e.preset in (preset, "*")
+               and e.usable(features)]
         if not out:
             return []
         best_p = min(0 if e.preset == preset else 1 for e in out)
@@ -116,17 +133,20 @@ class RateTable:
         near = min(out, key=lambda e: (abs(int(e.cameras) - cameras), -int(e.cameras)))
         return [e for e in out if e.cameras == near.cameras]
 
-    def concurrencies(self, preset: str, kind: str, cameras: int) -> list[int]:
-        return sorted({e.concurrency for e in self._candidates(preset, kind, cameras)})
+    def concurrencies(self, preset: str, kind: str, cameras: int,
+                      features: Features = ()) -> list[int]:
+        return sorted({e.concurrency for e in self._candidates(preset, kind, cameras,
+                                                                features)})
 
-    def rate(self, preset: str, kind: str, cameras: int, concurrency: int = 1) -> RateEntry:
-        cands = self._candidates(preset, kind, cameras)
+    def rate(self, preset: str, kind: str, cameras: int, concurrency: int = 1,
+             features: Features = ()) -> RateEntry:
+        cands = self._candidates(preset, kind, cameras, features)
         if not cands:
             raise KeyError(f"no rate for preset {preset!r} kind {kind!r} in {self.source}")
         below = [e for e in cands if e.concurrency <= concurrency]
         if below:
-            return max(below, key=lambda e: e.concurrency)
-        return min(cands, key=lambda e: e.concurrency)
+            return max(below, key=lambda e: (e.concurrency, len(e.requires)))
+        return min(cands, key=lambda e: (e.concurrency, -len(e.requires)))
 
     def startup_for(self, preset: str, kind: str) -> StartupEntry:
         def score(e: StartupEntry) -> tuple[int, int] | None:

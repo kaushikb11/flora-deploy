@@ -14,7 +14,7 @@ from flora_deploy.cli.plan import parse_duration
 from flora_deploy.config.schema import load_config
 
 runner = CliRunner()
-ARGS = ["--video-hours", "100", "--budget", "3000", "--deadline", "48h", "--max-gpus", "10"]
+ARGS = ["--video-hours", "100", "--budget", "6000", "--deadline", "96h", "--max-gpus", "10"]
 
 
 @pytest.fixture
@@ -38,7 +38,9 @@ def test_plan_table(cfg):
     assert r.exit_code == 0, r.output
     assert "exact x4" in r.output and "balanced x1" in r.output
     assert "reference" in r.output and "needs certificates" in r.output
-    assert "Recommended: 1 (exact x8)" in r.output
+    assert "Recommended: 1 (exact x4)" in r.output
+    assert "exact x8 +gpu_thread" in r.output and "projection only" in r.output
+    assert "warning: includes projected" in r.output
     assert "pinned 2026-10-21" in r.output
 
 
@@ -62,7 +64,7 @@ def test_plan_write(cfg):
     r = runner.invoke(app, ["plan", "-c", str(cfg), *ARGS, "--preset", "exact", "--write", "1"])
     assert r.exit_code == 0, r.output
     c = load_config(cfg)
-    assert c.pools()["segcap"].max_inputs == 8 and c.modal.budget_usd == 3000
+    assert c.pools()["segcap"].max_inputs == 4 and c.modal.budget_usd == 6000
     assert (cfg.parent / "flora.yaml.bak").read_text() == template_text("exact_mp4_dir")
 
 

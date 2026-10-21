@@ -76,25 +76,27 @@ def test_default_estimator_is_rates_json_not_placeholders():
     pool4 = settings(max_inputs=4).pools["segcap"]
     s = Shard("segcap-00000", "segcap", ("u",), 0.0)
     est = RateTableEstimator(RateTable.load(), "exact", durations={"u": 100.0})
-    assert est.container_seconds(s, pool1) == pytest.approx(862.0)  # 8.62 x 100 video-s, c=1
-    assert est.container_seconds(s, pool4) == pytest.approx(408.0)  # 4.08 at c=4
-    assert est.startup_s("segcap") == 213
+    # rates.json (review 4 M5): the cu128 c=4 rate, 7.0, is the only usable exact segcap row
+    # (the cu130 rows are stale), so c=1 uses it too
+    assert est.container_seconds(s, pool1) == pytest.approx(700.0)  # 7.0 x 100 video-s
+    assert est.container_seconds(s, pool4) == pytest.approx(700.0)  # 7.0 at c=4
+    assert est.startup_s("segcap") == 103
     upper = RateTableEstimator(RateTable.load(), "exact", durations={"u": 100.0},
                                quantile="upper")
-    assert upper.container_seconds(s, pool1) == pytest.approx(862.0 * 1.35)
+    assert upper.container_seconds(s, pool1) == pytest.approx(700.0 * 1.35)
     # without durations, video seconds come back out of the manifest's placeholder estimate
-    assert g.estimator.container_seconds(shards(1)[0], pool1) == pytest.approx(86.2)
-    # the gate and `flora plan` now agree: 2.9x the old placeholder (3.0) on exact segcap
+    assert g.estimator.container_seconds(shards(1)[0], pool1) == pytest.approx(70.0)
+    # the gate and `flora plan` agree: 2.3x the old placeholder (3.0) on exact segcap
     assert g.estimator.container_seconds(shards(1)[0], pool1) / ManifestEstimator(
-    ).container_seconds(shards(1)[0], pool1) == pytest.approx(8.62 / 3.0)
+    ).container_seconds(shards(1)[0], pool1) == pytest.approx(7.0 / 3.0)
     d = g.admit(shards(1)[0], {})
     assert "rates.json" in d.detail["estimate_source"]
 
 
 def test_projection_charges_rates_json_work_and_startup():
     p = gate(1e6).projection({})
-    assert p.queued_usd == pytest.approx(3 * 86.2)
-    assert p.startup_usd == pytest.approx(2 * 213)  # max_containers 2 containers to start
+    assert p.queued_usd == pytest.approx(3 * 70.0)
+    assert p.startup_usd == pytest.approx(2 * 103)  # max_containers 2 containers to start
 
 
 # ----------------------------------------------------------------------------------------------
@@ -368,7 +370,8 @@ def test_hard_cap_holds_without_any_container_receipts():
 
 
 def test_projection_policy_with_rates_json_refuses_a_job_it_cannot_afford():
-    out, spent, _ = simulate(lag=0, max_containers=8, run_s=600)
+    # $2 < the projection (12 shards x 10 video-s x 7.0 + 8 x 103 s startup on H200, ~$2.6)
+    out, spent, _ = simulate(lag=0, max_containers=8, run_s=600, budget=2.0)
     assert out.result == "budget_stopped" and spent == 0.0
 
 
