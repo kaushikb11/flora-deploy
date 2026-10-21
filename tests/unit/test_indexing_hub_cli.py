@@ -159,9 +159,9 @@ def test_cli_local(tmp_path, envelope, planned):
     assert "2 episodes, 2 indexed" in r.output and f"planned {planned}" in r.output
     s = json.loads(out.read_text())
     assert s["job_id"] == "idx-test" and s["counts"]["planned"] == planned
-    assert s["dataset"]["name"] == "./ds"  # uids follow the config, not the cwd
+    assert s["dataset"]["name"] == "ds"  # normalized by config (Fix-CFG); uids follow the config, not the cwd
     store = LocalStore(tmp_path / "store")
-    assert store.exists(I.JobPaths("idx-test").index(episode_uid("./ds", "episode_000000")))
+    assert store.exists(I.JobPaths("idx-test").index(episode_uid("ds", "episode_000000")))
     # the summary feeds `flora plan --index`
     r = CliRunner().invoke(app, ["plan", "-c", str(cfg), "--index", str(out), "--json"])
     assert r.exit_code == 0, r.output
