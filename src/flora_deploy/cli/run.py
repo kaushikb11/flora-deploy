@@ -140,7 +140,8 @@ def run(
         "--detach", help="Modal: start the job and return (watch with `flora status`).")
     ] = False,
     receipt: Annotated[list[str] | None, typer.Option(
-        help="Modal: derived-weight receipt NAME=HASH, as given to `flora deploy` (repeatable).")
+        help="Modal: derived-weight receipt NAME=HASH (repeatable); overrides weights.derived "
+             "in flora.yaml, as for `flora deploy`.")
     ] = None,
     determinism: Annotated[str | None, typer.Option(
         help="Modal: the --determinism the app was deployed with (nvidia | deterministic).")

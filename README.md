@@ -28,16 +28,12 @@ You need:
 
 ```bash
 flora init --template exact_lerobot          # then set preset: balanced (see config below)
-flora prepare                                # download + verify the weights into your Modal Volume
-
-# one-time weight conversions; each prints a receipt hash
-uv run modal run src/flora_deploy/modal_app/convert_app.py::tempseg --step merge
-uv run modal run src/flora_deploy/modal_app/convert_app.py --step convert
-
+flora prepare                                # download + verify the weights into your Modal Volume,
+                                             # build the derived weights, record them in flora.yaml
 flora index                                  # scan the dataset
 flora plan --index summary.json              # cost / time options
-flora deploy --receipt tempseg_merged=<sha> --receipt captioner_bf16=<sha>
-flora run    --receipt tempseg_merged=<sha> --receipt captioner_bf16=<sha>
+flora deploy
+flora run
 flora results --job <job> --stage caption
 ```
 
@@ -109,7 +105,7 @@ An episode that keeps crashing workers is isolated and excluded rather than fail
 ```python
 from flora_deploy import sdk
 
-job = sdk.submit("flora.yaml", receipts={"tempseg_merged": "...", "captioner_bf16": "..."})
+job = sdk.submit("flora.yaml")    # derived-weight receipts come from `flora prepare`
 job.wait()
 records = job.results("caption")
 ```
