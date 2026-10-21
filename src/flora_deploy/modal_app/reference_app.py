@@ -906,9 +906,10 @@ def _image_fingerprint() -> str | None:
 def segcap_settings_from_env(env=None, **overrides):
     """``SegcapWorkerSettings`` from the container env the app factory sets (``FLORA_PRESET``,
     ``FLORA_ENVELOPE``, ``FLORA_MEDIA_ROOT``, ``FLORA_INSTRUCTION_TEXT``) and the pins."""
-    from flora_deploy.workers_impl.segcap import SegcapWorkerSettings
+    from flora_deploy.workers_impl.segcap import SegcapWorkerSettings, scheduling_from_env
 
     env = os.environ if env is None else env
+    overrides = {**scheduling_from_env(env), **overrides}  # G3 longest-first (FLORA_SEGCAP_...)
     if "gpu" not in overrides:
         from flora_deploy.modal_app.workers_app import gpu_name
 

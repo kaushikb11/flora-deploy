@@ -12,7 +12,7 @@ Layout (see ``config/templates/*.yaml`` for commented templates)::
     allow_uncertified: false             # required for balanced until its certificates exist
     input: {format, repo, revision, path, cameras, stage_to}
     pipeline: {stages, embodiment, episode_instruction, envelope, shard_target_gpu_minutes,
-               determinism, terminal_rationale}
+               determinism, terminal_rationale, exact_scheduling}
     resources: {<shard kind>: {gpu, gpu_count, max_containers, max_inputs, episode_concurrency,
                                cpu, memory}}
     output: {sink, formats}
@@ -181,6 +181,21 @@ class EpisodeInstruction(_Model):
         return self
 
 
+class ExactScheduling(_Model):
+    """G3 (``docs/exact-cost.md``): how the exact ``segcap`` worker orders a shard's episodes.
+    **Not hashed** (``config.hashing`` picks fields explicitly; this section is not one of them):
+    it changes only *when* an episode starts, never what NVIDIA's code is given, so every model
+    call's input is unchanged (CPU proof: ``tests/unit/test_exact_scheduling.py``).
+
+    - ``episode_order``: ``plan`` (manifest order) or ``longest_first`` (LPT by duration).
+
+    G3's shard overlap (several shards per container sharing episode slots) was removed (review
+    7b): it needed ``max_inputs > 1``, which the segcap worker refuses (one shard per container,
+    review 6 H2), and its engine-wide cancel and shared crash blame broke D15 attribution."""
+
+    episode_order: Literal["plan", "longest_first"] = "plan"
+
+
 class PipelineSection(_Model):
     stages: tuple[Stage, ...] = Field(min_length=1)
     embodiment: Embodiment
@@ -194,6 +209,9 @@ class PipelineSection(_Model):
     # NVIDIA's terminal_reward.py `--with-rationale` (default off: score only). Different
     # prompt, max_tokens and regex, so it is hashed into the reward.terminal stage hash (M4).
     terminal_rationale: bool = Field(False, strict=True)
+    # G3: exact segcap episode start order (longest-first). Not hashed: inputs to
+    # every model call are unchanged (see ExactScheduling).
+    exact_scheduling: ExactScheduling = Field(default_factory=ExactScheduling)
 
     @field_validator("stages")
     @classmethod
@@ -416,6 +434,7 @@ def review4_problems(cfg: FloraConfig) -> list[str]:
         p = per_device_gpu_problem(cfg.preset, kind, pool.gpu, pool.gpu_count)
         if p:
             problems.append(p)
+    problems += scheduling_problems(cfg, kinds)
     cams = cfg.input.cameras
     if cams is not None:
         if cfg.pipeline.embodiment == "human" and len(cams) == 3:
@@ -433,6 +452,21 @@ def review4_problems(cfg: FloraConfig) -> list[str]:
         problems.append(f"input.repo {cfg.input.repo!r} is not a Hugging Face repo id "
                         "('namespace/name')")
     return problems
+
+
+def scheduling_problems(cfg: FloraConfig, kinds: list[str] | tuple[str, ...]) -> list[str]:
+    """G3: ``pipeline.exact_scheduling`` applies to the exact ``segcap`` worker only."""
+    if cfg.pipeline.exact_scheduling == ExactScheduling():
+        return []
+    if "segcap" not in kinds:
+        return ["pipeline.exact_scheduling applies to the exact preset's segcap worker only"]
+    return []
+
+
+def exact_scheduling(cfg: FloraConfig) -> dict[str, Any]:
+    """What the segcap worker needs (``workers_impl.segcap.SCHEDULING_ENV``, read by
+    ``segcap.scheduling_from_env``): ``episode_order``. Not hashed (``ExactScheduling``)."""
+    return {"episode_order": cfg.pipeline.exact_scheduling.episode_order}
 
 
 def output_settings(cfg: FloraConfig) -> dict[str, Any]:

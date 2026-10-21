@@ -54,6 +54,11 @@ and the paths are re-keyed by the ``segcap`` stage hash from the config's manife
 6. ``ShardReceipt`` LAST, ``parts`` = earlier parts + this container's own, ``config_hash`` = the
    stage hash (``JobFiles.key``), ``episodes_failed`` = terminal exclusions only.
 
+G3 scheduling (``docs/exact-cost.md``; not hashed: no model input changes):
+``SegcapWorkerSettings.episode_order="longest_first"`` starts a shard's episodes longest first
+(:func:`order_episodes`), set by ``pipeline.exact_scheduling.episode_order`` through
+``FLORA_SEGCAP_SCHEDULING``. Shards never overlap: one shard per container (review 7b).
+
 Records: ``provenance.config_hash`` is the stage hash (stamped by the part sink);
 ``certified`` per the episode's envelope verdict (``EpisodeRef.envelope_ok``, D13;
 ``envelope="ignore"`` certifies regardless); ``provenance.engine`` is the engine label
@@ -98,6 +103,10 @@ from flora_deploy.workers_impl.reward import (
 
 ENGINE_LABEL = "nvidia-hf"
 AUDIT_SCHEMA = "flora_segcap_audit_v1"
+# G3 scheduling (docs/exact-cost.md): the start order of a shard's episodes. It changes no model
+# input (only which episode starts when), so it is not hashed: ``config.schema.ExactScheduling``.
+EPISODE_ORDERS = ("plan", "longest_first")
+SCHEDULING_ENV = "FLORA_SEGCAP_SCHEDULING"  # JSON {"episode_order"}, from the app factory
 # EpisodeRef.pool -> (NVIDIA profile, yam32), as ``jobs.indexing`` maps it (receipts carry both).
 POOL_PROFILES = {"human": ("human", False), "yam": ("yam", False), "yam32": ("yam", True),
                  "dex": ("dex", False), "tianji": ("tianji", False)}
@@ -481,6 +490,40 @@ class SegcapWorkerSettings:
     determinism: str = "nvidia"
     local_dir: str = "/tmp/flora-segcap"
     container_id: str = field(default_factory=default_container_id)
+    # G3 (docs/exact-cost.md; ``config.schema.ExactScheduling``, not hashed): "plan" (manifest
+    # order) or "longest_first" (LPT by the manifest's ``duration_s``, ties in plan order)
+    episode_order: str = "plan"
+
+
+def scheduling_from_env(env: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """``SegcapWorkerSettings`` scheduling fields from ``FLORA_SEGCAP_SCHEDULING`` (JSON the app
+    factory writes from ``config.schema.exact_scheduling``); defaults when unset."""
+    import os
+
+    env = os.environ if env is None else env
+    raw = env.get(SCHEDULING_ENV)
+    if not raw:
+        return {"episode_order": "plan"}
+    out = {"episode_order": str(json.loads(raw).get("episode_order", "plan"))}
+    check_scheduling(**out)
+    return out
+
+
+def check_scheduling(episode_order: str) -> None:
+    if episode_order not in EPISODE_ORDERS:
+        raise ValueError(f"episode_order {episode_order!r}: use one of {EPISODE_ORDERS}")
+
+
+def order_episodes(uids: list[str], refs: Mapping[str, EpisodeRef], order: str) -> list[str]:
+    """The order a shard's episodes start in. ``longest_first`` is LPT list scheduling: the
+    longest episode (manifest ``duration_s``) first, so the shard's makespan is not set by a
+    long episode that started last; ties keep plan order. Only start order changes: each
+    episode is still one independent NVIDIA ``annotate``."""
+    check_scheduling(order)
+    if order == "plan":
+        return list(uids)
+    pos = {u: i for i, u in enumerate(uids)}
+    return sorted(uids, key=lambda u: (-float(refs[u].duration_s or 0.0), pos[u]))
 
 
 def certification(ref: EpisodeRef, envelope: str = "warn") -> tuple[bool, str | None]:
@@ -562,6 +605,7 @@ class SegcapShardRunner:
         from flora_deploy.accel import determinism as det
 
         det.check_mode(settings.determinism)
+        check_scheduling(settings.episode_order)
         self.store, self.engine, self.settings = store, engine, settings
         self.inputs_for = inputs or self.inputs_from_index
         self.call_id, self.clock = call_id, clock
@@ -574,6 +618,7 @@ class SegcapShardRunner:
         self._busy = False  # one shard per container (ConcurrentShardRefused)
         self._next_k: dict[tuple[str, str, str], int] = {}
         self.last_batch: dict | None = None  # the last annotate batch summary (diagnostics)
+        self.skipped_refreshes = 0
 
     # -- contract ------------------------------------------------------------------------
 
@@ -593,9 +638,7 @@ class SegcapShardRunner:
 
     def _run_shard(self, job_id: str, shard_id: str, config_hash: str,
                    token: str) -> ShardReceipt | None:
-        refresh = getattr(self.store, "refresh", None)
-        if callable(refresh):  # Volume stores: see current ledgers / parts in a warm container
-            refresh()
+        self._refresh()
         jf = A.JobFiles(self.store, job_id, config_hash)  # paths keyed by the stage hash
         manifests = StoreManifestSource(jf)
         shard = manifests.shard(shard_id)
@@ -641,6 +684,40 @@ class SegcapShardRunner:
         finally:
             with self._lock:
                 self._active.pop(id(active), None)
+
+    def _media_on_store(self) -> bool:
+        """The media root lies inside the store's Volume mount (``factory.media_for`` stages
+        inputs there when ``stage_to`` names the store Volume): NVIDIA then has Volume files
+        open while an episode runs."""
+        mount, media = getattr(self.store, "mount", None), self.settings.media_root
+        if mount is None or not media or "://" in str(media):
+            return False
+        try:
+            Path(media).resolve().relative_to(Path(mount).resolve())
+        except (ValueError, OSError):
+            return False
+        return True
+
+    def _episodes_live(self) -> bool:
+        """Episode threads still run in this container: an interrupted or cancelled shard's
+        in-flight episodes outlive its ``run_shard`` (``FastExactEngine._thread``)."""
+        thread = getattr(self.engine, "_thread", None)
+        return thread is not None and thread.is_alive()
+
+    def _refresh(self) -> None:
+        """Volume stores: see current ledgers / parts in a warm container. A Volume reload fails
+        (or blanks the mount) while a Volume file is open; ``VolumeStore.refresh`` guards its own
+        calls, not NVIDIA's open media. So while episode threads still run (review 7b G3-5: live
+        episodes, not running shards) and the media are on the store Volume, the reload is
+        skipped; this shard sees the view of the last reload, which the contract tolerates."""
+        refresh = getattr(self.store, "refresh", None)
+        if not callable(refresh):
+            return
+        if self._episodes_live() and self._media_on_store():
+            with self._lock:
+                self.skipped_refreshes += 1
+            return
+        refresh()
 
     def preempt(self) -> bool:
         """``@modal.exit`` / SIGINT hook: stop queued episodes from starting, flush **every**
@@ -778,11 +855,13 @@ class SegcapShardRunner:
 
         refs = {e.uid: e for e in manifests.base().episodes}
         todo = [u for u in shard.episodes if u not in done and u not in poisoned]
+        missing_refs = [u for u in todo if u not in refs]
+        if missing_refs:
+            raise KeyError(f"episode {missing_refs[0]!r} is not in the manifest")
+        todo = order_episodes(todo, refs, s.episode_order)  # G3: start order only
         inputs: dict[str, SegcapInputs] = {}
         errors: list[EpisodeError] = []
         for uid in todo:  # step 4: inputs (per-episode isolation)
-            if uid not in refs:
-                raise KeyError(f"episode {uid!r} is not in the manifest")
             got = self._load_inputs(shard, refs[uid])
             if isinstance(got, SegcapInputs):
                 inputs[uid] = got
@@ -844,7 +923,8 @@ class SegcapShardRunner:
                      "timing_dependent_calls": timing, "gpu_timing": gpu_timing,
                      "config_hash": jf.key(shard.kind), "job_config_hash": jf.config_hash,
                      "shard_id": shard.shard_id, "container_id": self.container_id,
-                     "runtime": {**self.engine.runtime_provenance(), "nv_audit": audit_report},
+                     "runtime": {**self.engine.runtime_provenance(), "nv_audit": audit_report,
+                                 "scheduling": {"episode_order": s.episode_order}},
                      "result": result}
             sink.add(records=records, audits=[audit])
             sink.flush()  # every finished episode is on the store before the next one lands
