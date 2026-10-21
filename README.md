@@ -123,7 +123,7 @@ caption, terminal = pd.read_parquet("caption.parquet"), pd.read_parquet("termina
 labels = caption.merge(terminal[["uid", "terminal_score"]], on="uid")
 ```
 
-Get the files with `flora results --job <job> --stage caption --format parquet --out caption.parquet`.
+Get the files with `flora results --job <job> --stage caption --store <store> --format parquet --out caption.parquet`.
 Every field is described in [`docs/output-format.md`](docs/output-format.md).
 
 ## Python SDK

@@ -189,7 +189,7 @@ def test_config_block_validates_with_its_placeholders_filled():
 def test_sdk_snippet_calls_exist():
     from flora_deploy import sdk
 
-    (py,) = [b for b in BLOCKS if b.lang == "python"]
+    (py,) = [b for b in BLOCKS if b.lang == "python" and "sdk." in b.code]
     for kw in re.findall(r"sdk\.submit\([^)]*?(\w+)=", py.code):
         assert kw in inspect.signature(sdk.submit).parameters
     for meth in re.findall(r"job\.(\w+)\(", py.code):
