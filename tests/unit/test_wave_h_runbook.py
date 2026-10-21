@@ -46,18 +46,33 @@ def test_same_six_episodes_as_h0_and_subsets():
     assert set(wh.NOISE_EPISODES) <= set(ids) and len(wh.NOISE_EPISODES) == 2
 
 
-def test_projections_fit_every_cap():
+def test_projections_are_honest_about_the_caps():
+    """H2: upper projections (upper quantiles, every cold start, scale-down tail and the client
+    slack per app) are what the stop rule gates on; the dry run names the minimum honest cap."""
     m = _manifest()
-    total = 0.0
-    for step in wh.STEPS:
-        p = wh.project(step, m)
-        assert p.usd <= wh.CAPS_USD[step] + 1e-9, (step, p.usd)
+    ps = {step: wh.project(step, m) for step in wh.STEPS}
+    for p in ps.values():
         assert p.usd_upper >= p.usd
-        total += p.usd
-    assert total <= wh.GLOBAL_CAP_USD
-    # exact runs on the preset's H200 pool, balanced on L40S + H100
-    assert {i["gpu"] for i in wh.project("exact_e2e", m).items} == {"H200"}
-    assert {i["gpu"] for i in wh.project("balanced", m).items} == {"L40S", "H100"}
+    for it in ps["exact_e2e"].items + ps["noise"].items:  # every app carries the client slack
+        assert it["upper_seconds"] - it["seconds"] >= wh.CLIENT_SLACK_S
+    # exact on the preset's H200 pool (two apps: two cold starts); balanced on its L40S + H100
+    # pools (two apps, one cold start per pool each) plus the two lab containers
+    assert [i["gpu"] for i in ps["exact_e2e"].items] == ["H200", "H200"]
+    assert [i["gpu"] for i in ps["balanced"].items] == ["L40S", "H100!", "L40S", "H100!",
+                                                        "L40S", "H100"]
+    assert wh.CAPS_USD["exact_e2e"] == 1.80 and wh.GLOBAL_CAP_USD == 3.20
+    assert ps["exact_e2e"].usd <= wh.CAPS_USD["exact_e2e"]  # nominal: two cold starts fit
+    honest = wh.honest_caps(ps)
+    for step in ("rewards", "balanced", "noise", "preflight"):
+        assert ps[step].usd_upper <= wh.CAPS_USD[step] <= honest[step]
+    upper = sum(p.usd_upper for p in ps.values())
+    assert upper > wh.GLOBAL_CAP_USD  # reported by the dry run, not hidden
+    assert honest["global"] >= upper
+
+
+def test_noise_repeats_the_oracle_human_job():
+    assert wh.NOISE_EPISODES == h0.EPISODES[wh.NOISE_JOB] == h0.EPISODES["human"]
+    assert wh.ORACLE_DETERMINISM == "nvidia"  # Fix-Cert: oracle and noise in default mode
 
 
 def test_container_prices_are_list_prices():
@@ -72,27 +87,32 @@ def test_container_prices_are_list_prices():
 def test_stop_rules_before_after_and_deadline():
     st = wh.State("r", 0.0, "2026-10-21")
     p = wh.Projection("exact_e2e")
-    p.add("x", wh.Container("H200", 8, 96), 900)  # ~$1.42 > $1.20
-    with pytest.raises(wh.StopRule, match="over its cap"):
-        wh.check_before(st, "exact_e2e", p)
-    st.step("balanced").tracked_usd = 2.5
+    p.add("x", wh.Container("H200", 8, 96), 600, upper_s=1300)  # nominal fits, upper not
+    assert p.usd < wh.CAPS_USD["exact_e2e"] < p.usd_upper
+    with pytest.raises(wh.StopRule, match="upper projection"):
+        wh.check_before(st, "exact_e2e", p)  # H2: the upper figure is what is gated
+    st.step("balanced").attempts.append(wh.Attempt(0.0, "done", tracked_usd=2.5))
     small = wh.Projection("exact_e2e")
-    small.add("x", wh.Container("H200", 8, 96), 600)  # ~$0.95 fits the step, not the global
+    small.add("x", wh.Container("H200", 8, 96), 400, upper_s=600)  # fits the step only
     with pytest.raises(wh.StopRule, match="global"):
         wh.check_before(st, "exact_e2e", small)
-    st.step("rewards").billed_usd = 0.7  # billed beats tracked when larger
+    st.step("rewards").billed_usd = 0.95  # billed beats tracked when larger
     with pytest.raises(wh.StopRule, match="rewards"):
         wh.check_after(st, "rewards")
     st2 = wh.State("r", 0.0, "2026-10-21")
     c = wh.Container("H200", 8, 96)
-    assert wh.gpu_deadline_s(st2, "noise", c) == pytest.approx(0.40 / c.usd_per_s())
-    assert wh.gpu_deadline_s(st2, "noise", c, spent_in_step=0.5) == 0.0
+    r = c.usd_per_s()
+    # the deadline keeps the client slack: deadline + slack never spends more than the cap
+    d = wh.gpu_deadline_s(st2, "noise", c)
+    assert d == pytest.approx((wh.CAPS_USD["noise"] - wh.CLIENT_SLACK_S * r) / r)
+    assert (d + wh.CLIENT_SLACK_S) * r == pytest.approx(wh.CAPS_USD["noise"])
+    assert wh.gpu_deadline_s(st2, "noise", c, spent_in_step=1.2) == 0.0
 
 
 def test_state_round_trip_and_resume(tmp_path):
     st = wh.State("abc", 1.0, "2026-10-21", {"flora-x": 1.0})
     st.step("preflight").status = "done"
-    st.step("preflight").tracked_usd = 0.01
+    st.step("preflight").attempts.append(wh.Attempt(1.0, "done", tracked_usd=0.01))
     path = tmp_path / "state.json"
     wh.save_state(st, path)
     back = wh.load_state(path)
@@ -151,5 +171,203 @@ def test_dry_run_spends_nothing(monkeypatch, tmp_path, capsys):
     state = tmp_path / "state.json"
     assert wh.main(["--dry-run", "--state", str(state)]) == 0
     out = capsys.readouterr().out
-    assert "total projected" in out and "dry run" in out and not state.exists()
+    assert "total: nominal" in out and "dry run" in out and not state.exists()
+    assert "nominal $" in out and "upper $" in out
+    assert "NOT HONEST AT $3.20" in out and "at least $" in out  # H2: reported, not hidden
     assert json.dumps(wh.CAPS_USD)  # caps are plain data
+
+
+# --- H1: receipts resolved as `flora deploy` resolves them -------------------------------------
+
+
+def _receipt(tag: str) -> bytes:
+    return json.dumps({"kind": tag, "ok": True}).encode()
+
+
+def test_receipts_come_from_the_volume_and_are_pin_checked(monkeypatch):
+    from flora_deploy.config import receipts
+    from flora_deploy.config.pins import DERIVED_PINS_BY_KEY
+    from flora_deploy.prep.derived import DERIVED_BUILDS, receipt_sha256
+
+    seen = []
+    monkeypatch.setattr(receipts, "check_pinned", lambda n, r, where=None: seen.append(n))
+    files = {DERIVED_BUILDS["captioner_bf16"].receipt_path(): _receipt("c")}
+    got = wh.resolve_receipts(["captioner_bf16"], read=files.get)
+    assert got == {"captioner_bf16": receipt_sha256(_receipt("c"))}
+    assert seen == ["captioner_bf16"]
+    with pytest.raises(RuntimeError, match="flora prepare"):
+        wh.resolve_receipts(["tempseg_merged"], read=files.get)
+    files[DERIVED_BUILDS["tempseg_merged"].receipt_path()] = _receipt("t")
+    assert set(wh.resolve_receipts(["tempseg_merged"], read=files.get)) == {"tempseg_merged"}
+    if DERIVED_PINS_BY_KEY["tempseg-merged"].content_sha256 is None:  # balanced fails closed
+        with pytest.raises(RuntimeError, match="pinned"):
+            wh.resolve_receipts(["tempseg_merged"], read=files.get, require_pin=True)
+
+
+def test_receipt_pin_mismatch_is_refused(monkeypatch):
+    from flora_deploy.config import receipts
+    from flora_deploy.prep.derived import DERIVED_BUILDS
+
+    def bad(name, receipt, where=None):
+        raise receipts.ReceiptPinMismatch(f"{where}: not the pinned content")
+
+    monkeypatch.setattr(receipts, "check_pinned", bad)
+    files = {DERIVED_BUILDS["captioner_bf16"].receipt_path(): _receipt("c")}
+    with pytest.raises(receipts.ReceiptPinMismatch):
+        wh.resolve_receipts(["captioner_bf16"], read=files.get)
+
+
+def test_no_pin_attribute_lookups_remain():
+    """H1 regression: ``DerivedPin`` has no ``receipt_sha256``."""
+    src = (SCRIPTS / "wave_h.py").read_text()
+    assert ".receipt_sha256" not in src and "_receipt()" not in src
+
+
+def test_generated_configs_carry_weights_derived_and_resolve_like_deploy(tmp_path, monkeypatch):
+    from flora_deploy.config.receipts import resolve
+    from flora_deploy.config.schema import loads_config
+    from flora_deploy.modal_app.factory import plan_app
+
+    (tmp_path / "d").mkdir()
+    monkeypatch.chdir(tmp_path)
+    derived = {"captioner_bf16": "a" * 64, "tempseg_merged": "b" * 64}
+    text = h0.config_text(project="wave-h-x-balanced-human", data_dir="d", embodiment="human",
+                          stages=("segment", "caption"), store_volume=wh.STORE_VOLUME,
+                          media_volume=wh.MEDIA_VOLUME, run_id="x", preset="balanced",
+                          derived=derived)
+    cfg = loads_config(text, source=str(tmp_path / "flora.yaml"))
+    assert cfg.allow_uncertified and resolve(cfg) == derived
+    plan = plan_app(cfg, determinism="nvidia", derived_receipts=resolve(cfg))
+    assert plan.worker_classes == {"segment": "SegmentWorker", "caption": "CaptionWorker"}
+
+
+# --- H3: cumulative, crash-safe spend ----------------------------------------------------------
+
+
+def test_retries_add_instead_of_overwriting():
+    st = wh.State("r", 0.0, "x")
+    s = st.step("exact_e2e")
+    s.attempts.append(wh.Attempt(0.0, "failed", finished=10.0, tracked_usd=1.00))
+    s.attempts.append(wh.Attempt(20.0, "done", finished=30.0, tracked_usd=0.90))
+    assert s.spent == pytest.approx(1.90) and st.spent == pytest.approx(1.90)
+    with pytest.raises(wh.StopRule, match="exact_e2e"):
+        wh.check_after(st, "exact_e2e")  # $1.90 > $1.80
+
+
+def test_legacy_state_files_keep_their_spend(tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"run_id": "r", "created": 0, "billing_since": "x",
+                                "steps": {"exact_e2e": {"status": "failed", "tracked_usd": 1.0,
+                                                        "billed_usd": None, "started": 1.0,
+                                                        "finished": 2.0}}}))
+    assert wh.load_state(path).spent == pytest.approx(1.0)
+
+
+def test_killed_step_counts_its_heartbeat_and_budget_until_billing_reconciles(tmp_path):
+    path = tmp_path / "state.json"
+    st = wh.State("r", 0.0, "x")
+    s = st.step("noise")
+    s.status = "running"
+    a = wh.Attempt(started=100.0, rate_usd_per_s=0.002, budget_usd=0.80, apps=["flora-app"])
+    s.attempts.append(a)
+    clock = iter([160.0, 400.0])
+    hb = wh.Heartbeat(st, a, path, every=3600, clock=lambda: next(clock))
+    hb.beat()
+    assert a.tracked_usd == pytest.approx(0.12)  # 60 s x $0.002/s, saved to disk
+    hb.beat()
+    assert a.tracked_usd == pytest.approx(0.60)
+    # the process is killed here; a new one loads the state file
+    back = wh.load_state(path)
+    assert back.steps["noise"].attempts[0].tracked_usd == pytest.approx(0.60)
+    assert back.mark_killed() == ["flora-app"] and back.steps["noise"].status == "failed"
+    assert back.spent == pytest.approx(0.80)  # its budget: billing has not caught up
+    back.billing_baseline = {"flora-app": 0.0}
+    assert wh.refresh_billing(back, now={"flora-app": 0.55}, clock=lambda: 400.0 + 3600)
+    assert back.steps["noise"].billed_usd == pytest.approx(0.55)
+    assert back.spent == pytest.approx(0.60)  # reconciled: max(heartbeat tracked, billed)
+
+
+def test_failed_report_is_charged_its_budget():
+    st = wh.State("r", 0.0, "x")
+    st.step("rewards").attempts.append(wh.Attempt(0.0, "failed", finished=1.0,
+                                                  budget_usd=0.9, report_error=True))
+    assert st.spent == pytest.approx(0.9)
+
+
+def test_billing_is_reread_for_every_app_and_shared_apps_count_once():
+    st = wh.State("r", 0.0, "x", {"lab": 1.0, "exact-human": 0.0})
+    st.step("preflight").attempts.append(wh.Attempt(0.0, "done", tracked_usd=0.01,
+                                                    apps=["lab"]))
+    st.step("balanced").attempts.append(wh.Attempt(0.0, "done", tracked_usd=0.5,
+                                                   apps=["lab", "bal-app"]))
+    st.step("exact_e2e").attempts.append(wh.Attempt(0.0, "done", tracked_usd=1.0,
+                                                    apps=["exact-human"]))
+    st.step("noise").attempts.append(wh.Attempt(0.0, "done", tracked_usd=0.3,
+                                                apps=["exact-human"]))  # (b)'s app again
+    wh.refresh_billing(st, now={"lab": 1.2, "bal-app": 2.0, "exact-human": 1.1})
+    assert st.billed_total == pytest.approx(0.2 + 2.0 + 1.1)
+    assert st.step("balanced").billed_usd == pytest.approx(2.0)  # only its own app
+    assert st.step("exact_e2e").billed_usd is None  # shared with noise: global only
+    assert st.spent == pytest.approx(0.01 + 2.0 + 1.0 + 0.3)
+    wh.refresh_billing(st, now={"lab": 1.2, "bal-app": 2.0, "exact-human": 5.0})
+    assert st.spent == pytest.approx(0.2 + 2.0 + 5.0)  # the billed total wins when larger
+
+
+def _fake_run(monkeypatch, tmp_path, runner):
+    monkeypatch.setattr(h0, "golden_manifest", _manifest)
+    monkeypatch.setattr(wh, "billed_by_app", lambda since: {})
+    monkeypatch.setattr(wh, "RUNNERS", {**{k: (lambda ctx: {"ok": True, "tracked_usd": 0.0})
+                                           for k in wh.STEPS}, "preflight": runner})
+    monkeypatch.setattr(wh, "REPORT", tmp_path / "report.md")
+    monkeypatch.chdir(tmp_path)  # main() chdirs into --work; monkeypatch restores the cwd
+    state = tmp_path / "state.json"
+    return state, ["--yes-spend", "--only", "preflight", "--state", str(state), "--work",
+                   str(tmp_path / "work")]
+
+
+def test_main_retry_accumulates_and_resume_skips_done(monkeypatch, tmp_path):
+    calls = []
+
+    def flaky(ctx):
+        calls.append(1)
+        ok = len(calls) > 1
+        return {"ok": ok, "tracked_usd": 0.01 if ok else 0.02, "apps": ["flora-balanced-lab"]}
+
+    state, argv = _fake_run(monkeypatch, tmp_path, flaky)
+    assert wh.main(argv) == 1  # failed attempt
+    assert wh.main(argv) == 0  # retried
+    s = wh.load_state(state).steps["preflight"]
+    assert [a.status for a in s.attempts] == ["failed", "done"]
+    assert s.spent == pytest.approx(0.03)  # both attempts count
+    assert wh.main(argv) == 0 and len(calls) == 2  # done: never re-run
+
+
+def test_main_charges_a_crashed_step(monkeypatch, tmp_path):
+    def crash(ctx):
+        ctx.note_app("flora-balanced-lab")
+        raise RuntimeError("boom")
+
+    state, argv = _fake_run(monkeypatch, tmp_path, crash)
+    assert wh.main(argv) == 1
+    s = wh.load_state(state).steps["preflight"]
+    (a,) = s.attempts
+    assert a.status == "failed" and a.report_error and a.apps == ["flora-balanced-lab"]
+    assert a.budget_usd == wh.CAPS_USD["preflight"] and s.spent == pytest.approx(a.budget_usd)
+
+
+def test_main_resumes_after_a_kill(monkeypatch, tmp_path):
+    stopped = []
+    monkeypatch.setattr(wh.subprocess, "run", lambda args, **k: stopped.append(args))
+    state, argv = _fake_run(monkeypatch, tmp_path,
+                            lambda ctx: {"ok": True, "tracked_usd": 0.01, "apps": []})
+    st = wh.State("r", 0.0, "x", {"x": 0.0})
+    s = st.step("preflight")
+    s.status = "running"  # a killed process left it here
+    s.attempts.append(wh.Attempt(0.0, heartbeat=10.0, tracked_usd=0.004, budget_usd=0.05,
+                                 apps=["flora-balanced-lab"]))
+    wh.save_state(st, state)
+    assert wh.main(argv) == 0
+    s = wh.load_state(state).steps["preflight"]
+    assert [a.status for a in s.attempts] == ["killed", "done"]
+    assert s.spent == pytest.approx(0.05 + 0.01)  # the killed attempt at its budget
+    assert ["modal", "app", "stop", "--yes", "flora-balanced-lab"] in stopped

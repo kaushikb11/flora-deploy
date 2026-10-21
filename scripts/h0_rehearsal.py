@@ -5,8 +5,14 @@ Usage::
 
     uv run python scripts/h0_rehearsal.py [--dry-run] [--keep] [--work DIR] [--max-wall-s 1500]
 
-What it runs, per job (``human``: 2 EgoDex episodes; ``yam``: 2 three-view + 2 single-view robot
-episodes + 1 injected poison episode), exactly the commands Wave H runs, with fake models:
+What it runs, per job, exactly the commands Wave H runs, with fake models. ``exact`` jobs:
+``human`` (2 EgoDex episodes) and ``yam`` (2 three-view + 2 single-view robot episodes + 1
+injected poison episode). ``balanced`` jobs (``preset: balanced``, ``allow_uncertified: true``;
+the factory's ``FakeSegmentWorker`` / ``FakeCaptionWorker``) on the same 6 episodes:
+``bal-human`` (clean), ``bal-yam-seg`` (one preemption of a ``segment`` shard, the poison episode
+poisoned at ``segment``: excluded at caption too, counted once) and ``bal-yam-cap`` (one
+preemption of a ``caption`` shard, poisoned at ``caption`` only). ``--preset exact|balanced``
+runs one family; the default runs both:
 
 1. fetch the episodes from the golden Volume (``flora-golden``, ``golden/v1/``) into a local
    ``mp4_dir`` dataset (task text next to each video) and upload it to a dedicated media Volume
@@ -15,9 +21,10 @@ episodes + 1 injected poison episode), exactly the commands Wave H runs, with fa
    dedicated Volume ``flora-h0``: ``flora index --local`` cannot write a ``modal-volume://``
    store from a laptop, and ``flora index`` on Modal refuses a local ``input.path``);
 3. ``flora plan --index``, ``flora deploy --fake-models --determinism deterministic``;
-4. fault spec into the yam job (``workers_app.fake_faults_path``): ``simulate_preemption()``
-   before the 2nd episode of ``segcap-00000`` and a poison episode (``os._exit(137)`` every
-   time), then ``flora run --fake-models --determinism deterministic`` for both jobs in parallel;
+4. fault specs (``workers_app.fake_faults_path``): ``simulate_preemption()`` before the 2nd
+   episode of the first start of a ``segcap`` (``segment`` / ``caption``) shard and a poison
+   episode (``os._exit(137)`` every time; for the balanced jobs only in workers of the named
+   kind), then ``flora run --fake-models --determinism deterministic`` for every job in parallel;
 5. ``flora status``, ``flora results`` and the SDK's ``Job.results`` / store listing;
 6. assertions (printed as PASS/FAIL), then ``modal app stop`` for the apps it deployed and
    deletion of the two dedicated Volumes and this run's lease/watch entries (``--keep`` skips
@@ -67,6 +74,55 @@ EPISODES: dict[str, tuple[str, ...]] = {
             "single_view_robot/wgo/galaxea_045"),
 }  # 76.5 s of video in all (scripts/wave_h.py prices exactly this set)
 STAGES = ("segment", "caption", "reward.terminal", "reward.dense")
+
+
+@dataclass(frozen=True)
+class JobSpec:
+    """One H0 job: its data directory (``EPISODES`` key), preset and injected faults."""
+
+    name: str
+    data: str
+    preset: str = "exact"
+    preempt: str | None = None  # shard kind preempted once (before its 2nd episode)
+    poison_at: str | None = None  # "any" (exact: every worker) or a balanced shard kind
+
+    @property
+    def embodiment(self) -> str:
+        return "human" if self.data == "human" else "yam"
+
+    @property
+    def determinism(self) -> str:
+        """``deterministic`` applies to exact segcap only (the config refuses it otherwise)."""
+        return DETERMINISM if self.preset == "exact" else "nvidia"
+
+    def lost(self, stage: str) -> bool:
+        """Whether the poison episode has no record of ``stage``."""
+        if self.poison_at is None:
+            return False
+        if self.poison_at == "any":
+            return True
+        return stage == "caption" if self.poison_at == "caption" else stage in ("segment",
+                                                                                 "caption")
+
+    def faults(self, poison: str) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        if self.preempt:
+            out["preempt"] = {self.preempt: PREEMPT_AT}
+        if self.poison_at == "any":
+            out["poison"] = [poison]
+        elif self.poison_at:
+            out["poison"] = {self.poison_at: [poison]}
+        return out
+
+
+JOBS: tuple[JobSpec, ...] = (
+    JobSpec("human", "human"),
+    JobSpec("yam", "yam", preempt=PREEMPT_SHARD, poison_at="any"),
+    JobSpec("bal-human", "human", "balanced"),
+    JobSpec("bal-yam-seg", "yam", "balanced", preempt="segment", poison_at="segment"),
+    JobSpec("bal-yam-cap", "yam", "balanced", preempt="caption", poison_at="caption"),
+)
+JOB_SPECS = {j.name: j for j in JOBS}
 
 
 def flora_bin() -> str:
@@ -151,15 +207,23 @@ def upload_dir(volume: str, local: Path, remote: str) -> int:
 def config_text(*, project: str, data_dir: str, embodiment: str, stages: tuple[str, ...],
                 store_volume: str, media_volume: str, run_id: str, budget_usd: float = 20.0,
                 resources: dict[str, str] | None = None, tag: str = "flora-h0",
-                header: str = "H0 rehearsal; generated by scripts/h0_rehearsal.py") -> str:
+                header: str = "H0 rehearsal; generated by scripts/h0_rehearsal.py",
+                preset: str = "exact", derived: dict[str, str] | None = None) -> str:
     """One ``flora.yaml`` for an ``mp4_dir`` job staged on ``media_volume``. Shared with
-    ``scripts/wave_h.py``, so H0 rehearses exactly Wave H's configs."""
+    ``scripts/wave_h.py``, so H0 rehearses exactly Wave H's configs. ``preset: balanced`` sets
+    ``allow_uncertified: true`` (no certificate exists yet). ``derived``: ``weights.derived``
+    receipts, as ``flora prepare`` records them (``config.receipts``)."""
     from flora_deploy.config.presets import get_preset, shard_kinds_for
 
-    kinds = shard_kinds_for(get_preset("exact"), list(stages))
+    kinds = shard_kinds_for(get_preset(preset), list(stages))
     res = {k: "{max_containers: 1}" for k in kinds}
     res.update(resources or {})
     res_lines = "\n".join(f"  {k}: {v}" for k, v in res.items())
+    extra = "allow_uncertified: true\n" if preset != "exact" else ""
+    weights = ""
+    if derived:
+        weights = "weights:\n  derived:\n" + "".join(
+            f"    {k}: {v}\n" for k, v in sorted(derived.items()))
     return f"""# {header} ({data_dir})
 project: {project}
 license_ack: research-only
@@ -168,8 +232,8 @@ modal:
   max_gpus: 4
   budget_usd: {budget_usd:g}
   tags: {{{tag}: "{run_id}"}}
-preset: exact
-input:
+preset: {preset}
+{extra}{weights}input:
   format: mp4_dir
   path: ./{data_dir}
   stage_to: volume://{media_volume}/{run_id}/{data_dir}
@@ -191,27 +255,32 @@ retries:
 
 
 def write_config(work: Path, job: str, run_id: str) -> Path:
-    text = config_text(project=f"h0-{run_id}-{job}", data_dir=job,
-                       embodiment="human" if job == "human" else "yam", stages=STAGES,
-                       store_volume=STORE_VOLUME, media_volume=MEDIA_VOLUME, run_id=run_id)
+    spec = JOB_SPECS[job]
+    text = config_text(project=f"h0-{run_id}-{job}", data_dir=spec.data,
+                       embodiment=spec.embodiment, stages=STAGES, store_volume=STORE_VOLUME,
+                       media_volume=MEDIA_VOLUME, run_id=run_id, preset=spec.preset)
     path = work / f"flora-{job}.yaml"
     path.write_text(text, encoding="utf-8")
     return path
 
 
-def plans(cfg_path: Path) -> dict[str, Any]:
-    """The fake app plan and, for comparison, the real ones (nvidia / deterministic)."""
+def plans(cfg_path: Path, mode: str | None = None) -> dict[str, Any]:
+    """The fake app plan and, for comparison, the real ones (nvidia / deterministic). ``mode``
+    (default: the job's; ``deterministic`` for exact) is the deployed determinism mode; the
+    other-mode plans exist for exact only (balanced has no determinism mode)."""
     from flora_deploy.config.schema import load_config
     from flora_deploy.modal_app.factory import FAKE_RECEIPT, plan_app
 
     cfg = load_config(cfg_path)
-    receipts = {"captioner_bf16": FAKE_RECEIPT}
-    fake = plan_app(cfg, determinism=DETERMINISM, fake_models=True)
-    real = plan_app(cfg, determinism=DETERMINISM, derived_receipts=receipts)
-    real_nv = plan_app(cfg, determinism="nvidia", derived_receipts=receipts)
-    fake_nv = plan_app(cfg, determinism="nvidia", fake_models=True)
-    return {"cfg": cfg, "fake": fake, "real": real, "real_nvidia": real_nv,
-            "fake_nvidia": fake_nv}
+    mode = mode or (DETERMINISM if cfg.preset == "exact" else "nvidia")
+    receipts = {"captioner_bf16": FAKE_RECEIPT, "tempseg_merged": FAKE_RECEIPT}
+    fake = plan_app(cfg, determinism=mode, fake_models=True)
+    real = plan_app(cfg, determinism=mode, derived_receipts=receipts)
+    out = {"cfg": cfg, "fake": fake, "real": real, "real_nvidia": None, "fake_nvidia": None}
+    if cfg.preset == "exact":
+        out["real_nvidia"] = plan_app(cfg, determinism="nvidia", derived_receipts=receipts)
+        out["fake_nvidia"] = plan_app(cfg, determinism="nvidia", fake_models=True)
+    return out
 
 
 # ---------------------------------------------------------------------------------------------
@@ -237,6 +306,10 @@ class JobRun:
     run_out: str = ""
     status: dict[str, Any] = field(default_factory=dict)
     checks: list[Check] = field(default_factory=list)
+
+    @property
+    def spec(self) -> JobSpec:
+        return JOB_SPECS[self.job]
 
     def check(self, name: str, ok: bool, detail: str = "", *, gap: bool = False) -> None:
         self.checks.append(Check(name, bool(ok), detail, gap))
@@ -293,6 +366,9 @@ def assert_job(r: JobRun, run_id: str, poison: str | None) -> None:
     from flora_deploy.jobs.store import JobPaths
 
     p = r.plan
+    spec = r.spec
+    if spec.poison_at is None:
+        poison = None
     want_state = "completed_with_errors" if poison else "done"
     r.check("end state", r.status.get("state") == want_state,
             f"state={r.status.get('state')} (want {want_state}), flora run rc={r.run_rc}")
@@ -301,7 +377,9 @@ def assert_job(r: JobRun, run_id: str, poison: str | None) -> None:
     store = job.store
     manifest = job._deps().manifests.load()
     manifest_uids = {e.uid for e in manifest.episodes}
-    want_uids = manifest_uids - ({poison} if poison else set())
+    def want(stage: str) -> set[str]:
+        return manifest_uids - ({poison} if poison and spec.lost(stage) else set())
+
     tasks = {}
     for eid, meta in r.episodes.items():
         for u in manifest_uids:
@@ -320,11 +398,11 @@ def assert_job(r: JobRun, run_id: str, poison: str | None) -> None:
     for stage, recs in records.items():
         uids = Counter(x.uid for x in recs)
         dup = sorted(u for u, n in uids.items() if n > 1)
+        w = want(stage)
         r.check(f"{stage}: no lost/duplicate records",
-                set(uids) == want_uids and not dup,
-                f"{len(uids)} uids (want {len(want_uids)}), missing "
-                f"{sorted(want_uids - set(uids))}, extra {sorted(set(uids) - want_uids)}, "
-                f"dup {dup}")
+                set(uids) == w and not dup,
+                f"{len(uids)} uids (want {len(w)}), missing "
+                f"{sorted(w - set(uids))}, extra {sorted(set(uids) - w)}, dup {dup}")
         certs = {x.provenance.certificate for x in recs}
         models = {v for x in recs for v in x.provenance.models.values()}
         r.check(f"{stage}: records marked fake", certs <= {"fake-models"} and models <= {"fake"}
@@ -334,9 +412,16 @@ def assert_job(r: JobRun, run_id: str, poison: str | None) -> None:
     if poison:
         pills = summary.get("poison_pills", [])
         r.check("poison excluded (exactly)",
-                all(n == 1 for n in excused.values()) and any(poison in json.dumps(x)
-                                                             for x in pills),
+                all(n == int(spec.lost(s)) for s, n in excused.items())
+                and any(poison in json.dumps(x) for x in pills),
                 f"excused {excused}, poison pills {pills}")
+        if spec.preset == "balanced":  # excluded downstream with a reason, counted once
+            up = {s: c.get("excused_upstream", 0) for s, c in stages_sum.items()}
+            heads = sorted({str(x).split(":")[0] for x in summary.get("problems", [])})
+            r.check("upstream exclusion counted once",
+                    up.get("caption", 0) == int(spec.poison_at == "segment")
+                    and heads == [spec.poison_at],
+                    f"excused_upstream {up}, problems {summary.get('problems')}")
     else:
         r.check("nothing excused", not any(excused.values()) and not summary.get("poison_pills"),
                 f"excused {excused}")
@@ -362,7 +447,8 @@ def assert_job(r: JobRun, run_id: str, poison: str | None) -> None:
             f"manifest==plan {hashes == p.stage_hashes}")
 
     # determinism forwarded: env, hash and the segcap shard receipts' runtime record
-    env = p.object(p.worker_classes["segcap"]).env
+    first = "segcap" if "segcap" in p.worker_classes else "segment"
+    env = p.object(p.worker_classes[first]).env
     modes: Counter = Counter()
     reward_tasks_ok, reward_audits = True, 0
     for f in files:
@@ -376,19 +462,20 @@ def assert_job(r: JobRun, run_id: str, poison: str | None) -> None:
                 elif a.get("stage") == "reward.terminal" and a.get("uid") in tasks:
                     reward_audits += 1  # NVIDIA's terminal line carries the task it scored
                     reward_tasks_ok &= (a.get("nv") or {}).get("task") == tasks[a["uid"]]
+    mode = spec.determinism
     r.check("determinism forwarded (env, hash, worker engine)",
-            env.get("FLORA_DETERMINISM") == DETERMINISM and
-            json.loads(env["FLORA_OUTPUT_SETTINGS"])["determinism"] == DETERMINISM and
-            set(modes) == {DETERMINISM}, f"env {env.get('FLORA_DETERMINISM')}, segcap audit "
-            f"modes {dict(modes)}")
+            env.get("FLORA_DETERMINISM") == mode and
+            json.loads(env["FLORA_OUTPUT_SETTINGS"])["determinism"] == mode and
+            (set(modes) == {mode} or (first == "segment" and not modes)),
+            f"env {env.get('FLORA_DETERMINISM')}, segcap audit modes {dict(modes)}")
     r.check("instruction text flows into reward requests (terminal audits)",
-            reward_audits >= len(want_uids) and reward_tasks_ok,
+            reward_audits >= len(want("reward.terminal")) and reward_tasks_ok,
             f"{reward_audits} terminal audit rows")
     r.check("media root resolved", env.get("FLORA_MEDIA_ROOT") ==
-            f"/media/{MEDIA_VOLUME}/{run_id}/{r.job}" and bool(records.get("segment")),
+            f"/media/{MEDIA_VOLUME}/{run_id}/{spec.data}" and bool(records.get("segment")),
             f"FLORA_MEDIA_ROOT={env.get('FLORA_MEDIA_ROOT')}")
-    if poison:
-        markers = [f for f in files if "/attempts/" in f and f"/{PREEMPT_SHARD}/" in f]
+    if spec.preempt:
+        markers = [f for f in files if "/attempts/" in f and f"/{spec.preempt}/" in f]
         preempted = 0
         for f in markers:
             with contextlib.suppress(ValueError):
@@ -396,7 +483,7 @@ def assert_job(r: JobRun, run_id: str, poison: str | None) -> None:
         fired = any("fake_faults/fired/" in f for f in files)
         r.check("simulate_preemption on a worker (marked preempted, shard still done)",
                 fired and preempted >= 1, f"fired={fired}, {len(markers)} markers on "
-                f"{PREEMPT_SHARD}, {preempted} preempted")
+                f"{spec.preempt}, {preempted} preempted")
     r.summary = summary  # type: ignore[attr-defined]
 
 
@@ -455,6 +542,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-wall-s", type=float, default=1500.0,
                     help="cancel the jobs if `flora run` has not returned by then")
     ap.add_argument("--json", type=Path, help="write the report here")
+    ap.add_argument("--preset", choices=("exact", "balanced", "both"), default="both",
+                    help="which jobs to run (default both: 2 exact + 3 balanced)")
     args = ap.parse_args(argv)
 
     run_id = args.run_id or (time.strftime("%m%d%H%M") + uuid.uuid4().hex[:4])
@@ -470,12 +559,14 @@ def main(argv: list[str] | None = None) -> int:
     manifest = golden_manifest()
     eps = fetch_dataset(manifest, work, download=not args.dry_run)
     runs: list[JobRun] = []
-    for job in EPISODES:
-        cfg_path = write_config(work, job, run_id)
-        runs.append(JobRun(job, cfg_path, f"h0-{run_id}-{job}", eps[job]))
+    for spec in JOBS:
+        if args.preset != "both" and spec.preset != args.preset:
+            continue
+        cfg_path = write_config(work, spec.name, run_id)
+        runs.append(JobRun(spec.name, cfg_path, f"h0-{run_id}-{spec.name}", eps[spec.data]))
     if args.dry_run:
         for r in runs:
-            pl = plans(r.cfg_path) if (work / r.job).is_dir() else None
+            pl = plans(r.cfg_path) if (work / r.spec.data).is_dir() else None
             if pl is None:
                 continue
             f, real = pl["fake"], pl["real"]
@@ -493,9 +584,9 @@ def main(argv: list[str] | None = None) -> int:
     poison = None
     try:
         # media to its own Volume (input.stage_to), as Wave H stages it
-        for r in runs:
-            n = upload_dir(MEDIA_VOLUME, work / r.job, f"{run_id}/{r.job}")
-            print(f"[{r.job}] uploaded {n} files to {MEDIA_VOLUME}:/{run_id}/{r.job}", flush=True)
+        for data in sorted({r.spec.data for r in runs}):
+            n = upload_dir(MEDIA_VOLUME, work / data, f"{run_id}/{data}")
+            print(f"[{data}] uploaded {n} files to {MEDIA_VOLUME}:/{run_id}/{data}", flush=True)
         fl = flora_bin()
         for r in runs:
             local_store = work / f"store-{r.job}"
@@ -512,28 +603,31 @@ def main(argv: list[str] | None = None) -> int:
                     all(pl["fake"].stage_hashes[k] != pl["real"].stage_hashes[k]
                         for k in pl["fake"].stage_hashes)
                     and pl["fake"].app_name != pl["real"].app_name
-                    and pl["fake"].config_hash != pl["fake_nvidia"].config_hash,
+                    and (pl["fake_nvidia"] is None
+                         or pl["fake"].config_hash != pl["fake_nvidia"].config_hash),
                     f"fake {pl['fake'].app_name}, real {pl['real'].app_name}")
             r.check("fake workers on CPU", all(o.gpu is None for o in pl["fake"].objects),
                     ", ".join(f"{o.name}:{o.gpu}" for o in pl["fake"].objects))
             dep = sh([fl, "deploy", "--config", str(r.cfg_path), "--fake-models",
-                      "--determinism", DETERMINISM], cwd=work, log=log, timeout=1200)
+                      "--determinism", r.spec.determinism], cwd=work, log=log, timeout=1200)
             app_names.append(r.plan.app_name)
             watch.append(r.plan.watch_dict)
             r.check("deployed app == the client's plan", f"deployed {r.plan.app_name}" in
                     " ".join((dep.stdout + dep.stderr).split()), r.plan.app_name)
-            if r.job == "yam":
+            if r.spec.preempt or r.spec.poison_at:
                 from flora_deploy.modal_app.workers_app import fake_faults_path
 
-                poison = poison_uid(local_store, r.job_id)
-                remote_store(run_id).put_bytes(fake_faults_path(r.job_id), json.dumps({
-                    "preempt": {PREEMPT_SHARD: PREEMPT_AT}, "poison": [poison]}).encode())
-                print(f"[yam] faults: preempt {PREEMPT_SHARD}@{PREEMPT_AT}, poison {poison}")
+                poison = poison_uid(local_store, r.job_id) if r.spec.poison_at else ""
+                r.poison = poison or None  # type: ignore[attr-defined]
+                faults = r.spec.faults(poison)
+                remote_store(run_id).put_bytes(fake_faults_path(r.job_id),
+                                               json.dumps(faults).encode())
+                print(f"[{r.job}] faults: {json.dumps(faults)}")
 
         procs = {}
         for r in runs:
             args_ = [fl, "run", "--config", str(r.cfg_path), "--fake-models", "--determinism",
-                     DETERMINISM, "--job", r.job_id, "--poll", "10"]
+                     r.spec.determinism, "--job", r.job_id, "--poll", "10"]
             print(f"$ {' '.join(args_)}", flush=True)
             procs[r.job] = subprocess.Popen(args_, cwd=work, stdout=subprocess.PIPE,
                                             stderr=subprocess.STDOUT, text=True)
@@ -563,7 +657,7 @@ def main(argv: list[str] | None = None) -> int:
             r.check("`flora results` CLI reads a modal-volume store from the laptop",
                     res.returncode == 0, " ".join((res.stdout + res.stderr).split())[-160:],
                     gap=True)
-            assert_job(r, run_id, poison if r.job == "yam" else None)
+            assert_job(r, run_id, getattr(r, "poison", None))
     except Exception as e:  # noqa: BLE001 - always clean up, then report
         import traceback
 
@@ -572,8 +666,8 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         notes += cleanup(app_names, run_id, [r.job_id for r in runs], watch, keep=args.keep)
         if not args.work:
-            shutil.rmtree(work / "human", ignore_errors=True)
-            shutil.rmtree(work / "yam", ignore_errors=True)
+            for data in EPISODES:
+                shutil.rmtree(work / data, ignore_errors=True)
 
     report = {"run_id": run_id, "wall_s": round(time.time() - t0, 1), "apps": app_names,
               "notes": notes, "jobs": {r.job: {

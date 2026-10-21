@@ -5,8 +5,48 @@ Status: 2026-10-21. Code, unit tests, conformance and nvlink tests are done and 
 as one command per model kind (see "GPU validation" below). No Modal GPU container was started,
 and P1b-1 has spent **$0**.
 
-The `balanced` kinds are still refused by `modal_app/factory.py`. Certificates (P1b-2) unlock them.
-Every record these stages write is `certified: false` with `uncertified_reason: "uncertified_stack"`.
+2026-10-22 (Wire-balanced): `balanced` deploys and runs through `flora deploy` / `flora run`
+(see "Deployment" below). Without a certificate it needs `allow_uncertified: true`. Every record
+these stages write is `certified: false` with `uncertified_reason: "uncertified_stack"` until
+certificates (P1b-2) exist.
+
+## Deployment (`modal_app/factory.py`, `modal_app/balanced_app.py`)
+
+- **Worker classes.** `segment` -> `SegmentWorker` (pool default `L40S`), `caption` ->
+  `CaptionWorker` (`H100!`). Both run on `img_vllm`, with `max_inputs` 1 (episodes run
+  concurrently inside the shard), `WORKER_RETRIES`, the rate-table timeouts, `scaledown_window`,
+  `flora-weights` and `flora-cache` mounted read-only, and the store and media mounts. Their env
+  adds `FLORA_DERIVED_RECEIPTS` (the `weights.derived` receipts of the kind),
+  `FLORA_POOL_GPUS`, `FLORA_KIND_MODES` and `FLORA_EMBODIMENT`.
+- **`@modal.enter`**, failing closed at each step: the preflight (store, media root,
+  instruction); then the derived weights. The receipt file on the Volume must hash to the
+  recorded `weights.derived` identity, and its content digest (recomputed) must equal
+  `pins.DERIVED_PINS` (`None` refuses: TempSeg merger v2 is not pinned yet, so `SegmentWorker`
+  refuses until it is). Every byte is then hashed against the receipt, on a thread joined before
+  ready. Next the Captioner's `model.visual` `_extra_state` check, then the certification stamp
+  (`workers_impl/certstamp.py`: `embodiment`, `cert_key` from `validate.certkey.key_document`
+  on the pool GPU with the verified content digests, `gpu`). Then NVIDIA's code, the processor,
+  and `OfflineEngine(spec_for(kind, model, pool GPU))`, which runs the dt_bias plugin flag check
+  and the GDN dtype verify (M6). Last come the accel patches and the runner, with
+  `fatal=workers_app._die` (CUDA fault or dead engine: mark, then exit the container).
+- **Segment -> caption, per episode.** Caption shards `depends_on` the segment shards that hold
+  their episodes (manifest). The orchestrator (`jobs.orchestrator.deps_ready`; the reconciler
+  and `progress.derive` agree) spawns a caption shard once each of *its* episodes is resolved
+  upstream. A segment shard is resolved when it is satisfied. A quarantined, bisected one is
+  resolved when the child holding that episode is satisfied, or when the episode was done before
+  the bisection. In the worker, `attempts.upstream_excluded` gives the episodes the segment
+  stage excluded: poison-pilled ones, and ones in a segment receipt's `episodes_failed`
+  (`nv_failure`). They are written as caption `EpisodeError`s with that kind and
+  `diagnostics.upstream: true`, and never reach the model. The error-rate guard counts them
+  once, at `segment` (`progress.UPSTREAM_KINDS`, `tally_exclusions`, compose's
+  `excused_upstream`). Resume, preemption and bisection use the existing machinery for both
+  pools. The budget projection prices both pools (rate table rows `balanced segment/caption`,
+  with a startup per pool).
+- **Fake models.** `flora deploy/run --fake-models` registers `FakeSegmentWorker` /
+  `FakeCaptionWorker` (CPU), and `flora run --local --fake-models` runs `preset: balanced` too.
+  Both are the real `BalancedShardRunner` and micro-batcher, with `local/balanced.py`'s fake jobs
+  at the model boundary. Fault spec `poison: {"<kind>": [uid]}` poisons an episode in one kind
+  only.
 
 ## Design
 
@@ -250,9 +290,13 @@ in the spec plus `install_entry_point` env) and certify that stack instead.
   calls and changes numerics (`docs/rewarder-smoke.md`). That is allowed for `balanced`, and P1b-2
   measures it against the oracle's noise.
 - The worker uses NVIDIA's `media.probe` per camera, which fully decodes each camera, plus NVIDIA's
-  decode for frames. The OPT-1 `accel` patches (decode-once, in-memory PNG, pools) are compatible
-  (they patch the same NVIDIA names the stages call), but they are not wired into the workers yet.
-  Turning them on needs `apply_patches` plus `active.episode()` per episode coroutine.
+  decode for frames. The OPT-1 `accel` patches (decode-once, in-memory PNG, pools) are now wired
+  in. `workers_impl/balanced.py` applies every registered patch (each behind its parity test;
+  `FLORA_BALANCED_ACCEL=none` turns them off) and runs each episode coroutine inside
+  `active.episode()`. `tests/nvlink/test_balanced_accel.py` checks that every model request
+  (prompt, frames, metadata digest), every record and every audit is byte-identical with and
+  without them. It runs two overlapping episodes (1-view human, 3-view YAM) on real H.264 files
+  through NVIDIA's code and the Flora processors. The probe's full decode is still NVIDIA's.
 - Pre-rendering and AsyncLLM (online, `render_cmpl_async`) are out of scope. Gate C would need
   extending first.
 - `_preprocess_cmpl` is a private vLLM API, used only by the lab's L0 check.
