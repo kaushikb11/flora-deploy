@@ -91,6 +91,13 @@ def main(argv: list[str] | None = None) -> int:
                    help="D-1 mode (docs/determinism.md)")
     p.add_argument("--no-instruction", action="store_true",
                    help="S1: blank instruction instead of the dataset task text")
+    p.add_argument("--validate", action="store_true",
+                   help="P1a-5s: run_shard on golden episodes, then NVIDIA unmodified on "
+                        "--nvidia ids (one H200)")
+    p.add_argument("--nvidia", action="append", default=[],
+                   help="P1a-5s: golden id(s) for the NVIDIA-unmodified arm")
+    p.add_argument("--compare-run", help="P1a-5s: earlier run id whose stored fast results "
+                                         "the NVIDIA arm is also compared with")
     p.add_argument("--repeat", type=int, default=1, help="W3-A: run each episode K times")
     p.add_argument("--compare-to", type=Path, help="W3-A: earlier summary to compare digests")
     args = p.parse_args(argv)
@@ -100,6 +107,8 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(out, indent=2))
         _write(args.summary, out)
         return 0 if all("error" not in r for r in out["receipts"].values()) else 1
+    if args.validate:
+        return validate(args)
     if args.identity:
         return identity(args)
     if args.concurrency:
@@ -223,6 +232,68 @@ def identity(args) -> int:
         print("FAILED:", summary.get("error"))
     _write(args.summary, summary)
     return 0 if proof and proof["identity"]["gate_ok"] else 1
+
+
+# --- P1a-5s ------------------------------------------------------------------------------------
+
+S1_SKIPPED = (  # S1's identity gap: no NVIDIA-unmodified arm (docs/exact-worker.md)
+    "human/egodex_make_sandwich/episode_000002",
+    "single_view_robot/wgo/robointer_droid_000010",
+    "yam/aloha_static_towel/episode_000000",
+    "dex/g1_dex3_toasted_bread/episode_000034",
+)
+S1_RUN = "s1-20261021T104132Z-d75244fb"
+
+
+def validate(args) -> int:
+    """``ReferenceWorker.validate_shard``: the wired worker's ``run_shard`` + identity gap."""
+    from flora_deploy.modal_app.reference_app import CPU_CORES, MEMORY_MIB
+
+    t0 = time.monotonic()
+    ids = args.golden or list(IDENTITY_EPISODES)
+    nvidia_ids = args.nvidia or list(S1_SKIPPED)
+    run_id = new_run_id("p1a5s")
+    memory_gib = args.memory_gib or MEMORY_MIB / 1024
+    cpu = args.cpu or CPU_CORES
+    rate = container_rate(cpu, memory_gib)
+    bound_s = STARTUP_TIMEOUT_S + TIMEOUT_S
+    print(f"run {run_id}: {len(ids)} fast, {len(nvidia_ids)} NVIDIA-unmodified; worst case "
+          f"{bound_s / 60:.0f} min = ${rate * bound_s:.2f} at ${rate * 3600:.2f}/h")
+    summary: dict = {"run_id": run_id, "ids": ids, "nvidia_ids": nvidia_ids,
+                     "rate_per_h": round(rate * 3600, 3)}
+    with modal.enable_output(), app.run():
+        worker = _worker(args)
+        try:
+            summary["load"] = worker.report.remote()
+            print("load:", json.dumps({k: summary["load"].get(k) for k in
+                                       ("enter_s", "marks_s", "container_import_to_enter_s",
+                                        "receipts", "gpu_thread")}, default=str)[:4000])
+            summary["validate"] = worker.validate_shard.remote(
+                ids, run_id, nvidia_ids=nvidia_ids, compare_to=args.compare_run or S1_RUN,
+                deadline_s=args.deadline_min * 60)
+        except Exception as e:  # noqa: BLE001 - keep what we have
+            summary["error"] = f"{type(e).__name__}: {e}"
+    summary["local_wall_s"] = round(time.monotonic() - t0, 1)
+    v = summary.get("validate")
+    if v:
+        fast = v["fast"]
+        vh = fast["video_s"] / fast["shard_wall_s"] if fast["shard_wall_s"] else 0
+        summary["throughput"] = {
+            "video_h_per_gpu_h": round(vh, 4),
+            "usd_per_video_h": round(rate * 3600 / vh, 2) if vh else None,
+            "container_s_per_video_s": round(1 / vh, 2) if vh else None,
+            "startup_s": summary["load"].get("enter_s"),
+        }
+        print("fast:", json.dumps({k: fast[k] for k in fast if k != "episodes"}, indent=1))
+        print("throughput:", json.dumps(summary["throughput"]))
+        print("nvidia:", json.dumps(v["nvidia"]))
+        for name, ident in v["identity"].items():
+            print(name, json.dumps({k: x for k, x in ident.items() if k != "episodes"}))
+    else:
+        print("FAILED:", summary.get("error"))
+    _write(args.summary, summary)
+    ok = bool(v) and all(x.get("ok", x.get("gate_ok", True)) for x in v["identity"].values())
+    return 0 if ok else 1
 
 
 def throughput(load: dict, proof: dict, rate_per_s: float) -> dict:

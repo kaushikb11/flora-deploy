@@ -78,9 +78,80 @@ def _reward_specs() -> list[WorkerSpec]:
             for kind in ("reward.terminal", "reward.dense")]
 
 
+def segcap_fake_engine(script, *, concurrency: int = 2):
+    """The production ``FastExactEngine`` composite over the fake NVIDIA SEGCAP family of
+    ``tests/unit/test_reference_concurrency`` (NVIDIA's call structure: ``api`` entry point,
+    ``pipeline.Session``, ``asyncio.to_thread`` predictor, ``FLORA_RUNTIME`` events): resident
+    ``CachedSession``, ``install_nvidia_entry`` + GPU lock (``generate_output`` lines on) +
+    ``accel.gpu_thread``. ``script.interrupt_before`` raises ``KeyboardInterrupt`` inside NVIDIA's
+    ``pipeline.annotate`` for that episode (its main camera path names the uid)."""
+    from flora_deploy.accel import gpu_thread
+    from flora_deploy.nv.session import CachedSession
+    from flora_deploy.observe import Patcher, TimedLock
+    from flora_deploy.stages import reference as ref
+    from flora_deploy.workers_impl.segcap import FastExactEngine
+    from tests.unit.test_reference_concurrency import FakeNvSession, GpuProbe, fake_nv
+
+    nv = fake_nv(GpuProbe())
+    original = nv.pipeline.annotate
+
+    def annotate(videos, *a, **k):
+        if script.interrupt_before and script.interrupt_before in str(videos["main"].path):
+            raise KeyboardInterrupt("SIGINT")
+        return original(videos, *a, **k)
+
+    nv.pipeline.annotate = annotate
+    nv.audits = []
+    nv.audit_report = lambda: nv.audits.append(1) or {"ok": True, "audits": len(nv.audits)}
+    patcher, lock = Patcher(), TimedLock(ref.GPU_LOCK_NAME)
+    # one Patcher patches an attribute once: the GPU thread has its own (innermost) layer
+    gt = gpu_thread.install(nv, Patcher(), gpu_thread.GpuThread(torch=None))
+    ref.install_gpu_lock(nv, lock, patcher, emit_output=True)
+    ref.install_nvidia_entry(nv, patcher, request_lock=False)
+    return FastExactEngine(nv, CachedSession(FakeNvSession), gpu_lock=lock,
+                           clones=ref.ProcessorClones(), gpu_thread=gt,
+                           concurrency=concurrency, profile=ref.ExactProfile().provenance(),
+                           image_fingerprint="sha256:fake")
+
+
+def _segcap_spec() -> WorkerSpec:
+    """The real ``SegcapShardRunner`` (``workers_impl.segcap``) over the suite's store, running
+    the real fast-exact composite (``segcap_fake_engine``) with two episode threads. An
+    ``script.nv_fail`` episode asks NVIDIA for the 32-second profile on one camera, which
+    NVIDIA's ``_inputs`` rejects (``InputError``)."""
+    from flora_deploy.workers_impl.segcap import (
+        SegcapInputs,
+        SegcapShardRunner,
+        SegcapWorkerSettings,
+    )
+
+    class Worker:
+        def __init__(self, env):
+            def inputs(ref):
+                return SegcapInputs(uid=ref.uid, profile="human",
+                                    long_windows=ref.uid in env.script.nv_fail,
+                                    instruction="", videos={"main": f"/v/{ref.uid}.mp4"},
+                                    sources={}, duration_s=ref.duration_s)
+
+            settings = SegcapWorkerSettings(container_id=env.container_id, gpu="H200",
+                                            models={"tempseg": "test"})
+            self.runner = SegcapShardRunner(env.store, segcap_fake_engine(env.script), settings,
+                                            call_id=lambda: env.call_id, clock=env.clock,
+                                            inputs=inputs)
+
+        def run_shard(self, job_id, shard_id, config_hash, token=""):
+            return self.runner.run_shard(job_id, shard_id, config_hash, token)
+
+        def on_exit(self):
+            self.runner.on_exit()
+
+    return WorkerSpec("segcap-worker", "segcap", Worker)
+
+
 WORKERS: list[WorkerSpec] = [
     fake_spec("segcap"),
     fake_spec("reward.terminal"),
     _canary_spec(),
     *_reward_specs(),
+    _segcap_spec(),
 ]

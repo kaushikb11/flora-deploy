@@ -66,6 +66,7 @@ OUTPUT_MODULES: dict[str, tuple[str, ...]] = {
         "stages/__init__.py",
         "stages/reference.py",
         "modal_app/reference_app.py",
+        "workers_impl/segcap.py",  # segcap records, certification, provenance (P1a-5s)
     ),
     # vLLM TempSeg / Captioner (balanced): NVIDIA's input builders, captured and wrapped for vLLM
     # (Gate C), on the same patch layer. No worker exists yet, so this is deliberately broad.

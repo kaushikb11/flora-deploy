@@ -17,6 +17,10 @@ objects only. Never run from tests.
 - ``@modal.exit``: :meth:`RewardShardRunner.preempt` (flush + ``mark_preempted``; a no-op when no
   shard is in flight, e.g. a normal scale-down).
 
+The ``segcap`` worker is ``reference_app.ReferenceWorker`` (P1a-5s: the fast ``exact`` worker
+around :class:`flora_deploy.workers_impl.segcap.SegcapShardRunner`); it reuses
+:func:`store_from_env` and :func:`gpu_name` from here.
+
 Store and worker settings come from the container env (the factory sets them):
 ``FLORA_STORE_KIND`` (``local`` | ``volume``), ``FLORA_STORE_ROOT`` (path / mount),
 ``FLORA_STORE_VOLUME`` (Volume name, for commits), ``FLORA_MEDIA_ROOT``,
