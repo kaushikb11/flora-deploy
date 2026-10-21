@@ -160,4 +160,15 @@ RUNTIME = {
     "huggingface_hub": ">=1.29,<2.0",
     # CUDA 13.0 matches the torch 2.11.0 PyPI wheels (cu130); Modal's host driver is CUDA 13.3.
     "cuda_base_vllm": "nvidia/cuda:13.0.2-devel-ubuntu24.04",
+    # Image reproducibility (review M3; see modal_app/images.py). Digest of the tag's multi-arch
+    # index on Docker Hub, read 2026-10-21 (its linux/amd64 manifest is
+    # sha256:0eee3094c71518ad31d011a594ae6ed6de72959ee07e318cb31cffe71690e90c).
+    "cuda_base_vllm_digest": (
+        "sha256:5dc1bca23d05bd37b011be68ec470c03b403a5da07ec3a86e41af9470e9d0cc6"
+    ),
+    # Fixes debian_slim's Debian release and Python micro version and add_python's build.
+    "modal_image_builder_version": "2025.06",
+    # uv binary used both to compile the image locks and to install them in the image.
+    "uv": "0.12.22",
+    "hf_xet": "1.7.0",
 }
