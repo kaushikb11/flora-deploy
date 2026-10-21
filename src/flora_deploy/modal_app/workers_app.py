@@ -331,8 +331,9 @@ def warm_reward_cache() -> dict[str, Any]:
 # ["<uid>", ...]}``. ``preempt``: once per target and job, in the first start of a shard that
 # matches the target (a shard kind, e.g. ``segcap``, or an ``fnmatch`` pattern on shard ids,
 # which are content-addressed) and reaches its n-th episode (1-based):
-# ``modal.exception.simulate_preemption`` (SIGINT; ``@modal.exit`` flushes and marks the start
-# preempted; Modal restarts the input). ``poison``: the container dies (``os._exit(137)``, no
+# :func:`deliver_preemption` (``modal.exception.simulate_preemption`` from the main thread, a
+# process SIGINT from any other; the runner flushes and marks the start preempted; Modal
+# restarts the input). ``poison``: the container dies (``os._exit(137)``, no
 # marker update) whenever a fake worker reaches that episode, so D15 quarantine, bisection and
 # the poison pill run as they would for a real OOM.
 
@@ -447,12 +448,31 @@ class FakeFaultHook:
                                                     "t": time.time()}).encode())
             print(f"fake-models: simulate_preemption({self.preempt_wait_s}) on "
                   f"{self.shard_id} before {uid}", flush=True)
-            fn = self.preempt_fn
-            if fn is None:
-                from modal.exception import simulate_preemption as fn
-            fn(self.preempt_wait_s)
-            self.sleep(60.0)  # the SIGINT arrives during this sleep
+            (self.preempt_fn or deliver_preemption)(self.preempt_wait_s)
+            self.sleep(60.0)  # the interrupt arrives during this sleep
             return
+
+
+def deliver_preemption(wait_s: int) -> None:
+    """Preempt this container in ``wait_s`` seconds, from whatever thread the fake worker's
+    episode hook runs on. In the main thread: ``modal.exception.simulate_preemption`` (a
+    ``SIGALRM`` whose handler raises ``KeyboardInterrupt`` there). Elsewhere (the balanced fake
+    jobs run the hook in ``asyncio.to_thread``; ``@modal.concurrent`` inputs run in a pool),
+    ``simulate_preemption`` cannot install its handler (``signal.signal`` is main-thread only:
+    ``ValueError``, which the runner recorded as an infra error, not a preemption), so a timer
+    sends the process the ``SIGINT`` Modal itself sends on a real preemption. Either way the
+    interrupt lands in the main thread, where the runner's preemption path expects it."""
+    import signal
+    import threading
+
+    if threading.current_thread() is threading.main_thread():
+        from modal.exception import simulate_preemption
+
+        simulate_preemption(wait_s)
+        return
+    timer = threading.Timer(wait_s, os.kill, (os.getpid(), signal.SIGINT))
+    timer.daemon = True
+    timer.start()
 
 
 def preempt_matches(target: str, shard_id: str) -> bool:

@@ -380,6 +380,8 @@ def check_preempt_flush_then_mark(spec: WorkerSpec, root: Path) -> None:
         f"{sorted(set(w.uids[:3]) - have)}"
     m = w.marker("ta-1")
     assert m is not None and m.preempted and m.ended_utc, "marker not flagged preempted"
+    assert not m.crashed and not m.error, \
+        f"a preemption recorded as a crash / error (crashed={m.crashed}, error={m.error!r})"
     assert w.receipt() is None, "a preempted start must not write a receipt"
     assert A.counted_starts(w.jf, w.kind, w.shard_id) == 0, "a preempted start counted for D15"
     rec = w.worker("ta-2").run_shard(JOB, w.shard_id, CFG, w.token(1))

@@ -35,6 +35,8 @@ class Breakage:
     append_parts: bool = False
     no_preempt_mark: bool = False
     swallow_interrupt: bool = False
+    preempt_as_error: bool = False  # the H0 balanced symptom: an infra error, not preempted
+    preempt_as_crash: bool = False
     receipt_own_parts: bool = False
     receipt_first: bool = False
     duplicate_records: bool = False
@@ -93,9 +95,16 @@ class FakeConformantWorker:
         if a is None:
             return
         self._flush()
-        if not self.b.no_preempt_mark:
-            A.mark_preempted(a["jf"], self.kind, a["sid"], self.env.container_id,
-                             ended_utc=utc(self.env.clock()), marker=a["marker"])
+        now = utc(self.env.clock())
+        if self.b.preempt_as_error:
+            A.mark_exception(a["jf"], self.kind, a["sid"], self.env.container_id,
+                             ended_utc=now, error="ShardInfraError: ...", marker=a["marker"])
+        elif not self.b.no_preempt_mark:
+            m = A.mark_preempted(a["jf"], self.kind, a["sid"], self.env.container_id,
+                                 ended_utc=now, marker=a["marker"])
+            if self.b.preempt_as_crash:
+                A.mark_exception(a["jf"], self.kind, a["sid"], self.env.container_id,
+                                 ended_utc=now, error="cuda_fatal: ...", marker=m, crashed=True)
         self._active = None
 
     def on_exit(self) -> None:
@@ -202,7 +211,9 @@ BROKEN: dict[str, list[tuple[str, Breakage]]] = {
     "records_valid": [("foreign-provenance", _b(foreign_provenance=True))],
     "parts_whole": [("appends-parts", _b(append_parts=True))],
     "preempt": [("no-preempt-mark", _b(no_preempt_mark=True)),
-                ("swallows-sigint", _b(swallow_interrupt=True))],
+                ("swallows-sigint", _b(swallow_interrupt=True)),
+                ("preempt-as-error", _b(preempt_as_error=True)),
+                ("preempt-as-crash", _b(preempt_as_crash=True))],
     "receipt_last": [("receipt-own-parts", _b(receipt_own_parts=True)),
                      ("receipt-first", _b(receipt_first=True))],
     "idempotent": [("no-skip-done", _b(no_skip_done=True)),
