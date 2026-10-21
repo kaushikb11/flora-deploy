@@ -33,7 +33,7 @@ Everything is deterministic: same inputs, same options in the same order.
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Literal
 
@@ -47,7 +47,11 @@ ORCHESTRATOR_CORES = 0.25  # modal_app/orchestrator_app.py
 ORCHESTRATOR_GIB = 1.0
 DEFAULT_EPISODE_S = 60.0  # assumed mean episode length when only total hours are known
 
-Certification = Literal["reference", "needs certificates"]
+Certification = Literal["reference", "certified", "needs certificates"]
+# The ``unavailable`` reason (and flag) of a preset without certificates; :func:`with_certificates`
+# removes both from an option whose every pool is certified.
+UNCERTIFIED = "uncertified ({preset} has no certificates)"
+_UNCERTIFIED_FLAG = "{preset}: uncertified until its certificates exist"
 Status = Literal["ok", "at risk", "infeasible"]
 
 # The user-facing preset: its options are listed first. `exact` stays selectable as the
@@ -333,11 +337,11 @@ def build_option(req: PlanRequest, table: RateTable, rates: Rates, preset: str, 
         flags.append(f"warning: {what}: {', '.join(unmeasured)}")
     cert: Certification = "reference" if preset == "exact" else "needs certificates"
     if cert == "needs certificates":
-        flags.append(f"{preset}: uncertified until its certificates exist "
-                     "(`flora run` needs --allow-uncertified)")
+        flags.append(_UNCERTIFIED_FLAG.format(preset=preset)
+                     + " (`flora run` needs --allow-uncertified)")
     unavailable: list[str] = []
     if cert != "reference":
-        unavailable.append(f"uncertified ({preset} has no certificates)")
+        unavailable.append(UNCERTIFIED.format(preset=preset))
     if worst == "placeholder":
         unavailable.append("priced from placeholder rates: "
                            + ", ".join(k.kind for k in kinds if k.status == "placeholder"))
@@ -432,17 +436,48 @@ def plan_options(req: PlanRequest, *, table: RateTable | None = None,
     return out
 
 
-def recommended(options: Sequence[PlanOption]) -> PlanOption | None:
+def _blocking(o: PlanOption, certified: Collection[str]) -> tuple[str, ...]:
+    """``o.unavailable`` without the "uncertified" reason when ``o`` is named in ``certified``."""
+    if o.name not in certified:
+        return o.unavailable
+    return tuple(u for u in o.unavailable if u != UNCERTIFIED.format(preset=o.preset))
+
+
+def with_certificates(options: Sequence[PlanOption],
+                      certified: Collection[str]) -> list[PlanOption]:
+    """``options`` with every option named in ``certified`` (each of its pools has a
+    ``certified`` Gate certificate: ``cli.plan.certified_options``) marked ``certified``, its
+    "uncertified" ``unavailable`` reason and flag removed. Other reasons stay."""
+    out = []
+    for o in options:
+        if o.name not in certified or o.certification != "needs certificates":
+            out.append(o)
+            continue
+        unavailable = _blocking(o, certified)
+        flags = [f for f in o.flags
+                 if not f.startswith(_UNCERTIFIED_FLAG.format(preset=o.preset))
+                 and not f.startswith("unavailable: ")]
+        if unavailable:
+            flags.append("unavailable: " + "; ".join(unavailable))
+        out.append(replace(o, certification="certified", unavailable=unavailable,
+                           flags=tuple(flags)))
+    return out
+
+
+def recommended(options: Sequence[PlanOption],
+                certified: Collection[str] = ()) -> PlanOption | None:
     """The option to suggest: never a projection that needs an unwired feature, never an
     ``unavailable`` one (uncertified, placeholder-priced or refused by the factory); ``ok`` before
-    ``at risk``; then the reference preset before uncertified ones; then measured rates before
-    projected before placeholders (review 4 M5); then the cheapest. ``None`` when no option is
-    feasible and runnable."""
+    ``at risk``; then the reference preset, or an option named in ``certified`` (every pool has
+    a ``certified`` Gate certificate), before uncertified ones; then measured rates before
+    projected before placeholders (review 4 M5); then the cheapest. So a certified ``balanced``
+    that is cheaper wins over ``exact``. ``None`` when no option is feasible and runnable."""
     live = [o for o in options
-            if o.status != "infeasible" and not o.requires and not o.unavailable]
+            if o.status != "infeasible" and not o.requires and not _blocking(o, certified)]
     if not live:
         return None
-    return min(live, key=lambda o: (o.status != "ok", o.certification != "reference",
+    return min(live, key=lambda o: (o.status != "ok",
+                                    o.certification != "reference" and o.name not in certified,
                                     STATUS_RANK[o.rate_status], o.cost_usd, o.wall_s, o.name))
 
 

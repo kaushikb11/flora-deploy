@@ -452,6 +452,7 @@ def plan_app(
     store: str | StoreSpec | None = None,
     bucket_secret: str = DEFAULT_BUCKET_SECRET,
     derived_receipts: Mapping[str, str] | None = None,
+    derived_content: Mapping[str, str] | None = None,
     allow_uncertified: bool = False,
     min_containers: int = 0,
     reconcile_cron: str | None = None,
@@ -466,7 +467,9 @@ def plan_app(
 
     ``cfg``: a validated ``FloraConfig``. ``store``: the job store URI (default: the config's
     ``output.sink``). ``derived_receipts``: as for ``config.hashing.config_hash`` (exact segcap
-    needs ``captioner_bf16``). ``missing_workers="skip"`` leaves out kinds whose worker class is
+    needs ``captioner_bf16``). ``derived_content``: the derived weights' content digests, for
+    certificate matching (none: a kind with derived weights matches no certificate).
+    ``missing_workers="skip"`` leaves out kinds whose worker class is
     not importable yet (listed in ``skipped``) instead of refusing; ``flora deploy`` never skips.
     ``hash_kwargs``: extra ``config_hash`` arguments (tests). ``determinism`` (``flora deploy
     --determinism``) overrides ``pipeline.determinism`` through ``config.schema.with_pipeline``,
@@ -515,7 +518,10 @@ def plan_app(
                                                                 bucket_secret=bucket_secret)
 
     if needs_certificate(cfg.preset) and not (cfg.allow_uncertified or allow_uncertified):
-        certs = find_certificates(cfg.preset, rs.pools)
+        from flora_deploy.validate.certkey import lookup_context  # Fix-Cert: H6/H7
+
+        certs = find_certificates(cfg.preset, rs.pools, **lookup_context(
+            cfg, rs.pools, derived_content=derived_content))
         missing = [f"{k} on {p.gpu}" for k, p in rs.pools.items() if k not in certs]
         if missing:
             raise DeployError(f"preset {cfg.preset!r} has no Gate certificate for "

@@ -76,7 +76,7 @@ def _record(plan: Any, record: dict[str, Any]) -> str:
     return f"{st.uri.rstrip('/')}/{rel}"
 
 
-def _certificates(cfg: Any, plan: Any, derived_receipts: dict[str, str] | None
+def _certificates(cfg: Any, plan: Any, derived_content: dict[str, str] | None
                   ) -> dict[str, dict[str, Any]]:
     """Gate certificate status of each deployed shard kind on its GPU (``cli._certs``)."""
     pools: dict[str, str | None] = {}
@@ -90,7 +90,7 @@ def _certificates(cfg: Any, plan: Any, derived_receipts: dict[str, str] | None
     from flora_deploy.cli._certs import certificate_report
 
     try:
-        return certificate_report(cfg, pools, derived_receipts=derived_receipts)
+        return certificate_report(cfg, pools, derived_content=derived_content)
     except Exception as e:  # noqa: BLE001 - a report; never block the deploy on it
         return {k: {"gpu": g, "status": "unknown", "certificate": None,
                     "why": f"could not check: {e!r}"} for k, g in pools.items()}
@@ -161,19 +161,21 @@ def deploy(
 ) -> None:
     """Deploy the config's Modal app (one app per config; workers scale from zero)."""
     from flora_deploy.config.hashing import MissingReceiptError
-    from flora_deploy.config.schema import ConfigError, load_config
+    from flora_deploy.config.receipts import load_certified
+    from flora_deploy.config.receipts import resolve as resolve_receipts
+    from flora_deploy.config.schema import ConfigError
     from flora_deploy.modal_app.factory import DeployError, deployment_record, materialize, plan_app
 
+    overrides = _receipts(receipt)
     try:
-        cfg = load_config(config, allow_uncertified=allow_uncertified)
+        cfg, content = load_certified(config, allow_uncertified=allow_uncertified,
+                                      overrides=overrides)
     except (ConfigError, OSError) as e:
         raise _fail(str(e)) from None
-    from flora_deploy.config.receipts import resolve as resolve_receipts
-
-    derived = resolve_receipts(cfg, _receipts(receipt))
     try:
+        derived = resolve_receipts(cfg, overrides)
         plan = plan_app(cfg, store=store, bucket_secret=bucket_secret,
-                        derived_receipts=derived,
+                        derived_receipts=derived, derived_content=content,
                         allow_uncertified=allow_uncertified,
                         min_containers=min_containers, reconcile_cron=reconcile_cron,
                         determinism=determinism, fake_models=fake_models)
@@ -185,7 +187,7 @@ def deploy(
         from flora_deploy.config.schema import with_pipeline
 
         cert_cfg = with_pipeline(cfg, determinism=determinism)  # plan_app accepted it
-    certs = _certificates(cert_cfg, plan, derived)
+    certs = _certificates(cert_cfg, plan, content)
     if as_json:
         print(json.dumps({**plan.to_json(), "certificates": certs}, indent=2, sort_keys=True))
     else:

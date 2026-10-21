@@ -788,11 +788,14 @@ def _done_shards(job: Job, manifest: Any) -> set[str]:
 # ----------------------------------------------------------------------------------------------
 
 
-def _load_cfg(cfg: Any, *, allow_uncertified: bool = False) -> Any:
+def _load_cfg(cfg: Any, *, allow_uncertified: bool = False,
+              receipts: Mapping[str, str] | None = None) -> Any:
+    """A ``FloraConfig`` (a path is loaded with its derived content digests,
+    ``config.receipts.load_certified``, so a certified preset validates)."""
     if isinstance(cfg, str | Path):
-        from flora_deploy.config.schema import load_config
+        from flora_deploy.config.receipts import load_certified
 
-        return load_config(cfg, allow_uncertified=allow_uncertified)
+        return load_certified(cfg, allow_uncertified=allow_uncertified, overrides=receipts)[0]
     return cfg
 
 
@@ -840,6 +843,7 @@ def submit(cfg: Any, *, job_id: str | None = None, store: str | None = None,
     (recorded by ``flora prepare``; ``config.receipts.resolve``). ``budget_usd`` overrides
     ``modal.budget_usd``."""
     from flora_deploy.config.hashing import MissingReceiptError
+    from flora_deploy.config.receipts import derived_content
     from flora_deploy.config.receipts import resolve as resolve_receipts
     from flora_deploy.config.schema import to_run_settings
     from flora_deploy.jobs.orchestrator import utc
@@ -848,11 +852,12 @@ def submit(cfg: Any, *, job_id: str | None = None, store: str | None = None,
 
     say = log or (lambda m: None)
     be = backend or get_backend()
-    cfg = _load_cfg(cfg, allow_uncertified=allow_uncertified)
+    cfg = _load_cfg(cfg, allow_uncertified=allow_uncertified, receipts=receipts)
     try:
         plan = (planner or _plan_deployment)(
             cfg, store=store, bucket_secret=bucket_secret,
             derived_receipts=resolve_receipts(cfg, receipts),
+            derived_content=derived_content(cfg, receipts),
             allow_uncertified=allow_uncertified, determinism=determinism)
     except (DeployError, MissingReceiptError, ValueError) as e:
         raise FloraError(str(e)) from None

@@ -25,7 +25,6 @@ Exit code 0 when nothing failed, else 2 (a refusal, as in the rest of the CLI).
 
 from __future__ import annotations
 
-import inspect
 import json
 import os
 import uuid
@@ -200,17 +199,14 @@ class RealProbes:
         return sum(1 for _ in p.rglob(pattern))
 
     def certificate_status(self, cfg: Any) -> dict[str, str] | None:
-        try:
-            from flora_deploy.validate import certkey  # type: ignore[attr-defined]
-        except ImportError:
-            return None
-        fn = getattr(certkey, "status", None)
-        if fn is None:
-            return None
-        res = fn(cfg) if inspect.signature(fn).parameters else fn()
-        if isinstance(res, dict):
-            return {str(k): str(v) for k, v in res.items()}
-        return None
+        """Kind -> ``certified``, or the status and why (``cli._certs``)."""
+        from flora_deploy.cli._certs import certificate_report
+        from flora_deploy.config.receipts import derived_content
+
+        rep = certificate_report(cfg, {k: p.gpu for k, p in cfg.pools().items()},
+                                 derived_content=derived_content(cfg))
+        return {k: r["status"] if r["status"] == "certified" else f"{r['status']}: {r['why']}"
+                for k, r in rep.items()}
 
 
 def _probe_local(root: Path, key: str, data: bytes) -> str:
@@ -257,13 +253,14 @@ def _probe_bucket(scheme: str, bucket: str, prefix: str, key: str, data: bytes) 
 
 
 def check_config(path: Path) -> tuple[Check, Any]:
-    from flora_deploy.config.schema import ConfigError, load_config
+    from flora_deploy.config.receipts import load_certified
+    from flora_deploy.config.schema import ConfigError
 
     if not path.is_file():
         return Check("config", "fail", f"{path} not found",
                      "write one with `flora init` (or pass --config)"), None
     try:
-        cfg = load_config(path)
+        cfg = load_certified(path)[0]
     except ConfigError as e:
         text = str(e)
         first = next((ln.strip(" -") for ln in text.splitlines()[1:]), text)
@@ -442,17 +439,18 @@ def check_weights(p: Probes, cfg: Any) -> list[Check]:
         return out
     weights = getattr(cfg, "weights", None)
     have = getattr(weights, "derived", None) if weights is not None else None
-    if have is None:
-        out.append(Check("weights.derived", "warn", "this config has no `weights.derived`; "
+    if not have:  # nothing recorded yet: the usual state before `flora prepare`
+        out.append(Check("weights.derived", "warn", "this config records no `weights.derived`; "
                          f"{', '.join(derived)} receipts are not checked",
-                         "pass them as `--receipt name=<sha>` to deploy and run"))
+                         "run `flora prepare` (it builds them and records them in flora.yaml), "
+                         "or pass `--receipt name=<sha>` to deploy and run"))
         return out
     have = dict(have)
     missing = [d for d in derived if not have.get(d)]
     if missing:
         out.append(Check("weights.derived", "fail", f"missing derived-weight receipts: "
-                         f"{', '.join(missing)}", "run the conversions (README, Run on Modal) "
-                         "and add each receipt under weights.derived"))
+                         f"{', '.join(missing)}", "run `flora prepare` (it records each "
+                         "receipt under weights.derived)"))
     else:
         out.append(Check("weights.derived", "pass", f"receipts for {', '.join(derived)}"))
     return out

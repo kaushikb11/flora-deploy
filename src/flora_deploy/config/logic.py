@@ -147,6 +147,7 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     # cli: argument parsing; every output-affecting choice goes through the (hashed) config
     "cli/__init__.py",
     "cli/_app.py",
+    "cli/_certs.py",  # certificate status report (validate.certkey.status); display only
     "cli/cancel.py",
     "cli/certify.py",
     "cli/deploy.py",

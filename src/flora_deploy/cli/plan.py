@@ -34,16 +34,23 @@ def _fail(msg: str, code: int = 2) -> typer.Exit:
     return typer.Exit(code=code)
 
 
-def certificate_status(cfg, option) -> dict[str, dict]:
+def certificate_status(cfg, option, derived_content=None) -> dict[str, dict]:
     """Per shard kind of ``option``: the Gate certificate status of its (kind, GPU) pool
-    (``cli._certs``: reference / certified / provisional / fail / none, and why)."""
-    from dataclasses import replace
-
+    (``cli._certs``: reference / certified / provisional / fail / none /
+    unverified_weights, and why), for the config's embodiment, modes and derived content
+    digests."""
     from flora_deploy.cli._certs import certificate_report
 
     pools = {k.kind: k.gpu for k in option.kinds}
-    c = cfg if cfg.preset == option.preset else replace(cfg, preset=option.preset)
-    return certificate_report(c, pools)
+    return certificate_report(cfg, pools, preset=option.preset,
+                              derived_content=derived_content)
+
+
+def certified_options(cfg, options, derived_content=None) -> set[str]:
+    """Names of the options whose every pool is ``reference`` or ``certified``."""
+    return {o.name for o in options
+            if all(c["status"] in ("reference", "certified")
+                   for c in certificate_status(cfg, o, derived_content).values())}
 
 
 def _cameras_from_config(cfg) -> int:
@@ -83,7 +90,8 @@ def plan(
     from rich.table import Table
 
     from flora_deploy.config.presets import PresetUnavailableError
-    from flora_deploy.config.schema import ConfigError, load_config, parse_config
+    from flora_deploy.config.receipts import load_certified
+    from flora_deploy.config.schema import ConfigError, parse_config
     from flora_deploy.jobs.budget import load_rates, modal_rates_provider, region_multiplier_for
     from flora_deploy.planner.options import (
         PlanRequest,
@@ -93,12 +101,13 @@ def plan(
         plan_options,
         rates_label,
         recommended,
+        with_certificates,
         with_pool_overrides,
     )
     from flora_deploy.planner.rates import RatesFileError, RateTable
 
     try:
-        cfg = load_config(config)
+        cfg, content = load_certified(config)
     except FileNotFoundError:
         raise _fail(f"{config} not found; run `flora init` first") from None
     except ConfigError as e:
@@ -135,7 +144,9 @@ def plan(
         options = plan_options(req, table=table, rates=rates)
     except (PresetUnavailableError, KeyError) as e:
         raise _fail(str(e.args[0] if e.args else e)) from None
-    best = recommended(options)
+    certified = certified_options(cfg, options, content)
+    options = with_certificates(options, certified)
+    best = recommended(options, certified=certified)
 
     if as_json:
         typer.echo(json.dumps({
@@ -145,7 +156,7 @@ def plan(
             "prices": rates.source, "rates": table.source,
             "recommended": options.index(best) + 1 if best else None,
             "options": [{**o.as_dict(), "rates": rates_label(o),
-                         "certificates": certificate_status(cfg, o)}
+                         "certificates": certificate_status(cfg, o, content)}
                         for o in options]}, indent=2))
     else:
         dl = f", deadline {deadline_s / 3600:.0f} h" if deadline_s else ""
@@ -175,10 +186,10 @@ def plan(
             for f in o.flags:
                 console.print(f"  {i}. {escape(f)}")
             if o.preset != "exact":
-                certs = certificate_status(cfg, o)
+                certs = certificate_status(cfg, o, content)
                 console.print(f"  {i}. certificates: " + ", ".join(
-                    f"{k} on {c['gpu']}: {c['status']}" + (f" ({c['certificate']})"
-                                                         if c["certificate"] else "")
+                    f"{k} on {c['gpu']}: {c['status']}" + (f" ({escape(c['why'])})"
+                                                         if c["why"] else "")
                     for k, c in certs.items()))
         console.print(f"Prices: {escape(rates.source)}" +
                       (f" (x{rates.region_multiplier} region)" if rates.region_multiplier != 1
@@ -199,7 +210,7 @@ def plan(
         data = yaml.safe_load(config.read_text(encoding="utf-8"))
         new = apply_option(data, chosen, budget_usd=budget)
         try:
-            parse_config(new, source=str(config))
+            parse_config(new, source=str(config), derived_content=content)
         except ConfigError as e:
             raise _fail(str(e), 1) from None
         backup = config.with_suffix(config.suffix + ".bak")
