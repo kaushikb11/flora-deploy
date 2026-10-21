@@ -320,7 +320,7 @@ def test_deterministic_engine_death_is_quarantined_not_looped(demo, clean, tmp_p
     res = run_local(demo, store=tmp_path / "store")
     assert res.state == "completed_with_errors", res.as_dict()
     assert res.summary["poison_pills"] == [f"{u3}/{kind}"]
-    assert res.spawner["crashes"] >= 3  # the container was replaced each time (fatal)
+    assert res.spawner["crashes"] >= 2  # the container was replaced (fatal), D15 counted
     jf = A.JobFiles(LocalStore(res.store_root), res.job_id, res.config_hash)
     (poisoned,) = [e["shard_id"] for e in res.events if e["event"] == "poisoned"]
     marks = A.markers(jf, kind, poisoned)
