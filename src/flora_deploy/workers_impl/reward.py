@@ -351,8 +351,12 @@ class ShardPartSink:
             f.write("".join(_line(r) + "\n" for r in rows))
 
     def _stamp(self, rec: StageRecord) -> StageRecord:
+        key, own = self.jf.key(self.kind), rec.provenance.config_hash
+        keep = rec.provenance.engine_hash
+        if keep is None and own and own not in (key, self.jf.config_hash):
+            keep = own  # the stage's own hash is not lost (review 6 M3)
         return dataclasses.replace(rec, provenance=dataclasses.replace(
-            rec.provenance, config_hash=self.jf.key(self.kind)))
+            rec.provenance, config_hash=key, engine_hash=keep))
 
     def add(self, records: Sequence[StageRecord] = (), audits: Sequence[dict] = (),
             errors: Sequence[EpisodeError] = ()) -> None:

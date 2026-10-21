@@ -9,9 +9,11 @@ the per-episode job and the engine are scripted (``WorkerEnv.script``):
   ``stages.caption.caption_record``); for ``script.nv_fail`` episodes it raises a ``ValueError``
   the way NVIDIA's code does (``media.InputError``), which the runner must classify as
   ``nv_failure``;
-* the engine raises ``KeyboardInterrupt`` (SIGINT) inside ``generate_batch`` when it sees
-  ``script.interrupt_before``'s call, i.e. from the batcher's worker thread, which is how a real
-  preemption reaches a running ``llm.generate``.
+* when the engine sees ``script.interrupt_before``'s call it delivers SIGINT to the **main**
+  thread (``_thread.interrupt_main``), where a real signal lands (``asyncio.run`` turns it into a
+  cancel of the shard's event loop), and keeps "generating" for a while in the batcher's worker
+  thread, as a long ``llm.generate`` round would (review 6 M4). The runner must flush and mark
+  without waiting for that round.
 
 Episodes run one at a time (``max_inflight_episodes=1``, flush after every episode), so every
 episode before the interrupted one is finished and flushed, as the preemption check expects.
@@ -19,7 +21,10 @@ episode before the interrupted one is finished and flushed, as the preemption ch
 
 from __future__ import annotations
 
+import _thread
+import signal
 import tempfile
+import threading
 
 from flora_deploy.engines.base import Completion, Sampling, VllmRequest
 from flora_deploy.records import Provenance
@@ -36,15 +41,19 @@ from tests.conformance.worker_suite import WorkerSpec
 class ScriptedEngine:
     name = "scripted-vllm"
 
+    HOLD_S = 2.0  # the in-flight round the runner must not wait for
+
     def __init__(self, interrupt: str | None):
         self.interrupt = interrupt
         self.batches: list[list[str]] = []
+        self.release = threading.Event()
 
     def generate_batch(self, requests, samplings):
         keys = [r.key for r in requests]
         self.batches.append(keys)
         if self.interrupt is not None and self.interrupt in keys:
-            raise KeyboardInterrupt("SIGINT")
+            _thread.interrupt_main(signal.SIGINT)  # where a real SIGINT lands
+            self.release.wait(self.HOLD_S)
         return [Completion(key=k, token_ids=(1, 2), finish_reason="stop", prompt_tokens=3)
                 for k in keys]
 

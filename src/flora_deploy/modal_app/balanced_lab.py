@@ -148,10 +148,10 @@ def child(args: dict) -> None:
     proc = nv.models.processor(kind, Path(model_dir))
     spec = EngineSpec.for_gpu(kind, model_dir, args["gpu"], dtbias_fp32=plugin,
                               logprobs_mode="raw_logits", max_logprobs=20)
-    engine = OfflineEngine(spec, keep_prompt_ids=True)
+    engine = OfflineEngine(spec, keep_prompt_ids=True)  # verifies the GDN dtypes (M6)
     out["engine_build_s"] = round(time.time() - t0, 1)
     out["spec"] = spec.as_json()
-    out["gdn_dtypes"] = gdn_param_dtypes(engine.llm)
+    out["gdn_dtypes"] = engine.gdn_dtypes or gdn_param_dtypes(engine.llm)
     eos = proc.tokenizer.eos_token_id
 
     if not args.get("gate_only"):
@@ -264,13 +264,16 @@ def _run_child(args: dict, env: dict[str, str]) -> dict:
 @app.function(image=cpu_image(), cpu=2.0, memory=4096, timeout=600,
               volumes={str(WEIGHTS_MOUNT): weights, str(GOLDEN_MOUNT): golden.read_only()})
 def preflight() -> dict:
-    """CPU: derived dirs exist with receipts; ``_extra_state`` key prefixes vLLM must skip; EOS
-    ids; the golden episodes the GPU runs would pick."""
+    """CPU: derived dirs exist with receipts; ``_extra_state`` key prefixes vLLM must skip
+    (raises if any is under ``model.visual``: vLLM's vision loader would KeyError); EOS ids; the
+    golden episodes the GPU runs would pick."""
+    from flora_deploy.engines.offline_llm import check_extra_state
+
     out: dict[str, Any] = {}
     for kind, d in MODEL_DIRS.items():
         d = Path(d)
         idx = json.loads((d / "model.safetensors.index.json").read_text())
-        extra = sorted({k.split(".layers.")[0] for k in idx["weight_map"] if "_extra_state" in k})
+        extra = check_extra_state(idx["weight_map"])  # fails on model.visual (review 6 Q5)
         tok = json.loads((d / "tokenizer_config.json").read_text())
         out[kind] = {"dir": str(d), "receipt": (d / "derived_receipt.json").is_file(),
                      "extra_state_prefixes": extra, "eos_token": tok.get("eos_token"),

@@ -21,8 +21,10 @@ record building) never NVIDIA's. Only ``nv_failure`` is terminal; an ``infra`` /
 ``oom`` episode error makes the shard raise ``ShardInfraError`` (no receipt, retried). A CUDA
 fault (``cuda_fatal``) stops the shard at once and calls ``fatal`` (``os._exit``) after the mark.
 
-Records are uncertified (``uncertified_stack``) until certificates exist; the job's config hash
-is stamped by the sink, the stage hash and the engine audit go to the audit lines.
+Records are uncertified (``uncertified_stack``) until certificates exist; the sink stamps the
+job's stage key (``JobFiles.key``, which covers the engine spec: ``config.hashing``) as
+``provenance.config_hash`` and keeps the stage's own spec hash as ``provenance.engine_hash``;
+the engine audit goes to the audit lines. The receipt carries the stage key (review 6 L3).
 """
 
 from __future__ import annotations
@@ -178,7 +180,9 @@ def _classify(exc: BaseException, nv: Any = None) -> str:
     from flora_deploy.stages.segment import EngineRequestError
 
     msg = f"{type(exc).__name__}: {exc}"
-    if cuda_fatal(msg):
+    from flora_deploy.engines.offline_llm import engine_dead
+
+    if cuda_fatal(msg) or engine_dead(msg):  # the engine is unusable (offline_llm.EngineDead)
         return "cuda_fatal"
     if "out of memory" in msg.lower() or type(exc).__name__ == "OutOfMemoryError":
         return "oom"
@@ -445,7 +449,7 @@ class BalancedShardRunner:
         todo = [u for u in shard.episodes if u not in done and u not in poisoned]
         ctx = ShardContext(jf, shard, manifests, self.container_id)
         if todo:
-            asyncio.run(self._episodes(todo, refs, sink, ctx))  # step 4
+            asyncio.run(self._episodes(todo, refs, sink, ctx, active))  # step 4
         sink.flush()
         self._next_k[key] = sink.k
 
@@ -458,7 +462,7 @@ class BalancedShardRunner:
         if missing:
             raise RuntimeError(f"shard {shard.shard_id!r}: no record or error for {missing}")
         receipt = ShardReceipt(  # step 6: LAST
-            shard_id=shard.shard_id, kind=shard.kind, config_hash=jf.config_hash,
+            shard_id=shard.shard_id, kind=shard.kind, config_hash=jf.key(shard.kind),
             container_id=self.container_id,
             episodes_done=tuple(u for u in shard.episodes if u in finished),
             episodes_failed=tuple(u for u in shard.episodes if u in failed),
@@ -470,7 +474,8 @@ class BalancedShardRunner:
         return receipt
 
     async def _episodes(self, todo: list[str], refs: Mapping[str, EpisodeRef],
-                        sink: ShardPartSink, ctx: ShardContext) -> None:
+                        sink: ShardPartSink, ctx: ShardContext,
+                        active: _Active | None = None) -> None:
         s = self.settings
         sem = asyncio.Semaphore(max(1, s.max_inflight_episodes))
         finished = 0
@@ -507,7 +512,12 @@ class BalancedShardRunner:
             tasks = [asyncio.ensure_future(one(u)) for u in todo]
             try:
                 await asyncio.gather(*tasks)
-            except BaseException:
+            except BaseException as exc:
+                if active is not None and isinstance(exc, asyncio.CancelledError
+                                                     | KeyboardInterrupt):
+                    # SIGINT: asyncio.run cancels this task. Flush + mark now, before the
+                    # batcher closes and the loop's teardown waits on any thread (review 6 M4).
+                    self._end(active, preempted=True)
                 for t in tasks:
                     t.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)

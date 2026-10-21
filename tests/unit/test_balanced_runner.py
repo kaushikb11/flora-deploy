@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from flora_deploy.engines.base import Completion
+from flora_deploy.engines.base import Completion, Sampling, VllmRequest
 from flora_deploy.stages import segment as S
 from flora_deploy.workers_impl.reward import ShardInfraError
 from flora_deploy.workers_impl.segment import (
@@ -42,6 +42,9 @@ class FakeStage:
         self.exc_for = exc_for
 
     async def segment(self, batcher, ep):
+        out = await batcher.generate(VllmRequest(prompt="<p>", videos=(), key=ep.uid),
+                                     Sampling(max_tokens=1))
+        assert out.ok
         exc = self.exc_for(ep.uid)
         if exc is not None:
             raise exc
@@ -147,3 +150,35 @@ def test_classify_categories(exc, phase, want):
 
     exc.flora_phase = phase
     assert _classify(exc) == want
+
+
+
+def test_sigint_in_main_thread_marks_preempted_promptly(tmp_path, monkeypatch):
+    """Review 6 M4: real SIGINT lands in the main thread (``asyncio.run`` turns it into a
+    cancel) while ``llm.generate`` is running in the batcher's thread. The preempt mark must be
+    written without waiting for that generate to finish."""
+    import _thread
+    import signal
+    import time
+
+    from tests.unit.test_engines_microbatch import SlowEngine
+
+    eng = SlowEngine(hold=6.0, on_start=lambda: _thread.interrupt_main(signal.SIGINT))
+    w = world(tmp_path, monkeypatch)
+    w.spec = WorkerSpec(w.spec.name, w.spec.kind, _swap_engine(w.spec.factory, eng))
+    t0 = time.perf_counter()
+    with pytest.raises(KeyboardInterrupt):
+        w.run("ta-1")
+    took = time.perf_counter() - t0
+    m = w.marker("ta-1")
+    assert m is not None and m.preempted
+    assert took < 3.0, f"preempt mark took {took:.1f}s (waited for the in-flight generate)"
+    eng.release.set()
+
+
+def _swap_engine(factory, eng):
+    def f(env):
+        runner = factory(env)
+        runner.engine = eng
+        return runner
+    return f

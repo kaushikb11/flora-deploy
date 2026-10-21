@@ -285,3 +285,91 @@ def test_cancelled_episode_does_not_block_others():
             return await episode(mb, "a", 1)
 
     assert asyncio.run(main()) == [["a.0.0"]]
+
+
+
+class SlowEngine:
+    """A long ``llm.generate``: blocks until released (or ``hold`` seconds pass)."""
+
+    name = "slow"
+
+    def __init__(self, hold: float = 5.0, on_start=None):
+        self.hold, self.on_start = hold, on_start
+        self.release = threading.Event()
+        self.started = threading.Event()
+        self.finished = threading.Event()
+
+    def generate_batch(self, requests, samplings):
+        self.started.set()
+        if self.on_start is not None:
+            self.on_start()
+        self.release.wait(self.hold)
+        self.finished.set()
+        return [Completion(key=r.key, token_ids=(1,), finish_reason="stop", prompt_tokens=1)
+                for r in requests]
+
+
+def test_close_on_cancel_does_not_wait_for_the_inflight_generate():
+    """Review 6 M4: cancelling (SIGINT -> asyncio cancel) must not block on the in-flight
+    ``generate``; the episode's future fails, the loop ends at once."""
+    eng = SlowEngine(hold=5.0)
+
+    async def main():
+        mb = await MicroBatcher(eng, max_wait_s=0.01).start()
+        task = asyncio.ensure_future(mb.generate(req("a"), SP))
+        await asyncio.to_thread(eng.started.wait, 2)
+        task.cancel()
+        t0 = time.perf_counter()
+        await mb.close()
+        return time.perf_counter() - t0
+
+    took = asyncio.run(main())
+    assert took < 1.0, f"close() blocked {took:.1f}s on the in-flight generate"
+    eng.release.set()
+
+
+def test_close_does_not_block_the_event_loop():
+    """Even a waiting close leaves the loop free (the wait runs off the loop)."""
+    eng = SlowEngine(hold=0.6)
+    ticks = []
+
+    async def ticker():
+        while True:
+            ticks.append(time.perf_counter())
+            await asyncio.sleep(0.05)
+
+    async def main():
+        mb = await MicroBatcher(eng, max_wait_s=0.01).start()
+        fut = asyncio.ensure_future(mb.generate(req("a"), SP))
+        await asyncio.to_thread(eng.started.wait, 2)
+        t = asyncio.ensure_future(ticker())
+        await asyncio.sleep(0.1)
+        await mb.close()
+        await asyncio.sleep(0.2)
+        t.cancel()
+        fut.cancel()
+
+    asyncio.run(main())
+    gaps = [b - a for a, b in zip(ticks, ticks[1:], strict=False)]
+    assert gaps and max(gaps) < 0.3, f"event loop stalled {max(gaps):.2f}s in close()"
+
+
+def test_abandoned_generate_never_overlaps_the_next_batcher():
+    """An orphaned in-flight generate holds the engine: a later batcher on the same engine
+    waits for it instead of calling ``llm.generate`` concurrently (vLLM is not thread-safe)."""
+    eng = EchoEngine(delay=0.4)
+
+    async def first():
+        mb = await MicroBatcher(eng, max_wait_s=0.01).start()
+        task = asyncio.ensure_future(mb.generate(req("a"), SP))
+        await asyncio.sleep(0.1)
+        task.cancel()
+        await mb.close()
+
+    async def second():
+        async with MicroBatcher(eng, max_wait_s=0.01) as mb:
+            return await mb.generate(req("b"), SP)
+
+    asyncio.run(first())
+    asyncio.run(second())
+    assert eng.max_concurrent == 1

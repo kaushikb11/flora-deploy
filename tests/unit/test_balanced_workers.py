@@ -103,3 +103,19 @@ def test_upstream_segments_accepts_segment_stage_hash(tmp_path):
     loaded = UpstreamSegments.load(jf, shard)
     assert set(loaded) == {"ds--a"}
     assert loaded["ds--a"].provenance.config_hash == "SEGHASH"
+
+
+
+def test_sink_keeps_the_stage_own_hash(tmp_path):
+    """Review 6 M3: the sink stamps the stage key but keeps the stage's own (engine spec)
+    hash in ``provenance.engine_hash``."""
+    from flora_deploy.workers_impl.reward import ShardPartSink
+
+    store = LocalStore(tmp_path / "s")
+    jf = A.JobFiles(store, "job", "JOBHASH", stage_hashes={"segment": "SEGHASH"})
+    sink = ShardPartSink(jf, "segment", "segment-00000", "c1", tmp_path / "loc")
+    sink.add(records=[seg("ds--a", "SPECHASH")])
+    sink.flush()
+    (rec,) = [r for p in sink.parts for r in P.read_part(jf, p)]
+    assert rec.provenance.config_hash == "SEGHASH"
+    assert rec.provenance.engine_hash == "SPECHASH"

@@ -27,10 +27,13 @@ tokenizer's EOS (``<|im_end|>``) only. NVIDIA's acceptance rules (EOS reached, n
 ``decode(ids, skip_special_tokens=True).strip()``, the 32k guard) are applied by the stages, not
 here.
 
-``OfflineEngine.generate_batch`` runs one ``llm.generate`` per batch. If the batch raises, every
-request is retried alone so one bad request (e.g. a prompt over ``max_model_len``) cannot fail
-its neighbours; a request that still fails gets ``Completion.error`` (and ``too_long`` when
-vLLM rejected its length).
+``OfflineEngine.generate_batch`` runs one ``llm.generate`` per batch. If the batch raises, it is
+**bisected** (review 6 M5): each half is retried as one batch, recursively, so one bad request
+(e.g. a prompt over ``max_model_len``) costs O(log n) generates instead of n serial ones and its
+batch-mates stay batched; a request that still fails alone gets ``Completion.error`` (and
+``too_long`` when vLLM rejected its length). A **dead engine** (vLLM's ``EngineDeadError``, or a
+CUDA fault: ``workers_impl.reward.cuda_fatal``) is never retried: ``generate_batch`` raises
+:class:`EngineDead` at once and on every later call, so the worker fails fast and exits.
 """
 
 from __future__ import annotations
@@ -57,6 +60,21 @@ NV_VIDEO_KWARGS: Mapping[str, Mapping[str, int]] = {
     "tempseg": {"fps": 4, "max_frames": 128},
     "captioner": {"fps": 8, "max_frames": 40},
 }
+
+
+class EngineDead(RuntimeError):
+    """The vLLM engine is unusable (``EngineDeadError`` / CUDA fault): never retried."""
+
+
+def engine_dead(message: str) -> bool:
+    from flora_deploy.workers_impl.reward import cuda_fatal
+
+    return "EngineDead" in message or "EngineCore encountered" in message or \
+        cuda_fatal(message)
+
+
+class EngineVerifyError(RuntimeError):
+    """The built engine is not the one its spec describes (review 6 M6)."""
 
 
 class EngineArgsError(ValueError):
@@ -219,6 +237,24 @@ class EngineSpec:
         return out
 
 
+# Balanced shard kind -> engine kind.
+SHARD_ENGINE_KINDS: Mapping[str, str] = {"segment": "tempseg", "caption": "captioner"}
+
+
+def spec_for(shard_kind: str, model: str, gpu: str, *, dtbias_fp32: bool = False,
+             **kw) -> EngineSpec:
+    """The engine a balanced ``segment`` / ``caption`` worker runs on ``gpu``. The config hash
+    (``config.hashing``) hashes :func:`hashed_spec_for` of the same arguments, so a worker that
+    builds its engine here runs exactly what keys its shards."""
+    return EngineSpec.for_gpu(SHARD_ENGINE_KINDS[shard_kind], model, gpu,
+                              dtbias_fp32=dtbias_fp32, **kw)
+
+
+def hashed_spec_for(shard_kind: str, gpu: str, *, dtbias_fp32: bool = False) -> dict:
+    """``spec_for(...).hashed()`` (the model path is not hashed: the model is pinned)."""
+    return spec_for(shard_kind, "<pinned>", gpu, dtbias_fp32=dtbias_fp32).hashed()
+
+
 def nvidia_sampling(budget: int, eos_token_id: int, *, logprobs: int | None = None) -> Sampling:
     """NVIDIA's ``models.generate``: greedy, ``max_new_tokens=budget``, stop on EOS only."""
     if type(eos_token_id) is not int:
@@ -273,14 +309,19 @@ class OfflineEngine:
     """``BatchEngine`` over a ``vllm.LLM`` (built from ``spec`` unless ``llm`` is given)."""
 
     def __init__(self, spec: EngineSpec, llm: Any = None, *,
-                 params_cls: Callable[..., Any] | None = None, keep_prompt_ids: bool = False):
+                 params_cls: Callable[..., Any] | None = None, keep_prompt_ids: bool = False,
+                 verify: bool | None = None):
+        """``verify`` (default: when the engine is built here): after the build, check the
+        GDN parameter dtypes against the spec (:func:`verify_gdn_dtypes`); vLLM only logs a
+        plugin that failed to load, so a ``+dtbias`` spec could otherwise run bf16."""
         self.spec = spec
         self.kwargs = spec.engine_kwargs()  # validated before anything is loaded
         self.name = spec.label
         self.keep_prompt_ids = keep_prompt_ids
         self._params_cls = params_cls
         self.stats: dict[str, float] = {"batches": 0, "requests": 0, "isolated_retries": 0,
-                                        "errors": 0, "generate_s": 0.0}
+                                        "bisections": 0, "errors": 0, "generate_s": 0.0}
+        self.dead: str | None = None
         if llm is None:
             from flora_deploy.engines.patches import dt_bias_fp32
 
@@ -290,19 +331,45 @@ class OfflineEngine:
             t0 = time.perf_counter()
             llm = LLM(**self.kwargs)
             self.stats["build_s"] = round(time.perf_counter() - t0, 3)
+            verify = True if verify is None else verify
         self.llm = llm
+        self.gdn_dtypes: dict[str, Any] | None = None
+        if verify:
+            self.gdn_dtypes = verify_gdn_dtypes(spec, gdn_param_dtypes(llm))
 
     def _params(self, sp: Sampling):
         return to_vllm_sampling(sp, self._params_cls)
 
-    def _one(self, req: VllmRequest, sp: Sampling) -> Completion:
+    def _generate(self, requests: Sequence[VllmRequest],
+                  samplings: Sequence[Sampling]) -> list[Completion]:
+        outs = self.llm.generate([r.prompt_dict() for r in requests],
+                                 [self._params(s) for s in samplings], use_tqdm=False)
+        if len(outs) != len(requests):
+            raise RuntimeError(f"generate returned {len(outs)} outputs for {len(requests)}")
+        return [completion_from_output(r.key, o, keep_prompt_ids=self.keep_prompt_ids)
+                for r, o in zip(requests, outs, strict=True)]
+
+    def _check_dead(self, exc: BaseException) -> None:
+        msg = f"{type(exc).__name__}: {exc}"
+        if engine_dead(msg):
+            self.dead = msg[:2000]
+            raise EngineDead(self.dead) from exc
+
+    def _bisect(self, requests: Sequence[VllmRequest],
+                samplings: Sequence[Sampling]) -> list[Completion]:
         try:
-            (ro,) = self.llm.generate([req.prompt_dict()], [self._params(sp)], use_tqdm=False)
-            return completion_from_output(req.key, ro, keep_prompt_ids=self.keep_prompt_ids)
-        except Exception as exc:  # noqa: BLE001 - isolated to this request
-            self.stats["errors"] += 1
-            msg = f"{type(exc).__name__}: {exc}"
-            return Completion(key=req.key, error=msg[:2000], too_long=bool(_TOO_LONG.search(msg)))
+            return self._generate(requests, samplings)
+        except Exception as exc:  # noqa: BLE001 - isolate by bisection
+            self._check_dead(exc)
+            if len(requests) == 1:
+                self.stats["errors"] += 1
+                msg = f"{type(exc).__name__}: {exc}"
+                return [Completion(key=requests[0].key, error=msg[:2000],
+                                   too_long=bool(_TOO_LONG.search(msg)))]
+        self.stats["bisections"] += 1
+        mid = len(requests) // 2
+        return self._bisect(requests[:mid], samplings[:mid]) + \
+            self._bisect(requests[mid:], samplings[mid:])
 
     def generate_batch(self, requests: Sequence[VllmRequest],
                        samplings: Sequence[Sampling]) -> list[Completion]:
@@ -310,23 +377,29 @@ class OfflineEngine:
             raise ValueError("one Sampling per request")
         if not requests:
             return []
+        if self.dead is not None:  # fail fast: a dead engine never recovers in-process
+            raise EngineDead(self.dead)
         t0 = time.perf_counter()
         self.stats["batches"] += 1
         self.stats["requests"] += len(requests)
         try:
-            outs = self.llm.generate([r.prompt_dict() for r in requests],
-                                     [self._params(s) for s in samplings], use_tqdm=False)
-            if len(outs) != len(requests):
-                raise RuntimeError(f"generate returned {len(outs)} outputs for {len(requests)}")
-            result = [completion_from_output(r.key, o, keep_prompt_ids=self.keep_prompt_ids)
-                      for r, o in zip(requests, outs, strict=True)]
-        except Exception:  # noqa: BLE001 - isolate: retry each request alone
-            if len(requests) == 1:
-                result = [self._one(requests[0], samplings[0])]
-            else:
-                self.stats["isolated_retries"] += 1
-                result = [self._one(r, s) for r, s in zip(requests, samplings, strict=True)]
-        self.stats["generate_s"] += time.perf_counter() - t0
+            try:
+                result = self._generate(requests, samplings)
+            except Exception as exc:  # noqa: BLE001 - isolate: bisect the batch
+                self._check_dead(exc)
+                if len(requests) > 1:
+                    self.stats["isolated_retries"] += 1
+                    self.stats["bisections"] += 1
+                    mid = len(requests) // 2
+                    result = self._bisect(requests[:mid], samplings[:mid]) + \
+                        self._bisect(requests[mid:], samplings[mid:])
+                else:
+                    self.stats["errors"] += 1
+                    msg = f"{type(exc).__name__}: {exc}"
+                    result = [Completion(key=requests[0].key, error=msg[:2000],
+                                         too_long=bool(_TOO_LONG.search(msg)))]
+        finally:
+            self.stats["generate_s"] += time.perf_counter() - t0
         return result
 
     def audit(self) -> dict:
@@ -377,6 +450,53 @@ def gdn_param_dtypes(llm) -> dict[str, Any]:
         return {"workers": llm.collective_rpc(probe)}
     except Exception as exc:  # pragma: no cover - diagnostics only
         return {"error": repr(exc)}
+
+
+def verify_gdn_dtypes(spec: EngineSpec, report: Mapping[str, Any]) -> dict[str, Any]:
+    """Raise :class:`EngineVerifyError` unless every worker of the built engine has GDN
+    parameters and every ``dt_bias`` is FP32 with ``dtbias_fp32`` (bf16, vLLM's own, without)
+    and every ``A_log`` FP32 (vLLM creates it FP32). ``report``: :func:`gdn_param_dtypes`.
+    Returns the report."""
+    if "error" in report or not report.get("workers"):
+        raise EngineVerifyError(f"cannot read the engine's GDN parameter dtypes: {report!r}")
+    want = "float32" if spec.dtbias_fp32 else "bfloat16"
+    for i, counts in enumerate(report["workers"]):
+        counts = dict(counts or {})
+        dt = {k.split(":", 1)[1]: n for k, n in counts.items() if k.startswith("dt_bias:")}
+        alog = {k.split(":", 1)[1]: n for k, n in counts.items() if k.startswith("A_log:")}
+        if not dt or not alog:
+            raise EngineVerifyError(f"worker {i}: no GDN dt_bias / A_log parameters: {counts}")
+        if set(dt) != {want}:
+            raise EngineVerifyError(
+                f"worker {i}: dt_bias dtypes {dt}, spec {spec.label!r} needs all {want}"
+                + (" (the dt_bias plugin did not load: vLLM only logs plugin errors)"
+                   if spec.dtbias_fp32 else " (a dt_bias patch is active but not in the spec)"))
+        if set(alog) != {"float32"}:
+            raise EngineVerifyError(f"worker {i}: A_log dtypes {alog}, expected all float32")
+    return dict(report)
+
+
+def extra_state_prefixes(weight_map: Mapping[str, Any]) -> list[str]:
+    """Module prefixes (before ``.layers.`` / ``.blocks.``) of ``*._extra_state`` keys."""
+    out = set()
+    for k in weight_map:
+        if "_extra_state" in k:
+            out.add(re.split(r"\.(?:layers|blocks)\.", k, maxsplit=1)[0])
+    return sorted(out)
+
+
+def check_extra_state(weight_map: Mapping[str, Any]) -> list[str]:
+    """Preflight (review 6 Q5): vLLM's language-model loader skips unknown ``_extra_state``
+    keys, but ``Qwen3_VisionTransformer.load_weights`` does a bare ``params_dict[name]``, so
+    any such key under ``model.visual`` fails the load. Raises :class:`EngineVerifyError`
+    then; returns the prefixes otherwise."""
+    prefixes = extra_state_prefixes(weight_map)
+    bad = sorted(k for k in weight_map if "_extra_state" in k
+                 and (k.startswith("model.visual") or k.startswith("visual.")))
+    if bad:
+        raise EngineVerifyError(f"{len(bad)} _extra_state key(s) under model.visual would "
+                                f"KeyError in vLLM's vision loader, e.g. {bad[:3]}")
+    return prefixes
 
 
 def with_limits(spec: EngineSpec, **changes) -> EngineSpec:

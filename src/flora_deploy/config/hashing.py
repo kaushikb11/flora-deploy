@@ -32,6 +32,8 @@ Per shard kind:
   ``terminal_mode`` for ``reward.terminal`` (score only, NVIDIA's default, or with rationale);
 - engine name, versions, patches, engine args (for vLLM video engines incl. the Gate C-required
   ``mm_processor_cache_gb=0``), sampling, mm_kwargs, and the ``image_fingerprint()`` of its image;
+  for the balanced vLLM video kinds also the worker's full ``EngineSpec.hashed()`` on the
+  configured GPU (``spec``: per-GPU scheduler limits, ``dtbias_fp32``; review 6 M3);
 - for each NVIDIA pin it depends on: repo, revision, role, ``plan_digest``, ``expected`` digests
   (incl. NVIDIA's manifest sha256) and code digests (``config/pins.py``). NVIDIA's prompt pools
   live in ``batch_utils/`` and are bound by the code-manifest digests;
@@ -161,6 +163,17 @@ def kind_modes(cfg, kind: str) -> dict[str, Any]:
     return modes
 
 
+def _engine_spec(cfg, kind: str, eng: EngineIdentity) -> dict[str, Any] | None:
+    """Balanced vLLM video kinds: the full ``EngineSpec.hashed()`` their worker runs on the
+    configured GPU (per-GPU scheduler limits, ``dtbias_fp32``, every engine kwarg; the GPU name
+    itself stays out, D11). ``None`` for every other engine (their documents are unchanged)."""
+    from flora_deploy.engines.offline_llm import SHARD_ENGINE_KINDS, hashed_spec_for
+
+    if eng.name != "vllm-offline" or kind not in SHARD_ENGINE_KINDS:
+        return None
+    return hashed_spec_for(kind, cfg.pools()[kind].gpu)
+
+
 def _default_fingerprint(name: str) -> str:
     from flora_deploy.modal_app.images import image_fingerprint
 
@@ -204,6 +217,9 @@ def hash_document(
         e = asdict(eng)
         e["patches"] = list(eng.patches)
         e["image_fingerprint"] = fingerprint(eng.image)
+        spec = _engine_spec(cfg, kind, eng)  # review 6 M3
+        if spec is not None:
+            e["spec"] = spec
         pins = sorted(preset.pins[kind])
         weights = sorted(preset.derived_weights.get(kind, ()))
         shard_kinds[kind] = {
