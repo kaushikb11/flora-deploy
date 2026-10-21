@@ -49,6 +49,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from collections import Counter
@@ -359,17 +360,21 @@ class JobRun:
         self.checks.append(Check(name, bool(ok), detail, gap))
 
 
+_LOCK = threading.Lock()  # setup runs jobs in threads: one writer at a time
+
+
 def sh(args: list[str], *, cwd: Path, timeout: float = 900, check: bool = True,
        log: Path | None = None) -> subprocess.CompletedProcess:
     print(f"$ {' '.join(args)}", flush=True)
     p = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout)
     out = (p.stdout or "") + (p.stderr or "")
-    if log is not None:
-        with log.open("a", encoding="utf-8") as f:
-            f.write(f"$ {' '.join(args)}\n{out}\n[rc={p.returncode}]\n")
     tail = "\n".join(out.strip().splitlines()[-12:])
-    if tail:
-        print("  " + tail.replace("\n", "\n  "), flush=True)
+    with _LOCK:
+        if log is not None:
+            with log.open("a", encoding="utf-8") as f:
+                f.write(f"$ {' '.join(args)}\n{out}\n[rc={p.returncode}]\n")
+        if tail:
+            print("  " + tail.replace("\n", "\n  "), flush=True)
     if check and p.returncode != 0:
         raise RuntimeError(f"{args[:3]} failed ({p.returncode})")
     return p
@@ -629,7 +634,6 @@ def main(argv: list[str] | None = None) -> int:
     app_names: list[str] = []
     watch: list[str] = []
     notes: list[str] = []
-    poison = None
     try:
         # media to its own Volume (input.stage_to), as Wave H stages it
         for data in sorted({r.spec.data for r in runs}):
@@ -637,7 +641,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[{data}] uploaded {n} files to {media_volume(run_id)}:/{run_id}/{data}",
                   flush=True)
         fl = flora_bin()
-        for r in runs:
+
+        def setup(r: JobRun) -> None:
+            # index -> plan -> deploy for one job. Jobs touch only their own config, store
+            # prefix and app, so they set up side by side (deploys dominate the wall clock).
             local_store = work / f"store-{r.job}"
             sh([fl, "index", "--local", "--config", str(r.cfg_path), "--job", r.job_id,
                 "--store", f"file://{local_store}", "--out", str(work / f"summary-{r.job}.json")],
@@ -660,8 +667,9 @@ def main(argv: list[str] | None = None) -> int:
                     ", ".join(f"{o.name}:{o.gpu}" for o in pl["fake"].objects))
             dep = sh([fl, "deploy", "--config", str(r.cfg_path), "--fake-models",
                       "--determinism", r.spec.determinism], cwd=work, log=log, timeout=1200)
-            app_names.append(r.plan.app_name)
-            watch.append(r.plan.watch_dict)
+            with _LOCK:
+                app_names.append(r.plan.app_name)
+                watch.append(r.plan.watch_dict)
             r.check("deployed app == the client's plan", f"deployed {r.plan.app_name}" in
                     " ".join((dep.stdout + dep.stderr).split()), r.plan.app_name)
             if r.spec.preempt or r.spec.poison_at:
@@ -673,6 +681,12 @@ def main(argv: list[str] | None = None) -> int:
                 remote_store(run_id).put_bytes(fake_faults_path(r.job_id),
                                                json.dumps(faults).encode())
                 print(f"[{r.job}] faults: {json.dumps(faults)}")
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=len(runs)) as pool:
+            for fut in [pool.submit(setup, r) for r in runs]:
+                fut.result()  # re-raise the first setup failure
 
         procs = {}
         for r in runs:
