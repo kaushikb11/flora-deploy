@@ -5,6 +5,10 @@ A worker class (Modal Cls, defined at module scope, decorated by the app factory
 ``jobs.progress``; the shard itself comes from ``jobs.deps.StoreManifestSource.shard``, which
 sees bisection children immediately):
 
+Before step 0, every input must see current state: on a Volume store call
+``store.refresh()`` (a warm container otherwise reads a stale ledger and stale parts; found by
+the canary). Bucket stores need nothing.
+
 0. if ``attempts.superseded(jf, kind, shard_id, token)``: return ``None`` at once, writing
    nothing (a duplicate or stale spawn; see ``jobs.spawner``);
 1. write ``AttemptMarker`` (``attempts.write_attempt`` with ``token`` and the Modal call id);
