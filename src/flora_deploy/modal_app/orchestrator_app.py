@@ -103,6 +103,11 @@ class ModalErrors:
     function_timeout: type[BaseException]
     cancelled: tuple[type[BaseException], ...] = ()
     transient: tuple[type[BaseException], ...] = ()  # client/network errors: state unknown
+    # A call stopped with ``cancel(terminate_containers=True)`` surfaces as a generic
+    # ``RemoteError(result.exception)`` carrying this server message (seen on modal 1.6.2 by the
+    # canary), not as ``InputCancellation``. Only an exact match counts as cancelled.
+    remote: tuple[type[BaseException], ...] = ()
+    cancelled_messages: tuple[str, ...] = ()
 
 
 def modal_errors() -> ModalErrors:
@@ -115,6 +120,8 @@ def modal_errors() -> ModalErrors:
         cancelled=(mx.InputCancellation,),
         transient=(mx.ConnectionError, mx.ServiceError, mx.InternalError,
                    mx.ResourceExhaustedError),
+        remote=(mx.RemoteError,),
+        cancelled_messages=("Function call was cancelled by user or a failure.",),
     )
 
 
@@ -140,6 +147,9 @@ def status_from_get(call_id: str, get: Callable[[], Any], errors: ModalErrors) -
     except errors.transient as exc:
         return CallStatus(call_id, "pending", error=f"transient: {exc!r}")
     except Exception as exc:  # the remote exception, re-raised (retries exhausted, init failure)
+        if (errors.remote and isinstance(exc, errors.remote)
+                and str(exc).strip() in errors.cancelled_messages):
+            return CallStatus(call_id, "cancelled", error=repr(exc))
         return CallStatus(call_id, "failed", error=repr(exc))
     return CallStatus(call_id, "success", receipt=coerce_receipt(result))
 
