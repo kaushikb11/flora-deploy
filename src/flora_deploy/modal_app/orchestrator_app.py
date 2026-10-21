@@ -444,7 +444,7 @@ def build_orchestrator(job_id: str, deps: OrchestratorDeps, *, lease_kv: Any,
     )
 
 
-TERMINAL = ("done", "failed", "cancelled", "budget_stopped")
+TERMINAL = ("done", "completed_with_errors", "failed", "cancelled", "budget_stopped")
 
 
 def _retry(fn: Callable[[], Any], attempts: int = 3, delay_s: float = 5.0) -> Any:
@@ -507,6 +507,7 @@ def _reconcile_job(job_id: str, factory: str, revive: bool = True, *,
         spawner=ModalSpawner(deps.worker_app, deps.worker_classes),
         lease=DictLease(leases, f"orchestrator/{job_id}"),
         max_starts=deps.settings.max_starts_before_quarantine,
+        max_error_rate=deps.settings.max_episode_error_rate,
     )
     # revive spawns ``run``; a second contender loses the lease and exits (never two loops)
     revived = revive and revive_if_needed(status, lambda: spawn(job_id, factory, 0, True))

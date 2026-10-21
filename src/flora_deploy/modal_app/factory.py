@@ -14,7 +14,8 @@ Two steps, so the same truth drives ``build_app``, ``flora deploy --dry-run`` an
    ``@modal.concurrent`` inputs, timeouts, retries, scaledown, Volumes, secret *names*, env).
    It contacts nothing and refuses what cannot run: shard kinds without a worker class (balanced
    ``segment``/``caption`` until P1b-1, ``reward.rubric``), uncertified presets without
-   ``allow_uncertified`` (D9/D16), local stores, decorated (module-scope) workers.
+   ``allow_uncertified`` (D9/D16), local stores, decorated (module-scope) workers, and inputs the
+   containers cannot read (a local ``input.path`` that was not staged to a Volume).
 2. :func:`materialize` (``build_app``) applies the decorators to a fresh ``modal.App``. Still
    offline: images, Volumes and secrets are lazy until ``app.deploy()``.
 
@@ -33,6 +34,25 @@ Objects, by stable Modal name (``ModalSpawner`` looks classes up by ``AppPlan.wo
 The app name is ``flora-<project>-<digest of the stage hashes>`` (D11), so two configs that
 produce different outputs never share an app, and resource-only edits (GPU, containers) redeploy
 the same app in place.
+
+**Inputs (C1).** Index receipts hold dataset-relative video paths, so every worker gets
+``FLORA_MEDIA_ROOT`` (:func:`media_for`): with ``input.stage_to: volume://<vol>/<dir>`` the
+staged dataset on that Volume (mounted read-only at ``/media/<vol>``, or through the store mount
+when it is the store's Volume), laid out as ``flora index`` stages it (``<dir>/<dataset key>
+[/<subdir>]`` for a Hub dataset, ``<dir>`` itself for a local dataset uploaded there); without
+``stage_to`` a Hub dataset is read from the Hub at its pinned revision
+(``hf://datasets/<repo>@<rev>[/<subdir>]``). Workers check it in a preflight before building
+their engine. The configured instruction travels as ``FLORA_INSTRUCTION_SOURCE`` /
+``FLORA_INSTRUCTION_TEXT`` (C2).
+
+**Caches (M7).** ``flora-cache`` is mounted read-only on workers (``FLORA_CACHE_MODE=ro``: a
+local copy, never committed); ``warm_reward_cache`` (one container, read-write) is its only
+writer.
+
+**Timeouts (M5).** Per worker class, from ``planner/rates.json``: the wall time of a full shard
+(``shard_target_gpu_minutes`` of placeholder-rate work, converted to video seconds and priced at
+the measured container-s per video-s, upper quantile, times ``max_inputs``) plus startup, times
+:data:`TIMEOUT_SAFETY`, at least 30 min.
 """
 
 from __future__ import annotations
@@ -48,7 +68,7 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Literal
 from urllib.parse import urlparse
 
-from flora_deploy.jobs.settings import PoolSettings
+from flora_deploy.jobs.settings import WORKER_SCALEDOWN_S, PoolSettings
 
 APP_ENV = "FLORA_APP_NAME"
 WATCH_ENV = "FLORA_WATCH_DICT"
@@ -59,6 +79,11 @@ WORKER_RETRIES = {"max_retries": 2, "initial_delay": 10.0, "backoff_coefficient"
 ORCH_RETRIES = {"max_retries": 3, "initial_delay": 30.0, "backoff_coefficient": 2.0}
 MIN_WORKER_TIMEOUT_S = 30 * 60
 MAX_TIMEOUT_S = 24 * 3600
+TIMEOUT_SAFETY = 2.0  # worker timeout = safety x (rate-table wall time of a full shard + startup)
+MEDIA_MOUNT_ROOT = "/media"
+CACHE_MODE_ENV = "FLORA_CACHE_MODE"  # ro (workers: local copy, no commit) | rw (warm-up only)
+LOCAL_CACHE_ROOT = "/tmp/flora-cache"
+WARM_CACHE_FUNCTION = "warm_reward_cache"
 RECONCILE_EVERY = "*/10 * * * *"
 
 IMAGE_BUILDERS = {"img_cpu": "cpu_image", "img_hfref": "hfref_image", "img_vllm": "vllm_image"}
@@ -83,7 +108,7 @@ class WorkerRef:
     name: str  # class name == Modal class name (ModalSpawner's lookup key)
     image: str  # modal_app.images key; must match the preset's EngineIdentity.image
     startup_timeout_s: int
-    scaledown_window_s: int = 300
+    scaledown_window_s: int = WORKER_SCALEDOWN_S
     cache: bool = False  # mount flora-cache (compile/Triton caches)
     recipe: Literal["segcap", "reward"] = "reward"  # container env recipe
 
@@ -252,10 +277,42 @@ def app_name_for(project: str, stage_hashes: Mapping[str, str]) -> str:
     return f"flora-{slug}-{_digest(stage_hashes)}"
 
 
-def worker_timeout_s(shard_target_gpu_minutes: float) -> int:
-    """Per-call timeout: 3x the shard target, at least 30 min, at most Modal's 24 h."""
-    return int(min(MAX_TIMEOUT_S, max(MIN_WORKER_TIMEOUT_S,
-                                      math.ceil(shard_target_gpu_minutes * 60 * 3))))
+def worker_timeout_s(shard_target_gpu_minutes: float, *, preset: str = "exact",
+                     kinds: tuple[str, ...] = (), max_inputs: int = 1,
+                     startup_s: float = 0.0, table: Any = None) -> int:
+    """Per-call timeout (M5): :data:`TIMEOUT_SAFETY` x (the wall time of a full shard of each
+    kind, from ``planner/rates.json`` at the upper quantile and the pool's concurrency, plus
+    startup), at least 30 min, at most Modal's 24 h.
+
+    Manifests pack ``shard_target_gpu_minutes`` of *placeholder-rate* work per shard
+    (``jobs.manifest.DEFAULT_RATES``), so a full shard holds ``target / DEFAULT_RATES[kind]``
+    video seconds; the rate table says what those really cost (exact segcap: 8.62 container-s per
+    video-s, not 3.0). Without kinds: 3x the target, as before."""
+    target_s = shard_target_gpu_minutes * 60
+    if not kinds:
+        return int(min(MAX_TIMEOUT_S, max(MIN_WORKER_TIMEOUT_S, math.ceil(target_s * 3))))
+    from flora_deploy.jobs.manifest import DEFAULT_RATES
+    from flora_deploy.planner.rates import RateTable
+
+    table = table or RateTable.load()
+    wall = 0.0
+    for kind in kinds:
+        video_s = target_s / DEFAULT_RATES[kind]  # type: ignore[index]
+        rates = []
+        for cams in (1, 3):  # the slowest camera layout the table knows
+            try:
+                e = table.rate(preset, kind, cams, max_inputs)
+            except KeyError:
+                continue
+            rates.append(e.container_s_per_video_s * (1.0 + e.uncertainty))
+        per = max(rates) if rates else DEFAULT_RATES[kind]  # type: ignore[index]
+        try:
+            st = table.startup_for(preset, kind)
+            start = st.startup_s * (1.0 + st.uncertainty)
+        except KeyError:
+            start = startup_s
+        wall = max(wall, video_s * per * max(max_inputs, 1) + max(start, startup_s))
+    return int(min(MAX_TIMEOUT_S, max(MIN_WORKER_TIMEOUT_S, math.ceil(wall * TIMEOUT_SAFETY))))
 
 
 def memory_mib(gib: float) -> tuple[int, int]:
@@ -283,7 +340,7 @@ def merge_pools(kinds: list[str], pools: Mapping[str, PoolSettings]) -> PoolSett
                    memory_gib=max(p.memory_gib for p in ps))
 
 
-def _recipe_env(recipe: str, determinism: str) -> dict[str, str]:
+def _recipe_env(recipe: str, determinism: str, cache_mode: str = "ro") -> dict[str, str]:
     if recipe == "segcap":
         from flora_deploy.accel import determinism as det
         from flora_deploy.modal_app.warm import linked_offline_env
@@ -291,7 +348,72 @@ def _recipe_env(recipe: str, determinism: str) -> dict[str, str]:
         return {**linked_offline_env(), **det.container_env(determinism)}
     from flora_deploy.modal_app import rewarder_app as ra
 
-    return {ra.IMAGE_FP_ENV: ra.IMAGE_FP, **ra.cache_env()}
+    root = LOCAL_CACHE_ROOT if cache_mode == "ro" else None
+    cache = ra.cache_env(root) if root is not None else ra.cache_env()
+    return {ra.IMAGE_FP_ENV: ra.IMAGE_FP, **cache, CACHE_MODE_ENV: cache_mode}
+
+
+def _has_function(module: str, attr: str, skipped: dict[str, str]) -> bool:
+    try:
+        resolve(module, attr, want="function")
+    except DeployError as e:
+        skipped[attr] = str(e)
+        return False
+    return True
+
+
+@dataclass(frozen=True)
+class MediaSpec:
+    """Where containers read the dataset's videos (C1): ``root`` is ``FLORA_MEDIA_ROOT``."""
+
+    root: str
+    volumes: dict[str, VolumeMount] = field(default_factory=dict)
+    how: str = ""
+
+
+def media_for(cfg: Any, store: StoreSpec) -> MediaSpec:
+    """The media root the workers resolve index receipts' relative paths against (module
+    docstring). Raises :class:`DeployError` for inputs containers cannot reach."""
+    from flora_deploy.jobs.indexing import DatasetSpec
+
+    inp = cfg.input
+    spec = DatasetSpec.from_config(inp)
+    stage = (inp.stage_to or "").strip()
+    if stage:
+        u = urlparse(stage)
+        if u.scheme not in ("volume", "modal-volume"):
+            raise DeployError(
+                f"input.stage_to {stage!r}: workers read staged inputs from a Modal Volume; use "
+                "volume://<volume>/<dir> (bucket staging is not supported yet)")
+        if not _VOLUME_NAME.match(u.netloc or ""):
+            raise DeployError(f"input.stage_to {stage!r}: volume://<volume name>/<dir>")
+        sub = u.path.strip("/")
+        if store.kind == "volume" and store.volume == u.netloc:
+            base, vols = str(store.mount), {}
+        else:
+            base = f"{MEDIA_MOUNT_ROOT}/{u.netloc}"
+            vols = {base: VolumeMount(u.netloc, read_only=True)}
+        root = f"{base}/{sub}" if sub else base
+        if spec.repo is not None:  # as ``flora index`` stages a Hub dataset (DatasetMirror)
+            root = f"{root}/{spec.key}" + (f"/{spec.subdir}" if spec.subdir else "")
+        return MediaSpec(root, vols, f"staged on Volume {u.netloc}")
+    if spec.repo is not None:
+        root = f"hf://datasets/{spec.repo}@{spec.revision}" + (
+            f"/{spec.subdir}" if spec.subdir else "")
+        return MediaSpec(root, {}, "Hugging Face Hub at the pinned revision")
+    raise DeployError(
+        f"input.path {inp.path!r} is a local directory, which Modal containers cannot read: "
+        "upload it to a Volume (`modal volume put <vol> <dir> <dest>`) and set "
+        "input.stage_to: volume://<vol>/<dest>")
+
+
+def instruction_env(cfg: Any) -> dict[str, str]:
+    """C2: the configured instruction for workers (the fixed text when ``source: fixed``)."""
+    ins = cfg.pipeline.episode_instruction
+    env = {"FLORA_INSTRUCTION_SOURCE": ins.source}
+    if ins.source == "fixed" and ins.text:
+        env["FLORA_INSTRUCTION_TEXT"] = ins.text
+    return env
 
 
 def plan_app(
@@ -329,7 +451,8 @@ def plan_app(
         raise DeployError("min_containers must be >= 0")
     reg = dict(WORKERS if registry is None else registry)
     ch = config_hash(cfg, derived_receipts=derived_receipts, **dict(hash_kwargs or {}))
-    rs = to_run_settings(cfg, "deploy", config_hash=ch.hash)
+    rs = to_run_settings(cfg, "deploy", config_hash=ch.hash, stage_hashes=dict(ch.stage_hashes),
+                         min_containers=min_containers)
     preset = get_preset(cfg.preset)
     st = store if isinstance(store, StoreSpec) else parse_store(store or cfg.output.sink,
                                                                 bucket_secret=bucket_secret)
@@ -379,22 +502,30 @@ def plan_app(
     store_volumes = ({str(st.mount): VolumeMount(str(st.volume), create=True)}
                      if st.kind == "volume" else {})
     secrets = (st.secret,) if st.secret else ()
+    media = media_for(cfg, st) if by_class else None
 
     from flora_deploy.layout import CACHE_MOUNT, CACHE_VOLUME, WEIGHTS_MOUNT, WEIGHTS_VOLUME
 
     objects: list[ObjectSpec] = []
-    timeout = worker_timeout_s(rs.shard_target_gpu_minutes)
+    scaledown = WORKER_SCALEDOWN_S
     for cls_name, kinds in by_class.items():
         ref = refs[cls_name]
         pool = merge_pools(kinds, rs.pools)
+        scaledown = max(scaledown, ref.scaledown_window_s)
         volumes = {str(WEIGHTS_MOUNT): VolumeMount(WEIGHTS_VOLUME, read_only=True)}
-        if ref.cache:
-            volumes[str(CACHE_MOUNT)] = VolumeMount(CACHE_VOLUME, create=True)
+        if ref.cache:  # M7: read-only on workers; warm_reward_cache is the one writer
+            volumes[str(CACHE_MOUNT)] = VolumeMount(CACHE_VOLUME, read_only=True)
         volumes.update(store_volumes)
-        env = {**_recipe_env(ref.recipe, determinism), **base_env,
+        assert media is not None
+        volumes.update(media.volumes)
+        env = {**_recipe_env(ref.recipe, determinism), **base_env, **instruction_env(cfg),
+               "FLORA_MEDIA_ROOT": media.root,
                "FLORA_DETERMINISM": determinism, "FLORA_SHARD_KINDS": ",".join(kinds),
                "FLORA_STAGE_HASHES": json.dumps({k: ch.stage_hashes[k] for k in kinds},
                                                 sort_keys=True)}
+        timeout = worker_timeout_s(rs.shard_target_gpu_minutes, preset=cfg.preset,
+                                   kinds=tuple(kinds), max_inputs=pool.max_inputs,
+                                   startup_s=float(ref.startup_timeout_s) / 2)
         objects.append(ObjectSpec(
             kind="cls", name=cls_name, module=ref.module, attr=ref.name, image=ref.image,
             gpu=gpu_string(pool), cpu=float(pool.cpu_cores), memory=memory_mib(pool.memory_gib),
@@ -404,8 +535,22 @@ def plan_app(
             max_inputs=pool.max_inputs if pool.max_inputs > 1 else None,
             retries=dict(WORKER_RETRIES), volumes=volumes, secrets=secrets,
             env=dict(sorted(env.items())), region=cfg.modal.region, shard_kinds=tuple(kinds)))
+        if ref.cache and ref.recipe == "reward" and _has_function(ref.module,
+                                                                 WARM_CACHE_FUNCTION, skipped):
+            warm_volumes = {**volumes, str(CACHE_MOUNT): VolumeMount(CACHE_VOLUME, create=True)}
+            objects.append(ObjectSpec(
+                kind="function", name=WARM_CACHE_FUNCTION, module=ref.module,
+                attr=WARM_CACHE_FUNCTION, image=ref.image, gpu=gpu_string(pool),
+                cpu=float(pool.cpu_cores), memory=memory_mib(pool.memory_gib),
+                timeout=2 * ref.startup_timeout_s, max_containers=1, volumes=warm_volumes,
+                secrets=secrets, region=cfg.modal.region,
+                env=dict(sorted({**env, **_recipe_env(ref.recipe, determinism, "rw")}.items()))))
 
-    orch_env = dict(sorted({**base_env, WATCH_ENV: watch_dict}.items()))
+    orch_env = dict(sorted({**base_env, WATCH_ENV: watch_dict,
+                            "FLORA_SCALEDOWN_S": str(scaledown),
+                            "FLORA_MIN_CONTAINERS": str(min_containers),
+                            **({"FLORA_REGION": cfg.modal.region} if cfg.modal.region else {}),
+                            }.items()))
     here = __name__
     common = {"module": here, "image": "img_cpu", "cpu": float(oa.CPU_CORES),
               "memory": int(oa.MEMORY_MIB), "volumes": dict(store_volumes), "secrets": secrets,

@@ -30,7 +30,10 @@ input:
   #   observation.images.top: main
   #   observation.images.left_wrist: left_wrist
   #   observation.images.right_wrist: right_wrist
-  stage_to: null                    # where downloaded inputs are staged (null = default)
+  # Where workers read the videos. null: from the Hub at `revision` (each worker downloads the
+  # files its episodes need). volume://<vol>/<dir>: the copy `flora index` staged there (read
+  # once from the Hub, kept for reruns and later stages).
+  stage_to: null
 
 pipeline:
   # segment, caption, reward.terminal, reward.dense, reward.rubric
@@ -38,6 +41,7 @@ pipeline:
   embodiment: human                 # human | yam | yam32 | dex | tianji
   episode_instruction:
     source: dataset_task            # dataset_task | fixed (then set `text`) | none
+                                    # (none is refused with reward stages: they need a task)
   envelope: warn                    # warn | enforce | ignore: out-of-envelope episodes (D13)
 
 # Per shard kind overrides of the preset's pools: gpu, gpu_count, max_containers, max_inputs,
@@ -56,6 +60,9 @@ output:
 
 retries:
   max_starts_before_quarantine: 3   # then the shard is quarantined and bisected
+  # A job that excludes more than this share of a stage's episodes (NVIDIA-semantics failures,
+  # poison pills) ends `completed_with_errors` instead of `done`.
+  max_episode_error_rate: 0.1
 
 observability:
   log_level: info

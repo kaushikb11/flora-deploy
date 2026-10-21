@@ -13,7 +13,7 @@ Rules every implementation must honor:
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping
 from typing import Protocol
 
 from flora_deploy.jobs.types import safe_key
@@ -34,17 +34,48 @@ def _fan(key: str) -> str:
 class JobPaths:
     """Relative paths of every job file under ``flora/<job_id>/``.
 
-    Everything a config change invalidates (parts, receipts, attempts, errors, audits) lives under
-    ``<cfg_hash>/``, so outputs of different configs never mix and resume is per config.
+    Two scopes below the job root (review-4 M1/M6):
+
+    * **per config** (``<job hash>/``): the manifest (``config_manifest``), the orchestrator's
+      per-shard ledgers (``calls/``) and the composed outputs (``output/``): what one config's
+      orchestrator decided and composed;
+    * **per stage** (``<stage hash>/``): everything a shard *produces* (parts, receipts, attempts,
+      errors, audits, replans), keyed by the stage hash of the shard's kind
+      (``config.hashing.stage_hashes``), so adding ``reward.dense`` to a config reuses its
+      finished ``segcap`` shards instead of redoing them.
+
+    Callers keep passing the **job** hash to the per-shard path methods; when this object knows
+    the stage hashes (``JobPaths(job_id, config_hash=..., stage_hashes=...)``, which
+    ``attempts.JobFiles`` builds from the manifest) a per-stage area is re-keyed to the stage hash
+    of ``kind``. Without stage hashes (old manifests, tests) everything stays under the job hash.
+    Any other hash passed explicitly is used as given.
     """
 
-    def __init__(self, job_id: str):
+    PER_CONFIG_AREAS = frozenset({"calls"})
+
+    def __init__(self, job_id: str, *, config_hash: str | None = None,
+                 stage_hashes: Mapping[str, str] | Callable[[], Mapping[str, str]] | None = None):
         self.root = f"flora/{safe_key(job_id)}"
+        self.config_hash = config_hash
+        self._stage_hashes = stage_hashes
+
+    def stage_key(self, cfg_hash: str, kind: str) -> str:
+        """The directory key of ``kind``'s shard files when the caller passes ``cfg_hash``."""
+        if self.config_hash is None or cfg_hash != self.config_hash or not self._stage_hashes:
+            return cfg_hash
+        sh = self._stage_hashes() if callable(self._stage_hashes) else self._stage_hashes
+        return sh.get(kind) or cfg_hash
 
     # job-level
     @property
     def manifest(self) -> str:
+        """The job's *latest planned* manifest (a convenience pointer: ``flora compose`` /
+        ``flora results`` default to its config). The authority is :meth:`config_manifest`."""
         return f"{self.root}/manifest.json"
+
+    def config_manifest(self, cfg_hash: str) -> str:
+        """The manifest of one config (M6: re-planning config B never clobbers config A's)."""
+        return f"{self.root}/{safe_key(cfg_hash)}/manifest.json"
 
     @property
     def job_cache(self) -> str:
@@ -62,8 +93,14 @@ class JobPaths:
 
     # per config
     def _cfg(self, cfg_hash: str, area: str, kind: str, shard_id: str) -> str:
-        return (f"{self.root}/{safe_key(cfg_hash)}/{area}/{safe_key(kind)}/{_fan(shard_id)}/"
+        key = cfg_hash if area in self.PER_CONFIG_AREAS else self.stage_key(cfg_hash, kind)
+        return (f"{self.root}/{safe_key(key)}/{area}/{safe_key(kind)}/{_fan(shard_id)}/"
                 f"{safe_key(shard_id)}")
+
+    def area_prefix(self, cfg_hash: str, area: str, kind: str) -> str:
+        """Listing prefix of one area of one shard kind (``.../<key>/<area>/<kind>/``)."""
+        key = cfg_hash if area in self.PER_CONFIG_AREAS else self.stage_key(cfg_hash, kind)
+        return f"{self.root}/{safe_key(key)}/{area}/{safe_key(kind)}/"
 
     def part(self, cfg_hash: str, kind: str, shard_id: str, container_id: str, k: int) -> str:
         return f"{self._cfg(cfg_hash, 'parts', kind, shard_id)}/{safe_key(container_id)}-{k}.jsonl"

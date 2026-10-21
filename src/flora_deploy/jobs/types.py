@@ -15,8 +15,14 @@ from typing import Literal
 
 from flora_deploy.records import Stage
 
+# ``done``: every planned episode has a record or a legitimate exclusion (NVIDIA-semantics
+# failure, D15 poison pill) and the exclusions stay within ``RunSettings.max_episode_error_rate``.
+# ``completed_with_errors``: every shard resolved, but more episodes were excluded than that (or
+# every episode of a stage was): the outputs exist but must not be read as a clean run.
+# ``failed``: some shard failed for good (python / infra errors exhausted its respawns).
 JobState = Literal[
-    "indexed", "planned", "running", "composing", "done", "failed", "budget_stopped", "cancelled"
+    "indexed", "planned", "running", "composing", "done", "completed_with_errors", "failed",
+    "budget_stopped", "cancelled"
 ]
 
 # A shard's unit of work. ``segcap`` is the exact preset's combined segment+caption worker
@@ -59,7 +65,10 @@ class EpisodeRef:
 
 @dataclass(frozen=True)
 class Shard:
-    shard_id: str  # path-safe: "<kind>-<seq>" or "<kind>-ep-<uid>" after bisection
+    # path-safe and content-addressed (``manifest.shard_id_for``): "<kind>-<digest of kind + the
+    # sorted episode uids>", or "<kind>-ep-<uid>" after bisection. A re-plan that changes a
+    # shard's episodes therefore changes its id, so an old receipt can never finish it (H4).
+    shard_id: str
     kind: ShardKind
     episodes: tuple[str, ...]  # episode uids
     est_gpu_seconds: float
@@ -74,6 +83,12 @@ class Manifest:
     episodes: tuple[EpisodeRef, ...]
     shards: tuple[Shard, ...]
     created_utc: str
+    # shard kind -> its stage hash (``config.hashing.stage_hashes``): the key of that kind's shard
+    # files (``JobPaths``). Empty (old manifests, tests): everything is keyed by ``config_hash``.
+    stage_hashes: dict[str, str] = field(default_factory=dict)
+    # GPU-seconds per video-second each kind was packed with (``build_manifest(rates=)``), so
+    # estimators can recover video seconds from ``Shard.est_gpu_seconds`` without guessing.
+    rates: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -105,7 +120,14 @@ class AttemptMarker:
 
 @dataclass(frozen=True)
 class ShardReceipt:
-    """Written LAST by a worker; its existence means the shard is done."""
+    """Written LAST by a worker; its existence means the shard is done.
+
+    A receipt only ever lists *terminal* outcomes: ``episodes_failed`` holds legitimate
+    exclusions (``EpisodeError`` kinds ``nv_failure`` / ``poison_pill``). An episode that hit an
+    infrastructure error (``kind="infra"``: missing media, transient I/O, CUDA faults) is never in
+    a receipt: the worker raises instead, so the shard is retried (bounded) and, if the error
+    persists, ends ``shard_failed`` and the job ``failed``. ``config_hash`` is the key the
+    shard's files live under (the kind's stage hash, or the job hash for old manifests)."""
 
     shard_id: str
     kind: ShardKind
@@ -147,7 +169,9 @@ class EpisodeError:
     stage: Stage
     shard_id: str
     container_id: str
-    kind: Literal["nv_failure", "infra", "poison_pill"]  # nv_failure = NVIDIA's own semantics
+    # nv_failure = NVIDIA's own semantics and poison_pill = D15 isolation: terminal, excused.
+    # infra = our side (missing media, I/O, CUDA): diagnostic only, never terminal (retried).
+    kind: Literal["nv_failure", "infra", "poison_pill"]
     message: str
     diagnostics: dict = field(default_factory=dict)
 

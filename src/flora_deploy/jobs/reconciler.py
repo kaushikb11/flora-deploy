@@ -24,6 +24,7 @@ from flora_deploy.jobs.orchestrator import (
     read_controls,
     resolve,
 )
+from flora_deploy.jobs.settings import MAX_EPISODE_ERROR_RATE
 from flora_deploy.jobs.spawner import Spawner
 from flora_deploy.jobs.store import JobPaths, Store
 from flora_deploy.jobs.types import MAX_STARTS_BEFORE_QUARANTINE, JobState
@@ -68,11 +69,17 @@ def reconcile(*, job_id: str, config_hash: str, store: Store, manifests: Manifes
               attempts: AttemptLedger, spawner: Spawner | None = None, lease: Lease | None = None,
               clock: Callable[[], float] = time.time, stuck_after_s: float = STUCK_AFTER_S,
               max_starts: int = MAX_STARTS_BEFORE_QUARANTINE,
-              compose_done: Callable[[], bool] | None = None) -> JobStatus:
+              compose_done: Callable[[], bool] | None = None,
+              max_error_rate: float = MAX_EPISODE_ERROR_RATE) -> JobStatus:
     """Derive status. ``spawner`` (optional) lets it poll live calls to spot ones whose outcome
-    the orchestrator never processed; ``lease`` tells whether an orchestrator is alive."""
-    paths = JobPaths(job_id)
+    the orchestrator never processed; ``lease`` tells whether an orchestrator is alive.
+
+    A resolved job is ``done`` only under the orchestrator's error-rate guard
+    (``progress.error_rate_problems`` over receipts' ``episodes_failed`` and poison-pilled
+    episodes); otherwise ``completed_with_errors`` (``notes`` say why)."""
     manifest = manifests.load()
+    paths = JobPaths(job_id, config_hash=config_hash,
+                     stage_hashes=dict(getattr(manifest, "stage_hashes", {}) or {}))
     shards = list(manifest.shards)
     quarantine_recs = attempts.quarantined()
     failed_fn = getattr(attempts, "failed", None)
@@ -146,15 +153,21 @@ def reconcile(*, job_id: str, config_hash: str, store: Store, manifests: Manifes
         c = counts.setdefault(s.kind, dict.fromkeys(SHARD_STATUSES, 0))
         c[status[s.shard_id]] += 1
     active = sum(1 for v in status.values() if v == "running")
-    errors = tuple(store.list(f"{paths.root}/{config_hash}/errors/"))
+    errors = tuple(p for kind in sorted({s.kind for s in shards})
+                   for p in store.list(paths.area_prefix(config_hash, "errors", kind)))
 
     state: JobState
     if controls.cancelled is not None:
         state = "cancelled"
     elif shards and all(s.shard_id in satisfied or s.shard_id in dead for s in shards) \
             and active == 0:
+        problems = [] if dead else _error_rate_problems(store, paths, config_hash, shards,
+                                                         status, max_error_rate)
+        notes += problems
         if dead:
             state = "failed"
+        elif problems:
+            state = "completed_with_errors"
         elif compose_done is None or compose_done():
             state = "done"
         else:
@@ -175,6 +188,32 @@ def reconcile(*, job_id: str, config_hash: str, store: Store, manifests: Manifes
         errors=errors, orchestrator=lease.current() if lease is not None else None,
         notes=tuple(notes),
     )
+
+
+def _error_rate_problems(store: Store, paths: JobPaths, config_hash: str, shards, status,
+                         max_error_rate: float) -> list[str]:
+    from flora_deploy.jobs.manifest import from_json
+    from flora_deploy.jobs.progress import error_rate_problems
+    from flora_deploy.jobs.types import ShardReceipt
+
+    planned: dict[str, set[str]] = {}
+    excluded: dict[str, set[str]] = {}
+    for s in shards:
+        if not s.bisected_from:
+            planned.setdefault(s.kind, set()).update(s.episodes)
+        st = status.get(s.shard_id)
+        if st == "poisoned":
+            excluded.setdefault(s.kind, set()).update(s.episodes)
+        elif st == "done":
+            p = paths.receipt(config_hash, s.kind, s.shard_id)
+            if store.exists(p):
+                r = from_json(ShardReceipt, store.get_bytes(p))
+                excluded.setdefault(s.kind, set()).update(r.episodes_failed)
+    tallies = {}
+    for kind, eps in planned.items():
+        x = len(excluded.get(kind, set()) & eps)
+        tallies[kind] = {"planned": len(eps), "done": len(eps) - x, "excluded": x, "pending": 0}
+    return error_rate_problems(tallies, max_error_rate)
 
 
 def needs_orchestrator(status: JobStatus) -> bool:

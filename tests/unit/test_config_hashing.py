@@ -101,7 +101,7 @@ def test_invariant_to_non_output_knobs(path, value):
         ("pipeline.stages", ["segment", "caption", "reward.terminal"]),
         ("pipeline.embodiment", "dex"),
         ("pipeline.envelope", "enforce"),
-        ("pipeline.episode_instruction", {"source": "none"}),
+        ("pipeline.episode_instruction", {"source": "fixed", "text": "Wipe."}),
         ("pipeline.episode_instruction", {"source": "fixed", "text": "Fold."}),
         ("input.repo", "org/other"),
         ("input.revision", "0" * 40),

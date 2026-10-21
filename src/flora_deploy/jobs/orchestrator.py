@@ -33,6 +33,19 @@ budget gate to P1a-4; they are consumed here only through the small ``Protocol``
   record, **never bisected**. Dead: the job ends ``failed`` once nothing else is live.
 - ``cancelled``: the job was cancelled. Dead.
 
+**Job outcome** once every shard is satisfied or dead and nothing is live: ``failed`` if any shard
+is dead; otherwise ``done`` only if, per shard kind, the excluded episodes (receipts'
+``episodes_failed``: NVIDIA-semantics failures; poison-pilled episodes) stay within
+``settings.max_episode_error_rate`` and at least one planned episode has a record; else
+``completed_with_errors`` (event ``completed_with_errors`` names why). Infrastructure errors never
+reach a receipt (the worker raises), so they surface as respawns and then ``failed``.
+
+**Work shared across configs.** Shard files are keyed by stage hash (``jobs.store.JobPaths``),
+so another config of the job may already have finished, bisected or poison-pilled a shard (same
+content-addressed id). Before spawning, a shard with a receipt is finished, a multi-episode shard
+with a persisted replan is quarantined onto its existing children, and a single-episode shard
+whose poison file exists is marked ``poisoned``; none of them is spawned again.
+
 **D15 counting.** ``AttemptLedger.starts`` counts container starts *that were not preempted*
 (workers flag preempted starts via ``attempts.mark_preempted``), so spot preemption alone never
 quarantines a shard or poison-pills a healthy episode.
@@ -73,10 +86,10 @@ RESPAWNS_EXHAUSTED = "respawns_exhausted"
 Event = dict[str, Any]
 EventSink = Callable[[Event], None]
 
-TickResult = Literal["running", "done", "failed", "cancelled", "budget_stopped", "continue",
-                     "lost_lease"]
-RunResult = Literal["done", "failed", "cancelled", "budget_stopped", "continue", "lost_lease",
-                    "lease_held", "max_ticks"]
+TickResult = Literal["running", "done", "completed_with_errors", "failed", "cancelled",
+                     "budget_stopped", "continue", "lost_lease"]
+RunResult = Literal["done", "completed_with_errors", "failed", "cancelled", "budget_stopped",
+                    "continue", "lost_lease", "lease_held", "max_ticks"]
 
 # Ledger statuses (``call.json``). ``retry`` = respawn wanted; ``spawning`` = intent written but the
 # call id was never recorded (crash between spawn and write).
@@ -491,7 +504,10 @@ class Orchestrator:
         self.settings = settings
         self.job_id = settings.job_id
         self.cfg = settings.config_hash
-        self.paths = JobPaths(settings.job_id)
+        self._stage_hashes: dict[str, str] = dict(settings.stage_hashes)
+        self.paths = JobPaths(settings.job_id, config_hash=self.cfg,
+                              stage_hashes=lambda: self._stage_hashes)
+        self._planned: Manifest | None = None
         self.store, self.spawner, self.lease = store, spawner, lease
         self.manifests, self.attempts, self.progress = manifests, attempts, progress
         self.budget = budget or AllowAll()
@@ -602,6 +618,9 @@ class Orchestrator:
             self._emit("lease_lost")
             return "lost_lease"
         manifest = self.manifests.load()
+        if getattr(manifest, "stage_hashes", None):
+            self._stage_hashes = dict(manifest.stage_hashes)
+        self._planned = manifest
         shards = list(manifest.shards)
         for s in shards:
             if s.kind not in self.settings.pools:
@@ -644,6 +663,8 @@ class Orchestrator:
                 self._quarantine(s, led, reason=quarantined[s.shard_id].reason, redo=True)
             elif led.status == "active":
                 self._watch(s, led)
+            elif led.status in ("new", "retry"):
+                self._adopt_shared(s, led, by_id)
 
         # re-load if bisection added shards this tick
         if any(led.status == "quarantined" and led.children and
@@ -672,8 +693,13 @@ class Orchestrator:
 
         active = self._active_count()
         if all(sid in satisfied or sid in dead for sid in by_id) and active == 0:
-            result: TickResult = "failed" if dead else "done"
-            self._emit(result, shards=len(by_id), dead=sorted(dead))
+            problems: list[str] = []
+            if dead:
+                result: TickResult = "failed"
+            else:
+                problems = self._error_rate_problems(shards)
+                result = "completed_with_errors" if problems else "done"
+            self._emit(result, shards=len(by_id), dead=sorted(dead), problems=problems)
             return result
         if stopped and active == 0:
             self._emit("budget_stopped")
@@ -682,6 +708,53 @@ class Orchestrator:
 
     def _active_count(self) -> int:
         return sum(1 for led in self._ledgers.values() if led.status in _LIVE)
+
+    def _adopt_shared(self, s: Shard, led: ShardLedger, by_id: Mapping[str, Shard]) -> None:
+        """A not-yet-spawned shard whose work another config already finished, bisected or
+        poison-pilled (same stage hash, same content-addressed id): settle it from those files
+        instead of spawning (module docstring)."""
+        if self._receipt_exists(s):
+            self._finish(s, led, "receipt")
+            return
+        if len(s.episodes) > 1:
+            if any(c.bisected_from == s.shard_id for c in by_id.values()):
+                self._emit("replan_found", shard_id=s.shard_id)
+                self._quarantine(s, led, reason="replanned under a shared stage hash")
+            return
+        poisoned = getattr(self.attempts, "is_poisoned", None)
+        if callable(poisoned) and poisoned(s):
+            self._save(led, status="poisoned", call_id=None, reason="poison file exists")
+            self._emit("poisoned", shard_id=s.shard_id, episodes=list(s.episodes), via="file")
+
+    def _error_rate_problems(self, shards: Sequence[Shard]) -> list[str]:
+        """The job-level error-rate guard (module docstring), from receipts and ledgers."""
+        from flora_deploy.jobs.manifest import from_json
+        from flora_deploy.jobs.progress import error_rate_problems
+        from flora_deploy.jobs.types import ShardReceipt
+
+        base = self._planned.shards if self._planned is not None else shards
+        planned: dict[str, set[str]] = {}
+        for s in base:
+            if not s.bisected_from:
+                planned.setdefault(s.kind, set()).update(s.episodes)
+        excluded: dict[str, set[str]] = {}
+        for s in shards:
+            led = self._ledgers.get(s.shard_id)
+            if led is None:
+                continue
+            if led.status == "poisoned":
+                excluded.setdefault(s.kind, set()).update(s.episodes)
+            elif led.status == "done":
+                p = self.paths.receipt(self.cfg, s.kind, s.shard_id)
+                if self.store.exists(p):
+                    r = from_json(ShardReceipt, self.store.get_bytes(p))
+                    excluded.setdefault(s.kind, set()).update(r.episodes_failed)
+        tallies = {}
+        for kind, eps in planned.items():
+            x = len(excluded.get(kind, set()) & eps)
+            tallies[kind] = {"planned": len(eps), "done": len(eps) - x, "excluded": x,
+                             "pending": 0}
+        return error_rate_problems(tallies, self.settings.max_episode_error_rate)
 
     # budget hard cap ------------------------------------------------------------------------
     def budget_state(self) -> Any:

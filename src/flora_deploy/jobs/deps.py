@@ -18,6 +18,7 @@ orchestrator lease makes it the single writer), so its own writes are cached. Wo
 
 from __future__ import annotations
 
+import dataclasses
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -25,12 +26,16 @@ from typing import Any
 from flora_deploy.jobs import attempts as A
 from flora_deploy.jobs import progress as P
 from flora_deploy.jobs.manifest import load_manifest
-from flora_deploy.jobs.orchestrator import AllowAll, BudgetGate, OrchestratorDeps, utc
+from flora_deploy.jobs.orchestrator import BudgetGate, OrchestratorDeps, utc
 from flora_deploy.jobs.settings import RunSettings
 from flora_deploy.jobs.store import Store
 from flora_deploy.jobs.types import ControlRecord, Manifest, Shard
 
 Clock = Callable[[], float]
+# The orchestrator's own container (``modal_app.orchestrator_app``: 0.25 cores, 1 GiB,
+# non-preemptible): charged by the default budget gate.
+ORCHESTRATOR_CORES = 0.25
+ORCHESTRATOR_MEMORY_GIB = 1.0
 
 
 class StoreManifestSource:
@@ -44,7 +49,7 @@ class StoreManifestSource:
 
     def base(self) -> Manifest:
         if self._base is None:
-            m = load_manifest(self.jf.store, self.jf.job_id)
+            m = load_manifest(self.jf.store, self.jf.job_id, self.jf.config_hash)
             if m.config_hash != self.jf.config_hash:
                 raise ValueError(f"manifest is for config {m.config_hash!r}, "
                                  f"not {self.jf.config_hash!r}")
@@ -77,8 +82,7 @@ class StoreManifestSource:
                 if c.shard_id not in shards:
                     shards[c.shard_id] = c
                     todo.append(c.shard_id)
-        return Manifest(m.job_id, m.config_hash, m.episodes, tuple(shards.values()),
-                        m.created_utc)
+        return dataclasses.replace(m, shards=tuple(shards.values()))
 
     def replan(self, parent: Shard, children: Sequence[Shard]) -> None:
         if len(parent.episodes) <= 1:
@@ -160,6 +164,11 @@ class StoreAttemptLedger:
     def call_for_token(self, shard: Shard, token: str) -> str | None:
         return A.call_for_token(self.jf, shard.kind, shard.shard_id, token)
 
+    def is_poisoned(self, shard: Shard) -> bool:
+        """Poison file of a single-episode shard exists (e.g. isolated under another config that
+        shares this kind's stage hash): the orchestrator then never spawns it again."""
+        return A.is_poisoned(self.jf, shard)
+
 
 class StoreProgress:
     """``ProgressDeriver``: episodes already in this shard's visible part files."""
@@ -171,15 +180,65 @@ class StoreProgress:
         return set(P.shard_parts(self.jf, shard).done)
 
 
+def default_budget_gate(store: Store, settings: RunSettings, manifests: StoreManifestSource,
+                        attempts: StoreAttemptLedger, *, clock: Clock = time.time) -> BudgetGate:
+    """The production gate (review-4 M2/M6): :class:`~flora_deploy.jobs.budget.
+    ProjectionBudgetGate` with ``planner/rates.json`` estimates over the manifest's episode
+    durations (no placeholder-rate unit guessing), pinned prices times the region multiplier of
+    ``settings.region``, the deployed ``scaledown_window`` as idle tail and
+    ``settings.min_containers`` warm containers counted as spend."""
+    from flora_deploy.jobs.budget import (
+        ProjectionBudgetGate,
+        RateTableEstimator,
+        pinned_rates,
+        region_multiplier_for,
+    )
+
+    def durations() -> dict[str, float]:  # lazily: the manifest may be saved after build_deps
+        return {e.uid: e.duration_s for e in manifests.base().episodes}
+
+    def packing_rates() -> dict[str, float]:
+        return dict(manifests.base().rates)
+
+    return ProjectionBudgetGate(
+        settings=settings, store=store, shards=lambda: manifests.load().shards,
+        rates=pinned_rates(region_multiplier=region_multiplier_for(settings.region)),
+        scaledown_s=float(settings.scaledown_s), clock=clock,
+        orchestrator_cores=ORCHESTRATOR_CORES, orchestrator_memory_gib=ORCHESTRATOR_MEMORY_GIB,
+        quarantined=lambda: attempts.quarantined().keys(),
+        estimator=RateTableEstimator.default(settings.preset, durations=durations,
+                                             packing_rates=packing_rates),
+        stage_hashes=lambda: manifests.base().stage_hashes)
+
+
+def deployment_settings_kw(env: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """``config.schema.to_run_settings`` keyword arguments a deps factory running inside the
+    deployed orchestrator should pass, from the env ``modal_app.factory`` sets there
+    (``FLORA_MIN_CONTAINERS``, ``FLORA_SCALEDOWN_S``), so the budget gate charges the deployed
+    warm pool and idle tail."""
+    import os
+
+    from flora_deploy.jobs.settings import WORKER_SCALEDOWN_S
+
+    env = os.environ if env is None else env
+    return {"min_containers": int(env.get("FLORA_MIN_CONTAINERS", "0") or 0),
+            "scaledown_s": float(env.get("FLORA_SCALEDOWN_S", WORKER_SCALEDOWN_S))}
+
+
 def build_deps(store: Store, settings: RunSettings, *, budget: BudgetGate | None = None,
                worker_app: str = "", worker_classes: Mapping[str, str] | None = None,
                clock: Clock = time.time, rescan_s: float = 600.0) -> OrchestratorDeps:
-    """Everything the orchestrator / reconciler needs for one job + config, over ``store``."""
+    """Everything the orchestrator / reconciler needs for one job + config, over ``store``.
+
+    ``budget`` defaults to :func:`default_budget_gate` (the real projection gate). Pass
+    ``AllowAll()`` explicitly to run without budget enforcement (tests only)."""
     jf = A.JobFiles(store, settings.job_id, settings.config_hash)
     manifests = StoreManifestSource(jf, clock=clock, rescan_s=rescan_s)
+    attempts = StoreAttemptLedger(jf, limit=settings.max_starts_before_quarantine, clock=clock,
+                                  manifests=manifests)
+    if budget is None:
+        budget = default_budget_gate(store, settings, manifests, attempts, clock=clock)
     return OrchestratorDeps(
-        settings=settings, store=store, manifests=manifests,
-        attempts=StoreAttemptLedger(jf, limit=settings.max_starts_before_quarantine,
-                                    clock=clock, manifests=manifests),
-        progress=StoreProgress(jf), budget=budget or AllowAll(), worker_app=worker_app,
+        settings=settings, store=store, manifests=manifests, attempts=attempts,
+        progress=StoreProgress(jf), budget=budget, worker_app=worker_app,
         worker_classes=dict(worker_classes or {}))

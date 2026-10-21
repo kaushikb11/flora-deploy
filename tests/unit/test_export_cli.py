@@ -71,7 +71,7 @@ def test_cli_errors(tmp_path):
     r = runner.invoke(app, ["compose", "--job", JOB, "--store", "gs://x"])
     assert r.exit_code == 2
     r = runner.invoke(app, ["compose", "--job", JOB, "--store", uri, "--config-hash", "zz"])
-    assert r.exit_code == 1 and "not the manifest" in r.output
+    assert r.exit_code == 1 and "no manifest for config" in r.output
 
 
 def test_store_from_env(tmp_path):

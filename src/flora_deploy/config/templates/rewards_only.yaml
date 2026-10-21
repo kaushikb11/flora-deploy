@@ -17,14 +17,16 @@ preset: exact                       # rewards run NVIDIA's offline vLLM engine o
 
 input:
   format: mp4_dir
-  path: ./rollouts
-  stage_to: null
+  path: ./rollouts                  # local directory (`flora index --local` reads it here)
+  # Workers read the uploaded copy: modal volume put flora-media ./rollouts rollouts
+  stage_to: volume://flora-media/rollouts
 
 pipeline:
   stages: [reward.terminal, reward.dense]
   embodiment: yam                   # human | yam | yam32 | dex | tianji
   episode_instruction:
     source: dataset_task            # task text from the dataset; or `fixed` + `text`
+                                    # (`none` is refused: reward prompts need a task)
   envelope: warn
 
 resources:

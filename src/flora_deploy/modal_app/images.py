@@ -64,6 +64,10 @@ CUDA_BASE = f"{RUNTIME['cuda_base_vllm']}@{RUNTIME['cuda_base_vllm_digest']}"
 # which is why the install step is written out below instead of using ``uv_pip_install``.
 UV_IMAGE = f"ghcr.io/astral-sh/uv@{RUNTIME['uv_image_digest']}"  # uv RUNTIME["uv"]
 
+# The bucket job store (``jobs.stores.BucketStore``, the D6 default ``s3://`` / ``r2://`` /
+# ``gs://`` sink) in the orchestrator, index and reward-worker containers (review-4 H3).
+BOTO3 = "boto3==1.40.0"
+
 CPU_PACKAGES = (
     AV,
     NUMPY,  # exact: an unpinned resolution once gave numpy 1.26, which breaks pyarrow 26
@@ -71,6 +75,7 @@ CPU_PACKAGES = (
     f"pyarrow=={RUNTIME['pyarrow']}",
     HF_HUB,
     HF_XET,
+    BOTO3,
 )
 
 # NVIDIA TempSeg/Captioner batch_utils/requirements.txt at the code pin, with Pillow and numpy
@@ -100,6 +105,7 @@ VLLM_PACKAGES = (
     PILLOW,
     HF_HUB,
     HF_XET,
+    BOTO3,
 )
 
 PACKAGES = {"img_cpu": CPU_PACKAGES, "img_hfref": HFREF_PACKAGES, "img_vllm": VLLM_PACKAGES}

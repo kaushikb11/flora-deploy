@@ -19,21 +19,36 @@ a stale ledger or stale parts.
    store (``JobPaths.part`` / ``audit`` / ``errors``, one ``k`` per flush). Episode inputs come
    from the index receipt each ``EpisodeRef.index_ref`` names: the task and one video per camera
    role, in NVIDIA's collage order (:func:`collage_order`); an episode range inside a
-   concatenated file is stream-copy cut to a local MP4 first (:class:`VideoResolver`). An input
-   that cannot be resolved, a video NVIDIA's ``Collage`` rejects and an answer NVIDIA's parser
-   rejects all become ``EpisodeError`` files (``nv_failure`` for NVIDIA's ``ValueError``
-   semantics, ``infra`` otherwise), never a crash;
+   concatenated file is stream-copy cut to a local MP4 first (:class:`VideoResolver`). A video
+   NVIDIA's ``Collage`` rejects and an answer NVIDIA's parser rejects become
+   ``EpisodeError(kind="nv_failure")`` files: NVIDIA's own semantics, terminal, excused.
+   **Infrastructure errors are not terminal**: an input that cannot be read (missing media, a
+   transient store or I/O error, a cut that fails) is retried once in-process and then, like a
+   ``generate`` failure the stage reports as ``infra`` (CUDA faults), is written to ``errors/``
+   for diagnosis, the finished episodes are flushed, and the shard **raises**
+   :class:`ShardInfraError` instead of writing a receipt, so the episode is retried by
+   ``modal.Retries`` / the orchestrator's bounded respawns and a persistent failure ends
+   ``shard_failed`` (the job ``failed``), never ``done`` without the episode. After a CUDA fault
+   the container is unusable: ``RewardShardRunner(fatal=...)`` (``os._exit`` in the Modal worker)
+   is called after the marker is written. An episode without a task instruction is a
+   configuration error (:class:`TaskInstructionMissing`): the shard fails, nothing is excused;
 5. ``KeyboardInterrupt`` (Python's SIGINT) or :meth:`~RewardShardRunner.preempt` (from
    ``@modal.exit``) flushes what is pending and calls ``attempts.mark_preempted``; any other
    exception flushes, calls ``attempts.mark_exception`` and re-raises;
 6. ``ShardReceipt`` is written LAST, with ``parts`` = the earlier parts seen in step 2 plus this
    container's own.
 
-Records carry the *job's* config hash in ``provenance.config_hash`` (the job hash covers every
-setting that changes outputs, ``config.hashing``; ``progress.shard_parts`` and compose filter on
-it). The stage's own hash stays in each audit line as ``config_hash``, next to
-``job_config_hash``. ``StageRecord.audit_ref`` is left unset: the audit path names the container,
-so it would make the same record from two containers differ (compose would report a conflict);
+Records carry the shard kind's **stage hash** in ``provenance.config_hash``
+(``JobFiles.key(kind)``: the key the shard's files live under, ``jobs.store.JobPaths``; the job
+hash when the manifest has no stage hashes); ``progress.shard_parts`` and compose accept it. The
+stage's own hash stays in each audit line as ``config_hash``, next to ``job_config_hash``.
+
+Concurrent inputs (``@modal.concurrent``): every in-flight shard of the container is tracked, and
+:meth:`~RewardShardRunner.preempt` (``@modal.exit``) flushes and marks **each** of them preempted
+(M4), not only the latest.
+
+``StageRecord.audit_ref`` is left unset: the audit path names the container, so it would make
+the same record from two containers differ (compose would report a conflict);
 audits are found under ``JobPaths.audit`` by ``(uid, stage)``.
 
 Rubric rewards are deferred (``stages.reward.check_mode``): a ``reward.rubric`` shard raises
@@ -119,8 +134,10 @@ def parse_index_receipt(data: bytes | str) -> IndexInputs:
     * ``flora_index_receipt_v1`` (``jobs.indexing``, ``flora index``): ``status`` must be
       ``indexed`` (a ``source_error`` receipt raises ``ValueError``); ``dataset.name``; stream
       uris are dataset-relative (resolved against ``RewardWorkerSettings.media_root``); the task
-      is the receipt's ``task`` for the ``dataset_task`` instruction source and ``None`` for
-      ``fixed`` / ``none`` (the worker then uses ``default_task``: the configured fixed text);
+      is the resolved ``instruction_text`` when the receipt has one (``IndexJob.instruction_for``:
+      the fixed text, the dataset task, or ``""`` for ``none``), else the receipt's ``task`` for
+      the ``dataset_task`` source and ``None`` for ``fixed`` / ``none`` (older receipts; the
+      worker then uses ``default_task``: the configured fixed text, ``FLORA_INSTRUCTION_TEXT``);
     * plain ``dataclasses.asdict(media.types.EpisodeIndex)`` JSON (tests, ad-hoc jobs).
 
     Only the episode id, dataset, task, ``streams.<role>.source`` and ``envelope.ok`` are read."""
@@ -131,7 +148,9 @@ def parse_index_receipt(data: bytes | str) -> IndexInputs:
         if d.get("status") != "indexed":
             raise ValueError(f"episode {d.get('uid')!r} was not indexed: {d.get('error')}")
         dataset = dataset["name"]
-        if d.get("instruction", "dataset_task") != "dataset_task":
+        if d.get("instruction_text"):
+            task = d["instruction_text"]
+        elif d.get("instruction", "dataset_task") != "dataset_task":
             task = None
     sources: dict[str, SourceRef] = {}
     for role, stream in (d.get("streams") or {}).items():
@@ -155,32 +174,113 @@ def _stream_copy_cut(source: SourceRef, dest: Path) -> Path:
     return stream_copy_cut(source, dest)
 
 
+HF_SCHEME = "hf://datasets/"
+
+
+def parse_hf_root(media_root: str) -> tuple[str, str, str]:
+    """``hf://datasets/<owner>/<name>@<revision>[/<subdir>]`` -> (repo, revision, subdir)."""
+    if not media_root.startswith(HF_SCHEME):
+        raise ValueError(f"not a Hub media root: {media_root!r}")
+    rest = media_root[len(HF_SCHEME):]
+    head, at, tail = rest.partition("@")
+    if not at or head.count("/") != 1:
+        raise ValueError(f"media root {media_root!r}: use hf://datasets/<owner>/<name>@<rev>[/sub]")
+    revision, _, subdir = tail.partition("/")
+    if not revision:
+        raise ValueError(f"media root {media_root!r}: a pinned revision is required")
+    return head, revision, subdir.strip("/")
+
+
+def hub_fetch(repo: str, revision: str, filename: str, local_dir: str) -> str:
+    """One dataset file at a pinned revision (``huggingface_hub``; retried by the caller)."""
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(repo_id=repo, filename=filename, revision=revision,
+                           repo_type="dataset", local_dir=local_dir)
+
+
+Fetcher = Callable[[str, str, str, str], str]
+
+
 @dataclass
 class VideoResolver:
     """Source uri → absolute local video path for NVIDIA's ``Collage``.
 
-    Relative uris resolve against ``media_root`` (e.g. the dataset Volume mount). A source with an
-    episode range (one episode of a concatenated LeRobot v3 MP4) is cut without re-encoding
-    (``media.cuts.stream_copy_cut``) to ``cut_dir/<uid>/<role>.mp4``, reused if present. A cut
-    that would not decode like the source raises NVIDIA-semantics ``ValueError``
+    Relative uris resolve against ``media_root``: a directory (a Volume mount holding the staged
+    dataset, ``FLORA_MEDIA_ROOT``) or ``hf://datasets/<repo>@<revision>[/<subdir>]``, a Hub
+    dataset at its pinned revision, fetched file by file into ``hub_dir`` (C1). A relative uri
+    without a media root raises ``FileNotFoundError`` (an infra error: never terminal). A source
+    with an episode range (one episode of a concatenated LeRobot v3 MP4) is cut without
+    re-encoding (``media.cuts.stream_copy_cut``) to ``cut_dir/<uid>/<role>.mp4``, reused if
+    present. A cut that would not decode like the source raises NVIDIA-semantics ``ValueError``
     (``NotKeyframeAligned``)."""
 
     media_root: str | None = None
     cut_dir: str | Path = "/tmp/flora-reward/cuts"
     cutter: Cutter = _stream_copy_cut
+    hub_dir: str | Path = "/tmp/flora-reward/hub"
+    fetch: Fetcher = hub_fetch
+
+    def local(self, uri: str) -> str:
+        if os.path.isabs(uri):
+            return uri
+        if self.media_root is None:
+            raise FileNotFoundError(f"relative video uri {uri!r} and no media_root")
+        if self.media_root.startswith(HF_SCHEME):
+            repo, rev, sub = parse_hf_root(self.media_root)
+            dest = Path(self.hub_dir) / f"{repo.replace('/', '--')}@{rev[:12]}"
+            rel = f"{sub}/{uri}" if sub else uri
+            if (dest / rel).is_file():
+                return str(dest / rel)
+            return str(self.fetch(repo, rev, rel, str(dest)))
+        return str(Path(self.media_root) / uri)
 
     def resolve(self, uid: str, role: str, source: SourceRef) -> str:
-        uri = source.uri
-        if not os.path.isabs(uri):
-            if self.media_root is None:
-                raise FileNotFoundError(f"relative video uri {uri!r} and no media_root")
-            uri = str(Path(self.media_root) / uri)
+        uri = self.local(source.uri)
         if source.start_s is None and source.end_s is None:
             return uri
         dest = Path(self.cut_dir) / safe_key(uid) / f"{safe_key(role)}.mp4"
         if not dest.exists():
             self.cutter(SourceRef(uri, source.start_s, source.end_s), dest)
         return str(dest)
+
+
+class PreflightError(RuntimeError):
+    """The container cannot do any work (media root or store unreachable). Raised at worker
+    startup, before the GPU engine is built."""
+
+
+def check_media_root(media_root: str | None, *, hub_check: Callable[[str, str], Any] | None = None
+                     ) -> str:
+    """Fail fast (C1): the configured media root must exist and be readable (a directory), or be
+    a reachable Hub dataset revision (``hf://``). Returns a one-line description."""
+    if not media_root:
+        raise PreflightError("FLORA_MEDIA_ROOT is not set: index receipts hold dataset-relative "
+                             "video paths and this container cannot resolve them (the app "
+                             "factory sets it from input.stage_to or the Hub dataset)")
+    if media_root.startswith(HF_SCHEME):
+        repo, rev, _sub = parse_hf_root(media_root)
+        try:
+            if hub_check is not None:
+                hub_check(repo, rev)
+            else:
+                from huggingface_hub import HfApi
+
+                HfApi().dataset_info(repo, revision=rev)
+        except Exception as exc:  # noqa: BLE001 - reported with the reason
+            raise PreflightError(f"Hub dataset {repo}@{rev} is not reachable: {exc!r}") from exc
+        return f"hub {repo}@{rev}"
+    root = Path(media_root)
+    if not root.is_dir():
+        raise PreflightError(f"media root {media_root} does not exist or is not a directory "
+                             "(is the dataset Volume mounted and staged?)")
+    if not os.access(root, os.R_OK | os.X_OK):
+        raise PreflightError(f"media root {media_root} is not readable")
+    try:
+        next(iter(root.iterdir()), None)
+    except OSError as exc:
+        raise PreflightError(f"media root {media_root} cannot be listed: {exc!r}") from exc
+    return f"dir {media_root}"
 
 
 # ---------------------------------------------------------------------------
@@ -204,8 +304,9 @@ class ShardPartSink:
     (``JobPaths.part`` / ``audit`` / ``errors`` with this container id and ``k``) and only then
     advances ``k`` and counts the episodes as done / failed. A flush interrupted half-way leaves
     the pending files in place and the next flush rewrites the same paths whole, so calling it
-    again (``finally``, ``@modal.exit``) is always safe. Records are re-stamped with the job's
-    config hash."""
+    again (``finally``, ``@modal.exit``) is always safe. Records are re-stamped with the kind's
+    stage hash (``JobFiles.key``). ``failed`` holds terminal exclusions only; episodes with an
+    ``infra`` error are in ``infra`` (uid -> message) and never count as failed."""
 
     AREAS = ("part", "audit", "errors")
 
@@ -218,8 +319,10 @@ class ShardPartSink:
         self.published: list[str] = []
         self.done: set[str] = set()
         self.failed: set[str] = set()
+        self.infra: dict[str, str] = {}
         self._pending_done: set[str] = set()
         self._pending_failed: set[str] = set()
+        self._pending_infra: dict[str, str] = {}
         self._lock = threading.RLock()
         for area in self.AREAS:
             p = self._local(area)
@@ -245,7 +348,7 @@ class ShardPartSink:
 
     def _stamp(self, rec: StageRecord) -> StageRecord:
         return dataclasses.replace(rec, provenance=dataclasses.replace(
-            rec.provenance, config_hash=self.jf.config_hash))
+            rec.provenance, config_hash=self.jf.key(self.kind)))
 
     def add(self, records: Sequence[StageRecord] = (), audits: Sequence[dict] = (),
             errors: Sequence[EpisodeError] = ()) -> None:
@@ -255,7 +358,8 @@ class ShardPartSink:
                                    for a in audits])
             self._append("errors", list(errors))
             self._pending_done |= {r.uid for r in records}
-            self._pending_failed |= {e.uid for e in errors}
+            self._pending_failed |= {e.uid for e in errors if e.kind != "infra"}
+            self._pending_infra.update({e.uid: e.message for e in errors if e.kind == "infra"})
 
     def write(self, out: R.RoundOutput) -> list[str]:
         self.add(out.records, out.audits, out.errors)
@@ -278,7 +382,10 @@ class ShardPartSink:
             self.published += paths
             self.done |= self._pending_done
             self.failed |= self._pending_failed - self.done
+            self.infra.update({u: m for u, m in self._pending_infra.items()
+                               if u not in self.done})
             self._pending_done, self._pending_failed = set(), set()
+            self._pending_infra = {}
             self.k = k + 1
             return paths
 
@@ -298,6 +405,32 @@ def _container_ks(paths: Iterable[str], container_id: str) -> list[int]:
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
+
+
+class ShardInfraError(RuntimeError):
+    """Some episodes of the shard hit infrastructure errors: no receipt; the shard is retried."""
+
+    def __init__(self, shard_id: str, infra: Mapping[str, str]):
+        self.infra = dict(infra)
+        first = next(iter(self.infra.items()))
+        super().__init__(f"shard {shard_id!r}: {len(self.infra)} episode(s) hit infrastructure "
+                         f"errors and will be retried (e.g. {first[0]}: {first[1][:300]})")
+
+
+class TaskInstructionMissing(RuntimeError):
+    """A reward episode has no task instruction: a configuration error, never excused."""
+
+
+CUDA_FATAL_MARKERS = ("CUDA error", "cudaError", "CUBLAS_STATUS", "CUDNN_STATUS",
+                      "illegal memory access", "device-side assert", "NCCL error")
+
+
+def cuda_fatal(message: str) -> bool:
+    """A CUDA fault leaves the engine unusable: the container must not run another input."""
+    return any(m in message for m in CUDA_FATAL_MARKERS)
+
+
+INPUT_RETRIES = 1  # in-process retries of an episode's input loading (transient I/O)
 
 
 @dataclass(frozen=True)
@@ -327,7 +460,7 @@ class RewardWorkerSettings:
     workers: int = 4
     tail_trim_s: float | None = None  # None: NVIDIA's DENSE_TAIL_TRIM_S
     envelope: str = "warn"  # D13: "ignore" certifies regardless of the envelope verdict
-    default_task: str | None = None  # used when an index receipt has no task
+    default_task: str | None = None  # the fixed instruction (``FLORA_INSTRUCTION_TEXT``)
     media_root: str | None = None
     local_dir: str = "/tmp/flora-reward"
     container_id: str = field(default_factory=default_container_id)
@@ -348,17 +481,21 @@ class RewardShardRunner:
     def __init__(self, store: Store, engine: RewardEngine, nv, settings: RewardWorkerSettings,
                  *, call_id: Callable[[], str | None] = lambda: "",
                  clock: Callable[[], float] = time.time, resolver: VideoResolver | None = None,
-                 episodes: Callable[[EpisodeRef], R.Episode] | None = None):
+                 episodes: Callable[[EpisodeRef], R.Episode] | None = None,
+                 fatal: Callable[[BaseException], None] | None = None):
         """``episodes``: EpisodeRef -> ``stages.reward.Episode`` (default: from the index receipt
-        ``EpisodeRef.index_ref`` names, :meth:`episode_from_index`)."""
+        ``EpisodeRef.index_ref`` names, :meth:`episode_from_index`). ``fatal``: called after the
+        marker is written when an error leaves the engine unusable (a CUDA fault); the Modal
+        worker passes ``os._exit`` so the container is replaced."""
         self.store, self.engine, self.nv, self.settings = store, engine, nv, settings
         self.episode_for = episodes or self.episode_from_index
         self.call_id, self.clock = call_id, clock
         self.container_id = safe_key(settings.container_id)
         self.resolver = resolver or VideoResolver(
             settings.media_root, Path(settings.local_dir) / "cuts")
+        self.fatal = fatal
         self._lock = threading.RLock()
-        self._active: _Active | None = None
+        self._active: dict[int, _Active] = {}  # one per in-flight input (M4)
         self._next_k: dict[tuple[str, str, str], int] = {}  # same-container re-runs
 
     # -- contract ------------------------------------------------------------------------
@@ -379,26 +516,30 @@ class RewardShardRunner:
             call_id=self.call_id() or "")
         active = _Active(jf, shard, marker)
         with self._lock:
-            self._active = active
+            self._active[id(active)] = active
         try:
             return self._run(active, manifests)
         except KeyboardInterrupt:  # SIGINT (preemption): flush, mark, let Modal retry
             self._end(active, preempted=True)
             raise
         except Exception as exc:
-            self._end(active, error=f"{type(exc).__name__}: {exc}")
+            msg = f"{type(exc).__name__}: {exc}"
+            self._end(active, error=msg)
+            if self.fatal is not None and cuda_fatal(msg):
+                self.fatal(exc)
             raise
         finally:
             with self._lock:
-                if self._active is active:
-                    self._active = None
+                self._active.pop(id(active), None)
 
     def preempt(self) -> bool:
-        """``@modal.exit`` / SIGINT hook: flush the shard in flight and mark it preempted.
-        Idempotent; a no-op when no shard is running. Returns True if it marked one."""
+        """``@modal.exit`` / SIGINT hook: flush **every** shard in flight (one per concurrent
+        input) and mark each preempted. Idempotent; a no-op when no shard is running. Returns
+        True if it marked at least one."""
         with self._lock:
-            active = self._active
-        return active is not None and self._end(active, preempted=True)
+            actives = list(self._active.values())
+        marked = [self._end(a, preempted=True) for a in actives]
+        return any(marked)
 
     def on_exit(self) -> None:
         """The ``@modal.exit`` hook (runs after SIGINT, and on a normal scale-down)."""
@@ -433,7 +574,10 @@ class RewardShardRunner:
             raise ValueError(f"episode {ref.uid!r}: index receipt has no camera streams")
         task = idx.task or self.settings.default_task
         if not str(task or "").strip():
-            raise ValueError(f"episode {ref.uid!r}: no task instruction")
+            raise TaskInstructionMissing(
+                f"episode {ref.uid!r}: no task instruction (the index receipt has none and "
+                "FLORA_INSTRUCTION_TEXT is unset); NVIDIA's reward prompts need one: use "
+                "episode_instruction.source dataset_task with tasks, or fixed + text")
         videos = tuple(self.resolver.resolve(ref.uid, role, idx.sources[role])
                        for role in collage_order(idx.sources))
         envelope_ok = True if self.settings.envelope == "ignore" else ref.envelope_ok
@@ -469,17 +613,30 @@ class RewardShardRunner:
         stage = R.STAGES[mode]
         episodes, errors = [], []
         for uid in todo:  # step 4: inputs (per-episode isolation)
-            try:
-                if uid not in refs:
-                    raise KeyError(f"episode {uid!r} is not in the manifest")
-                episodes.append(self.episode_for(refs[uid]))
-            except Exception as exc:  # noqa: BLE001 - becomes this episode's EpisodeError
-                kind = "nv_failure" if isinstance(exc, ValueError) else "infra"
-                errors.append(EpisodeError(
-                    uid=uid, stage=stage, shard_id=shard.shard_id,
-                    container_id=self.container_id, kind=kind, message=str(exc),
-                    diagnostics={"phase": "inputs", "type": type(exc).__name__,
-                                 "mode": mode}))
+            if uid not in refs:
+                raise KeyError(f"episode {uid!r} is not in the manifest")
+            for attempt in range(INPUT_RETRIES + 1):
+                try:
+                    episodes.append(self.episode_for(refs[uid]))
+                    break
+                except TaskInstructionMissing:
+                    raise  # configuration: fail the shard, never excuse the episode
+                except ValueError as exc:  # NVIDIA semantics (parse, Collage, cut alignment)
+                    errors.append(EpisodeError(
+                        uid=uid, stage=stage, shard_id=shard.shard_id,
+                        container_id=self.container_id, kind="nv_failure", message=str(exc),
+                        diagnostics={"phase": "inputs", "type": type(exc).__name__,
+                                     "mode": mode}))
+                    break
+                except Exception as exc:  # noqa: BLE001 - infra: retried, then not terminal
+                    if attempt < INPUT_RETRIES:
+                        continue
+                    errors.append(EpisodeError(
+                        uid=uid, stage=stage, shard_id=shard.shard_id,
+                        container_id=self.container_id, kind="infra",
+                        message=f"{type(exc).__name__}: {exc}",
+                        diagnostics={"phase": "inputs", "type": type(exc).__name__,
+                                     "mode": mode, "attempts": attempt + 1}))
         if errors:
             sink.add(errors=errors)
             sink.flush()
@@ -495,14 +652,18 @@ class RewardShardRunner:
 
         finished = done | sink.done
         failed = (sink.failed | poisoned) - finished
+        infra = {u: m for u, m in sink.infra.items() if u not in finished and u not in failed}
+        if infra:  # never terminal: no receipt, the shard is retried (module docstring)
+            raise ShardInfraError(shard.shard_id, infra)
         missing = [u for u in shard.episodes if u not in finished and u not in failed]
         if missing:  # never write a receipt that loses episodes
             raise RuntimeError(f"shard {shard.shard_id!r}: no record or error for {missing}")
         receipt = ShardReceipt(  # step 6: LAST
-            shard_id=shard.shard_id, kind=shard.kind, config_hash=jf.config_hash,
+            shard_id=shard.shard_id, kind=shard.kind,
             container_id=self.container_id,
             episodes_done=tuple(u for u in shard.episodes if u in finished),
             episodes_failed=tuple(u for u in shard.episodes if u in failed),
+            config_hash=jf.key(shard.kind),
             parts=tuple(sorted(set(prior.parts) | set(sink.parts))), gpu=s.gpu,
             wall_seconds=round(time.perf_counter() - t0, 3), finished_utc=utc(self.clock()))
         P.write_receipt(jf, receipt)

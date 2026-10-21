@@ -15,6 +15,13 @@ from flora_deploy.jobs.types import MAX_STARTS_BEFORE_QUARANTINE, ShardKind
 Preset = Literal["exact", "balanced", "budget", "interactive"]
 EnvelopePolicy = Literal["warn", "enforce", "ignore"]  # PLAN.md D13
 
+# Modal ``scaledown_window`` of every deployed worker class (``modal_app.factory.WorkerRef``): the
+# budget charges this much idle time each time a worker container goes away.
+WORKER_SCALEDOWN_S = 300
+# Job-level error-rate guard: more excluded episodes than this (per shard kind) and a job that
+# resolved every shard ends ``completed_with_errors`` instead of ``done``.
+MAX_EPISODE_ERROR_RATE = 0.10
+
 
 @dataclass(frozen=True)
 class PoolSettings:
@@ -41,10 +48,21 @@ class RunSettings:
     envelope: EnvelopePolicy = "warn"
     environment_budget_factor: float = 1.2  # native Modal Environment budget backstop
     tags: dict[str, str] = field(default_factory=dict)
+    # shard kind -> stage hash (``config.hashing``); the manifest records it and shard files are
+    # keyed by it (``jobs.store.JobPaths``). Empty: everything is keyed by ``config_hash``.
+    stage_hashes: dict[str, str] = field(default_factory=dict)
+    region: str | None = None  # ``modal.region``: pinning a region multiplies every price
+    scaledown_s: float = WORKER_SCALEDOWN_S  # deployed workers' ``scaledown_window``
+    min_containers: int = 0  # warm containers per worker class (``flora deploy --min-containers``)
+    max_episode_error_rate: float = MAX_EPISODE_ERROR_RATE
 
     def __post_init__(self) -> None:
         if self.budget_usd <= 0:
             raise ValueError("budget_usd must be positive")
+        if not 0.0 <= self.max_episode_error_rate <= 1.0:
+            raise ValueError("max_episode_error_rate must be in [0, 1]")
+        if self.scaledown_s < 0 or self.min_containers < 0:
+            raise ValueError("scaledown_s and min_containers must be >= 0")
         if self.max_gpus < 1:
             raise ValueError("max_gpus must be >= 1")
         need = sum(p.gpu_count * p.max_containers for p in self.pools.values())
