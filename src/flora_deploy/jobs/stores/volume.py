@@ -18,7 +18,18 @@ Discipline (research_notes ``modal_verification.md`` findings 2-4):
   runs the mount looks empty to the container. ``reload`` refuses without the promise.
 * Listing walks the deepest directory the prefix names and shows this container's view (as of
   start or the last reload), so it lags other containers' commits: an eventually consistent
-  listing, exactly what ``jobs.store`` tells callers to expect.
+  listing, exactly what ``jobs.store`` tells callers to expect. **``exists`` and ``get_bytes``
+  lag the same way**: until this container reloads, another container's committed receipt is
+  invisible, so "receipts are read-after-write" holds only for this container's own writes.
+* **``refresh()`` once per orchestrator tick.** A reader that must see other containers' files
+  (the orchestrator, the reconciler, the budget gate) calls :meth:`VolumeStore.refresh` at the
+  start of every tick and never caches a listing across ticks. ``refresh`` reloads only when no
+  store operation is in flight in this container (it tracks its own calls; nothing is held open
+  between calls), commits this container's pending writes first, and otherwise skips and returns
+  ``False``. The caller still vouches that *other* code in the container has no Volume file open
+  (true for the single-threaded, CPU-only orchestrator, which touches the Volume only through
+  this store). Bucket and local stores need no refresh; callers use
+  ``getattr(store, "refresh", None)``.
 """
 
 from __future__ import annotations
@@ -46,6 +57,22 @@ class VolumeStore:
         self.tmp_dir = tmp_dir
         self._pending = 0
         self._lock = threading.Lock()
+        self._io = threading.Condition()
+        self._busy = 0  # store calls in flight in this container (each opens and closes files)
+        self._reloading = False
+        self.reloads = 0
+        self.skipped_refreshes = 0
+
+    def _enter(self) -> None:
+        with self._io:
+            while self._reloading:  # never touch the mount while it reloads (it looks empty)
+                self._io.wait()
+            self._busy += 1
+
+    def _exit(self) -> None:
+        with self._io:
+            self._busy -= 1
+            self._io.notify_all()
 
     def _abs(self, path: str) -> Path:
         return self.mount / check_rel_path(path)
@@ -54,6 +81,18 @@ class VolumeStore:
         if not isinstance(data, bytes | bytearray):
             raise TypeError("whole-file bytes only")
         dest = self._abs(path)
+        self._enter()
+        try:
+            self._put(dest, data)
+        finally:
+            self._exit()
+        with self._lock:
+            self._pending += 1
+            due = self._pending >= self.commit_every
+        if due:
+            self.commit()
+
+    def _put(self, dest: Path, data: bytes) -> None:
         fd, local = tempfile.mkstemp(prefix=TMP_MARK, dir=self.tmp_dir)
         try:
             with os.fdopen(fd, "wb") as f:
@@ -67,20 +106,28 @@ class VolumeStore:
                 staged.unlink(missing_ok=True)
         finally:
             os.unlink(local)
-        with self._lock:
-            self._pending += 1
-            due = self._pending >= self.commit_every
-        if due:
-            self.commit()
 
     def get_bytes(self, path: str) -> bytes:
-        return self._abs(path).read_bytes()
+        self._enter()
+        try:
+            return self._abs(path).read_bytes()
+        finally:
+            self._exit()
 
     def exists(self, path: str) -> bool:
-        return self._abs(path).is_file()
+        self._enter()
+        try:
+            return self._abs(path).is_file()
+        finally:
+            self._exit()
 
     def list(self, prefix: str) -> Iterator[str]:
-        return list_tree(self.mount, prefix)
+        """Materialized at call time (no lazy directory walk spanning a later ``refresh``)."""
+        self._enter()
+        try:
+            return iter(list(list_tree(self.mount, prefix)))
+        finally:
+            self._exit()
 
     @property
     def pending_writes(self) -> int:
@@ -101,3 +148,27 @@ class VolumeStore:
                                "blanks the mount) while any Volume file is open")
         if self.volume is not None:
             self.volume.reload()
+        self.reloads += 1
+
+    def refresh(self) -> bool:
+        """Safe per-tick reload: see other containers' commits. Returns ``True`` if it reloaded.
+
+        Skips (``False``) while any call on this store is in flight in another thread, because a
+        reload with an open Volume file fails or blanks the mount. Pending writes are committed
+        first so a reload never races this container's own uncommitted files. Call it at the start
+        of every orchestrator tick (``orchestrator_app`` does); see the module docstring for the
+        caller's half of the no-open-files promise."""
+        if self._pending:
+            self.commit()
+        with self._io:
+            if self._busy or self._reloading:
+                self.skipped_refreshes += 1
+                return False
+            self._reloading = True  # new calls on this store wait until the reload finishes
+        try:
+            self.reload(no_open_files=True)
+        finally:
+            with self._io:
+                self._reloading = False
+                self._io.notify_all()
+        return True
