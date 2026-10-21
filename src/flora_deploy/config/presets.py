@@ -240,8 +240,10 @@ def find_certificates(preset: str, pools: Mapping[str, PoolSettings], *,
                       modes: Mapping[str, Mapping] | None = None,
                       **kwargs) -> dict[str, Certificate]:
     """The ``certified`` certificate matching each (shard kind, GPU, engine spec) of ``pools``,
-    by shard kind (``validate.certkey.matching``; ``modes``: each kind's output-affecting run
-    modes, ``config.hashing.kind_modes``). Provisional and failed certificates never count."""
+    by shard kind (``validate.certkey.matching``; pass ``**certkey.lookup_context(cfg, pools,
+    derived_content=...)``: embodiment, modes, derived content digests). The deciding (newest)
+    certificate must be ``certified``: provisional ones never count, and a newer ``fail``
+    revokes an older ``certified``."""
     from flora_deploy.validate.certkey import matching
 
     out: dict[str, Certificate] = {}

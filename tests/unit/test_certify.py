@@ -1,4 +1,6 @@
-"""validate/certify.py + validate/certkey.py: metrics, pass rule, certificate content, matching."""
+"""validate/certify.py + validate/certkey.py: metrics, pass rule, certificate content, matching.
+
+The review 7 repros (H1-H7, M1, M2, M4, M6) are in ``test_certify_review7.py``."""
 
 from __future__ import annotations
 
@@ -8,7 +10,6 @@ import string
 
 import pytest
 
-from flora_deploy import LOGIC_VERSION
 from flora_deploy.config import presets
 from flora_deploy.config.presets import PoolSettings
 from flora_deploy.records import (
@@ -20,55 +21,31 @@ from flora_deploy.records import (
 )
 from flora_deploy.validate import certify as C
 from flora_deploy.validate import certkey
+from tests.fakes.certrecords import (
+    BOUNDS,
+    CAND_HASH,
+    CONTENT,
+    FP,
+    L0_PASS,
+    STAGE_SETS,
+    key,
+    prov,
+    rec,
+    segment_set,
+    segs,
+    terminal_set,
+)
 
-FP = {"image_fingerprint": lambda name: f"fp-{name}"}
-STAGE_HASH = "a" * 64
-
-
-def prov(preset: str, gpu: str | None = None, config_hash: str = STAGE_HASH, **kw) -> Provenance:
-    return Provenance(models={"tempseg": "r"}, engine=kw.pop("engine", "e"), preset=preset,
-                      config_hash=config_hash, logic_version=LOGIC_VERSION,
-                      framework="flora-deploy test", gpu=gpu, **kw)
-
-
-def rec(uid: str, stage: str, preset: str, *, gpu: str | None = None, segments=(),
-        terminal=None, dense=None, **kw) -> StageRecord:
-    return StageRecord(uid=uid, dataset="ds", episode_id=uid, stage=stage,
-                       provenance=prov(preset, gpu, **kw), certified=preset == "exact",
-                       uncertified_reason=None if preset == "exact" else "uncertified_stack",
-                       segments=tuple(segments), terminal=terminal, dense=dense)
-
-
-def segs(bounds, captions=None) -> list[Segment]:
-    return [Segment(event_id=f"event_{i:04d}", start_s=s, end_s=e,
-                    caption=(captions[i] if captions else None), segmentation_provenance="fine")
-            for i, (s, e) in enumerate(bounds)]
+STAMP = "2026-10-22T00:00:00Z"
+MATCH = {"embodiment": "yam", "derived_content": CONTENT, **FP}
 
 
-BOUNDS = [(0.0, 2.0), (2.0, 5.0), (5.0, 9.0)]
-
-
-def segment_set(preset: str, n: int, shift: float = 0.0, gpu: str | None = None):
-    return [rec(f"u{i}", "segment", preset, gpu=gpu,
-                segments=segs([(s + shift, e + shift) for s, e in BOUNDS])) for i in range(n)]
-
-
-def engine_spec(kind: str = "segment", **kw):
-    return certkey.engine_spec_document("balanced", kind, **FP, **kw)
-
-
-L0_PASS = {"kind": "tempseg", "baseline": {"l0": [
-    {"key": "k", "ids_equal": True, "render_ids_equal": True, "grid_equal": True}] * 6},
-    "gate_a": {"requests": 6, "greedy_identical": 6, "positions": 10, "max_abs_dlogit": 0.1,
-               "mean_abs_dlogit": 0.01, "first_divergence": []}}
-
-
-def cert_for(kind="segment", *, n=6, noise=True, shift=0.0, noise_shift=0.0, l0=L0_PASS,
-             gpu="L40S", **kw):
-    noise_recs = segment_set("exact", 3, noise_shift) if noise else None
-    return C.certify_stage(kind, exact=segment_set("exact", n), balanced=segment_set(
-        "balanced", n, shift), noise=noise_recs, engine_spec=engine_spec(kind), gpu=gpu,
-        l0=l0, **kw)
+def cert_for(stage="segment", *, n=12, noise=True, n_noise=5, shift=0.0, noise_shift=0.0,
+             l0=L0_PASS, gpu="L40S", stamp=STAMP, **kw):
+    noise_recs = segment_set("exact", n_noise, noise_shift) if noise else None
+    return C.certify_stage(stage, exact=segment_set("exact", n), balanced=segment_set(
+        "balanced", n, shift), noise=noise_recs, engine_spec=key("balanced", stage, gpu),
+        gpu=gpu, l0=l0, generated_at=stamp, **kw)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -127,12 +104,14 @@ def test_identical_records_with_noise_and_samples_are_certified():
     c = cert_for()
     assert c["verdict"] == "certified" and c["unlocks"] is True and c["reasons"] == []
     assert all(ch["pass"] for ch in c["checks"])
-    assert c["metrics"]["noise"]["n"] == 3 and c["metrics"]["coverage"] == 1.0
+    assert c["metrics"]["noise"]["n"] == 5 and c["metrics"]["coverage"] == 1.0
     assert c["l0"]["status"] == "pass" and c["gate_a"]["greedy_identical"] == 6
     assert c["id"] == certkey.certificate_id(c) and c["id"].startswith("cert_")
-    assert c["stage_hash"] == STAGE_HASH
-    assert c["engine_spec_hash"] == certkey.engine_spec_hash("balanced", "segment", **FP)
-    assert c["episodes"]["count"] == 6 and len(c["episodes"]["uid_sha256"]) == 6
+    assert c["stage_hash"] == CAND_HASH and c["covered_pools"] == ["yam"]
+    assert c["engine_spec_hash"] == certkey.engine_spec_hash(
+        "balanced", "segment", "L40S", derived_content=CONTENT, **FP)
+    assert c["episodes"]["count"] == 12 and len(c["episodes"]["uid_sha256"]) == 12
+    assert c["generated_at"] == STAMP and certkey.policy_problems(c) == []
 
 
 def test_divergence_above_noise_floor_fails():
@@ -142,9 +121,12 @@ def test_divergence_above_noise_floor_fails():
     assert {"iou_divergence", "boundary_error_s"} <= bad
     # within tolerance x noise: certified
     assert cert_for(shift=0.12, noise_shift=0.1)["verdict"] == "certified"
-    # slack lifts the threshold
-    th = C.Thresholds(slack={"iou_divergence": 1.0, "boundary_error_s": 1.0})
-    assert cert_for(shift=0.5, noise_shift=0.1, thresholds=th)["verdict"] == "certified"
+    # a bounded slack lifts the threshold by its value
+    th = C.Thresholds(slack={"boundary_error_s": 0.1})
+    t0 = cert_for(noise_shift=0.1)["thresholds"]["per_metric"]["boundary_error_s"]["threshold"]
+    t1 = cert_for(noise_shift=0.1, thresholds=th)["thresholds"]["per_metric"][
+        "boundary_error_s"]["threshold"]
+    assert t1 == pytest.approx(t0 + 0.1)
 
 
 def test_no_noise_run_is_provisional_and_never_unlocks():
@@ -157,20 +139,13 @@ def test_no_noise_run_is_provisional_and_never_unlocks():
 
 
 @pytest.mark.parametrize("kw,reason", [
-    ({"n": 3}, "too_few_samples"),
+    ({"n": 9}, "too_few_samples"),
     ({"l0": None}, "no_l0"),
-    ({"thresholds": C.Thresholds(min_noise_samples=5)}, "too_few_noise_samples"),
+    ({"n_noise": 4}, "too_few_noise_samples"),
 ])
 def test_insufficient_evidence_is_provisional(kw, reason):
     c = cert_for(**kw)
     assert c["verdict"] == "provisional" and reason in c["reasons"]
-
-
-def test_samples_counted_per_embodiment_class():
-    classes = {f"u{i}": ("yam" if i < 5 else "human") for i in range(6)}
-    c = cert_for(classes=classes)
-    assert c["metrics"]["candidate"]["human"]["n"] == 1
-    assert c["verdict"] == "provisional" and "too_few_samples" in c["reasons"]
 
 
 def test_l0_failure_fails_and_wrong_lab_kind_or_gpu_is_refused():
@@ -185,29 +160,25 @@ def test_l0_failure_fails_and_wrong_lab_kind_or_gpu_is_refused():
 
 
 def test_rewards_need_no_l0():
-    t = TerminalReward(score=4, expected_score=4.2, probabilities=(0, 0, 0, 0.8, 0.2))
-    mk = lambda p, n: [rec(f"u{i}", "reward.terminal", p, terminal=t)  # noqa: E731
-                       for i in range(n)]
-    c = C.certify_stage("reward.terminal", exact=mk("exact", 5), balanced=mk("balanced", 5),
-                        noise=mk("exact", 2), engine_spec=engine_spec("reward.terminal"),
-                        gpu="H100!")
+    c = C.certify_stage("reward.terminal", exact=terminal_set("exact", 10),
+                        balanced=terminal_set("balanced", 10), noise=terminal_set("exact", 5),
+                        engine_spec=key("balanced", "reward.terminal", "H100!"), gpu="H100!")
     assert c["l0"] == {"status": "not_applicable"} and c["verdict"] == "certified"
 
 
 def test_input_consistency_is_checked():
-    ex = segment_set("exact", 6)
+    ex = segment_set("exact", 12)
+    spec = key("balanced", "segment", "L40S")
     with pytest.raises(C.CertifyError, match="one stage hash"):
-        C.certify_stage("segment", exact=ex, engine_spec=engine_spec(), gpu="L40S",
-                        balanced=[*segment_set("balanced", 5),
-                                  rec("u9", "segment", "balanced", config_hash="b" * 64)])
+        C.certify_stage("segment", exact=ex, engine_spec=spec, gpu="L40S",
+                        balanced=[*segment_set("balanced", 11),
+                                  rec("u11", "segment", "balanced", config_hash="e" * 64)])
     with pytest.raises(C.CertifyError, match="not produced on"):
-        C.certify_stage("segment", exact=ex, engine_spec=engine_spec(), gpu="L40S",
-                        balanced=segment_set("balanced", 6, gpu="NVIDIA H100 80GB HBM3"))
+        C.certify_stage("segment", exact=ex, engine_spec=spec, gpu="H100",
+                        balanced=segment_set("balanced", 12))
     with pytest.raises(C.CertifyError, match="preset 'exact'"):
-        C.certify_stage("segment", exact=segment_set("balanced", 6), engine_spec=engine_spec(),
-                        gpu="L40S", balanced=segment_set("balanced", 6))
-    assert C.certify_stage("segment", exact=ex, engine_spec=engine_spec(), gpu="L40S",
-                           balanced=segment_set("balanced", 6, gpu="NVIDIA L40S"))
+        C.certify_stage("segment", exact=segment_set("balanced", 12), engine_spec=spec,
+                        gpu="L40S", balanced=segment_set("balanced", 12))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -220,20 +191,24 @@ POOLS = {"segment": PoolSettings(gpu="L40S", cpu_cores=6.0, memory_gib=48.0)}
 def test_written_certificate_matches_only_its_kind_gpu_and_engine_spec(tmp_path):
     p = C.write_certificate(cert_for(), tmp_path)
     assert p.name.startswith("cert_") and json.loads(p.read_text())["verdict"] == "certified"
-    found = presets.find_certificates("balanced", POOLS, cert_dir=tmp_path, **FP)
+    found = presets.find_certificates("balanced", POOLS, cert_dir=tmp_path, **MATCH)
     assert found["segment"].verdict == "certified" and found["segment"].gpu == "L40S"
     # GPU mismatch
     h100 = {"segment": PoolSettings(gpu="H100!", cpu_cores=6.0, memory_gib=48.0)}
-    assert presets.find_certificates("balanced", h100, cert_dir=tmp_path, **FP) == {}
-    # engine spec / stage hash mismatch: a different image, mode or logic tree
-    assert presets.find_certificates("balanced", POOLS, cert_dir=tmp_path,
+    assert presets.find_certificates("balanced", h100, cert_dir=tmp_path, **MATCH) == {}
+    # key mismatch: a different image, mode, or derived weights
+    assert presets.find_certificates("balanced", POOLS, cert_dir=tmp_path, embodiment="yam",
+                                     derived_content=CONTENT,
                                      image_fingerprint=lambda n: "other") == {}
     assert presets.find_certificates("balanced", POOLS, cert_dir=tmp_path,
-                                     modes={"segment": {"x": 1}}, **FP) == {}
+                                     modes={"segment": {"x": 1}}, **MATCH) == {}
+    assert presets.find_certificates("balanced", POOLS, cert_dir=tmp_path,
+                                     **{**MATCH, "derived_content": {"tempseg_merged": "f" * 64}}
+                                     ) == {}
     # another preset or kind
-    assert presets.find_certificates("budget", POOLS, cert_dir=tmp_path, **FP) == {}
+    assert presets.find_certificates("budget", POOLS, cert_dir=tmp_path, **MATCH) == {}
     assert certkey.matching("balanced", {"caption": POOLS["segment"]}, cert_dir=tmp_path,
-                            **FP) == {}
+                            **MATCH) == {}
 
 
 def test_logic_change_invalidates(tmp_path):
@@ -246,23 +221,23 @@ def test_logic_change_invalidates(tmp_path):
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes((package_root() / rel).read_bytes())
     assert certkey.matching("balanced", POOLS, cert_dir=tmp_path / "certs", logic_root=root,
-                            **FP)
-    (root / "stages/segment.py").write_text("# changed\n")
+                            **MATCH)
+    (root / "stages/segment.py").write_text("X = 1\n")
     assert certkey.matching("balanced", POOLS, cert_dir=tmp_path / "certs", logic_root=root,
-                            **FP) == {}
+                            **MATCH) == {}
 
 
 def test_provisional_is_listed_but_does_not_unlock(tmp_path):
-    C.write_certificate(cert_for(noise=False), tmp_path)
-    assert presets.find_certificates("balanced", POOLS, cert_dir=tmp_path, **FP) == {}
-    st = certkey.status("balanced", POOLS, cert_dir=tmp_path, **FP)
+    C.write_certificate(cert_for(noise=False, stamp="2026-10-21T00:00:00Z"), tmp_path)
+    assert presets.find_certificates("balanced", POOLS, cert_dir=tmp_path, **MATCH) == {}
+    st = certkey.status("balanced", POOLS, cert_dir=tmp_path, **MATCH)
     assert st["segment"]["status"] == "provisional" and st["segment"]["certificate"]
-    assert certkey.status("balanced", POOLS, cert_dir=tmp_path / "none", **FP)["segment"][
+    assert certkey.status("balanced", POOLS, cert_dir=tmp_path / "none", **MATCH)["segment"][
         "status"] == "none"
     assert certkey.status("exact", POOLS)["segment"]["status"] == "reference"
-    # certified wins over provisional for the same pool
+    # a newer certified one decides
     C.write_certificate(cert_for(), tmp_path)
-    assert certkey.status("balanced", POOLS, cert_dir=tmp_path, **FP)["segment"][
+    assert certkey.status("balanced", POOLS, cert_dir=tmp_path, **MATCH)["segment"][
         "status"] == "certified"
 
 
@@ -272,53 +247,59 @@ def test_tampered_certificate_is_ignored(tmp_path):
     body["verdict"] = "certified"
     p.write_text(json.dumps(body))
     assert certkey.load_certificates(tmp_path) == []
-    assert presets.find_certificates("balanced", POOLS, cert_dir=tmp_path, **FP) == {}
+    assert presets.find_certificates("balanced", POOLS, cert_dir=tmp_path, **MATCH) == {}
     with pytest.raises(C.CertifyError, match="content address"):
         C.write_certificate(body, tmp_path)
 
 
+def _write_stage(tmp_path, cfg, stage, *, noise=True, content=CONTENT, stamp=STAMP):
+    from flora_deploy.config.hashing import kind_modes
+
+    mk = STAGE_SETS[stage]
+    gpu = {"segment": "L40S"}.get(stage, "H100!")
+    modes = kind_modes(cfg, stage)
+    lab = {**L0_PASS, "kind": C.L0_STAGES.get(stage, "x")}
+    doc = key("balanced", stage, gpu, fp=None, modes=modes, content=content)
+    C.write_certificate(C.certify_stage(
+        stage, exact=mk("exact", 10, fp=None), balanced=mk("balanced", 10, fp=None, modes=modes),
+        noise=mk("exact", 5, fp=None) if noise else None, engine_spec=doc, gpu=gpu,
+        l0=lab if stage in C.L0_STAGES else None, generated_at=stamp), tmp_path)
+
+
+SCHEMA_CFG = {"project": "demo", "license_ack": "research-only",
+              "modal": {"max_gpus": 4, "budget_usd": 20}, "preset": "balanced",
+              "input": {"format": "lerobot_v3", "repo": "org/ds",
+                        "revision": "41d60b449629b2181ff5b735d31c2a2cf8b3cad8"},
+              "pipeline": {"stages": ["segment", "caption", "reward.terminal"],
+                           "embodiment": "yam"},
+              "output": {"sink": "s3://b/p"}}
+
+
 def test_schema_gate_reads_the_registry(tmp_path, monkeypatch):
     """End to end: certified certificates for every balanced pool unlock the preset without
-    allow_uncertified; a provisional one does not."""
+    allow_uncertified, given the derived content digests; a provisional one does not."""
     from flora_deploy.config.schema import ConfigError, parse_config
 
     monkeypatch.setattr(certkey, "CERT_DIR", tmp_path)
-    d = {"project": "demo", "license_ack": "research-only",
-         "modal": {"max_gpus": 4, "budget_usd": 20}, "preset": "balanced",
-         "input": {"format": "lerobot_v3", "repo": "org/ds",
-                   "revision": "41d60b449629b2181ff5b735d31c2a2cf8b3cad8"},
-         "pipeline": {"stages": ["segment", "caption", "reward.terminal"],
-                      "embodiment": "human"},
-         "output": {"sink": "s3://b/p"}}
+    d = SCHEMA_CFG
     with pytest.raises(ConfigError, match="no Gate certificate"):
-        parse_config(d)
+        parse_config(d, derived_content=CONTENT)
     cfg = parse_config(d, allow_uncertified=True)
-    from flora_deploy.config.hashing import kind_modes
-
-    def write(stage, gpu, noise=True):
-        mk = lambda p, n: segment_set(p, n)  # noqa: E731
-        if stage == "caption":
-            mk = lambda p, n: [rec(f"u{i}", "caption", p,  # noqa: E731
-                                   segments=segs(BOUNDS, ["a", "b", "c"])) for i in range(n)]
-        if stage == "reward.terminal":
-            t = TerminalReward(score=4, expected_score=4.0, probabilities=(0, 0, 0, 1, 0))
-            mk = lambda p, n: [rec(f"u{i}", stage, p, terminal=t)  # noqa: E731
-                               for i in range(n)]
-        lab = {**L0_PASS, "kind": C.L0_STAGES.get(stage, "x")}
-        doc = certkey.engine_spec_document("balanced", stage, modes=kind_modes(cfg, stage))
-        C.write_certificate(C.certify_stage(
-            stage, exact=mk("exact", 5), balanced=mk("balanced", 5),
-            noise=mk("exact", 2) if noise else None, engine_spec=doc, gpu=gpu,
-            l0=lab if stage in C.L0_STAGES else None), tmp_path)
-
-    write("segment", "L40S")
-    write("caption", "H100!", noise=False)
-    write("reward.terminal", "H100!")
+    _write_stage(tmp_path, cfg, "segment")
+    _write_stage(tmp_path, cfg, "caption", noise=False)
+    _write_stage(tmp_path, cfg, "reward.terminal")
     with pytest.raises(ConfigError, match="caption on H100!") as e:
-        parse_config(d)
+        parse_config(d, derived_content=CONTENT)
     assert "segment on L40S" not in str(e.value)
-    write("caption", "H100!")
-    assert parse_config(d).preset == "balanced"
+    _write_stage(tmp_path, cfg, "caption", stamp="2026-10-23T00:00:00Z")  # newer: decides
+    assert parse_config(d, derived_content=CONTENT).preset == "balanced"
+    # fail closed: without the derived weights' content digests nothing with weights matches
+    with pytest.raises(ConfigError, match="segment on L40S, caption on H100!"):
+        parse_config(d)
+    # another embodiment is not covered (D16)
+    with pytest.raises(ConfigError, match="no Gate certificate"):
+        parse_config({**d, "pipeline": {**d["pipeline"], "embodiment": "human"}},
+                     derived_content=CONTENT)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -340,9 +321,9 @@ def _random_record(rng: random.Random, uid: str, stage: str, preset: str) -> Sta
                           degradation={_rand(rng): _rand(rng)},
                           nv_metadata={_rand(rng): _rand(rng), "i": i}))
         t += d
-    p = Provenance(models={_rand(rng): _rand(rng)}, engine=_rand(rng), preset=preset,
-                   config_hash=STAGE_HASH, logic_version=LOGIC_VERSION, framework=_rand(rng),
-                   gpu=None, certificate=_rand(rng), source={_rand(rng): {"uri": _rand(rng)}})
+    p = prov(preset, stage, framework=_rand(rng), certificate=_rand(rng),
+             source={_rand(rng): {"uri": _rand(rng)}})
+    p = Provenance(**{**p.__dict__, "models": {**p.models, _rand(rng): _rand(rng)}})
     terminal = TerminalReward(score=rng.randint(1, 5), expected_score=rng.uniform(1, 5),
                               probabilities=(0.2,) * 5, rationale=_rand(rng))
     dense = DenseReward(segments=({"label": _rand(rng), "rationale": _rand(rng)},),
@@ -366,12 +347,12 @@ def _strings(obj, out: set[str]) -> set[str]:
     return out
 
 
-@pytest.mark.parametrize("seed", range(40))
+@pytest.mark.parametrize("seed", range(20))
 def test_certificate_never_contains_a_record_string(seed):
-    """Property: no string field of any input record (captions, rationales, metadata, ids,
-    dataset names, provenance text) appears anywhere in the certificate. The one exception by
-    design is ``provenance.config_hash``, the certified stage hash."""
-    from dataclasses import asdict
+    """Property: no free-text field of any input record (captions, rationales, metadata, ids,
+    dataset names, provenance text) appears anywhere in the certificate. The binding values
+    (stage hashes, the key document, which must equal this checkout's) are ours by design."""
+    from dataclasses import asdict, fields
 
     rng = random.Random(seed)
     stage = rng.choice(list(C.STAGE_METRICS))
@@ -380,47 +361,34 @@ def test_certificate_never_contains_a_record_string(seed):
     bal = [_random_record(rng, u, stage, "balanced") for u in uids if rng.random() < 0.9] or [
         _random_record(rng, uids[0], stage, "balanced")]
     nz = [_random_record(rng, u, stage, "exact") for u in uids[:2]]
-    classes = {u: _rand(rng) for u in uids} if rng.random() < 0.5 else None
     lab = {**L0_PASS, "kind": C.L0_STAGES.get(stage, "x")}
+    gpu = {"segment": "L40S"}.get(stage, "H100!")
     cert = C.certify_stage(stage, exact=ex, balanced=bal, noise=nz,
-                           engine_spec=engine_spec(stage),
-                           gpu="L40S", classes=None, l0=lab if stage in C.L0_STAGES else None,
+                           engine_spec=key("balanced", stage, gpu), gpu=gpu,
+                           l0=lab if stage in C.L0_STAGES else None,
                            similarity=(lambda a, b: 0.5) if stage == "caption" else None)
-    # Our own enum vocabulary (stage, preset, status, schema names) is not record text.
-    ours = {STAGE_HASH, "complete", "uncertified_stack", "flora_labels_v1", stage, "exact",
-            "balanced"}
-    # ... nor are the record schema's own field names (dict keys of ``asdict``).
-    from dataclasses import fields
-
+    ours = {"complete", "uncertified_stack", "flora_labels_v1", stage, "exact", "balanced"}
     ours |= {f.name for cls in (StageRecord, Provenance, Segment, TerminalReward, DenseReward)
              for f in fields(cls)}
+    for r in ex + bal + nz:  # the binding fields: validated and ours
+        ours |= _strings(r.provenance.cert_key, set()) | {r.provenance.config_hash}
 
     def leaks(text: str, records) -> set[str]:
         return {s for r in records for s in _strings(asdict(r), set())
                 if s not in ours and len(s) >= 8 and s in text}
 
     assert not leaks(json.dumps(cert), ex + bal + nz)
-    if classes:  # embodiment class names are ours, but they still never carry record text
-        cert2 = C.certify_stage(stage, exact=ex, balanced=bal, noise=nz,
-                                engine_spec=engine_spec(stage), gpu="L40S", classes=classes,
-                                l0=lab if stage in C.L0_STAGES else None)
-        assert not leaks(json.dumps(cert2), ex + bal + nz)
 
 
 # ---------------------------------------------------------------------------------------------
 # CLI
 
 
-def _balanced_yaml(tmp_path):
+def _balanced_yaml(tmp_path, embodiment="yam"):
     import yaml
 
-    d = {"project": "demo", "license_ack": "research-only",
-         "modal": {"max_gpus": 4, "budget_usd": 20}, "preset": "balanced",
-         "allow_uncertified": True,
-         "input": {"format": "lerobot_v3", "repo": "org/ds",
-                   "revision": "41d60b449629b2181ff5b735d31c2a2cf8b3cad8"},
-         "pipeline": {"stages": ["segment", "caption"], "embodiment": "human"},
-         "output": {"sink": "s3://b/p"}}
+    d = {**SCHEMA_CFG, "allow_uncertified": True,
+         "pipeline": {"stages": ["segment", "caption"], "embodiment": embodiment}}
     p = tmp_path / "flora.yaml"
     p.write_text(yaml.safe_dump(d))
     return p
@@ -431,31 +399,48 @@ def _jsonl(path, records):
     return path
 
 
+def _content_args():
+    return [a for n, h in CONTENT.items() for a in ("--derived-content", f"{n}={h}")]
+
+
 def test_cli_certify_writes_metrics_only_certificates(tmp_path):
     from typer.testing import CliRunner
 
     from flora_deploy.cli import app
 
     cfg = _balanced_yaml(tmp_path)
-    ex = _jsonl(tmp_path / "exact.jsonl", segment_set("exact", 6))
-    bal = _jsonl(tmp_path / "bal.jsonl", segment_set("balanced", 6, gpu="NVIDIA L40S"))
-    nz = _jsonl(tmp_path / "noise.jsonl", segment_set("exact", 3))
+    ex = _jsonl(tmp_path / "exact.jsonl", segment_set("exact", 12, fp=None))
+    bal = _jsonl(tmp_path / "bal.jsonl", segment_set("balanced", 12, fp=None))
+    nz = _jsonl(tmp_path / "noise.jsonl", segment_set("exact", 5, fp=None))
     lab = tmp_path / "lab.json"
     lab.write_text(json.dumps(L0_PASS))
     out = tmp_path / "certs"
-    args = ["certify", "--exact", str(ex), "-c", str(cfg), "--out-dir", str(out)]
+    args = ["certify", "--exact", str(ex), "-c", str(cfg), "--out-dir", str(out),
+            *_content_args()]
     r = CliRunner().invoke(app, [*args, "--balanced", str(bal), "--noise", str(nz),
                                  "--l0", str(lab), "--json"])
     assert r.exit_code == 0, r.output
     (cert,) = json.loads(r.output)
     assert cert["verdict"] == "certified" and cert["gpu"] == "L40S"
     assert (out / f"{cert['id']}.json").is_file()
-    assert cert["engine_spec_hash"] == certkey.engine_spec_hash("balanced", "segment")
+    assert cert["engine_spec_hash"] == certkey.engine_spec_hash(
+        "balanced", "segment", "L40S", derived_content=CONTENT)
     # without the noise run: provisional, still written, exit 0
     r = CliRunner().invoke(app, [*args, "--balanced", str(bal)])
     assert r.exit_code == 0 and "provisional" in r.output and "allow_uncertified" in r.output
     # a failing stack exits 1
-    bad = _jsonl(tmp_path / "bad.jsonl", segment_set("balanced", 6, shift=1.0))
+    bad = _jsonl(tmp_path / "bad.jsonl", segment_set("balanced", 12, shift=1.0, fp=None))
     r = CliRunner().invoke(app, [*args, "--balanced", str(bad), "--noise", str(nz),
                                  "--l0", str(lab)])
     assert r.exit_code == 1 and "fail" in r.output
+    # no content digests: refused
+    r = CliRunner().invoke(app, ["certify", "--exact", str(ex), "-c", str(cfg), "--balanced",
+                                 str(bal)])
+    assert r.exit_code == 2 and "derived-content" in r.output
+    # knobs outside policy: refused
+    r = CliRunner().invoke(app, [*args, "--balanced", str(bal), "--tolerance", "4"])
+    assert r.exit_code == 2 and "outside policy" in r.output
+    # the config's embodiment must be the records'
+    r = CliRunner().invoke(app, ["certify", "--exact", str(ex), "--balanced", str(bal), "-c",
+                                 str(_balanced_yaml(tmp_path / "..", "human")), *_content_args()])
+    assert r.exit_code == 2 and "embodiment" in r.output

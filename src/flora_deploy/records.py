@@ -40,6 +40,11 @@ class Provenance:
     # ``stages.segment.config_hash``), kept when the part sink stamps ``config_hash`` with the
     # job's stage key (review 6 M3). ``None`` when the stage set none.
     engine_hash: str | None = None
+    # Certification binding (docs/certification.md, "Provenance a record must carry"): the
+    # job's embodiment pool, and ``validate.certkey.key_document`` of the stack that produced
+    # the record. ``flora certify`` refuses records without them.
+    embodiment: str | None = None
+    cert_key: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)

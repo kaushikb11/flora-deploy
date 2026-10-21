@@ -34,16 +34,24 @@ def _fail(msg: str, code: int = 2) -> typer.Exit:
     return typer.Exit(code=code)
 
 
-def certificate_status(cfg, option) -> dict[str, dict]:
+def certificate_status(cfg, option, derived_content=None) -> dict[str, dict]:
     """Per shard kind of ``option``: the Gate certificate status of its (kind, GPU) pool
-    (``validate.certkey.status``: reference / certified / provisional / fail / none)."""
+    (``validate.certkey.status``: reference / certified / provisional / fail / none /
+    unverified_weights), for the config's embodiment, modes and derived content digests."""
     from types import SimpleNamespace
 
-    from flora_deploy.config.hashing import kind_modes
-    from flora_deploy.validate.certkey import status
+    from flora_deploy.validate.certkey import lookup_context, status
 
     pools = {k.kind: SimpleNamespace(gpu=k.gpu) for k in option.kinds}
-    return status(option.preset, pools, modes={k: kind_modes(cfg, k) for k in pools})
+    return status(option.preset, pools,
+                  **lookup_context(cfg, pools, derived_content=derived_content))
+
+
+def certified_options(cfg, options) -> set[str]:
+    """Names of the options whose every pool is ``reference`` or ``certified``."""
+    return {o.name for o in options
+            if all(c["status"] in ("reference", "certified")
+                   for c in certificate_status(cfg, o).values())}
 
 
 def _cameras_from_config(cfg) -> int:
@@ -135,7 +143,7 @@ def plan(
         options = plan_options(req, table=table, rates=rates)
     except (PresetUnavailableError, KeyError) as e:
         raise _fail(str(e.args[0] if e.args else e)) from None
-    best = recommended(options)
+    best = recommended(options, certified=certified_options(cfg, options))
 
     if as_json:
         typer.echo(json.dumps({
