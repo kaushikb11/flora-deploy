@@ -2,11 +2,12 @@
 #
 #   flora init --template local_demo
 #   flora run --local --fake-models --sample-data      # makes ./videos, then runs the job
-#   flora results --job local-demo --stage caption --store flora-local-store
+#   flora results --job local-demo.fake --stage caption --store flora-local-store
 #
 # No Modal account, no GPU, no NVIDIA weights. The models are deterministic fakes, so the
 # outputs only demonstrate the pipeline (index -> plan -> run -> compose -> results); they are
 # marked `certificate: local-fake-models` and never share a config hash with real outputs.
+# Fake-models jobs run under `<project>.fake`, so they never share job state with real jobs.
 # Every key is documented in exact_lerobot.yaml. Unknown keys are an error.
 
 project: local-demo

@@ -36,6 +36,16 @@ def _store(uri: str):
         raise _fail(str(e), 2) from None
 
 
+def _check_namespace(st, job: str, config_hash: str | None) -> None:
+    """Refuse to read a fake-models run as a real job or the reverse (review 8b M5)."""
+    from flora_deploy import sdk
+
+    try:
+        sdk.check_results_namespace(st, job, config_hash)
+    except sdk.FloraError as e:
+        raise _fail(str(e)) from None
+
+
 @app.command()
 def compose(
     job: JobOpt,
@@ -51,6 +61,7 @@ def compose(
     from flora_deploy.export.compose import compose as do_compose
 
     st = _store(store)
+    _check_namespace(st, job, config_hash)
     try:
         res = do_compose(st, job, config_hash=config_hash, partial=partial,
                          max_error_rate=max_error_rate)
@@ -108,6 +119,7 @@ def results(
     if fmt == "parquet" and out is None:
         raise _fail("--format parquet needs --out <file>", 2)
     st = _store(store)
+    _check_namespace(st, job, config_hash)
     from flora_deploy.export.results import load_summary
 
     try:
