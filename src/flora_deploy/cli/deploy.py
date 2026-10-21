@@ -4,6 +4,10 @@
 standalone script for review instead of deploying. A real deploy records the deployment (app
 name, stage hashes, image fingerprints, worker classes) in the job store at
 ``flora/deployments/<app>.json``.
+
+``--fake-models`` (H0 rehearsal): the same app with G2's fake engines in CPU worker containers
+(``modal_app.factory`` "Fake models"): a distinct config hash and app name, no weights, records
+marked ``certificate: fake-models``. Run jobs on it with ``flora run --fake-models``.
 """
 
 from __future__ import annotations
@@ -71,8 +75,10 @@ def _record(plan: Any, record: dict[str, Any]) -> str:
 
 
 def _print_plan(plan: Any) -> None:
+    fake = ("  [yellow]FAKE MODELS (CPU rehearsal)[/yellow]"
+            if getattr(plan, "fake_models", False) else "")
     console.print(f"[bold]{plan.app_name}[/bold]  (environment {plan.environment}, "
-                  f"preset {plan.preset}, store {plan.store.uri})")
+                  f"preset {plan.preset}, store {plan.store.uri}){fake}")
     t = Table("object", "kind", "gpu", "cpu", "memory MiB", "containers", "inputs", "image")
     for o in plan.objects:
         mem = "/".join(str(m) for m in o.memory) if isinstance(o.memory, tuple) else str(o.memory)
@@ -113,6 +119,9 @@ def deploy(
     dry_run: Annotated[bool, typer.Option(
         "--dry-run", help="Print the plan; do not contact Modal.")] = False,
     as_json: Annotated[bool, typer.Option("--json", help="Print the plan as JSON.")] = False,
+    fake_models: Annotated[bool, typer.Option(
+        "--fake-models", help="Rehearsal app: fake engines on CPU workers (no GPU, no weights; "
+                              "hashed apart from real outputs).")] = False,
 ) -> None:
     """Deploy the config's Modal app (one app per config; workers scale from zero)."""
     from flora_deploy.config.hashing import MissingReceiptError
@@ -127,7 +136,7 @@ def deploy(
         plan = plan_app(cfg, store=store, bucket_secret=bucket_secret,
                         derived_receipts=_receipts(receipt), allow_uncertified=allow_uncertified,
                         min_containers=min_containers, reconcile_cron=reconcile_cron,
-                        determinism=determinism)
+                        determinism=determinism, fake_models=fake_models)
     except (DeployError, MissingReceiptError, ValueError) as e:
         raise _fail(str(e)) from None
 

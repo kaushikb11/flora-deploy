@@ -53,6 +53,17 @@ writer.
 (``shard_target_gpu_minutes`` of placeholder-rate work, converted to video seconds and priced at
 the measured container-s per video-s, upper quantile, times ``max_inputs``) plus startup, times
 :data:`TIMEOUT_SAFETY`, at least 30 min.
+
+**Fake models (H0, ``flora deploy --fake-models``).** ``plan_app(fake_models=True)`` plans the
+same app (orchestrator, reconciler, index function, store and media Volumes, secrets, env,
+timeouts, retries, container caps) but registers :data:`FAKE_WORKERS`: ``FakeSegcapWorker`` /
+``FakeRewardWorker`` (``workers_app``: the real shard runners with G2's fake engines) on
+``img_cpu`` with no GPU and :data:`FAKE_WORKER_CPU` / :data:`FAKE_WORKER_MEMORY_GIB`. It
+hashes ``fake_models`` into every stage hash (``config.hashing``), fills missing derived-weight
+receipts with :data:`FAKE_RECEIPT`, names the app ``flora-<project>-fake-<digest>``, tags it
+``flora-fake-models``, sets ``FLORA_FAKE_MODELS=1`` on workers and records
+``certificate: fake-models`` in the deployment record. No weights are loaded;
+``warm_reward_cache`` is not deployed.
 """
 
 from __future__ import annotations
@@ -128,6 +139,21 @@ PENDING_WORKERS: dict[str, str] = {
     "reward.rubric": "there is no RubricWorker yet",
 }
 INDEX_FUNCTION: tuple[str, str] = ("flora_deploy.modal_app.index_app", "index_run_shard")
+
+# --fake-models (H0): CPU workers with G2's fake engines behind the real shard runners.
+FAKE_WORKERS: dict[str, WorkerRef] = {
+    "segcap": WorkerRef("flora_deploy.modal_app.workers_app", "FakeSegcapWorker", "img_cpu",
+                        startup_timeout_s=8 * 60, recipe="segcap"),
+    "reward.terminal": WorkerRef("flora_deploy.modal_app.workers_app", "FakeRewardWorker",
+                                 "img_cpu", startup_timeout_s=15 * 60, cache=True),
+    "reward.dense": WorkerRef("flora_deploy.modal_app.workers_app", "FakeRewardWorker",
+                              "img_cpu", startup_timeout_s=15 * 60, cache=True),
+}
+FAKE_RECEIPT = "flora-fake-models"
+FAKE_CERTIFICATE = "fake-models"
+FAKE_MODELS_ENV = "FLORA_FAKE_MODELS"
+FAKE_WORKER_CPU = 2.0
+FAKE_WORKER_MEMORY_GIB = 12.0  # fake decode keeps every frame in RAM (1080p ~ 6 MiB/frame)
 
 
 def resolve(module: str, attr: str, *, want: Literal["class", "function"]) -> Any:
@@ -255,6 +281,7 @@ class AppPlan:
     tags: dict[str, str] = field(default_factory=dict)
     skipped: dict[str, str] = field(default_factory=dict)  # what is not deployed, and why
     watch_dict: str = ""
+    fake_models: bool = False  # H0 rehearsal app (module docstring)
 
     def to_json(self) -> dict[str, Any]:
         return json.loads(json.dumps(asdict(self)))
@@ -271,10 +298,13 @@ def _digest(stage_hashes: Mapping[str, str]) -> str:
     return hashlib.sha256(blob).hexdigest()[:12]
 
 
-def app_name_for(project: str, stage_hashes: Mapping[str, str]) -> str:
-    """``flora-<project slug>-<12 hex of the stage hashes>`` (<= 60 chars, Modal-safe)."""
-    slug = re.sub(r"[^a-z0-9-]+", "-", project.lower()).strip("-")[:40].strip("-") or "job"
-    return f"flora-{slug}-{_digest(stage_hashes)}"
+def app_name_for(project: str, stage_hashes: Mapping[str, str], *,
+                 fake_models: bool = False) -> str:
+    """``flora-<project slug>-<12 hex of the stage hashes>`` (<= 60 chars, Modal-safe);
+    ``flora-<slug>-fake-<12 hex>`` for a ``--fake-models`` app."""
+    width = 35 if fake_models else 40
+    slug = re.sub(r"[^a-z0-9-]+", "-", project.lower()).strip("-")[:width].strip("-") or "job"
+    return f"flora-{slug}-{'fake-' if fake_models else ''}{_digest(stage_hashes)}"
 
 
 def worker_timeout_s(shard_target_gpu_minutes: float, *, preset: str = "exact",
@@ -430,6 +460,7 @@ def plan_app(
     index_function: tuple[str, str] | None = INDEX_FUNCTION,
     missing_workers: Literal["error", "skip"] = "error",
     hash_kwargs: Mapping[str, Any] | None = None,
+    fake_models: bool = False,
 ) -> AppPlan:
     """Everything ``build_app`` will register, as data. Contacts nothing.
 
@@ -440,7 +471,8 @@ def plan_app(
     ``hash_kwargs``: extra ``config_hash`` arguments (tests). ``determinism`` (``flora deploy
     --determinism``) overrides ``pipeline.determinism`` through ``config.schema.with_pipeline``,
     so it changes the config hash, the app name and the store paths (review 4 H3); workers get
-    ``config.schema.output_settings`` (``FLORA_DETERMINISM``, ``FLORA_TERMINAL_MODE``)."""
+    ``config.schema.output_settings`` (``FLORA_DETERMINISM``, ``FLORA_TERMINAL_MODE``).
+    ``fake_models``: the H0 rehearsal app (module docstring)."""
     from flora_deploy.accel import determinism as det
     from flora_deploy.config.hashing import config_hash
     from flora_deploy.config.presets import find_certificates, get_preset, needs_certificate
@@ -464,8 +496,18 @@ def plan_app(
     determinism = str(outputs["determinism"])
     if min_containers < 0:
         raise DeployError("min_containers must be >= 0")
-    reg = dict(WORKERS if registry is None else registry)
-    ch = config_hash(cfg, derived_receipts=derived_receipts, **dict(hash_kwargs or {}))
+    reg = dict((FAKE_WORKERS if fake_models else WORKERS) if registry is None else registry)
+    hkw = dict(hash_kwargs or {})
+    if fake_models:
+        from flora_deploy.config.presets import shard_kinds_for
+
+        p = get_preset(cfg.preset)
+        needed = {r for k in shard_kinds_for(p, cfg.pipeline.stages)
+                  for r in p.derived_weights.get(k, ())}
+        derived_receipts = {**{r: FAKE_RECEIPT for r in sorted(needed)},
+                            **dict(derived_receipts or {})}
+        hkw["fake_models"] = True
+    ch = config_hash(cfg, derived_receipts=derived_receipts, **hkw)
     rs = to_run_settings(cfg, "deploy", config_hash=ch.hash, stage_hashes=dict(ch.stage_hashes),
                          min_containers=min_containers)
     preset = get_preset(cfg.preset)
@@ -479,7 +521,7 @@ def plan_app(
             raise DeployError(f"preset {cfg.preset!r} has no Gate certificate for "
                               f"{', '.join(missing)}; deploy 'exact' or allow uncertified")
 
-    name = app_name_for(cfg.project, ch.stage_hashes)
+    name = app_name_for(cfg.project, ch.stage_hashes, fake_models=fake_models)
     watch_dict = f"flora-watch-{_digest(ch.stage_hashes)}"
     skipped: dict[str, str] = {}
     by_class: dict[str, list[str]] = {}
@@ -492,7 +534,7 @@ def plan_app(
                 skipped[kind] = why
                 continue
             raise WorkerUnavailable(f"shard kind {kind!r} cannot be deployed: {why}")
-        if ref.image != preset.engines[kind].image:
+        if ref.image != preset.engines[kind].image and not fake_models:
             raise DeployError(f"{kind}: worker {ref.name} uses {ref.image} but preset "
                               f"{cfg.preset!r} runs it on {preset.engines[kind].image}")
         try:
@@ -513,6 +555,7 @@ def plan_app(
         "FLORA_LOG_LEVEL": cfg.observability.log_level,
         "FLORA_HEARTBEAT_S": f"{cfg.observability.heartbeat_s:g}",
         **st.env(),
+        **({FAKE_MODELS_ENV: "1"} if fake_models else {}),
     }
     store_volumes = ({str(st.mount): VolumeMount(str(st.volume), create=True)}
                      if st.kind == "volume" else {})
@@ -544,17 +587,23 @@ def plan_app(
         timeout = worker_timeout_s(rs.shard_target_gpu_minutes, preset=cfg.preset,
                                    kinds=tuple(kinds), max_inputs=pool.max_inputs,
                                    startup_s=float(ref.startup_timeout_s) / 2)
+        gpu = gpu_string(pool)
+        if fake_models:  # CPU containers sized for the fake engines, not the models
+            gpu = None
+            pool = replace(pool, cpu_cores=FAKE_WORKER_CPU, memory_gib=FAKE_WORKER_MEMORY_GIB)
         objects.append(ObjectSpec(
             kind="cls", name=cls_name, module=ref.module, attr=ref.name, image=ref.image,
-            gpu=gpu_string(pool), cpu=float(pool.cpu_cores), memory=memory_mib(pool.memory_gib),
+            gpu=gpu, cpu=float(pool.cpu_cores), memory=memory_mib(pool.memory_gib),
             timeout=timeout, startup_timeout=ref.startup_timeout_s,
             min_containers=min_containers, max_containers=pool.max_containers,
             scaledown_window=ref.scaledown_window_s,
             max_inputs=pool.max_inputs if pool.max_inputs > 1 else None,
             retries=dict(WORKER_RETRIES), volumes=volumes, secrets=secrets,
             env=dict(sorted(env.items())), region=cfg.modal.region, shard_kinds=tuple(kinds)))
-        if ref.cache and ref.recipe == "reward" and _has_function(ref.module,
-                                                                 WARM_CACHE_FUNCTION, skipped):
+        if fake_models and ref.cache:
+            skipped[WARM_CACHE_FUNCTION] = "fake models: no engine cache to warm"
+        elif ref.cache and ref.recipe == "reward" and _has_function(ref.module,
+                                                                   WARM_CACHE_FUNCTION, skipped):
             warm_volumes = {**volumes, str(CACHE_MOUNT): VolumeMount(CACHE_VOLUME, create=True)}
             objects.append(ObjectSpec(
                 kind="function", name=WARM_CACHE_FUNCTION, module=ref.module,
@@ -601,14 +650,15 @@ def plan_app(
                 region=cfg.modal.region))
 
     images_used = sorted({o.image for o in objects})
-    tags = {**cfg.modal.tags, "flora-project": cfg.project, "flora-preset": cfg.preset}
+    tags = {**cfg.modal.tags, "flora-project": cfg.project, "flora-preset": cfg.preset,
+            **({"flora-fake-models": "true"} if fake_models else {})}
     return AppPlan(
         app_name=name, project=cfg.project, environment=cfg.modal.environment,
         preset=cfg.preset, config_hash=ch.hash, stage_hashes=dict(ch.stage_hashes),
         image_fingerprints={i: image_fingerprint(i) for i in images_used},
         worker_classes={k: n for n, ks in by_class.items() for k in ks},
         store=st, objects=tuple(objects), tags=dict(sorted(tags.items())), skipped=skipped,
-        watch_dict=watch_dict)
+        watch_dict=watch_dict, fake_models=fake_models)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -712,6 +762,7 @@ def deployment_record(plan: AppPlan, **extra: Any) -> dict[str, Any]:
         "flora_version": __version__,
         "logic_version": LOGIC_VERSION,
         "modal_client": RUNTIME["modal_client"],
+        **({"fake_models": True, "certificate": FAKE_CERTIFICATE} if plan.fake_models else {}),
         **extra,
     }
 

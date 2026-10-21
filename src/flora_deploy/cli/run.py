@@ -7,6 +7,9 @@
   and composes the outputs, unless ``--detach``.
 * **Local** (``--local --fake-models``): ``cli/run_local.py`` (G2): the whole job system in this
   process with fake models; same flags and exit codes as before.
+* **Modal, fake models** (``--fake-models`` without ``--local``): submit to the app
+  ``flora deploy --fake-models`` deployed (the H0 CPU rehearsal: the real deployed path with
+  G2's fake engines; its own config hash, so it never touches real outputs).
 
 Exit codes (both paths, and ``flora status`` / ``flora report``): 0 ``done`` (or still running
 with ``--detach``), 1 ``failed``, 3 ``completed_with_errors``, 4 ``budget_stopped``, 5 any
@@ -153,7 +156,8 @@ def run(
     local: Annotated[bool, typer.Option(
         "--local", help="Run in this process (needs --fake-models).")] = False,
     fake_models: Annotated[bool, typer.Option(
-        "--fake-models", help="Local: deterministic fake engines instead of NVIDIA's models.")
+        "--fake-models", help="Deterministic fake engines instead of NVIDIA's models (local, or "
+                              "on Modal: the app `flora deploy --fake-models` deployed).")
     ] = False,
     inject: Annotated[list[str] | None, typer.Option(
         "--inject", help="Local: faults, KIND:TARGET[xN] (see flora_deploy.local.faults).")
@@ -181,8 +185,8 @@ def run(
                       store=Path(store) if store else None, job=job, resume=resume,
                       budget=budget, sample_data=sample_data, as_json=as_json, verbose=verbose)
         return
-    if fake_models or inject or sample_data:
-        raise fail("--fake-models / --inject / --sample-data are local-mode flags: add --local")
+    if inject or sample_data:
+        raise fail("--inject / --sample-data are local-mode flags: add --local")
     if resume:
         raise fail("on Modal, continue a stopped job with `flora resume <job> [--budget-usd X]`")
     from flora_deploy import sdk
@@ -199,10 +203,23 @@ def run(
         if not as_json:
             console.print(msg, highlight=False, markup=False, soft_wrap=True)
 
+    planner = None
+    if fake_models:
+        import functools
+
+        from flora_deploy.modal_app.factory import plan_app
+
+        planner = functools.partial(plan_app, fake_models=True)
     try:
         j = sdk.submit(cfg, job_id=job, store=store, receipts=_receipts(receipt),
                        determinism=determinism, allow_uncertified=allow_uncertified,
-                       budget_usd=budget, bucket_secret=bucket_secret, log=log)
+                       budget_usd=budget, bucket_secret=bucket_secret, log=log,
+                       planner=planner)
+    except sdk.NotDeployed as e:
+        if fake_models:
+            raise fail(f"{e} (here: `flora deploy --fake-models`); or add --local to run the "
+                       "fake models in this process") from None
+        raise fail(str(e)) from None
     except sdk.FloraError as e:
         raise fail(str(e)) from None
     if detach:
