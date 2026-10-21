@@ -29,7 +29,7 @@ from flora_deploy.layout import (
     WEIGHTS_VOLUME,
     snapshot_path,
 )
-from flora_deploy.modal_app.images import CPU_PACKAGES, PY, hfref_image
+from flora_deploy.modal_app.images import cpu_image, hfref_image
 from flora_deploy.stages.reference import OFFLINE_ROOT, offline_env
 
 app = modal.App("flora-reference")
@@ -44,17 +44,6 @@ STARTUP_TIMEOUT_S = 25 * 60  # Volume hashing (~122 GiB) + both loads
 TIMEOUT_S = 20 * 60  # per annotate call
 SAMPLES_DIR = GOLDEN_MOUNT / "samples" / "wsd"
 RUNS_DIR = GOLDEN_MOUNT / "reference_runs"
-
-
-def _stage_image() -> modal.Image:
-    """img_cpu's packages with numpy forced to 2.x: in ``img_cpu`` the ``numpy<3`` requirement is
-    satisfied by debian_slim's preinstalled numpy 1.26, which pyarrow 26 refuses at import."""
-    return (
-        modal.Image.debian_slim(python_version=PY)
-        .uv_pip_install(*CPU_PACKAGES, "numpy>=2,<3")
-        .env({"HF_XET_HIGH_PERFORMANCE": "1"})
-        .add_local_python_source("flora_deploy")
-    )
 
 
 def _watchdog(limit_s: float = HARD_LIFETIME_S) -> None:
@@ -278,7 +267,7 @@ def offline_check() -> dict:
 
 
 @app.function(
-    image=_stage_image(),
+    image=cpu_image(),
     cpu=2.0,
     memory=8 * 1024,
     volumes={str(WEIGHTS_MOUNT): weights.read_only(), str(GOLDEN_MOUNT): golden},
