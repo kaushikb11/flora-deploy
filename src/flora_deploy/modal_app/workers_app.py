@@ -251,3 +251,278 @@ def warm_reward_cache() -> dict[str, Any]:
     _engine, _nv, startup = build_reward_engine(cache_mode="rw")
     print(f"warm_reward_cache: {startup}", flush=True)
     return {k: v for k, v in startup.items() if k != "engine"}
+
+
+# ---------------------------------------------------------------------------------------------
+# Fake-models workers (``flora deploy --fake-models``: the H0 CPU rehearsal on real Modal)
+#
+# Same contract, store, preflight, media resolution, env and lifecycle hooks as the real
+# workers, but the model boundary is G2's deterministic fakes (``local.engines``) and the
+# factory gives them CPU containers. No weights are read and no NVIDIA code is linked. Records
+# say so (``provenance.certificate = fake-models``, ``models = fake``), and the factory hashes
+# ``fake_models`` into every stage hash, so they never share store paths with real outputs.
+#
+# Fault injection for rehearsals is data in the job store, read only by these fake classes:
+# ``flora/<job>/fake_faults.json`` = ``{"preempt": {"<target>": <episode #>}, "poison":
+# ["<uid>", ...]}``. ``preempt``: once per target and job, in the first start of a shard that
+# matches the target (a shard kind, e.g. ``segcap``, or an ``fnmatch`` pattern on shard ids,
+# which are content-addressed) and reaches its n-th episode (1-based):
+# ``modal.exception.simulate_preemption`` (SIGINT; ``@modal.exit`` flushes and marks the start
+# preempted; Modal restarts the input). ``poison``: the container dies (``os._exit(137)``, no
+# marker update) whenever a fake worker reaches that episode, so D15 quarantine, bisection and
+# the poison pill run as they would for a real OOM.
+
+FAKE_MODELS_ENV = "FLORA_FAKE_MODELS"
+FAKE_CERTIFICATE = "fake-models"
+FAKE_FAULTS_FILE = "fake_faults.json"
+
+
+def fake_faults_path(job_id: str) -> str:
+    from flora_deploy.jobs.store import JobPaths
+
+    return f"{JobPaths(job_id).root}/{FAKE_FAULTS_FILE}"
+
+
+def fake_fired_path(job_id: str, what: str) -> str:
+    from flora_deploy.jobs.store import JobPaths
+    from flora_deploy.jobs.types import safe_key
+
+    return f"{JobPaths(job_id).root}/fake_faults/fired/{safe_key(what)}.json"
+
+
+class FakeFaultHook:
+    """Per-episode hook of the fake workers (see the block comment above)."""
+
+    def __init__(self, store: Store, *, preempt_wait_s: int = 1,
+                 exit_fn: Callable[[int], Any] = os._exit,
+                 preempt_fn: Callable[[int], Any] | None = None,
+                 sleep: Callable[[float], Any] = time.sleep):
+        self.store = store
+        self.preempt_wait_s = preempt_wait_s
+        self.exit_fn, self.preempt_fn, self.sleep = exit_fn, preempt_fn, sleep
+        import threading
+
+        self._local = threading.local()  # per input (``@modal.concurrent`` reward pools)
+
+    @property
+    def job_id(self) -> str:
+        return getattr(self._local, "job_id", "")
+
+    @property
+    def shard_id(self) -> str:
+        return getattr(self._local, "shard_id", "")
+
+    @property
+    def faults(self) -> dict[str, Any]:
+        return getattr(self._local, "faults", {})
+
+    def start_shard(self, job_id: str, shard_id: str) -> None:
+        import json
+
+        loc = self._local
+        loc.job_id, loc.shard_id, loc.seen = job_id, shard_id, 0
+        p = fake_faults_path(job_id)
+        try:
+            loc.faults = json.loads(self.store.get_bytes(p)) if self.store.exists(p) else {}
+        except (OSError, ValueError):
+            loc.faults = {}
+
+    def before_episode(self, uid: str) -> None:
+        import json
+
+        self._local.seen = getattr(self._local, "seen", 0) + 1
+        seen = self._local.seen
+        if uid in set(self.faults.get("poison", ())):
+            print(f"fake-models: poison {uid} -> os._exit(137)", flush=True)
+            commit = getattr(self.store, "commit", None)
+            if callable(commit):
+                commit()
+            self.exit_fn(137)
+            return
+        for target, at in sorted((self.faults.get("preempt") or {}).items()):
+            if seen != int(at) or not preempt_matches(target, self.shard_id):
+                continue
+            fired = fake_fired_path(self.job_id, f"preempt-{target}")
+            if self.store.exists(fired):
+                continue
+            self.store.put_bytes(fired, json.dumps({"shard_id": self.shard_id, "uid": uid,
+                                                    "t": time.time()}).encode())
+            print(f"fake-models: simulate_preemption({self.preempt_wait_s}) on "
+                  f"{self.shard_id} before {uid}", flush=True)
+            fn = self.preempt_fn
+            if fn is None:
+                from modal.exception import simulate_preemption as fn
+            fn(self.preempt_wait_s)
+            self.sleep(60.0)  # the SIGINT arrives during this sleep
+            return
+
+
+def preempt_matches(target: str, shard_id: str) -> bool:
+    """``target`` is a shard kind (``segcap`` matches the planned ``segcap-<hex>`` shards, not
+    bisection children ``segcap-ep-...``) or an ``fnmatch`` pattern on the shard id."""
+    import fnmatch
+
+    if fnmatch.fnmatchcase(shard_id, target):
+        return True
+    head, sep, rest = shard_id.partition(f"{target}-")
+    return not head and bool(sep) and "-" not in rest
+
+
+def fake_determinism_record(mode: str) -> dict[str, Any]:
+    from flora_deploy.accel import determinism as det
+
+    return {"schema": det.DETERMINISM_SCHEMA, "mode": det.check_mode(mode), "in_effect": False,
+            "fake_models": True}
+
+
+def configured_determinism_env(env: Mapping[str, str] = os.environ) -> str:
+    """``reference_app.configured_determinism`` without importing the HF worker module: the
+    hashed D-1 mode (``FLORA_DETERMINISM`` must agree with ``FLORA_OUTPUT_SETTINGS``)."""
+    import json
+
+    from flora_deploy.accel import determinism as det
+
+    mode = env.get("FLORA_DETERMINISM") or None
+    outputs = env.get("FLORA_OUTPUT_SETTINGS")
+    hashed = json.loads(outputs).get("determinism") if outputs else None
+    if mode and hashed and mode != hashed:
+        raise det.DeterminismError(
+            f"FLORA_DETERMINISM {mode!r} != FLORA_OUTPUT_SETTINGS determinism {hashed!r}")
+    return det.check_mode(mode or hashed or det.NVIDIA)
+
+
+def fake_segcap_engine(mode: str, hook: FakeFaultHook) -> Any:
+    """``local.engines.FakeSegcapEngine`` that runs ``hook`` before each episode and carries
+    the configured D-1 mode (the runner refuses an engine in another mode)."""
+    from flora_deploy.local.engines import FakeSegcapEngine
+
+    class _Engine(FakeSegcapEngine):
+        def __init__(self) -> None:
+            super().__init__()
+            self.determinism = fake_determinism_record(mode)
+
+        def runtime_provenance(self) -> dict:
+            return {**super().runtime_provenance(), "determinism": dict(self.determinism),
+                    "certificate": FAKE_CERTIFICATE}
+
+        def result_for(self, item: dict) -> dict:
+            hook.before_episode(item["episode"])
+            return super().result_for(item)
+
+    return _Engine()
+
+
+def fake_preflight(env: Mapping[str, str] = os.environ) -> tuple[Store, dict[str, Any]]:
+    """The real workers' store + :func:`preflight`, refusing outside a fake-models app."""
+    if env.get(FAKE_MODELS_ENV) != "1":
+        raise PreflightError(f"{FAKE_MODELS_ENV} is not set: fake workers only run in an app "
+                             "deployed with `flora deploy --fake-models`")
+    try:
+        store = store_from_env(env)
+    except Exception as exc:  # noqa: BLE001 - a misconfigured deployment: say so, early
+        raise PreflightError(f"job store: {exc}") from exc
+    return store, preflight(env, store=store)
+
+
+def fake_segcap_runner(store: Store, env: Mapping[str, str], hook: FakeFaultHook, *,
+                       call_id: Callable[[], str | None] = lambda: "",
+                       fatal: Callable[[BaseException], None] | None = None) -> Any:
+    from flora_deploy.local.engines import FAKE_MODELS
+    from flora_deploy.workers_impl.segcap import SegcapShardRunner, SegcapWorkerSettings
+
+    mode = configured_determinism_env(env)
+    settings = SegcapWorkerSettings(
+        preset=env.get("FLORA_PRESET", "exact"), models=dict(FAKE_MODELS["segcap"]),
+        gpu=gpu_name(), certificate=FAKE_CERTIFICATE, envelope=env.get("FLORA_ENVELOPE", "warn"),
+        media_root=env.get("FLORA_MEDIA_ROOT"),
+        instruction_text=env.get("FLORA_INSTRUCTION_TEXT") or None, determinism=mode)
+    return SegcapShardRunner(store, fake_segcap_engine(mode, hook), settings, call_id=call_id,
+                             fatal=fatal)
+
+
+def fake_reward_runner(store: Store, env: Mapping[str, str], hook: FakeFaultHook, *,
+                       call_id: Callable[[], str | None] = lambda: "",
+                       fatal: Callable[[BaseException], None] | None = None) -> Any:
+    """``RewardShardRunner`` with G2's fake Rewarder family and ``FakeLLM``. The caller holds
+    ``local.engines.vllm_shim()`` open while it runs (``stages.reward`` imports ``vllm``)."""
+    import dataclasses
+
+    from flora_deploy.local.engines import (
+        FAKE_MODELS,
+        EpisodeRegistry,
+        FakeLLM,
+        fake_rewarder_family,
+    )
+
+    registry = EpisodeRegistry()
+    settings = dataclasses.replace(
+        reward_settings_from_env(env, gpu=gpu_name()), models=dict(FAKE_MODELS["reward"]),
+        certificate=FAKE_CERTIFICATE, config_extra={"fake_models": FAKE_CERTIFICATE},
+        decoder="inline", workers=1)
+    runner = RewardShardRunner(store, RewardEngine(FakeLLM(), "fake-processor"),
+                               fake_rewarder_family(registry), settings, call_id=call_id,
+                               fatal=fatal)
+    from_index = runner.episode_from_index
+
+    def episode(ref):  # the runner's own reader, plus the rehearsal's fault hook
+        hook.before_episode(ref.uid)
+        ep = from_index(ref)
+        registry.add(ep.videos, ref.uid)
+        return ep
+
+    runner.episode_for = episode
+    return runner
+
+
+class FakeSegcapWorker:
+    """``segcap`` worker of a ``--fake-models`` app: the real ``SegcapShardRunner`` over the
+    real store and media root, ``local.engines.FakeSegcapEngine`` at the model boundary."""
+
+    @modal.enter()
+    def start(self) -> None:
+        self.store, self.preflight = fake_preflight()
+        self.hook = FakeFaultHook(self.store)
+        self.runner = fake_segcap_runner(self.store, os.environ, self.hook,
+                                         call_id=modal.current_function_call_id, fatal=_die)
+        print(f"fake-models segcap worker: determinism={self.runner.settings.determinism} "
+              f"media={self.runner.settings.media_root} preflight={self.preflight}", flush=True)
+
+    @modal.method()
+    def run_shard(self, job_id: str, shard_id: str, config_hash: str, token: str = ""):
+        self.hook.start_shard(job_id, shard_id)
+        return self.runner.run_shard(job_id, shard_id, config_hash, token=token)
+
+    @modal.exit()
+    def stop(self) -> None:
+        runner = getattr(self, "runner", None)
+        if runner is not None:
+            runner.preempt()
+
+
+class FakeRewardWorker:
+    """``reward.terminal`` / ``reward.dense`` worker of a ``--fake-models`` app: the real
+    ``RewardShardRunner`` (request building, rounds, parsing, records) with G2's fakes."""
+
+    @modal.enter()
+    def start(self) -> None:
+        from flora_deploy.local.engines import vllm_shim
+
+        self.store, self.preflight = fake_preflight()
+        self._shim = vllm_shim()  # held for the container's life
+        self._shim.__enter__()
+        self.hook = FakeFaultHook(self.store)
+        self.runner = fake_reward_runner(self.store, os.environ, self.hook,
+                                         call_id=modal.current_function_call_id, fatal=_die)
+        print(f"fake-models reward worker: terminal_mode={self.runner.settings.terminal_mode} "
+              f"media={self.runner.settings.media_root} preflight={self.preflight}", flush=True)
+
+    @modal.method()
+    def run_shard(self, job_id: str, shard_id: str, config_hash: str, token: str = ""):
+        self.hook.start_shard(job_id, shard_id)
+        return self.runner.run_shard(job_id, shard_id, config_hash, token=token)
+
+    @modal.exit()
+    def stop(self) -> None:
+        runner = getattr(self, "runner", None)
+        if runner is not None:
+            runner.preempt()

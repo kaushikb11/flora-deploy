@@ -175,6 +175,7 @@ def hash_document(
     image_fingerprint: Callable[[str], str] | None = None,
     logic_root: Path | None = None,
     input_digest: str | None = None,
+    fake_models: bool = False,
 ) -> dict[str, Any]:
     """The document ``config_hash`` hashes. See the module docstring for what is in it.
 
@@ -185,7 +186,11 @@ def hash_document(
     are only known at deploy time). ``image_fingerprint`` and ``logic_root`` (the package
     directory whose source is digested): injectable for tests. ``input_digest``: a digest of
     the input's contents (e.g. the index summary), when the caller has one; otherwise a local
-    input directory is digested here (:func:`local_input_digest`)."""
+    input directory is digested here (:func:`local_input_digest`). ``fake_models``
+    (``flora deploy --fake-models``, the H0 rehearsal): adds ``shared.fake_models = true``, so
+    every stage hash, the job hash and the app name differ from any real deployment's and fake
+    outputs can never share store paths with real ones. Absent (not ``false``) otherwise, so
+    real hashes are unchanged by this option's existence."""
     preset = get_preset(cfg.preset)
     fingerprint = image_fingerprint or _default_fingerprint
     receipts = dict(derived_receipts or {})
@@ -238,6 +243,8 @@ def hash_document(
             "content": input_digest,
         },
     }
+    if fake_models:
+        shared["fake_models"] = True
     return {
         "schema": HASH_SCHEMA,
         "shared": shared,
