@@ -302,6 +302,33 @@ class CaptureProcessor:
 VIDEO_TOKEN = "<|video_pad|>"
 VISION_START = "<|vision_start|>"
 VISION_END = "<|vision_end|>"
+PLACEHOLDER = "<|placeholder|>"
+# Special tokens that must not occur in a prompt handed to the wrap: vision start/end (mixed
+# shapes reorder HF's replacements), HF's internal ``<|placeholder|>`` (HF turns *every*
+# occurrence into ``video_pad`` after expansion while vLLM tokenizes it as text, so the two
+# diverge), and the image/vision pads (not part of Flora's video contract).
+FORBIDDEN_PROMPT_TOKENS = (VISION_START, VISION_END, PLACEHOLDER, "<|image_pad|>",
+                           "<|vision_pad|>")
+
+# Engine settings every vLLM engine that carries Flora video must use (Gate C, docs/gate-c.md).
+# Gate C certifies vLLM 0.24.0's uncached multimodal path only: with the processor cache on,
+# vLLM tokenizes the prompt text-only and applies its prompt updates with cached timestamps, a
+# different code path that Gate C does not exercise.
+REQUIRED_VLLM_ENGINE_KWARGS: Mapping[str, Any] = {"mm_processor_cache_gb": 0}
+
+
+def assert_engine_kwargs(kwargs: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Raise ``CaptureError`` unless ``kwargs`` (``vllm.LLM`` / ``EngineArgs`` keywords) set every
+    ``REQUIRED_VLLM_ENGINE_KWARGS`` value explicitly. Every engine builder that serves Flora
+    video (the Gate C harness and the production TempSeg/Captioner builders) must call this on
+    its final kwargs. Returns ``kwargs`` unchanged."""
+    for key, want in REQUIRED_VLLM_ENGINE_KWARGS.items():
+        if key not in kwargs:
+            raise CaptureError(f"vLLM engine kwargs must set {key}={want!r} (Gate C)")
+        if kwargs[key] != want:
+            raise CaptureError(f"vLLM engine kwargs set {key}={kwargs[key]!r}; Gate C requires "
+                               f"{want!r}")
+    return kwargs
 
 
 def wrap_bare_video_tokens(prompt: str, n_videos: int) -> str:
@@ -316,21 +343,32 @@ def wrap_bare_video_tokens(prompt: str, n_videos: int) -> str:
     evidence): for each video in order, transformers 5.8.1 ``Qwen3VLProcessor.__call__`` replaces
     the first ``vision_start + video_token + vision_end`` if the text contains one, otherwise the
     first bare ``video_token``, with the same per-frame string
-    ``<t seconds><|vision_start|><|placeholder|>*n<|vision_end|>``. That string contains no
-    ``video_token``, and every expansion ends in ``vision_end``, so a later bare token can never
-    look wrapped. With no vision start/end tokens in the input, the bare prompt and the wrapped
-    prompt therefore expand to the identical text, and the identical ``input_ids``.
+    ``<t seconds><|vision_start|><|placeholder|>*n<|vision_end|>``. The expansion writes
+    ``<|placeholder|>`` and turns it back into ``video_token`` only after the loop, so while the
+    loop runs no ``vision_start`` ever directly precedes a ``video_token`` (the input has none,
+    and the expansions have none in that position). The bare prompt therefore takes the bare
+    branch for every video and the wrapped prompt the wrapped branch; both replace the k-th
+    marker with the k-th expansion, so the expanded texts and ``input_ids`` are identical.
 
     Preconditions (checked; ``CaptureError`` otherwise), which every NVIDIA builder meets:
-    - the prompt has exactly ``n_videos`` video tokens and no vision start/end tokens (mixed
-      shapes would reorder HF's replacements);
+    - the prompt has exactly ``n_videos`` (>= 1) video tokens and none of
+      ``FORBIDDEN_PROMPT_TOKENS``: vision start/end would mix shapes and reorder HF's
+      replacements; a literal ``<|placeholder|>`` (e.g. in a user instruction) becomes an extra
+      ``video_pad`` in HF but stays text in vLLM;
     - each video token is preceded by a newline. vLLM tokenizes each ``<t seconds>`` string on
-      its own, while HF tokenizes it in context; after a newline the two agree (Gate C measured
-      it), after arbitrary text a merge across the boundary is possible.
+      its own, while HF tokenizes it in context. After a newline the tokenizer's pre-tokenizer
+      split cannot join the two (locked by
+      ``tests/nvlink/test_nv_link_capture_vllm_prompt_tokenizer.py``); after arbitrary text a
+      token can span the boundary.
     """
     if VISION_START in prompt or VISION_END in prompt:
         raise CaptureError("prompt already contains vision start/end tokens; only bare "
                            "video tokens are supported")
+    for token in FORBIDDEN_PROMPT_TOKENS:
+        if token in prompt:
+            raise CaptureError(f"prompt contains the special token {token}")
+    if n_videos < 1:
+        raise CaptureError("expected at least one video")
     if prompt.count(VIDEO_TOKEN) != n_videos:
         raise CaptureError(f"prompt has {prompt.count(VIDEO_TOKEN)} video tokens for "
                            f"{n_videos} videos")

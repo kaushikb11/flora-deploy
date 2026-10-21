@@ -4,11 +4,15 @@ import numpy as np
 import pytest
 
 from flora_deploy.nv.capture import (
+    FORBIDDEN_PROMPT_TOKENS,
+    PLACEHOLDER,
+    REQUIRED_VLLM_ENGINE_KWARGS,
     VIDEO_TOKEN,
     VISION_END,
     VISION_START,
     CapturedRequest,
     CaptureError,
+    assert_engine_kwargs,
     vllm_prompt,
     wrap_bare_video_tokens,
 )
@@ -46,3 +50,39 @@ def test_vllm_prompt_dict_keeps_frames_and_metadata():
     (f, m), = d["multi_modal_data"]["video"]
     assert f is frames and m == md and m is not md
     assert set(d) == {"prompt", "multi_modal_data"}
+
+
+@pytest.mark.parametrize("token", [PLACEHOLDER, "<|image_pad|>", "<|vision_pad|>"])
+def test_rejects_other_special_tokens(token):
+    # e.g. a user instruction carrying HF's internal placeholder: HF turns it into an extra
+    # video_pad while vLLM keeps it as text, so the two would diverge
+    assert token in FORBIDDEN_PROMPT_TOKENS
+    with pytest.raises(CaptureError, match="special token"):
+        wrap_bare_video_tokens(f"x\n{V}\n{{\"note\":\"{token}\"}}", 1)
+
+
+def test_rejects_zero_videos_and_first_token_without_newline():
+    with pytest.raises(CaptureError, match="at least one video"):
+        wrap_bare_video_tokens("no video here", 0)
+    with pytest.raises(CaptureError, match="video token 0 is not preceded by a newline"):
+        wrap_bare_video_tokens(f"A: {V}\n{V}", 2)
+    with pytest.raises(CaptureError, match="video token 0"):
+        wrap_bare_video_tokens(V, 1)
+
+
+def test_engine_kwargs_must_disable_processor_cache():
+    assert REQUIRED_VLLM_ENGINE_KWARGS == {"mm_processor_cache_gb": 0}
+    ok = {"model": "m", "mm_processor_cache_gb": 0}
+    assert assert_engine_kwargs(ok) is ok
+    with pytest.raises(CaptureError, match="must set mm_processor_cache_gb=0"):
+        assert_engine_kwargs({"model": "m"})  # vLLM's default is a 4 GiB cache
+    with pytest.raises(CaptureError, match="mm_processor_cache_gb=4"):
+        assert_engine_kwargs({"mm_processor_cache_gb": 4})
+
+
+def test_gatec_engine_builder_asserts_cache_off():
+    pytest.importorskip("modal")
+    from flora_deploy.modal_app.gatec_app import engine_kwargs
+
+    for kind in ("tempseg", "captioner"):
+        assert engine_kwargs(kind, "/m")["mm_processor_cache_gb"] == 0

@@ -64,7 +64,8 @@ def test_compare_pass_and_fail_details():
     grids = [[2, 4, 4]]
     hf = expanded(grids, [[0.25, 1.25]])
     ok = G.compare(case_id="c", index=0, source="s", variant="wrapped", hf_ids=hf,
-                   hf_grids=grids, vllm_ids=list(hf), vllm_grids=grids, sp=SP, merge_size=2)
+                   hf_grids=grids, vllm_ids=list(hf), vllm_grids=grids, sp=SP, merge_size=2,
+                   pixels_equal=[True], generate_ids_equal=True)
     assert ok.passed and ok.first_diff is None
     bad_ids = list(hf)
     bad_ids[5] = 999
@@ -82,11 +83,62 @@ def test_compare_pass_and_fail_details():
     assert d["passed"] is False and d["error"] == "RuntimeError: x" and d["vllm"] == {}
 
 
-def test_sanitize_error_elides_payload():
+def test_sanitize_error_is_an_allowlist():
     exc = ValueError("Failed to apply Qwen3VLProcessor on data={'text': 'SECRET'} with kwargs")
-    msg = G.sanitize_error(exc)
-    assert "SECRET" not in msg and msg.startswith("ValueError: Failed to apply")
-    assert G.sanitize_error(RuntimeError("a\nb")) == "RuntimeError: a"
+    assert G.sanitize_error(exc) == "ValueError: Failed to apply Qwen3VLProcessor [rest elided]"
+    bare = AssertionError("Failed to apply prompt replacement for mm_items['video'][0]")
+    assert G.sanitize_error(bare) == ("AssertionError: Failed to apply prompt replacement for "
+                                      "mm_items['video'][0]")
+    # unknown formats lose the whole message, whatever payload shape they use
+    for msg in ("prompt text SECRET", "Bad input: {'prompt': 'SECRET'}", "a\nSECRET",
+                "SECRET Failed to apply x"):
+        out = G.sanitize_error(RuntimeError(msg))
+        assert out == "RuntimeError: [message elided]" and "SECRET" not in out
+    assert G.sanitize_error(KeyError()) == "KeyError"
+
+
+def test_pass_requires_pixels_generate_and_no_bare_pads():
+    grids = [[2, 4, 4]]
+    hf = expanded(grids, [[0.25, 1.25]])
+    kw = dict(case_id="c", index=0, source="s", variant="wrapped", hf_ids=hf, hf_grids=grids,
+              vllm_ids=list(hf), vllm_grids=grids, sp=SP, merge_size=2)
+    assert G.compare(**kw, pixels_equal=[True]).passed
+    assert G.compare(**kw, pixels_equal=[True], generate_ids_equal=None).passed
+    # ids and grids equal, pixels not: FAIL (e.g. frame order or resample changed)
+    bad = G.compare(**kw, pixels_equal=[False])
+    assert bad.ids_equal and bad.grids_equal and not bad.passed
+    assert bad.to_dict()["pixels_ok"] is False and bad.to_dict()["passed"] is False
+    assert not G.compare(**kw).passed  # pixels not compared
+    assert not G.compare(**kw, pixels_equal=[]).passed
+    assert not G.compare(**kw, pixels_equal=[True, True]).passed  # count != videos
+    assert not G.compare(**kw, pixels_equal=[True], generate_ids_equal=False).passed
+    stray = hf[:3] + [3] + hf[3:]  # a bare video_pad outside any frame run, on both sides
+    s = G.compare(**{**kw, "hf_ids": stray, "vllm_ids": stray}, pixels_equal=[True])
+    assert s.ids_equal and s.runs_match_grid and not s.passed
+
+
+def test_pixel_digests_catch_frame_order_and_resample():
+    torch = pytest.importorskip("torch")
+    g = torch.Generator().manual_seed(0)
+    # two videos: (T=2, H=2, W=2) and (T=1, H=2, W=2) -> 8 + 4 rows of patch vectors
+    grids = [[2, 2, 2], [1, 2, 2]]
+    hf = torch.rand(12, 6, generator=g) * 2 - 1
+    digests = G.video_pixel_digests(hf, grids)
+    assert [d["rows"] for d in digests] == [8, 4]
+    v1, v2 = hf[:8].clone(), hf[8:].clone()
+    assert G.pixels_equal_per_video(digests, [v1, v2]) == [True, True]
+    assert G.pixels_equal_per_video(digests, [v1.bfloat16(), v2.bfloat16()]) == [True, True]
+    # frames in the wrong order (temporal groups swapped): same shape, same grid, FAIL
+    swapped = torch.cat([v1[4:], v1[:4]])
+    assert G.pixels_equal_per_video(digests, [swapped, v2]) == [False, True]
+    # videos swapped across items
+    assert G.pixels_equal_per_video(digests, [v2, v1]) == [False, False]
+    # a different resample filter: values move by more than a bf16 step
+    assert G.pixels_equal_per_video(digests, [v1, (v2 + 0.02).bfloat16()]) == [True, False]
+    assert G.pixels_equal_per_video(digests, [v1.half(), v2]) == [False, True]  # other dtype
+    assert G.pixels_equal_per_video(digests, [v1]) == [False, False]
+    with pytest.raises(ValueError, match="pixel rows"):
+        G.video_pixel_digests(hf[:10], grids)
 
 
 def test_report_and_verdicts():
@@ -98,7 +150,7 @@ def test_report_and_verdicts():
             rows.append(G.compare(case_id=case, index=idx, source="syn", variant="wrapped",
                                   hf_ids=hf, hf_grids=grids,
                                   vllm_ids=ids if idx else hf, vllm_grids=grids, sp=SP,
-                                  merge_size=2).to_dict())
+                                  merge_size=2, pixels_equal=[True]).to_dict())
         rows.append(G.compare(case_id=case, index=0, source="syn", variant="bare", hf_ids=hf,
                               hf_grids=grids, vllm_ids=None, vllm_grids=None, sp=SP,
                               merge_size=2, error="RuntimeError: 0 placeholders").to_dict())
@@ -119,5 +171,10 @@ def test_detail_table_is_well_formed():
                     hf_grids=grids, vllm_ids=hf, vllm_grids=grids, sp=SP,
                     merge_size=2).to_dict()
     detail = G.render_report([row]).split("\n\n", 1)[1].splitlines()
-    assert detail[1] == "|" + "---|" * 12
-    assert {line.count("|") for line in detail} == {13}
+    assert detail[1] == "|" + "---|" * 14
+    assert {line.count("|") for line in detail} == {15}
+    assert "| = | = | = | - | - |" in detail[2]  # pixels/gen not given
+    row = G.compare(case_id="a", index=0, source="syn", variant="wrapped", hf_ids=hf,
+                    hf_grids=grids, vllm_ids=hf, vllm_grids=grids, sp=SP, merge_size=2,
+                    pixels_equal=[False], generate_ids_equal=True).to_dict()
+    assert "| = | = | = | ≠ | = |" in G.render_report([row])

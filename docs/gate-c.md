@@ -1,226 +1,296 @@
 # Gate C: vLLM 0.24.0 model inputs vs NVIDIA's HF processor
 
-**Verdict: PASS with a capture-layer fix.** NVIDIA's prompts, as captured, are **rejected** by
-vLLM 0.24.0 (0/44 requests render). With the fix (`nv.capture.vllm_prompt`, which wraps each bare
-`<|video_pad|>` as `<|vision_start|><|video_pad|><|vision_end|>`), vLLM's `prompt_token_ids`,
-per-video `video_grid_thw` and `pixel_values_videos` (in bf16) are **identical** to the
-`input_ids` / `video_grid_thw` / `pixel_values_videos` of NVIDIA's own processor call, for all 44
-requests over 11 builder cases and 2 frame sources.
+**Verdict: PASS with a capture-layer fix, under a required engine setting
+(`mm_processor_cache_gb=0`).** NVIDIA's prompts, as captured, are **rejected** by vLLM 0.24.0
+(0/56 builder-case requests render). With the fix (`nv.capture.vllm_prompt`, which wraps each bare
+`<|video_pad|>` as `<|vision_start|><|video_pad|><|vision_end|>`), three things are **identical**
+to NVIDIA's own processor call for **all 127 requests**:
+- vLLM's `prompt_token_ids` and NVIDIA's `input_ids`;
+- the per-video `video_grid_thw`;
+- the per-video `pixel_values_videos`, compared in vLLM's dtype, bf16.
 
-Run: 2026-10-21, `uv run modal run scripts/gatec.py` (ephemeral app `flora-gatec`, two L40S
-containers, driver 610.57.04), vllm 0.24.0, transformers 5.8.1, torch 2.11.0+cu130.
-Results JSON (counts, positions, grids only) stays outside the repo
-(`~/.cache/flora-deploy/gatec/results.json`).
+The 127 requests are 56 from 14 builder cases on 2 frame sources, plus 71 from real golden
+episodes in all 6 TempSeg/Captioner pools.
+
+What is compared: prompt token ids, grids and pixels. M-RoPE position ids are **not** compared.
+Both engines derive them from exactly these ids and grids, but through different
+implementations (vLLM `_get_mrope_input_positions`, HF `get_rope_index`). Checking those is left
+to Gate D (logits parity).
+
+Run: 2026-10-21, `uv run modal run scripts/gatec.py`.
+- Infrastructure: ephemeral app `flora-gatec`, 16 CPU builder containers plus two L40S
+  containers, driver 610.57.04.
+- Versions: vllm 0.24.0, transformers 5.8.1, torch 2.11.0+cu130.
+- The results JSON (counts, positions, grids, digests only, no prompt or task text) stays outside
+  the repo, at `~/.cache/flora-deploy/gatec/results.json`.
 
 ## What was compared
 
-For each case, `validate.gatec_driver` runs NVIDIA's own pipeline function (`pipeline.segment`,
-`caption_three`, `caption_single`) with the processor built by NVIDIA's
-`models.processor(kind, path)` from the pinned Flora processor files. The only substitutions are
-the frame decoder (frames come from a source below) and `generate` (canned output). It runs twice:
-once through a spy around the real processor (the **HF reference**: NVIDIA's PIL-input call), once
-through `CaptureProcessor` (the `CapturedRequest`: prompt with bare `<|video_pad|>`, uint8 THWC
-frames, metadata `{total_num_frames, fps, frames_indices, duration=None, do_sample_frames=False}`).
-The driver checks the two runs made the same calls with the same prompt, frames and metadata.
+`validate.gatec_driver` runs NVIDIA's own pipeline function (`pipeline.segment`,
+`caption_three` or `caption_single`). The processor is built by NVIDIA's
+`models.processor(kind, path)` from the pinned Flora processor files. Each pipeline runs twice:
+- once through a spy around the real processor. This is the **HF reference**, NVIDIA's
+  PIL-input call;
+- once through `CaptureProcessor`. This gives the `CapturedRequest`: the prompt with bare
+  `<|video_pad|>`, uint8 THWC frames, and the metadata
+  `{total_num_frames, fps, frames_indices, duration=None, do_sample_frames=False}`.
 
-Each captured request then goes through vLLM's offline path in the same container:
-`LLM._preprocess_cmpl([prompt])` (exactly what `LLM.generate` calls) gives
-`prompt_token_ids`, the per-item `video_grid_thw` and `pixel_values_videos` and the placeholder
-ranges; `LLM.generate(..., max_tokens=1, temperature=0)` confirms the engine received the same
-ids (true for every request it was run on).
+The driver checks that both runs made the same calls with the same prompt, frames and metadata.
+`generate` is always canned. The pipeline is stopped after the wanted number of processor calls.
 
-Pass = ids identical **and** grids identical **and** the vLLM ids contain exactly the frame groups
-the grids imply (`T` groups of `vision_start, video_pad*(H*W/4), vision_end` per video).
+**Request sources**
 
-**Cases** (2 processor calls each; synthetic duration 40 s): temporal human, human + instruction
-suffix, YAM 1-view, YAM 3-view, Dex 3-view, yam32 3-view (64 temporal groups, 10.7k tokens);
-three-view captions YAM and Dex (+ instruction); single-view captions human, human + instruction,
-robot.
+| Source | Decoder | Requests |
+|---|---|---|
+| `synthetic`: 640x480 gradient plus seeded noise, 40 s | fake `decode_selected` | 2 per case |
+| `bbb_360_10s`: Big Buck Bunny 10 s, 640x360 H.264 30 fps CFR, CC BY 3.0 Blender Foundation | fake `decode_selected` | 2 per case |
+| **golden v1**: Volume `flora-golden`, `golden/v1/` (`docs/golden-manifest-v1.md`) | NVIDIA's **real** `media.probe` and `decode_selected` | up to 6 per pool and kind |
 
-**Frame sources:** `synthetic` (640x480 gradient + seeded noise) and `bbb_360_10s` (Big Buck
-Bunny 10 s, 640x360 H.264 30 fps CFR, CC BY 3.0 Blender Foundation; staged at
-`flora-golden:samples/wse/bbb_360_10s.mp4`, sha256 `77145c94…2016`; frames looped, wrist views
-mirrored/flipped). Every video's frames are off the 32-px grid (e.g. 173x231, 367x435, 443x591,
-360x640), so the processor's smart-resize is exercised in both engines.
+Notes on the sources:
+- The BBB sample is staged at `flora-golden:samples/wse/bbb_360_10s.mp4` (sha256 `77145c94…2016`).
+  Its frames are looped, and the wrist views are mirrored or flipped.
+- For the golden source, decoding is memoized, so the capture run reuses the spy run's frames.
+- Every frame size is off the 32-px grid, so both engines exercise the processor's smart-resize.
+
+**Builder cases (14):**
+- temporal: human, human + instruction, YAM 1-view, YAM 3-view, YAM 3-view + instruction, Dex
+  3-view, Tianji 3-view, and yam32 3-view (64 temporal groups, 10.7k tokens);
+- three-view captions: YAM, Dex + instruction, Tianji + instruction;
+- single-view captions: human, human + instruction, robot.
+
+**Golden coverage.** Every staged, oracle-eligible episode of each pool is eligible. Requests are
+spread over episodes: at most `ceil(6 / #episodes)` per episode, and at most 3. Every other
+episode uses its dataset task text as the instruction. Captioner targets are three spans at 10%,
+40% and 70% into the episode, each 1-4 s long. The golden requests run the `wrapped` variant
+only.
+
+| Pool | Episodes used | TempSeg requests | Captioner requests | Prompt length (tokens) | Media |
+|---|---|---|---|---|---|
+| `human` | 6 | 6 | 6 | 1811-7464 | HomER 1080p/720p/848x478 H.264 **VFR** (non-integer rates such as 29.99 fps and 59.94 fps); EgoDex 1080p AV1 |
+| `single_view_robot` (profile YAM) | 6 | 6 | 6 | 1417-5899 | DROID 320x180 at 10 fps; Galaxea 720p AV1; droid_success 720p at 15 fps |
+| `yam` | 6 | 6 | 6 | 5493-9736 | ManiRewardBench 680x480 at 10 fps; ALOHA 640x480 AV1 at 50 fps |
+| `yam32` | 2 | 6 | 6 | 7923-14711 | 88.5 s and 116 s episodes, 64 temporal groups |
+| `dex` (stand-in) | 3 | 6 | 6 | 5556-12136 | Unitree G1 640x480 AV1 |
+| `tianji` (stand-in) | 2 | 5 | 6 | 5523-13607 | 640x480 H.264. Episode 75 has only 2 TempSeg windows |
+
+The episodes used are the first ones in manifest order, `golden/v1/manifest.json`.
+
+Deviation from PLAN §9's "20 golden requests per pool": the gate uses up to 6 per pool and kind,
+11-12 per pool in total. The plan's 20 would mean 120 requests per kind on real media; the
+coverage above spans every pool, codec, rate class (VFR, 10/15/30/50 fps) and window length at
+about a third of the build cost. Raise `--quota` to 20 to run the plan's number.
+
+**Rendering in vLLM.** Each captured request goes through vLLM's offline path in an L40S
+container:
+- `LLM._preprocess_cmpl([prompt])` is exactly what `LLM.generate` calls. It is a private API, so
+  recheck it on any vLLM bump. It gives `prompt_token_ids`, the per-item `video_grid_thw` and
+  `pixel_values_videos`, and the placeholder ranges.
+- `LLM.generate(..., max_tokens=1, temperature=0)` confirms that the engine received the same
+  ids. It was true for all 183 requests it ran on.
+
+**PASS** requires all of the following (`validate.gatec.Comparison.passed`):
+- no error;
+- identical ids;
+- identical grids;
+- the vLLM ids contain exactly the frame groups the grids imply (`T` groups of
+  `vision_start, video_pad*(H*W/4), vision_end` per video);
+- **per-video pixels equal**: sha256 of HF's tensor cast to vLLM's dtype (bf16 here) equals that
+  of vLLM's tensor. Any other dtype, or a missing comparison, fails;
+- `generate` saw the same ids, where it was run;
+- no stray bare `video_pad` in either sequence.
+
+Unit tests (`tests/unit/test_gatec_compare.py`) and nvlink tests with the real processor
+(`tests/nvlink/test_nv_link_capture_vllm_prompt.py::test_pixel_only_changes_fail_the_verdict`)
+cover three changes that keep ids and grids but change pixels. Each one must give FAIL:
+- frames in the wrong order;
+- a different resample filter (`resample=0` instead of 3);
+- videos swapped across items.
 
 ## Engine settings
 
 | Setting | Value | Why |
 |---|---|---|
-| model dir | `/tmp/gatec-model-<kind>`: Qwen3.5-9B@c2022362 `config.json`, index, 4 shards (symlinks) + Flora `processor_config.json`, `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` (TempSeg@114a1076 or Captioner@fef0bbfe) | base `preprocessor_config.json`/`video_preprocessor_config.json` deliberately excluded |
+| model dir | `/tmp/gatec-model-<kind>`, rebuilt on every call: Qwen3.5-9B@c2022362 `config.json`, index and 4 shards (symlinks), plus Flora `processor_config.json`, `tokenizer.json`, `tokenizer_config.json` and `chat_template.jinja` (TempSeg@114a1076 or Captioner@fef0bbfe) | base `preprocessor_config.json`/`video_preprocessor_config.json` deliberately excluded |
 | `mm_processor_kwargs` (engine) | tempseg `{"fps": 4, "max_frames": 128}`, captioner `{"fps": 8, "max_frames": 40}` | NVIDIA's `Qwen3VLVideoProcessor(fps=…, max_frames=…)` overrides (equal to the files' values) |
+| `mm_processor_cache_gb` | **0, required** | see below |
 | `limit_mm_per_prompt` | `{"image": 0, "video": 3}` | |
-| other | `dtype=bfloat16`, `max_model_len=32768`, `mm_processor_cache_gb=0`, `generation_config="vllm"`, `gdn_prefill_backend="triton"`, `enforce_eager=True`, `max_num_seqs=8`, `seed=0` | |
+| other | `dtype=bfloat16`, `max_model_len=32768`, `generation_config="vllm"`, `gdn_prefill_backend="triton"`, `enforce_eager=True`, `max_num_seqs=8`, `seed=0` | |
 
-vLLM's resolved video processor equals NVIDIA's on every attribute checked (`size`
-{shortest 4096, longest 25165824}, `fps`, `max_frames`, `min_frames` 4, `patch_size` 16,
-`temporal_patch_size` 2, `merge_size` 2, `resample` 3, mean/std 0.5, rescale, resize/normalize/
-convert flags). Special-token ids agree between Flora's tokenizer and the base `config.json`
-(`vision_start` 248053, `vision_end` 248054, `video_pad` 248057). NVIDIA's `AutoProcessor`
-`min_pixels=1024, max_pixels=589824` are image-processor settings (they equal
-`processor_config.json`'s image section) and are not mirrored.
+**Processor cache off is a precondition of this certificate.** With a processor cache (vLLM's
+default is 4 GiB), vLLM 0.24.0 takes `_cached_apply_hf_processor`, which differs from the
+uncached path in three ways:
+- it tokenizes the prompt text-only;
+- it processes missing items separately;
+- it applies its string-target prompt updates with cached timestamps.
+
+Gate C does not exercise that path; a cache-on variant was not run. The setting is therefore
+enforced in code:
+- `flora_deploy.nv.capture.REQUIRED_VLLM_ENGINE_KWARGS` (`{"mm_processor_cache_gb": 0}`) and
+  `assert_engine_kwargs(kwargs)` raise unless the kwargs set it explicitly.
+- The Gate C engine builder (`modal_app.gatec_app.engine_kwargs`) calls it.
+- **Every production engine builder that carries Flora video (TempSeg, Captioner) must call
+  `assert_engine_kwargs` on its final `LLM`/`EngineArgs` kwargs.**
+- If production ever needs the cache or AsyncLLM pre-rendering (`render_cmpl_async`), Gate C
+  must be extended first.
+
+vLLM's resolved video processor equals NVIDIA's on every attribute checked:
+- `size` {shortest 4096, longest 25165824}, `fps`, `max_frames`, `min_frames` 4;
+- `patch_size` 16, `temporal_patch_size` 2, `merge_size` 2, `resample` 3;
+- mean/std 0.5, rescale, and the resize/normalize/convert flags.
+
+Special-token ids agree between Flora's tokenizer and the base `config.json`: `vision_start`
+248053, `vision_end` 248054, `video_pad` 248057.
+
+NVIDIA's `AutoProcessor` kwargs `min_pixels=1024, max_pixels=589824` are image-processor
+settings. They equal the image section of `processor_config.json` and are not mirrored.
 
 ## Results
 
-Per case and variant (requests passed / run):
+Per case and variant (requests passed / run), as printed by `render_report`:
 
-| case | wrapped (fix) | bare (as captured) | wrapped-naive-pixels | wrapped-no-duration |
+| case | wrapped | bare | wrapped-naive-pixels | wrapped-no-duration |
 |---|---|---|---|---|
 | caption-single-human | PASS (4/4) | FAIL (0/4) | PASS (2/2) | PASS (2/2) |
 | caption-single-human-instruction | PASS (4/4) | FAIL (0/4) | PASS (2/2) | PASS (2/2) |
 | caption-single-robot | PASS (4/4) | FAIL (0/4) | PASS (2/2) | PASS (2/2) |
 | caption-three-dex | PASS (4/4) | FAIL (0/4) | PASS (2/2) | PASS (2/2) |
+| caption-three-tianji | PASS (4/4) | FAIL (0/4) | PASS (2/2) | PASS (2/2) |
 | caption-three-yam | PASS (4/4) | FAIL (0/4) | PASS (2/2) | PASS (2/2) |
+| golden-dex | PASS (12/12) | n/a | n/a | n/a |
+| golden-human | PASS (12/12) | n/a | n/a | n/a |
+| golden-single_view_robot | PASS (12/12) | n/a | n/a | n/a |
+| golden-tianji | PASS (11/11) | n/a | n/a | n/a |
+| golden-yam | PASS (12/12) | n/a | n/a | n/a |
+| golden-yam32 | PASS (12/12) | n/a | n/a | n/a |
 | temporal-dex-3view | PASS (4/4) | FAIL (0/4) | PASS (2/2) | PASS (2/2) |
 | temporal-human | PASS (4/4) | FAIL (0/4) | PASS (2/2) | PASS (2/2) |
 | temporal-human-instruction | PASS (4/4) | FAIL (0/4) | PASS (2/2) | PASS (2/2) |
+| temporal-tianji-3view | PASS (4/4) | FAIL (0/4) | PASS (2/2) | PASS (2/2) |
 | temporal-yam-1view | PASS (4/4) | FAIL (0/4) | PASS (2/2) | PASS (2/2) |
 | temporal-yam-3view | PASS (4/4) | FAIL (0/4) | PASS (2/2) | PASS (2/2) |
+| temporal-yam-3view-instruction | PASS (4/4) | FAIL (0/4) | PASS (2/2) | PASS (2/2) |
 | temporal-yam32-3view | PASS (4/4) | FAIL (0/4) | PASS (2/2) | PASS (2/2) |
 
-`pixel_values_videos`: vLLM == HF cast to bf16 (vLLM's model dtype), bit for bit, in every passing
-row. `wrapped-naive-pixels` adds per-request `min_pixels=1024, max_pixels=589824` (a literal copy
-of NVIDIA's `AutoProcessor` kwargs); it did not change any grid here, but it buys nothing and
-should not be sent.
-
-Per request, fixed prompt (`=` equal, `≠` different):
-
-| case | # | source | variant | ids | grid | runs | HF len | vLLM len | first diff | grids (T,H,W) | error |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| caption-single-human | 0 | bbb_360_10s | wrapped | = | = | = | 5656 | 5656 |  | 6,22,40;12,22,40;6,22,40 |  |
-| caption-single-human | 1 | bbb_360_10s | wrapped | = | = | = | 6112 | 6112 |  | 6,22,40;14,22,40;6,22,40 |  |
-| caption-single-human | 0 | synthetic | wrapped | = | = | = | 6424 | 6424 |  | 6,28,36;12,28,36;6,28,36 |  |
-| caption-single-human | 1 | synthetic | wrapped | = | = | = | 6944 | 6944 |  | 6,28,36;14,28,36;6,28,36 |  |
-| caption-single-human-instruction | 0 | bbb_360_10s | wrapped | = | = | = | 5666 | 5666 |  | 6,22,40;12,22,40;6,22,40 |  |
-| caption-single-human-instruction | 1 | bbb_360_10s | wrapped | = | = | = | 6122 | 6122 |  | 6,22,40;14,22,40;6,22,40 |  |
-| caption-single-human-instruction | 0 | synthetic | wrapped | = | = | = | 6434 | 6434 |  | 6,28,36;12,28,36;6,28,36 |  |
-| caption-single-human-instruction | 1 | synthetic | wrapped | = | = | = | 6954 | 6954 |  | 6,28,36;14,28,36;6,28,36 |  |
-| caption-single-robot | 0 | bbb_360_10s | wrapped | = | = | = | 4283 | 4283 |  | 12,22,40;6,22,40 |  |
-| caption-single-robot | 1 | bbb_360_10s | wrapped | = | = | = | 4739 | 4739 |  | 6,22,40;14,22,40 |  |
-| caption-single-robot | 0 | synthetic | wrapped | = | = | = | 4859 | 4859 |  | 12,28,36;6,28,36 |  |
-| caption-single-robot | 1 | synthetic | wrapped | = | = | = | 5379 | 5379 |  | 6,28,36;14,28,36 |  |
-| caption-three-dex | 0 | bbb_360_10s | wrapped | = | = | = | 6465 | 6465 |  | 6,32,28;12,32,28;6,32,28 |  |
-| caption-three-dex | 1 | bbb_360_10s | wrapped | = | = | = | 6990 | 6990 |  | 6,32,28;14,32,28;6,32,28 |  |
-| caption-three-dex | 0 | synthetic | wrapped | = | = | = | 5121 | 5121 |  | 6,28,24;12,28,24;6,28,24 |  |
-| caption-three-dex | 1 | synthetic | wrapped | = | = | = | 5534 | 5534 |  | 6,28,24;14,28,24;6,28,24 |  |
-| caption-three-yam | 0 | bbb_360_10s | wrapped | = | = | = | 5111 | 5111 |  | 6,24,28;12,24,28;6,24,28 |  |
-| caption-three-yam | 1 | bbb_360_10s | wrapped | = | = | = | 5524 | 5524 |  | 6,24,28;14,24,28;6,24,28 |  |
-| caption-three-yam | 0 | synthetic | wrapped | = | = | = | 5111 | 5111 |  | 6,24,28;12,24,28;6,24,28 |  |
-| caption-three-yam | 1 | synthetic | wrapped | = | = | = | 5524 | 5524 |  | 6,24,28;14,24,28;6,24,28 |  |
-| temporal-dex-3view | 0 | bbb_360_10s | wrapped | = | = | = | 5557 | 5557 |  | 32,26,24 |  |
-| temporal-dex-3view | 1 | bbb_360_10s | wrapped | = | = | = | 5556 | 5556 |  | 32,26,24 |  |
-| temporal-dex-3view | 0 | synthetic | wrapped | = | = | = | 5557 | 5557 |  | 32,26,24 |  |
-| temporal-dex-3view | 1 | synthetic | wrapped | = | = | = | 5556 | 5556 |  | 32,26,24 |  |
-| temporal-human | 0 | bbb_360_10s | wrapped | = | = | = | 1811 | 1811 |  | 32,10,16 |  |
-| temporal-human | 1 | bbb_360_10s | wrapped | = | = | = | 1810 | 1810 |  | 32,10,16 |  |
-| temporal-human | 0 | synthetic | wrapped | = | = | = | 1651 | 1651 |  | 32,10,14 |  |
-| temporal-human | 1 | synthetic | wrapped | = | = | = | 1650 | 1650 |  | 32,10,14 |  |
-| temporal-human-instruction | 0 | bbb_360_10s | wrapped | = | = | = | 1820 | 1820 |  | 32,10,16 |  |
-| temporal-human-instruction | 1 | bbb_360_10s | wrapped | = | = | = | 1819 | 1819 |  | 32,10,16 |  |
-| temporal-human-instruction | 0 | synthetic | wrapped | = | = | = | 1660 | 1660 |  | 32,10,14 |  |
-| temporal-human-instruction | 1 | synthetic | wrapped | = | = | = | 1659 | 1659 |  | 32,10,14 |  |
-| temporal-yam-1view | 0 | bbb_360_10s | wrapped | = | = | = | 1845 | 1845 |  | 32,10,16 |  |
-| temporal-yam-1view | 1 | bbb_360_10s | wrapped | = | = | = | 1844 | 1844 |  | 32,10,16 |  |
-| temporal-yam-1view | 0 | synthetic | wrapped | = | = | = | 1685 | 1685 |  | 32,10,14 |  |
-| temporal-yam-1view | 1 | synthetic | wrapped | = | = | = | 1684 | 1684 |  | 32,10,14 |  |
-| temporal-yam-3view | 0 | bbb_360_10s | wrapped | = | = | = | 5493 | 5493 |  | 32,22,28 |  |
-| temporal-yam-3view | 1 | bbb_360_10s | wrapped | = | = | = | 5492 | 5492 |  | 32,22,28 |  |
-| temporal-yam-3view | 0 | synthetic | wrapped | = | = | = | 5493 | 5493 |  | 32,22,28 |  |
-| temporal-yam-3view | 1 | synthetic | wrapped | = | = | = | 5492 | 5492 |  | 32,22,28 |  |
-| temporal-yam32-3view | 0 | bbb_360_10s | wrapped | = | = | = | 10710 | 10710 |  | 64,22,28 |  |
-| temporal-yam32-3view | 1 | bbb_360_10s | wrapped | = | = | = | 10709 | 10709 |  | 64,22,28 |  |
-| temporal-yam32-3view | 0 | synthetic | wrapped | = | = | = | 10710 | 10710 |  | 64,22,28 |  |
-| temporal-yam32-3view | 1 | synthetic | wrapped | = | = | = | 10709 | 10709 |  | 64,22,28 |  |
+How to read this:
+- In every passing row, the pixels were equal and `generate` saw the rendered ids. In every row,
+  vLLM's pixel tensors were bf16.
+- `wrapped-naive-pixels` adds per-request `min_pixels=1024, max_pixels=589824`, a literal copy of
+  NVIDIA's `AutoProcessor` kwargs. It did not change any grid here, but it buys nothing and should
+  not be sent.
+- The per-request table (239 rows: ids, grid, runs, pixels and gen marks, lengths, grids, errors)
+  is in the results JSON and in the run's output. The previous revision of this page shows its
+  format for the first 44 requests.
 
 ## The mismatch: a bare `<|video_pad|>` is not a vLLM placeholder
 
 Every `bare` request fails in vLLM with
-`AssertionError: Failed to apply prompt replacement for mm_items['video'][0]`; no
-`prompt_token_ids` are produced. The cause, in vLLM 0.24.0 `model_executor/models/qwen3_vl.py`:
+`AssertionError: Failed to apply prompt replacement for mm_items['video'][0]`, and no
+`prompt_token_ids` are produced. The cause is in vLLM 0.24.0
+`model_executor/models/qwen3_vl.py`:
 
 - `Qwen3VLMultiModalProcessor._get_prompt_updates` registers the video `PromptReplacement`
-  with target `"<|vision_start|><|video_pad|><|vision_end|>"`, and
+  with the target `"<|vision_start|><|video_pad|><|vision_end|>"`.
   `_replace_video_token_placeholders` matches the same three-token sequence in token-id space.
-- NVIDIA's builders put a bare `proc.video_token` into the user message (always right after a
-  newline), and the chat template emits it verbatim, so the tokenized prompt has a lone
-  `video_pad` (id 248057) per video and zero `vision_start`/`vision_end` tokens. vLLM finds 0 of
-  the N expected placeholders.
+- NVIDIA's builders put a bare `proc.video_token` into the user message, always right after a
+  newline, and the chat template emits it verbatim. The tokenized prompt therefore has one lone
+  `video_pad` (id 248057) per video and no `vision_start`/`vision_end` tokens. vLLM finds 0 of the
+  N expected placeholders.
 
-So the difference is not a silently different token sequence: vLLM refuses the request. There is
-no position-level diff to report for `bare`; HF's sequence has, per video, `T` groups of
-`<t seconds>` text + `vision_start` + `video_pad*(H*W/4)` + `vision_end`, and vLLM produces none.
-
-HF's `Qwen3VLProcessor.__call__` (transformers 5.8.1) accepts both shapes: for each video in
-order it replaces the first `vision_start+video_pad+vision_end` if the text contains one,
-otherwise the first bare `video_pad` (comment in HF: "vllm may input video token directly"), with
-the per-frame string `<{t:.1f} seconds><|vision_start|><|placeholder|>*n<|vision_end|>`.
+HF's `Qwen3VLProcessor.__call__` (transformers 5.8.1) accepts both shapes. HF's own comment there
+says "vllm may input video token directly".
 
 ## The fix and its proof
 
-`flora_deploy.nv.capture.wrap_bare_video_tokens(prompt, n_videos)` (used by
-`vllm_prompt(request)`) replaces each bare `<|video_pad|>` with
-`<|vision_start|><|video_pad|><|vision_end|>`. It refuses (raises `CaptureError`) unless the
-prompt has exactly `n_videos` video tokens, no vision start/end tokens, and a newline before
-every video token. All NVIDIA builders satisfy this.
+`flora_deploy.nv.capture.wrap_bare_video_tokens(prompt, n_videos)`, used by
+`vllm_prompt(request)`, replaces each bare `<|video_pad|>` with
+`<|vision_start|><|video_pad|><|vision_end|>`. It refuses (`CaptureError`) unless all of these
+hold:
+- the prompt has exactly `n_videos` (>= 1) video tokens;
+- the prompt contains none of `FORBIDDEN_PROMPT_TOKENS`: `<|vision_start|>`, `<|vision_end|>`,
+  `<|placeholder|>`, `<|image_pad|>`, `<|vision_pad|>`;
+- a newline precedes every video token.
 
-**HF model inputs are unchanged** (so NVIDIA's reference is still the right reference):
+All NVIDIA builders satisfy this. A user instruction containing one of the forbidden tokens is
+refused (fail closed). The reason for `<|placeholder|>`: HF turns *every* `<|placeholder|>` in
+the text into `video_pad` after expansion, while vLLM keeps it as text, so the two would
+diverge.
 
-1. *Argument.* With no `vision_start`/`vision_end` in the input, HF takes the bare branch for every
-   video on the original prompt and the wrapped branch for every video on the fixed prompt. Both
-   replace the k-th video marker, in order, with the same string, because each expansion contains
-   no `video_pad` (it uses `<|placeholder|>` until the end) and ends in `vision_end`, so no later
-   bare token can appear wrapped. The two expanded texts are equal character for character, hence
-   so are `input_ids`. Frames and metadata are untouched, so `pixel_values_videos` and
-   `video_grid_thw` are too.
+**HF model inputs are unchanged**, so NVIDIA's reference is still the right reference:
+
+1. *Argument.*
+   - For each video in order, HF builds the same expansion
+     `<{t:.1f} seconds><|vision_start|><|placeholder|>*n<|vision_end|>` per frame group. It
+     replaces the first `vision_start+video_pad+vision_end` if the text has one, otherwise the
+     first bare `video_pad`.
+   - Expansions use `<|placeholder|>` and become `video_pad` only after the loop. With no
+     `vision_start` in the input, no `vision_start` ever directly precedes a `video_pad` while the
+     loop runs.
+   - So the bare prompt takes the bare branch for every video and the wrapped prompt the wrapped
+     branch, and both replace the k-th marker with the k-th expansion.
+   - The texts, and hence the `input_ids`, are equal. Frames and metadata are untouched.
 2. *Test.* `tests/nvlink/test_nv_link_capture_vllm_prompt.py` replays every case's captured
-   request through NVIDIA's real processor with the wrapped prompt: `input_ids`,
+   request through NVIDIA's real processor with the wrapped prompt. `input_ids`,
    `video_grid_thw` and `pixel_values_videos` equal NVIDIA's original PIL-input call bit for bit
-   (11 cases, 2 calls each). The existing `test_nv_link_capture.py` (captured ndarray replay ==
-   NVIDIA's call) still passes.
+   (14 cases, 2 calls each).
 
-**vLLM then matches HF** (the gate itself, on Modal, table above): 44/44 requests identical ids,
-grids and pixels. Why it holds: vLLM substitutes each triplet by, per temporal group,
-`tokenize("<t seconds>")` + `vision_start` + pads + `vision_end`, with `t` from
-`_calculate_timestamps(frames_indices, fps, temporal_patch_size)` (the same formula as HF). HF
-tokenizes the timestamp string in context, vLLM on its own; they agree because the character
-before each video is a newline (and between frames a `vision_end`), so no BPE merge crosses the
-boundary. That is why the fix requires a preceding newline. The nvlink test also checks a pure
-model of vLLM's expansion (`validate.gatec.simulate_vllm_expansion`) against HF on the wrapped
-prompt, and that the bare prompt finds no placeholder, so a change on either side shows up
-without a GPU.
+**vLLM then matches HF.** This is the gate itself, run on Modal (table above).
+- vLLM replaces each triplet, per temporal group, with `tokenize("<t seconds>")` +
+  `vision_start` + pads + `vision_end`. The timestamp `t` comes from
+  `_calculate_timestamps(frames_indices, fps, temporal_patch_size)`, the same formula HF uses.
+- vLLM tokenizes the timestamp string on its own; HF tokenizes it in context. They agree because
+  the character before each video is a newline, and between frames the previous token is
+  `<|vision_end|>`.
+- The mechanism is the pre-tokenizer's Split regex, which has no alternative that continues past
+  `\n` into `<`. The vision tokens are also added specials without lstrip/rstrip.
+- `tests/nvlink/test_nv_link_capture_vllm_prompt_tokenizer.py` locks this property for the
+  pinned Flora `tokenizer.json`, which TempSeg and Captioner share. It checks `<t seconds>` for
+  t = 0.0…5000.0 in 0.1 s steps plus large values, after 8 prefixes. It also asserts that the
+  property fails after `"A:"`, which is why the fix requires a newline.
+- The nvlink test also checks a pure model of vLLM's expansion
+  (`validate.gatec.simulate_vllm_expansion`) against HF.
 
 ## `duration=None`
 
-vLLM 0.24.0 accepts it. `Qwen3VLMultiModalProcessor._call_hf_processor` builds
-`VideoMetadata(**metadata)` (minus `do_sample_frames`), and the timestamps use only
-`frames_indices` and `fps` when `do_sample_frames` is False (`total_num_frames` is needed only
-for sampling). Captured metadata with `duration=None` passed in every `wrapped` row; dropping the
-key (`wrapped-no-duration`) gives the identical ids, grids and pixels. `do_sample_frames=False` in
-the metadata dict is honoured (vLLM copies it into the per-video HF kwargs).
+vLLM 0.24.0 accepts it:
+- `Qwen3VLMultiModalProcessor._call_hf_processor` builds `VideoMetadata(**metadata)`, minus
+  `do_sample_frames`.
+- When `do_sample_frames` is False, the timestamps use only `frames_indices` and `fps`.
+- Dropping the key (`wrapped-no-duration`) gives identical ids, grids and pixels.
 
 ## Incidental finding: three-view caption geometry depends on the platform's PNG encoder
 
-The three-view caption frame sizes differ between this macOS arm64 dev machine and the Modal
-x86_64 container for the same synthetic frames (e.g. caption-three-dex synthetic: grid 22x20 per
-frame locally, 28x24 on Modal). Within each machine HF and vLLM agree, so Gate C is unaffected.
-The cause is NVIDIA's `robot_caption_geometry.normalized`: it picks the first scale whose packed
-PNG byte size fits `PACKED_IMAGE_LIMIT_BYTES`, and compressed PNG size depends on the zlib build
-in the Pillow wheel. This confirms PLAN D11 (decode and image work on x86_64 with exact Pillow):
-golden data and production must share the image stack, not just the Pillow version.
+For the same synthetic frames, three-view caption frame sizes differ between the macOS arm64 dev
+machine and the Modal x86_64 container. Example, caption-three-dex synthetic: 22x20 locally,
+28x24 on Modal.
 
-## Spend and image
+The cause is NVIDIA's `robot_caption_geometry.normalized`. It picks the first scale whose packed
+PNG byte size fits `PACKED_IMAGE_LIMIT_BYTES`, and compressed size depends on the zlib build in
+the Pillow wheel.
 
-- Modal billing for app `flora-gatec` today: L40S $0.66 + CPU $0.06 + memory $0.13 ≈ **$0.86**
-  (cap $6). One earlier attempt failed locally (sample download 403, fixed with a User-Agent)
-  before any GPU container started.
-- Per container: request building 124 s (tempseg) / 297 s (captioner), engine start ≈ 200 s
-  (weights 13–22 s, profiling/warmup ≈ 150 s), compare ≈ 65 s.
-- `img_vllm` (`vllm_image()`) built as pinned with no changes (`nvidia/cuda:13.0.2-devel-ubuntu24.04`
-  + vllm==0.24.0, transformers==5.8.1, torch 2.11.0+cu130 from vLLM's own pin).
+Within each machine HF and vLLM agree, and stage 1 and stage 2 both run in the same image. This
+confirms PLAN D11: golden data and production must share the image stack, not just the Pillow
+version.
+
+## Spend and harness
+
+- Modal billing for app `flora-gatec`: $1.62 cumulative, which includes the first run's $0.86.
+  This run cost about **$0.76** (cap $1.50). Billing lags by about an hour.
+- Stage 1 (CPU, 2 vCPU and 12 GiB each), wall 556 s. The slowest part was captioner `golden:human`
+  at 547 s: 1080p PNG work in `caption_single`.
+- Stage 2 per L40S:
+
+  | Kind | Load | Engine start | Compare | Total in function |
+  |---|---|---|---|---|
+  | tempseg | 11 s | 210 s | 115 s | 355 s |
+  | captioner | 14 s | 212 s | 137 s | 382 s |
+
+- The stage 1 pickles (which hold NC-licensed frames) go to `flora-golden:gatec-tmp/<run>/`, and
+  stage 2 deletes them.
+- `img_vllm` (`vllm_image()`) was used unchanged for both stages.
 
 ## Reproduce
 
 ```
-uv run modal run scripts/gatec.py            # both kinds in parallel, prints the tables
-uv run pytest -q -m nvlink tests/nvlink/test_nv_link_capture_vllm_prompt.py   # no GPU
+uv run modal run scripts/gatec.py                 # [--quota 6] [--max-requests 2] [--no-golden]
+uv run pytest -q -m nvlink tests/nvlink/test_nv_link_capture_vllm_prompt*.py   # no GPU
 ```

@@ -10,6 +10,11 @@ canned answer instead of running a model. It runs twice per case:
   call), whose ``input_ids`` / ``video_grid_thw`` / ``pixel_values_videos`` we keep;
 - with ``CaptureProcessor``: the ``CapturedRequest`` objects that go to vLLM.
 
+Golden episodes (``build_golden``): the same two runs on a real staged episode of the
+``flora-golden`` Volume (``golden/v1/``), with NVIDIA's real ``media.probe`` and
+``decode_selected`` (memoized so the second run reuses the first run's frames); only
+``generate`` is canned, and the pipeline is stopped after the wanted number of calls.
+
 All NVIDIA objects are reached through the ``NvFamily`` handle from ``nv.linker.load_family``;
 this module imports no NVIDIA code itself.
 """
@@ -39,8 +44,11 @@ CASES: dict[str, tuple[str, str, int, str]] = {
     "temporal-yam-3view": ("segment", "yam", 3, ""),
     "temporal-dex-3view": ("segment", "dex", 3, ""),
     "temporal-yam32-3view": ("segment", "yam32", 3, ""),
+    "temporal-yam-3view-instruction": ("segment", "yam", 3, "Fold the towel."),
+    "temporal-tianji-3view": ("segment", "tianji", 3, ""),
     "caption-three-yam": ("caption_three", "YAM", 3, ""),
     "caption-three-dex": ("caption_three", "Dex", 3, "Fold the towel."),
+    "caption-three-tianji": ("caption_three", "Tianji", 3, "Fold the towel."),
     "caption-single-human": ("caption_single", "Human", 1, ""),
     "caption-single-human-instruction": ("caption_single", "Human", 1, "Fold the towel."),
     "caption-single-robot": ("caption_single", "YAM", 1, ""),
@@ -58,7 +66,7 @@ class FrameSource:
 
     name: str
     size: tuple[int, int]  # (width, height)
-    fps: int
+    fps: int | Fraction  # exact rate (e.g. 30000/1001); never truncated
     duration_s: float
     frame: Callable[[str, int], Any]
 
@@ -81,7 +89,8 @@ def synthetic_source(size=(640, 480), fps=30, duration_s=40.0) -> FrameSource:
                        lambda role, i: synthetic_frame(role, i, size))
 
 
-def decoded_source(name: str, frames: np.ndarray, fps: int, duration_s=40.0) -> FrameSource:
+def decoded_source(name: str, frames: np.ndarray, fps: int | Fraction,
+                   duration_s=40.0) -> FrameSource:
     """A real video's decoded frames (uint8 THWC). Index ``i`` maps to frame ``i % T``; the
     three camera roles get the frame as is, mirrored, and flipped, so they differ."""
     from PIL import Image
@@ -112,11 +121,12 @@ def decode_all(path: str | Path) -> tuple[np.ndarray, Fraction]:
 
 
 def make_videos(nv, roles, source: FrameSource):
-    n = int(source.duration_s * source.fps)
+    rate = Fraction(source.fps)
+    n = int(Fraction(source.duration_s) * rate)
     return {
         role: nv.media.Video(
-            path=Path(f"{role}.mp4"), sha256=f"{i:02d}" * 32, rate=Fraction(source.fps),
-            pts_us=tuple(Fraction(k * 1_000_000, source.fps) for k in range(n)),
+            path=Path(f"{role}.mp4"), sha256=f"{i:02d}" * 32, rate=rate,
+            pts_us=tuple(Fraction(k * 1_000_000) / rate for k in range(n)),
             duration_us=int(source.duration_s * 1_000_000), size=source.size, cfr=True,
         )
         for i, role in enumerate(roles)
@@ -173,72 +183,262 @@ class _Patch:
             setattr(obj, name, value)
 
 
-def drive(nv, case: tuple[str, str, int, str], procs: dict, source: FrameSource) -> int:
-    """Run one NVIDIA pipeline function with the given processors; return #generate calls."""
+class _Enough(BaseException):  # noqa: N818 - control flow, not an error
+    """Raised from the fake ``generate`` once enough calls are recorded. It stops NVIDIA's
+    pipeline early; a ``BaseException`` so no ``except Exception`` in NVIDIA's code swallows it."""
+
+
+def run_pipeline(nv, path: str, pool_or_profile: str, videos: dict, segments: list[dict],
+                 instruction: str, procs: dict, decode: Callable | None = None,
+                 max_calls: int | None = None) -> int:
+    """Run one NVIDIA pipeline function (``segment``, ``caption_three``, ``caption_single``)
+    with the given processors and a canned ``generate``; return the number of generate calls.
+    ``decode`` replaces ``media.decode_selected`` (None keeps NVIDIA's real decoder);
+    ``max_calls`` stops the pipeline after that many generate calls."""
     pipeline = nv.pipeline
     generated: list[int] = []
 
-    def fake_decode(video, wanted, canonical=False):
-        return {i: source.frame(video.path.stem, i) for i in wanted}
-
     def fake_generate(model, proc, inputs, budget):
         generated.append(budget)
+        if max_calls is not None and len(generated) >= max_calls:
+            raise _Enough
         return '{"segments":[]}' if budget == 1024 else "pick up the cup"
 
     patch = _Patch()
-    patch.set(nv.media, "decode_selected", fake_decode)
+    if decode is not None:
+        patch.set(nv.media, "decode_selected", decode)
     patch.set(pipeline, "generate", fake_generate)
     try:
         session = CachedSession(lambda: _FakeNvSession(procs))
         progress = lambda *a, **k: None  # noqa: E731
-        kind, pool_or_profile, n_views, instruction = case
-        videos = make_videos(nv, ROLES3[:n_views], source)
-        segments = [dict(start_s=2.0, end_s=5.0, metadata={}),
-                    dict(start_s=6.0, end_s=9.5, metadata={})]
-        if kind == "segment":
+        if path == "segment":
             pipeline.segment(videos, pool_or_profile, session, instruction, progress)
-        elif kind == "caption_three":
+        elif path == "caption_three":
             pipeline.caption_three(videos, segments, session, instruction, progress,
                                    profile=pool_or_profile)
-        else:
+        elif path == "caption_single":
             pipeline.caption_single(videos, segments, pool_or_profile, session, instruction,
                                     progress)
+        else:
+            raise ValueError(f"unknown pipeline path {path!r}")
+    except _Enough:
+        pass
     finally:
         patch.undo()
     return len(generated)
 
 
+def drive(nv, case: tuple[str, str, int, str], procs: dict, source: FrameSource,
+          max_calls: int | None = None) -> int:
+    """Run one ``CASES`` entry on a ``FrameSource``; return #generate calls."""
+
+    def fake_decode(video, wanted, canonical=False):
+        return {i: source.frame(video.path.stem, i) for i in wanted}
+
+    path, pool_or_profile, n_views, instruction = case
+    videos = make_videos(nv, ROLES3[:n_views], source)
+    segments = [dict(start_s=2.0, end_s=5.0, metadata={}),
+                dict(start_s=6.0, end_s=9.5, metadata={})]
+    return run_pipeline(nv, path, pool_or_profile, videos, segments, instruction, procs,
+                        decode=fake_decode, max_calls=max_calls)
+
+
 @dataclass
 class BuiltRequest:
     case_id: str
-    index: int  # n-th processor call of the case
+    index: int  # n-th processor call of the case (per source)
     kind: str  # tempseg | captioner
     source: str
     request: CapturedRequest
     hf: dict  # NVIDIA's own processor output: input_ids, video_grid_thw, pixel_values_videos
 
 
-def build_requests(nv, procs: dict, case_id: str, source: FrameSource,
-                   max_requests: int | None = None) -> list[BuiltRequest]:
-    """HF reference + captured requests for one case, checked to be the same calls."""
-    case = CASES[case_id]
-    kind = processor_kind(case_id)
+def _spy_and_capture(label: str, kind: str, procs: dict, run: Callable[[dict], int],
+                     source: str, max_requests: int | None) -> list[BuiltRequest]:
+    """Run NVIDIA's code twice (spy on the real processor, then ``CaptureProcessor``) and pair
+    the calls, checking they are the same calls (prompt, frames, metadata)."""
     spy = SpyProcessor(procs[kind])
-    n_ref = drive(nv, case, {**procs, kind: spy}, source)
+    n_ref = run({**procs, kind: spy})
     cap = CaptureProcessor(procs[kind])
-    n_cap = drive(nv, case, {**procs, kind: cap}, source)
+    n_cap = run({**procs, kind: cap})
     if not (n_ref == n_cap == len(spy.calls) == len(cap.requests) >= 1):
-        raise RuntimeError(f"{case_id}: {n_ref}/{n_cap} generate calls, {len(spy.calls)} HF "
+        raise RuntimeError(f"{label}: {n_ref}/{n_cap} generate calls, {len(spy.calls)} HF "
                            f"calls, {len(cap.requests)} captured")
     out = []
     for i, (ref, req) in enumerate(zip(spy.calls, cap.requests, strict=True)):
         if req.prompt != ref["prompt"] or len(req.videos) != len(ref["frames"]):
-            raise RuntimeError(f"{case_id}#{i}: captured prompt/videos differ from NVIDIA's call")
+            raise RuntimeError(f"{label}#{i}: captured prompt/videos differ from NVIDIA's call")
         for (frames, md), ref_frames, ref_md in zip(req.videos, ref["frames"], ref["metadata"],
                                                     strict=True):
             if not np.array_equal(frames, ref_frames) or md != metadata_to_dict(ref_md):
-                raise RuntimeError(f"{case_id}#{i}: captured frames/metadata differ")
-        out.append(BuiltRequest(case_id, i, kind, source.name, req, ref["output"]))
+                raise RuntimeError(f"{label}#{i}: captured frames/metadata differ")
+        out.append(BuiltRequest(label, i, kind, source, req, ref["output"]))
         if max_requests is not None and len(out) >= max_requests:
             break
     return out
+
+
+def build_requests(nv, procs: dict, case_id: str, source: FrameSource,
+                   max_requests: int | None = None) -> list[BuiltRequest]:
+    """HF reference + captured requests for one case, checked to be the same calls."""
+    kind = processor_kind(case_id)
+    return _spy_and_capture(
+        case_id, kind, procs, lambda p: drive(nv, CASES[case_id], p, source, max_requests),
+        source.name, max_requests)
+
+
+# ---------------------------------------------------------------------------------------------
+# Golden episodes (Volume ``flora-golden``, ``golden/v1/``; docs/golden-manifest-v1.md)
+
+# golden pool -> (segmenter pool, caption path, caption profile, camera views); the same mapping
+# NVIDIA's ``pipeline.annotate`` applies (single-view robot episodes use profile YAM, yam32 is
+# YAM with long windows).
+GOLDEN_POOLS: dict[str, tuple[str, str, str, int]] = {
+    "human": ("human", "caption_single", "Human", 1),
+    "single_view_robot": ("yam", "caption_single", "YAM", 1),
+    "yam": ("yam", "caption_three", "YAM", 3),
+    "yam32": ("yam32", "caption_three", "YAM", 3),
+    "dex": ("dex", "caption_three", "Dex", 3),
+    "tianji": ("tianji", "caption_three", "Tianji", 3),
+}
+
+
+@dataclass(frozen=True)
+class GoldenEpisode:
+    id: str  # "<pool>/<dataset>/<slug>"
+    pool: str
+    dir: Path
+    task: str  # dataset task text (used as the instruction on alternate episodes; never logged)
+
+
+def load_golden_manifest(root: str | Path) -> dict:
+    """``golden/v1/manifest.json`` under the Volume root ``root``."""
+    import json
+
+    from flora_deploy.validate.golden import GOLDEN_PREFIX, MANIFEST_NAME
+
+    return json.loads((Path(root) / GOLDEN_PREFIX / MANIFEST_NAME).read_text())
+
+
+def golden_episodes(root: str | Path, manifest: dict) -> dict[str, list[GoldenEpisode]]:
+    """Staged, oracle-eligible episodes of every ``GOLDEN_POOLS`` pool, in manifest order.
+    ``root`` is the Volume root (manifest paths start with ``golden/v1/``)."""
+    out: dict[str, list[GoldenEpisode]] = {p: [] for p in GOLDEN_POOLS}
+    for ep in manifest["episodes"]:
+        if ep["pool"] in out and ep.get("status") == "staged" and ep.get("oracle_eligible"):
+            out[ep["pool"]].append(GoldenEpisode(ep["id"], ep["pool"], Path(root) / ep["path"],
+                                                 ep.get("task") or ""))
+    return out
+
+
+def golden_segments(duration_s: float) -> list[dict]:
+    """Three caption targets spread over the episode (10%, 40%, 70% in; 1-4 s long)."""
+    length = max(1.0, min(4.0, 0.2 * duration_s))
+    return [dict(start_s=round(f * duration_s, 3),
+                 end_s=round(min(f * duration_s + length, 0.98 * duration_s), 3), metadata={})
+            for f in (0.1, 0.4, 0.7)]
+
+
+class MemoDecode:
+    """NVIDIA's real ``media.decode_selected``, memoized per (file, canonical, wanted) so the
+    capture run reuses the spy run's frames instead of decoding again. Returns copies."""
+
+    def __init__(self, real: Callable):
+        self.real, self.cache = real, {}
+
+    def __call__(self, video, wanted, canonical=False):
+        key = (str(video.path), bool(canonical), frozenset(wanted))
+        if key not in self.cache:
+            self.cache[key] = self.real(video, wanted, canonical)
+        return {i: im.copy() for i, im in self.cache[key].items()}
+
+
+def probe_episode(nv, ep: GoldenEpisode) -> dict:
+    """NVIDIA ``media.Video`` per role via NVIDIA's own ``media.probe`` (+ sync check)."""
+    n_views = GOLDEN_POOLS[ep.pool][3]
+    videos = {role: nv.media.probe(ep.dir / f"{role}.mp4") for role in ROLES3[:n_views]}
+    if n_views == 3:
+        nv.media.check_synchronized(videos)
+    return videos
+
+
+def build_golden_requests(nv, procs: dict, kind: str, ep: GoldenEpisode, max_requests: int,
+                          use_instruction: bool, videos: dict | None = None) -> list[BuiltRequest]:
+    """HF reference + captured requests for the first ``max_requests`` processor calls NVIDIA's
+    pipeline makes on a real golden episode (real probe, real decode; only ``generate`` is
+    canned). ``kind`` picks the segmenter (``tempseg``) or captioner path."""
+    seg_pool, cap_path, cap_profile, _ = GOLDEN_POOLS[ep.pool]
+    videos = videos if videos is not None else probe_episode(nv, ep)
+    instruction = ep.task.strip() if use_instruction else ""
+    if kind == "tempseg":
+        path, pool_or_profile, segments = "segment", seg_pool, []
+    else:
+        path, pool_or_profile = cap_path, cap_profile
+        segments = golden_segments(videos["main"].duration_s)
+    decode = MemoDecode(nv.media.decode_selected)
+    return _spy_and_capture(
+        f"golden-{ep.pool}", kind, procs,
+        lambda p: run_pipeline(nv, path, pool_or_profile, videos, segments, instruction, p,
+                               decode=decode, max_calls=max_requests),
+        ep.id, max_requests)
+
+
+# ---------------------------------------------------------------------------------------------
+# Compact records (what crosses the builder-process boundary on Modal)
+
+
+@dataclass
+class RequestRecord:
+    case_id: str
+    index: int
+    kind: str
+    source: str
+    request: CapturedRequest
+    hf_ids: list[int]
+    hf_grids: list[list[int]]
+    hf_pixels: list[dict]  # per video: rows + sha256 in fp32 and bf16 (validate.gatec)
+
+
+def compact(b: BuiltRequest) -> RequestRecord:
+    from flora_deploy.validate.gatec import video_pixel_digests
+
+    grids = b.hf["video_grid_thw"].tolist()
+    return RequestRecord(b.case_id, b.index, b.kind, b.source, b.request,
+                         b.hf["input_ids"][0].tolist(), grids,
+                         video_pixel_digests(b.hf["pixel_values_videos"], grids))
+
+
+def build_cases(nv, procs: dict, kind: str, sources: list[FrameSource],
+                max_requests: int) -> list[RequestRecord]:
+    out = []
+    for source in sources:
+        for case_id in CASES:
+            if processor_kind(case_id) == kind:
+                out += [compact(b) for b in
+                        build_requests(nv, procs, case_id, source, max_requests)]
+    return out
+
+
+def build_golden(nv, procs: dict, kind: str, episodes: dict[str, list[GoldenEpisode]],
+                 quota: int, max_per_episode: int = 3) -> tuple[list[RequestRecord], list[dict]]:
+    """Up to ``quota`` requests per pool, spread over the pool's episodes (at most
+    ``ceil(quota / #episodes)`` and ``max_per_episode`` each). Every other episode carries its
+    dataset task as the instruction. Errors are recorded by class name only."""
+    records, errors = [], []
+    for pool, eps in episodes.items():
+        if not eps:
+            continue
+        per_ep = min(max_per_episode, max(1, -(-quota // len(eps))))
+        remaining = quota
+        for n, ep in enumerate(eps):
+            if remaining <= 0:
+                break
+            try:
+                built = build_golden_requests(nv, procs, kind, ep, min(per_ep, remaining),
+                                              use_instruction=n % 2 == 0)
+            except Exception as exc:  # recorded, not raised: the gate reports coverage
+                errors.append(dict(pool=pool, episode=ep.id, error=type(exc).__name__))
+                continue
+            records += [compact(b) for b in built]
+            remaining -= len(built)
+    return records, errors
