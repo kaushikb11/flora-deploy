@@ -197,3 +197,23 @@ def test_apply_option_round_trips_config():
                                    max_gpus=10))[0]
     cfg2 = parse_config(apply_option(data, bal), allow_uncertified=True)  # no certificates yet
     assert cfg2.preset == "balanced" and "segcap" not in cfg2.resources
+
+
+def test_never_recommends_an_unavailable_option():
+    """Review 6 M2: exact over budget used to make the uncertified, placeholder-priced and
+    factory-refused ``balanced`` the recommendation."""
+    req = PlanRequest(WorkloadSummary.from_hours(10), budget_usd=80, max_gpus=10)
+    opts = plan_options(req)
+    bal = [o for o in opts if o.preset == "balanced"]
+    assert bal, "balanced must still be shown"
+    for o in bal:
+        why = " ".join(o.unavailable)
+        assert "uncertified" in why and "placeholder" in why and "factory" in why, why
+        assert any(f.startswith("unavailable:") for f in o.flags)
+    best = recommended(opts)
+    assert best is None or (best.preset == "exact" and not best.unavailable)
+
+
+def test_exact_segcap_is_available():
+    req = PlanRequest(WorkloadSummary.from_hours(10), presets=("exact",), max_gpus=10)
+    assert all(not o.unavailable for o in plan_options(req) if not o.requires)

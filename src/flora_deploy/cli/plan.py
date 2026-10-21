@@ -147,10 +147,13 @@ def plan(
                 for k in o.kinds)
             mark = " *" if o is best else ""
             colour = {"ok": "green", "at risk": "yellow", "infeasible": "red"}[o.status]
+            status = f"[{colour}]{o.status}[/{colour}]"
+            if o.unavailable:
+                status += " [red](unavailable)[/red]"
             t.add_row(str(i) + mark, o.name, gpus,
                       f"{_money(o.cost_usd)} ({_money(o.cost_low_usd)}-{_money(o.cost_high_usd)})",
                       f"{o.wall_s / 3600:.1f} h (<= {o.wall_high_s / 3600:.1f} h)",
-                      str(o.peak_gpus), o.certification, f"[{colour}]{o.status}[/{colour}]")
+                      str(o.peak_gpus), o.certification, status)
         console.print(t)
         for i, o in enumerate(options, 1):
             for f in o.flags:
@@ -159,8 +162,8 @@ def plan(
                       (f" (x{rates.region_multiplier} region)" if rates.region_multiplier != 1
                        else "") + f". Rates: {escape(table.source)} ({table.updated}).")
         if best is None:
-            console.print("[red]No option fits: raise --budget / --deadline / max_gpus, or "
-                          "label fewer episodes.[/red]")
+            console.print("[red]No option fits (of those available): raise --budget / --deadline / "
+                          "max_gpus, or label fewer episodes.[/red]")
         else:
             console.print(f"Recommended: {options.index(best) + 1} ({escape(best.name)}). "
                           f"Write it with `flora plan ... --write {options.index(best) + 1}`.")
