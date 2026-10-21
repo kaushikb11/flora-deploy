@@ -9,18 +9,24 @@
   memory) rates, over ``ContainerReceipt`` files. A container without ``stopped_utc`` is billed up
   to *now* while its heartbeat is fresh, and up to ``heartbeat + stale_after_s`` once the heartbeat
   is stale (presumed dead; Modal bills until the container is actually gone, so this is the
-  conservative end of what we can know).
-* **Projection** (:func:`project`): spend + in-flight + queued + future container starts.
-  Per-shard container time comes from ``Shard.est_gpu_seconds`` (GPU-seconds of the shard's pool,
-  so container-seconds = GPU-seconds / ``gpu_count``) times a calibration factor; in-flight shards
-  are charged ``in_flight_fraction`` (default 1.0: their full estimate, conservative because the
-  part already run is also in spend).
+  conservative end of what we can know). Spend never depends on receipts alone:
+  :func:`calls_cost` estimates it from the orchestrator's spawn-time call history,
+  :func:`modal_billing_provider` reads Modal's hourly billing, and the gate takes the largest of
+  the three (:class:`SpendReport`).
+* **Estimates** (:class:`RateTableEstimator`): ``planner/rates.json``, the same measured rates
+  ``flora plan`` uses (exact segcap 8.62 container-s per video-s at c=1, 4.08 at c=4), plus its
+  per-container startup, calibrated online from finished calls. ``Shard.est_gpu_seconds``
+  (placeholder manifest rates, :class:`ManifestEstimator`) is only a fallback.
+* **Projection** (:func:`project`): spend + in-flight (remaining estimate) + queued + future
+  container starts.
 * **Gate** (:class:`ProjectionBudgetGate`): implements ``orchestrator.BudgetGate``. Denies a spawn
   when the projection exceeds ``budget × (1 − safety_margin)``; the orchestrator then writes
-  ``budget_stop`` and drains.
+  ``budget_stop`` and drains. :meth:`ProjectionBudgetGate.overspend` is the hard cap: the live
+  calls to *cancel* when spend + in-flight would pass ``budget_usd``.
 * **Backstop** (:func:`environment_budget_usd`, :func:`apply_environment_budget`): the native Modal
   Environment budget at ``budget × environment_budget_factor``. Modal's Python SDK (1.6.2) has no
-  call to set an Environment budget, so the default is the exact manual instruction.
+  call to set an Environment budget, so the default is the exact manual instruction, printed when
+  the orchestrator starts and carried in its run summary (:func:`budget_summary`).
 """
 
 from __future__ import annotations
@@ -32,12 +38,13 @@ import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
-from typing import Any
+from typing import Any, Protocol
 
 from flora_deploy.jobs.orchestrator import BudgetDecision
 from flora_deploy.jobs.settings import PoolSettings, RunSettings
 from flora_deploy.jobs.store import JobPaths, Store
 from flora_deploy.jobs.types import ContainerReceipt, Shard
+from flora_deploy.planner.rates import RateTable
 
 # ----------------------------------------------------------------------------------------------
 # Rates
@@ -239,6 +246,228 @@ def read_container_receipts(store: Store, job_id: str) -> list[ContainerReceipt]
 
 
 # ----------------------------------------------------------------------------------------------
+# Spend from the orchestrator's own call history, and from Modal billing
+# ----------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CallRecord:
+    """One worker call as the orchestrator recorded it (``call.json`` ``calls`` entries).
+
+    ``spawned_at`` is when the orchestrator spawned it; ``ended_at`` when the orchestrator saw it
+    end (success, failure, expiry, cancel), ``None`` while it is live."""
+
+    call_id: str
+    shard_id: str
+    kind: str
+    spawned_at: float
+    ended_at: float | None = None
+    outcome: str | None = None
+
+    @property
+    def live(self) -> bool:
+        return self.ended_at is None
+
+
+@dataclass(frozen=True)
+class BudgetState:
+    """What the orchestrator tells the gate every tick (see :meth:`ProjectionBudgetGate.observe`
+    and :meth:`ProjectionBudgetGate.overspend`)."""
+
+    now: float
+    calls: tuple[CallRecord, ...] = ()
+
+    def live(self) -> list[CallRecord]:
+        return [c for c in self.calls if c.live]
+
+
+def calls_cost(calls: Iterable[CallRecord], settings: RunSettings, rates: Rates, now: float, *,
+               scaledown_s: float = 60.0) -> float:
+    """Spawn-time spend estimate, independent of container receipts.
+
+    Per kind, a sweep over call intervals ``[spawned_at, ended_at or now]``: at every instant the
+    kind runs ``ceil(live calls / max_inputs)`` containers, each billed at the pool rate, plus
+    ``scaledown_s`` of idle time every time a container goes away (Modal keeps it for its
+    ``scaledown_window``). A container never starts before its call is spawned and the
+    orchestrator sees a call end only after it ended, so this over- rather than under-counts the
+    containers of the calls it knows (it cannot see orphan calls; receipts and billing can)."""
+    by_kind: dict[str, list[tuple[float, int]]] = {}
+    for c in calls:
+        start = min(c.spawned_at, now)
+        ev = by_kind.setdefault(c.kind, [])
+        ev.append((start, +1))
+        if c.ended_at is not None and c.ended_at < now:  # live calls run up to now
+            ev.append((max(c.ended_at, start), -1))
+    total = 0.0
+    for kind, ev in by_kind.items():
+        pool = settings.pools[kind]  # type: ignore[index]
+        mi = max(pool.max_inputs, 1)
+        per_s = rates.pool_per_second(pool)
+        ev.sort(key=lambda e: (e[0], -e[1]))  # starts before ends at the same instant
+        ev.append((now, 0))
+        n = 0
+        last = ev[0][0]
+        for t, d in ev:
+            containers = math.ceil(n / mi)
+            total += (t - last) * containers * per_s
+            n += d
+            after = math.ceil(n / mi)
+            if after < containers:
+                total += (containers - after) * scaledown_s * per_s
+            last = t
+    return total
+
+
+BillingProvider = Callable[[], float]
+
+
+def modal_billing_provider(*, start: datetime, tags: Mapping[str, str] | None = None,
+                           descriptions: Sequence[str] = (),
+                           report: Callable[..., Any] | None = None) -> BillingProvider:
+    """Job spend from Modal's own billing (``Workspace.billing.report``, the API behind
+    ``modal billing report``), hourly resolution.
+
+    Rows count when their tags include every ``tags`` item (workers tagged with the job id) or
+    their description is one of ``descriptions`` (e.g. a per-job worker app). Modal reports only
+    *complete* intervals, so this lags by up to an hour (plus Modal's own processing delay): it
+    is a floor that catches what receipts and the call history miss (orphan calls, idle
+    containers, max(request, usage) CPU/memory billing), never the only source. Never called by
+    tests; ``report`` is injectable."""
+
+    def provider() -> float:
+        fn = report
+        if fn is None:
+            import modal
+
+            fn = modal.Workspace.from_context().billing.report
+        rows = fn(start=start, resolution="h", tag_names=["*"])
+        want = dict(tags or {})
+        total = 0.0
+        for row in rows:
+            row_tags = dict(row["tags"] or {})
+            if (want and all(row_tags.get(k) == v for k, v in want.items())) or \
+                    row["description"] in descriptions:
+                total += float(row["cost"])
+        return total
+
+    return provider
+
+
+@dataclass(frozen=True)
+class SpendReport:
+    """Spend from each source, reconciled. ``total_usd`` is the largest: each source is a
+    (near-)floor of the truth for a different reason, so the max never undercounts what any of
+    them can see."""
+
+    receipts_usd: float  # ContainerReceipt files (known ones re-read by path every tick)
+    calls_usd: float  # spawn-time estimate from the orchestrator's call history
+    billing_usd: float | None  # Modal billing report (hourly, lagging), if configured
+    containers: int  # container receipts known
+    live_calls: int
+
+    @property
+    def total_usd(self) -> float:
+        return max(self.receipts_usd, self.calls_usd, self.billing_usd or 0.0)
+
+    @property
+    def source(self) -> str:
+        vals = {"receipts": self.receipts_usd, "calls": self.calls_usd,
+                "billing": self.billing_usd or 0.0}
+        return max(vals, key=lambda k: vals[k])
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"spend_receipts_usd": round(self.receipts_usd, 4),
+                "spend_calls_usd": round(self.calls_usd, 4),
+                "spend_billing_usd": None if self.billing_usd is None
+                else round(self.billing_usd, 4),
+                "spend_source": self.source, "containers": self.containers,
+                "live_calls": self.live_calls}
+
+
+# ----------------------------------------------------------------------------------------------
+# Shard estimates (planner/rates.json, the same numbers ``flora plan`` uses)
+# ----------------------------------------------------------------------------------------------
+
+
+class ShardEstimator(Protocol):
+    @property
+    def source(self) -> str: ...
+
+    def container_seconds(self, shard: Shard, pool: PoolSettings) -> float:
+        """Container-seconds of ``pool`` one shard costs (amortized over ``max_inputs``)."""
+        ...
+
+    def startup_s(self, kind: str) -> float:
+        """Seconds from container start to ready, paid once per container."""
+        ...
+
+
+@dataclass(frozen=True)
+class ManifestEstimator:
+    """``Shard.est_gpu_seconds`` / ``gpu_count``: the manifest's own (placeholder-rate) estimate.
+    Only for tests and for kinds ``rates.json`` has no entry for."""
+
+    source: str = "manifest est_gpu_seconds"
+
+    def container_seconds(self, shard: Shard, pool: PoolSettings) -> float:
+        return shard.est_gpu_seconds / max(pool.gpu_count, 1)
+
+    def startup_s(self, kind: str) -> float:
+        return 0.0
+
+
+@dataclass(frozen=True)
+class RateTableEstimator:
+    """Estimates from ``planner/rates.json`` (:class:`~flora_deploy.planner.rates.RateTable`).
+
+    Shard cost = video seconds × ``container_s_per_video_s`` for (preset, kind, cameras,
+    concurrency = the pool's ``max_inputs``), e.g. exact segcap 8.62 container-s per video-s at
+    c=1 and 4.08 at c=4. Video seconds come from ``durations`` (uid -> seconds, from the manifest's
+    ``EpisodeRef.duration_s``) or, without them, are recovered from ``est_gpu_seconds`` by
+    dividing out the manifest's placeholder rate (``jobs.manifest.DEFAULT_RATES``). ``quantile=
+    "upper"`` charges the top of each rate's error bar (``× (1 + uncertainty)``)."""
+
+    table: RateTable
+    preset: str
+    cameras: int | Mapping[str, int] = 1
+    durations: Mapping[str, float] | None = None
+    quantile: str = "mid"
+    fallback: ManifestEstimator = field(default_factory=ManifestEstimator)
+
+    @property
+    def source(self) -> str:
+        return f"{self.table.source} ({self.quantile})"
+
+    @classmethod
+    def default(cls, preset: str, **kw: Any) -> RateTableEstimator:
+        return cls(RateTable.load(), preset, **kw)
+
+    def video_seconds(self, shard: Shard) -> float:
+        if self.durations is not None and all(u in self.durations for u in shard.episodes):
+            return float(sum(self.durations[u] for u in shard.episodes))
+        from flora_deploy.jobs.manifest import DEFAULT_RATES
+
+        return shard.est_gpu_seconds / DEFAULT_RATES[shard.kind]
+
+    def _cameras(self, shard: Shard) -> int:
+        if isinstance(self.cameras, int):
+            return self.cameras
+        return max((self.cameras.get(u, 1) for u in shard.episodes), default=1)
+
+    def container_seconds(self, shard: Shard, pool: PoolSettings) -> float:
+        try:
+            e = self.table.rate(self.preset, shard.kind, self._cameras(shard), pool.max_inputs)
+        except KeyError:
+            return self.fallback.container_seconds(shard, pool)
+        k = 1.0 + e.uncertainty if self.quantile == "upper" else 1.0
+        return self.video_seconds(shard) * e.container_s_per_video_s * k
+
+    def startup_s(self, kind: str) -> float:
+        e = self.table.startup_for(self.preset, kind)
+        return e.startup_s * (1.0 + e.uncertainty if self.quantile == "upper" else 1.0)
+
+
+# ----------------------------------------------------------------------------------------------
 # Projection
 # ----------------------------------------------------------------------------------------------
 
@@ -262,36 +491,44 @@ class Projection:
                 "projected_usd": round(self.total_usd, 4)}
 
 
-def shard_container_seconds(shard: Shard, pool: PoolSettings, calibration: float = 1.0) -> float:
-    """``est_gpu_seconds`` is GPU-seconds of the shard's pool; containers hold ``gpu_count``."""
-    return shard.est_gpu_seconds / max(pool.gpu_count, 1) * calibration
+def shard_container_seconds(shard: Shard, pool: PoolSettings, calibration: float = 1.0, *,
+                            estimator: ShardEstimator | None = None) -> float:
+    """Container-seconds of one shard (default: the manifest's ``est_gpu_seconds`` / GPUs)."""
+    return (estimator or ManifestEstimator()).container_seconds(shard, pool) * calibration
 
 
 def project(*, spent: float, pending: Sequence[Shard], in_flight: Mapping[str, int],
             settings: RunSettings, rates: Rates, startup_s: Mapping[str, float] | None = None,
-            calibration: Mapping[str, float] | None = None, in_flight_fraction: float = 1.0
-            ) -> Projection:
+            calibration: Mapping[str, float] | None = None, in_flight_fraction: float = 1.0,
+            estimator: ShardEstimator | None = None,
+            live_remaining_usd: Mapping[str, Sequence[float]] | None = None) -> Projection:
     """Projected job cost. ``pending``: shards without a receipt (in-flight ones included).
     ``in_flight``: active calls per kind (as the orchestrator passes them). ``startup_s``:
     per-kind container startup seconds, charged for the containers still to be started
-    (``max_containers`` minus those in flight) of kinds that still have queued work."""
+    (``max_containers`` minus those in flight) of kinds that still have queued work.
+    ``live_remaining_usd``: per kind, the remaining cost of each live call the gate knows about
+    (estimate less what has already run, which is in ``spent``); in-flight calls beyond those
+    are charged ``mean estimate × in_flight_fraction``."""
     by_kind: dict[str, list[float]] = {}
     for s in pending:
         pool = settings.pools[s.kind]
         cal = (calibration or {}).get(s.kind, 1.0)
         by_kind.setdefault(s.kind, []).append(
-            shard_container_seconds(s, pool, cal) * rates.pool_per_second(pool))
+            shard_container_seconds(s, pool, cal, estimator=estimator)
+            * rates.pool_per_second(pool))
     in_flight_usd = queued_usd = startup_usd = 0.0
-    for kind in sorted(set(by_kind) | set(in_flight)):
+    for kind in sorted(set(by_kind) | set(in_flight) | set(live_remaining_usd or {})):
         costs = by_kind.get(kind, [])
-        n_flight = min(in_flight.get(kind, 0), len(costs)) if costs else 0
+        known = list((live_remaining_usd or {}).get(kind, ()))
+        n_live = max(in_flight.get(kind, 0), len(known))
+        n_flight = min(n_live, len(costs))
         mean = sum(costs) / len(costs) if costs else 0.0
-        in_flight_usd += n_flight * mean * in_flight_fraction
+        in_flight_usd += sum(known) + max(n_flight - len(known), 0) * mean * in_flight_fraction
         queued_usd += sum(costs) - n_flight * mean
         n_queued = len(costs) - n_flight
-        if n_queued > 0 and startup_s and kind in startup_s:
+        if n_queued > 0 and startup_s and startup_s.get(kind):
             pool = settings.pools[kind]  # type: ignore[index]
-            running = math.ceil(in_flight.get(kind, 0) / max(pool.max_inputs, 1))
+            running = math.ceil(n_live / max(pool.max_inputs, 1))
             new = min(max(pool.max_containers - running, 0),
                       math.ceil(n_queued / max(pool.max_inputs, 1)))
             startup_usd += new * startup_s[kind] * rates.pool_per_second(pool)
@@ -305,14 +542,32 @@ def project(*, spent: float, pending: Sequence[Shard], in_flight: Mapping[str, i
 
 @dataclass
 class ProjectionBudgetGate:
-    """``BudgetGate`` for the orchestrator.
+    """``BudgetGate`` for the orchestrator, plus the hard-cap hook :meth:`overspend`.
 
-    Reads container receipts and shard receipts from the store (refreshed at most every
-    ``refresh_s``), projects the job cost and denies when it exceeds the limit
-    ``budget_usd × (1 − safety_margin)``. ``policy="projection"`` (default) denies as soon as the
-    *whole remaining job* no longer fits, so a job never starts work it cannot finish;
-    ``policy="next_shard"`` only denies when spend + in-flight + this shard does not fit (use it to
-    get partial results from an under-funded job)."""
+    Per tick the Modal orchestrator (``modal_app.orchestrator_app.drive_tick``) calls
+    :meth:`refresh` (drop cached reads), then :meth:`overspend` with the orchestrator's call
+    history (:class:`BudgetState`; it also :meth:`observe`\\ s it) and cancels what it returns;
+    then ``tick()`` calls :meth:`admit` before each spawn.
+
+    **Spend** (:meth:`spend_report`) reconciles three sources and takes the largest: container
+    receipts (each one ever listed is re-read *by path* every tick, so listing lag never makes a
+    known one vanish, and its cost never goes down), the orchestrator's spawn-time call history
+    (:func:`calls_cost`: works with no receipts at all, and sees new calls before any listing
+    does), and Modal billing (``billing``, hourly, lagging).
+
+    **Admission** denies when the projection exceeds ``budget × (1 − safety_margin)``.
+    ``policy="projection"`` (default) denies as soon as the *whole remaining job* no longer fits;
+    ``policy="next_shard"`` only when spend + in-flight + this shard does not fit. Live calls are
+    charged their *remaining* estimate (what already ran is in spend).
+
+    **Hard cap** (:meth:`overspend`): when spend + live calls' remaining estimates + one tick of
+    burn exceeds ``budget_usd`` (no margin), returns live calls to cancel, largest remaining cost
+    first, until the rest fits; all of them once spend + one tick of burn alone reaches the cap.
+    That bounds the overspend by one tick of burn, whatever the estimates said.
+
+    **Estimates** default to ``planner/rates.json`` (:class:`RateTableEstimator`), the numbers
+    ``flora plan`` uses, and are calibrated online: per kind, the mean of (observed wall time −
+    startup) / (estimate × max_inputs) over finished calls, never below ``calibration``."""
 
     settings: RunSettings
     store: Store
@@ -320,64 +575,203 @@ class ProjectionBudgetGate:
     rates: Rates = field(default_factory=pinned_rates)
     safety_margin: float = 0.05
     policy: str = "projection"
-    startup_s: Mapping[str, float] = field(default_factory=dict)
+    startup_s: Mapping[str, float] | None = None  # default: the estimator's startup per kind
     calibration: Mapping[str, float] = field(default_factory=dict)
     in_flight_fraction: float = 1.0
     stale_after_s: float = 300.0
-    refresh_s: float = 60.0
+    refresh_s: float = 60.0  # fallback cache lifetime when nobody calls refresh() per tick
     quarantined: Callable[[], Iterable[str]] = lambda: ()
     clock: Callable[[], float] = time.time
+    estimator: ShardEstimator | None = None  # default: RateTableEstimator for settings.preset
+    billing: BillingProvider | None = None
+    billing_refresh_s: float = 900.0
+    scaledown_s: float = 60.0
+    tick_reserve_s: float = 30.0  # burn charged ahead in overspend(): poll interval + cancel lag
+    learn_calibration: bool = True
+    billing_error: str | None = field(default=None, init=False)
+    last_overspend: dict[str, Any] = field(default_factory=dict, init=False)
     _cache_at: float = field(default=-math.inf, init=False, repr=False)
-    _receipts: list[ContainerReceipt] = field(default_factory=list, init=False, repr=False)
+    _known: set[str] = field(default_factory=set, init=False, repr=False)
+    _receipts: dict[str, ContainerReceipt] = field(default_factory=dict, init=False, repr=False)
+    _floor: dict[str, float] = field(default_factory=dict, init=False, repr=False)
     _done: set[str] = field(default_factory=set, init=False, repr=False)
+    _state: BudgetState | None = field(default=None, init=False, repr=False)
+    _billing_at: float = field(default=-math.inf, init=False, repr=False)
+    _billing_usd: float | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.safety_margin < 1.0:
             raise ValueError("safety_margin must be in [0, 1)")
         if self.policy not in ("projection", "next_shard"):
             raise ValueError("policy must be 'projection' or 'next_shard'")
+        if self.estimator is None:
+            self.estimator = RateTableEstimator.default(self.settings.preset)
 
     @property
     def limit_usd(self) -> float:
         return self.settings.budget_usd * (1.0 - self.safety_margin)
 
+    # reads ----------------------------------------------------------------------------------
+    def refresh(self) -> None:
+        """Start of a tick: drop cached listings so this tick re-reads the store (call it after
+        the store's own ``refresh()``). Receipts already known stay known."""
+        self._cache_at = -math.inf
+
     def _refresh(self, now: float) -> None:
         if now - self._cache_at < self.refresh_s:
             return
-        self._receipts = read_container_receipts(self.store, self.settings.job_id)
         paths = JobPaths(self.settings.job_id)
+        self._known |= {p for p in self.store.list(paths.root + "/containers/")
+                        if p.endswith(".json")}
+        for p in sorted(self._known):
+            old = self._receipts.get(p)
+            if old is not None and old.stopped_utc is not None:
+                continue  # final: never re-read
+            try:  # by path, not by listing: a known receipt never disappears under lag
+                self._receipts[p] = ContainerReceipt(**json.loads(self.store.get_bytes(p)))
+            except Exception:  # half-visible or a transient read error: keep what we had
+                continue
         prefix = f"{paths.root}/{self.settings.config_hash}/receipts/"
-        self._done = {p.rsplit("/", 1)[-1].removesuffix(".json")
-                      for p in self.store.list(prefix) if p.endswith(".json")}
+        self._done |= {p.rsplit("/", 1)[-1].removesuffix(".json")
+                       for p in self.store.list(prefix) if p.endswith(".json")}
         self._cache_at = now
+
+    def _billing_now(self, now: float) -> float | None:
+        if self.billing is None:
+            return None
+        if now - self._billing_at >= self.billing_refresh_s:
+            try:
+                self._billing_usd = max(float(self.billing()), self._billing_usd or 0.0)
+                self.billing_error = None
+            except Exception as exc:  # billing API down / plan without billing: other sources
+                self.billing_error = repr(exc)
+            self._billing_at = now
+        return self._billing_usd
 
     def note_done(self, shard_id: str) -> None:
         """Optional hint (e.g. from the orchestrator's events) so a lagging list is not needed."""
         self._done.add(shard_id)
 
+    # orchestrator state ---------------------------------------------------------------------
+    def observe(self, state: BudgetState) -> None:
+        """The orchestrator's call history this tick (live and ended calls)."""
+        self._state = state
+        for c in state.calls:
+            if c.outcome == "success":
+                self._done.add(c.shard_id)
+
+    def _shard_map(self) -> dict[str, Shard]:
+        return {s.shard_id: s for s in self.shards()}
+
+    def _cs(self, shard: Shard) -> float:
+        assert self.estimator is not None
+        return self.estimator.container_seconds(shard, self.settings.pools[shard.kind])
+
+    def _startup(self, kind: str) -> float:
+        if self.startup_s is not None:
+            return float(self.startup_s.get(kind, 0.0))
+        assert self.estimator is not None
+        return self.estimator.startup_s(kind)
+
+    def effective_calibration(self) -> dict[str, float]:
+        cal = dict(self.calibration)
+        if not self.learn_calibration or self._state is None:
+            return cal
+        by_id = self._shard_map()
+        ratios: dict[str, list[float]] = {}
+        for c in self._state.calls:
+            s = by_id.get(c.shard_id)
+            if c.outcome != "success" or c.ended_at is None or s is None:
+                continue
+            est = self._cs(s) * max(self.settings.pools[s.kind].max_inputs, 1)
+            if est <= 0:
+                continue
+            work = max(c.ended_at - c.spawned_at - self._startup(s.kind), 0.0)
+            ratios.setdefault(s.kind, []).append(work / est)
+        for kind, rs in ratios.items():
+            cal[kind] = max(cal.get(kind, 1.0), sum(rs) / len(rs))
+        return cal
+
+    def _remaining(self, now: float, cal: Mapping[str, float]) -> dict[str, float]:
+        """call_id -> remaining $ of each live call (estimate less elapsed, never negative)."""
+        if self._state is None:
+            return {}
+        by_id = self._shard_map()
+        out: dict[str, float] = {}
+        for c in self._state.live():
+            pool = self.settings.pools[c.kind]  # type: ignore[index]
+            mi = max(pool.max_inputs, 1)
+            s = by_id.get(c.shard_id)
+            est_cs = self._cs(s) * cal.get(c.kind, 1.0) if s else 0.0
+            wall = self._startup(c.kind) + est_cs * mi
+            left = max(wall - (now - c.spawned_at), 0.0)
+            out[c.call_id] = left / mi * self.rates.pool_per_second(pool)
+        return out
+
+    def burn_per_s(self) -> float:
+        """$/s the live calls are burning now (``ceil(calls / max_inputs)`` containers/kind)."""
+        if self._state is None:
+            return 0.0
+        n: dict[str, int] = {}
+        for c in self._state.live():
+            n[c.kind] = n.get(c.kind, 0) + 1
+        out = 0.0
+        for kind, k in n.items():
+            pool = self.settings.pools[kind]  # type: ignore[index]
+            out += math.ceil(k / max(pool.max_inputs, 1)) * self.rates.pool_per_second(pool)
+        return out
+
+    # spend / projection ---------------------------------------------------------------------
+    def spend_report(self, now: float | None = None) -> SpendReport:
+        now = self.clock() if now is None else now
+        self._refresh(now)
+        receipts = 0.0
+        for p, r in self._receipts.items():
+            c = max(container_cost(r, self.rates, now, stale_after_s=self.stale_after_s),
+                    self._floor.get(p, 0.0))
+            self._floor[p] = c  # spend never goes down (stale heartbeat, clock skew)
+            receipts += c
+        calls = 0.0
+        live = 0
+        if self._state is not None:
+            calls = calls_cost(self._state.calls, self.settings, self.rates, now,
+                               scaledown_s=self.scaledown_s)
+            live = len(self._state.live())
+        return SpendReport(receipts, calls, self._billing_now(now), len(self._known), live)
+
     def projection(self, in_flight: Mapping[str, int]) -> Projection:
         now = self.clock()
-        self._refresh(now)
-        spent = spend(self._receipts, self.rates, now, stale_after_s=self.stale_after_s).total_usd
+        spent = self.spend_report(now).total_usd
         skip = self._done | set(self.quarantined())
         pending = [s for s in self.shards() if s.shard_id not in skip]
+        cal = self.effective_calibration()
+        remaining: dict[str, list[float]] = {}
+        if self._state is not None:
+            rem = self._remaining(now, cal)
+            for c in self._state.live():
+                remaining.setdefault(c.kind, []).append(rem[c.call_id])
+        startup = self.startup_s if self.startup_s is not None else {
+            k: self._startup(k) for k in {s.kind for s in pending}}
         return project(spent=spent, pending=pending, in_flight=in_flight, settings=self.settings,
-                       rates=self.rates, startup_s=self.startup_s, calibration=self.calibration,
-                       in_flight_fraction=self.in_flight_fraction)
+                       rates=self.rates, startup_s=startup, calibration=cal,
+                       in_flight_fraction=self.in_flight_fraction, estimator=self.estimator,
+                       live_remaining_usd=remaining)
 
     def admit(self, shard: Shard, in_flight: Mapping[str, int]) -> BudgetDecision:
         p = self.projection(in_flight)
+        cal = self.effective_calibration()
+        pool = self.settings.pools[shard.kind]
+        this = self._cs(shard) * cal.get(shard.kind, 1.0) * self.rates.pool_per_second(pool)
         if self.policy == "projection":
             need = p.total_usd
         else:
-            pool = self.settings.pools[shard.kind]
-            this = shard_container_seconds(shard, pool, self.calibration.get(shard.kind, 1.0)
-                                           ) * self.rates.pool_per_second(pool)
             need = p.spend_usd + p.in_flight_usd + this
         detail: dict[str, Any] = {**p.as_dict(), "limit_usd": round(self.limit_usd, 4),
                                   "budget_usd": self.settings.budget_usd,
                                   "safety_margin": self.safety_margin, "policy": self.policy,
-                                  "needed_usd": round(need, 4), "rates_source": self.rates.source}
+                                  "needed_usd": round(need, 4), "rates_source": self.rates.source,
+                                  "estimate_source": getattr(self.estimator, "source", "?"),
+                                  "calibration": {k: round(v, 4) for k, v in cal.items()}}
         if need > self.limit_usd:
             return BudgetDecision(
                 False,
@@ -385,6 +779,37 @@ class ProjectionBudgetGate:
                 f"(budget ${self.settings.budget_usd:,.2f} less {self.safety_margin:.0%} margin)",
                 detail)
         return BudgetDecision(True, "", detail)
+
+    # hard cap -------------------------------------------------------------------------------
+    def overspend(self, state: BudgetState) -> list[str]:
+        """Call ids the orchestrator must cancel now to stay within ``budget_usd``.
+
+        Observes ``state`` first. Empty when spend + remaining in-flight estimates + one tick of
+        burn (``tick_reserve_s``) fits under the hard cap. Otherwise the live calls with the
+        largest remaining cost go first; once spend + one tick of burn alone reaches the cap,
+        every live call goes. The caller writes ``budget_stop`` (so nothing respawns) and then
+        cancels the calls; :attr:`last_overspend` holds the numbers for its event."""
+        self.observe(state)
+        now = state.now
+        spent = self.spend_report(now).total_usd
+        rem = self._remaining(now, self.effective_calibration())
+        reserve = self.burn_per_s() * self.tick_reserve_s
+        cap = self.settings.budget_usd
+        self.last_overspend = {"spend_usd": round(spent, 4), "reserve_usd": round(reserve, 4),
+                               "in_flight_remaining_usd": round(sum(rem.values()), 4),
+                               "cap_usd": cap}
+        if not rem or spent + reserve + sum(rem.values()) <= cap:
+            return []
+        if spent + reserve >= cap:
+            return sorted(rem)
+        left = sum(rem.values())
+        out: list[str] = []
+        for cid in sorted(rem, key=lambda cid: (-rem[cid], cid)):
+            if spent + reserve + left <= cap:
+                break
+            out.append(cid)
+            left -= rem[cid]
+        return out
 
 
 # ----------------------------------------------------------------------------------------------
@@ -444,3 +869,21 @@ def apply_environment_budget(environment: str, settings: RunSettings, *,
                               + environment_budget_instruction(environment, amount))
     return BackstopResult(True, amount,
                           f"Modal Environment {environment!r} budget set to ${amount:,.2f}")
+
+
+def budget_summary(environment: str, settings: RunSettings, backstop: BackstopResult, *,
+                   gate: Any = None) -> dict[str, Any]:
+    """The budget section of a run summary: the gate's numbers and the Environment backstop,
+    with the manual instruction whenever flora could not set it (Modal 1.6.2: always)."""
+    out: dict[str, Any] = {
+        "budget_usd": settings.budget_usd,
+        "environment": environment,
+        "environment_budget_usd": backstop.amount_usd,
+        "environment_budget_applied": backstop.applied,
+        "environment_budget_instruction": None if backstop.applied else backstop.message,
+    }
+    if isinstance(gate, ProjectionBudgetGate):
+        rep = gate.spend_report()
+        out.update({"gate_limit_usd": round(gate.limit_usd, 4), **rep.as_dict(),
+                    "spend_usd": round(rep.total_usd, 4), "billing_error": gate.billing_error})
+    return out

@@ -8,6 +8,7 @@ from dataclasses import asdict
 import pytest
 
 from flora_deploy.jobs.budget import (
+    ManifestEstimator,
     ProjectionBudgetGate,
     Rates,
     apply_environment_budget,
@@ -24,6 +25,7 @@ from tests.fakes.jobs import CFG, JOB, Harness
 T0 = 1_800_000_000.0
 # $1 per GPU-second, nothing else: costs are easy to do by hand.
 UNIT = Rates(gpu_per_s={"H200": 1.0}, core_per_s=0.0, gib_per_s=0.0, source="unit")
+LEGACY = ManifestEstimator()  # hand-calc tests: est_gpu_seconds, no startup
 
 
 def settings(budget=30.0, max_containers=2, max_inputs=1, gpu_count=1, factor=1.2):
@@ -63,7 +65,7 @@ def test_projection_gpu_count_and_calibration():
 def gate(budget, *, margin=0.0, store=None, n=3, policy="projection", **kw):
     return ProjectionBudgetGate(settings=settings(budget), store=store,
                                 shards=lambda: shards(n), rates=UNIT, safety_margin=margin,
-                                policy=policy, clock=lambda: T0, **kw)
+                                policy=policy, clock=lambda: T0, estimator=LEGACY, **kw)
 
 
 def test_gate_boundary(tmp_path):
@@ -110,7 +112,7 @@ def test_gate_refresh_is_cached(tmp_path):
     st = LocalStore(tmp_path)
     now = [T0]
     g = ProjectionBudgetGate(settings=settings(100), store=st, shards=lambda: shards(3),
-                             rates=UNIT, clock=lambda: now[0], refresh_s=60)
+                             rates=UNIT, clock=lambda: now[0], refresh_s=60, estimator=LEGACY)
     assert g.projection({}).queued_usd == 30.0
     st.put_bytes(JobPaths(JOB).receipt(CFG, "segcap", "segcap-00000"), b"{}")
     assert g.projection({}).queued_usd == 30.0  # cached
