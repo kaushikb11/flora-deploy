@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -216,6 +217,24 @@ def classify_error(nv, exc: BaseException) -> str:
 # ---------------------------------------------------------------------------------------------
 
 
+_ENGINE_GONE = re.compile(r"engine[ _-]?core|enginedead|engine is dead|engine died", re.I)
+
+
+def container_fatal(exc: BaseException, engine: Any = None) -> bool:
+    """Whether the container must be replaced after ``exc`` (review 8a R4): a CUDA fault, or
+    the vLLM engine is dead whatever the message says (``EngineDead`` / ``EngineDeadError``,
+    the engine-core process gone, ``OfflineEngine.dead`` set), in the shard error or in any of
+    its episodes' infra errors."""
+    from flora_deploy.engines.offline_llm import EngineDead, engine_dead
+
+    msgs = [f"{type(exc).__name__}: {exc}"]
+    if isinstance(exc, ShardInfraError):
+        msgs += list(exc.infra.values())
+    if isinstance(exc, EngineDead) or getattr(engine, "dead", None):
+        return True
+    return any(cuda_fatal(m) or engine_dead(m) or _ENGINE_GONE.search(m) for m in msgs)
+
+
 @dataclass
 class EpisodeOutcome:
     records: list[StageRecord]
@@ -375,9 +394,11 @@ class BalancedShardRunner:
             raise
         except Exception as exc:
             msg = f"{type(exc).__name__}: {exc}"
-            self._end(active, error=msg)
-            infra = exc.infra.values() if isinstance(exc, ShardInfraError) else ()
-            if self.fatal is not None and (cuda_fatal(msg) or any(map(cuda_fatal, infra))):
+            crash = container_fatal(exc, self.engine)
+            # D15-counted (``crashed``), so a deterministic fault is bisected down to a poison
+            # pill instead of restarting forever (review 8a R4), as segcap does
+            self._end(active, error=msg, crashed=crash)
+            if self.fatal is not None and crash:
                 self.fatal(exc)  # the engine is unusable: replace the container
             raise
         finally:
@@ -394,8 +415,8 @@ class BalancedShardRunner:
         self.preempt()
 
     # -- internals -----------------------------------------------------------------------
-    def _end(self, active: _Active, *, preempted: bool = False, error: str | None = None
-             ) -> bool:
+    def _end(self, active: _Active, *, preempted: bool = False, error: str | None = None,
+             crashed: bool = False) -> bool:
         with self._lock:
             if active.ended:
                 return False
@@ -412,7 +433,7 @@ class BalancedShardRunner:
                              marker=active.marker)
         else:
             A.mark_exception(jf, kind, sid, self.container_id, ended_utc=now,
-                             error=error or "error", marker=active.marker)
+                             error=error or "error", marker=active.marker, crashed=crashed)
         return True
 
     def _error(self, uid: str, shard: Shard, exc: BaseException, category: str

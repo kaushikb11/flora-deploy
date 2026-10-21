@@ -390,7 +390,10 @@ def _recipe_env(recipe: str, determinism: str, cache_mode: str = "ro") -> dict[s
 
         return {**linked_offline_env(), **det.container_env(determinism)}
     if recipe == "balanced":  # compile caches: balanced_app.cache_env (read-only mount, M7)
-        return {CACHE_MODE_ENV: cache_mode, "TOKENIZERS_PARALLELISM": "false"}
+        # review 8a R5: the GDN dtype verify sends a callable through ``collective_rpc``,
+        # which vLLM's V1 msgpack client refuses without this (a trusted, single-tenant process)
+        return {CACHE_MODE_ENV: cache_mode, "TOKENIZERS_PARALLELISM": "false",
+                "VLLM_ALLOW_INSECURE_SERIALIZATION": "1"}
     from flora_deploy.modal_app import rewarder_app as ra
 
     root = LOCAL_CACHE_ROOT if cache_mode == "ro" else None

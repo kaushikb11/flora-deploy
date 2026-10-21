@@ -295,3 +295,51 @@ def test_tally_counts_an_upstream_exclusion_once():
 
 def test_local_runner_accepts_balanced(demo):
     LocalRunner(demo).close()  # used to refuse segment / caption (no fake engine)
+
+
+# --- review 8a R4: CUDA faults and dead engines replace the container, D15-counted ------------
+
+
+@pytest.mark.parametrize("kind", ["segment", "caption"])
+@pytest.mark.parametrize("message", [
+    "EngineDeadError: EngineCore encountered an issue. See stack trace for the root cause.",
+    "RuntimeError: CUDA error: an illegal memory access was encountered"])
+def test_deterministic_engine_death_is_quarantined_not_looped(demo, clean, tmp_path,
+                                                              monkeypatch, kind, message):
+    from flora_deploy.local import balanced as LB
+
+    u3 = uid_of(clean, "ep003")
+    inner = LB.FakeBalancedEngine.generate_batch
+    stage = {"segment": "tempseg", "caption": "captioner"}[kind]
+
+    def generate_batch(self, requests, samplings):
+        if any(r.key.split("#")[0] == u3 and stage in r.prompt for r in requests):
+            raise RuntimeError(message)  # every time this episode reaches this engine
+        return inner(self, requests, samplings)
+
+    monkeypatch.setattr(LB.FakeBalancedEngine, "generate_batch", generate_batch)
+    res = run_local(demo, store=tmp_path / "store")
+    assert res.state == "completed_with_errors", res.as_dict()
+    assert res.summary["poison_pills"] == [f"{u3}/{kind}"]
+    assert res.spawner["crashes"] >= 3  # the container was replaced each time (fatal)
+    jf = A.JobFiles(LocalStore(res.store_root), JOB, res.config_hash)
+    (poisoned,) = [e["shard_id"] for e in res.events if e["event"] == "poisoned"]
+    marks = A.markers(jf, kind, poisoned)
+    crashed = [m for m in marks if m.crashed]  # D15-counted (a cancel at quarantine may add
+    assert len(crashed) >= 2                    # one preempted marker)
+    assert all(m.crashed or m.preempted for m in marks)
+    assert A.counted_starts(jf, kind, poisoned) >= len(crashed)
+
+
+def test_container_fatal_covers_dead_engines_without_a_cuda_marker():
+    from flora_deploy.engines.offline_llm import EngineDead
+    from flora_deploy.workers_impl.reward import ShardInfraError
+    from flora_deploy.workers_impl.segment import container_fatal
+
+    assert container_fatal(EngineDead("gone"))
+    assert container_fatal(RuntimeError("EngineCore encountered an issue"))
+    assert container_fatal(RuntimeError("Engine core proc EngineCore_0 died unexpectedly"))
+    assert container_fatal(ShardInfraError("s", {"u": "EngineBatchError: EngineDeadError: x"}))
+    assert container_fatal(ValueError("x"), engine=type("E", (), {"dead": "EngineDead"})())
+    assert not container_fatal(ShardInfraError("s", {"u": "OSError: media read failed"}))
+    assert not container_fatal(ValueError("bad input"))
