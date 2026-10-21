@@ -216,3 +216,42 @@ Rules:
 3. **After P1a-5s + W2:** S2 (coordinator-run, one tooling agent if needed).
 4. **After S2 + 6c:** S3 ∥ P1b-2.
 5. **Last:** review 5 → fixes → PLAN v4.
+
+---
+
+## Update (2026-10-21, late): budget-first plan
+
+The user deferred the $9 golden build ("a lot of dollars for now"). **Rule: ask before any single run over ~$2.** Spent ≈$19; ≈$31 left, but treat GPU spend as scarce.
+
+### Principle
+
+Do every remaining piece that can be proven **without GPUs** first (fake models, CPU fixtures, real-Modal CPU canary). Then compress all GPU validation into **one lean, user-approved session** where each GPU minute serves several purposes at once.
+
+### Wave G: zero GPU spend (subagents, ≤4 at a time)
+
+| ID | Depends on | Builds | Done when |
+|---|---|---|---|
+| **G1 CLI/SDK** | Fix-W1 | `flora run/status/resume/cancel/report/logs`, SDK `submit()/Job` (wait, stream results, cost so far), README quickstart | A new user follows README from `flora init` to `flora results` (using G2's local mode) without help |
+| **G2 local runner** | Fix-W1 | `flora run --local --fake-models`: the *real* orchestrator, stores, workers, compose and CLI, with deterministic fake engines on `media.synth` / staged-free fixtures, in-process (no Modal). A CI job that runs a full multi-stage job end to end with injected faults on every PR. | CI runs a complete job (index → plan → run → compose → results) in <2 min with zero Modal calls |
+| **G3 exact-split design** | P1a-5s | Cost study plus implementation if identity-testable on CPU. NVIDIA's `pipeline.segment()` and `caption_*()` are separately callable, so `exact` could run **TempSeg on L40S** (9B) and **Captioner on H100** (27B) as two pools, with persisted segments, without re-expressing NVIDIA glue. Also: output-identical Captioner speedups (bucketing caption calls by prompt length to reuse cuDNN graphs within a container; pre-warming common shapes). | Projected $/video-h per option with measured inputs; CPU identity tests for any implemented option |
+| **G4 CI hardening** | — | CI jobs for conformance, test-order independence, logic-digest coverage, license guard, nvlink; cached NVIDIA code; fail on any unclassified module | CI green with all gates |
+| **G5 docs + PLAN v4** | review 5 | Architecture doc, user guide (presets, costs, determinism, license), contributor guide (D17, conformance, canary), PLAN v4 rewritten to reality | Docs reviewed by a subagent for accuracy against code |
+| **Review 5 + fixes** | running | — | — |
+
+### Wave H: one lean GPU session (needs approval; ≈$6 total)
+
+One combined run where each step reuses the previous one's containers and data:
+
+1. **Deploy the real app** via the factory (CPU, cents).
+2. **End-to-end exact (S3), the internal v0.1 milestone.** `flora index → plan → run` on **8 short golden episodes** (≈90 s of video) in **deterministic mode** (reproducible and likely faster), plus rewards on 4 reward episodes. This run **is** the mini oracle (S2-lite), so there's no separate golden build.
+   - Pass criteria: job `done` by the new rule; per-call model inputs identical to the unmodified NVIDIA path on 2 of the episodes (CPU-proven elsewhere).
+   - Est. ≈$3.
+3. **Balanced validation + certification on the same 8 episodes.** Run P1b-1's engines on L40S/H100 for L0 parity, Gate A, throughput, and L3 metrics against the S3 outputs, with the noise floor taken from one default-mode re-run of 3 episodes. Result: a **provisional certificate** scoped to the covered pools. Est. ≈$3.
+
+The full golden build (30+12 episodes) stays deferred until the user wants production-grade certificates.
+
+### Order
+
+1. **Now:** review 5 (running), Fix-W1 and P1b-1 code (running), G4.
+2. **After Fix-W1:** G1 and G2 in parallel; G3 after P1a-5s review.
+3. **After G1/G2 + review fixes:** ask the user for Wave H; then G5 and PLAN v4.
