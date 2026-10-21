@@ -179,7 +179,9 @@ RUNTIME = {
     "accelerate": "1.12.0",
     "safetensors": "0.7.0",
     "pillow": "12.3.0",
-    "numpy": "2.4.6",
+    # One numpy in all three images: vLLM's mistral-common caps numpy<2.4 on CPython 3.12, and
+    # 2.3.5 is inside NVIDIA's "numpy<3" (review A6).
+    "numpy": "2.3.5",
     "pyarrow": "26.0.0",
     "huggingface_hub": ">=1.29,<2.0",
     # CUDA 13.0 matches the torch 2.11.0 PyPI wheels (cu130); Modal's host driver is CUDA 13.3.
@@ -195,4 +197,31 @@ RUNTIME = {
     # uv binary used both to compile the image locks and to install them in the image.
     "uv": "0.12.22",
     "hf_xet": "1.7.0",
+    # img_hfref follows NVIDIA's TempSeg/Captioner install recipe (batch_utils/README.md): torch and
+    # torchvision from https://download.pytorch.org/whl/cu128, then requirements.txt. The lock
+    # takes exactly these two cp312 x86_64 wheels by URL and sha256 (an override); everything
+    # else, including their nvidia-*-cu12 CUDA 12.8 and triton deps, comes from PyPI (review A1).
+    # (uv's --torch-backend took triton from another index at install than at lock time, so the
+    # hashes did not match.)
+    "torch_index_hfref": "https://download.pytorch.org/whl/cu128",
+    "torch_hfref": "2.11.0+cu128",
+    "torch_hfref_sha256": "d252cf975fb18c94a85336323ad425f473df56dab35a44b00399bd70c7a3b997",
+    "torchvision_hfref": "0.26.0+cu128",
+    "torchvision_hfref_sha256": (
+        "ccf26b4b659cfce6f2208cb8326071d51c70219a34856dfdf468d1e19af52c0d"
+    ),
+    # Bases pinned by digest (multi-arch index digests, read 2026-10-21; review A2). The Python base
+    # replaces Modal's debian_slim, whose layer adds unpinned apt and pip steps.
+    "python_base": "python:3.12.10-slim-bookworm",
+    "python_base_digest": (
+        "sha256:fd95fa221297a88e1cf49c55ec1828edd7c5a428187e67b5d1805692d11588db"
+    ),
+    "uv_image_digest": (
+        "sha256:f513a91fc62fe7c17567eee97230dd198e43edb8a9fbecca843714a4358fe1bc"
+    ),
+    # The Modal client renders every builder step and picks add_python's standalone build
+    # (modal/mount.py PYTHON_STANDALONE_VERSIONS); the image builders refuse another client.
+    "modal_client": "1.6.2",
+    "python_standalone_release": "20240107",
+    "python_standalone": "3.12.1",
 }

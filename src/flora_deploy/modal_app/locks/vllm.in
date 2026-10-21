@@ -4,6 +4,7 @@ transformers==5.8.1
 qwen-vl-utils==0.0.14
 decord==0.6.0
 av==16.0.1
+numpy==2.3.5
 Pillow==12.3.0
 huggingface_hub==1.33.0
 hf_xet==1.7.0
