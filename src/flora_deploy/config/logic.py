@@ -85,7 +85,19 @@ OUTPUT_MODULES: dict[str, tuple[str, ...]] = {
     ),
     # vLLM TempSeg / Captioner (balanced): NVIDIA's input builders, captured and wrapped for vLLM
     # (Gate C), on the same patch layer. No worker exists yet, so this is deliberately broad.
-    "vllm-video": _VIDEO_PATH,
+    "vllm-video": (
+        *_VIDEO_PATH,
+        "engines/__init__.py",
+        "engines/base.py",
+        "engines/offline_llm.py",  # every engine argument and NVIDIA's sampling
+        "engines/microbatch.py",  # batch composition changes numerics
+        "engines/patches/__init__.py",
+        "engines/patches/dt_bias_fp32.py",  # gated FP32 dt_bias (Gate A)
+        "stages/segment.py",
+        "stages/caption.py",
+        "workers_impl/segment.py",  # index-receipt -> NVIDIA arguments (profile, instruction)
+        "workers_impl/caption.py",  # upstream segment records -> caption inputs
+    ),
     # NVIDIA's offline vLLM Rewarder recipe, and the worker that feeds it: camera order of the
     # collage, which file/cut is read, the task fallback, ``certified``, the settings it applies
     # (``workers_app.reward_settings_from_env``), and the job's episode order, which fixes
@@ -154,6 +166,7 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     # modal_app: deployment and labs. Images are hashed by value (image_fingerprint); the modes
     # the factory forwards are config fields, hashed by value (config/hashing.kind_modes).
     "modal_app/__init__.py",
+    "modal_app/balanced_lab.py",  # GPU validation lab, not a production worker
     "modal_app/canary_app.py",
     "modal_app/coldstart_lab.py",
     "modal_app/convert_app.py",  # derived weights: hashed by receipt

@@ -146,6 +146,13 @@ def _segcap_spec() -> WorkerSpec:
             self.runner.on_exit()
 
     return WorkerSpec("segcap-worker", "segcap", Worker)
+def _balanced_specs() -> list[WorkerSpec]:
+    """The real balanced ``BalancedShardRunner`` + ``MicroBatcher`` (``workers_impl.segment`` /
+    ``workers_impl.caption``) with a scripted per-episode job and engine
+    (``tests/conformance/balanced_workers.py``)."""
+    from tests.conformance.balanced_workers import balanced_specs
+
+    return balanced_specs()
 
 
 WORKERS: list[WorkerSpec] = [
@@ -154,4 +161,5 @@ WORKERS: list[WorkerSpec] = [
     _canary_spec(),
     *_reward_specs(),
     _segcap_spec(),
+    *_balanced_specs(),
 ]
