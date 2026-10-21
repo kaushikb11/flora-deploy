@@ -161,21 +161,6 @@ def _load_kind(session, kind: str, callback=None) -> tuple[dict, list[dict]]:
     return info, watch.events
 
 
-@app.cls(
-    image=hfref_image(),
-    gpu=GPU,
-    cpu=CPU_CORES,
-    memory=MEMORY_MIB,
-    volumes={str(WEIGHTS_MOUNT): weights.read_only(), str(GOLDEN_MOUNT): golden},
-    env=linked_offline_env(),
-    timeout=TIMEOUT_S,
-    startup_timeout=STARTUP_TIMEOUT_S,
-    scaledown_window=60,
-    max_containers=1,
-    block_network=True,  # proves no weight download can happen
-    # No ephemeral_disk: the link-farm layout copies nothing large (the 109 GB Captioner copy
-    # was the only reason; the WS-D copy layout with the FP32 Captioner would need ~110 GB).
-)
 class ReferenceWorker:
     disable: str = modal.parameter(default="")  # ExactProfile toggles to switch off
     concurrency: int = modal.parameter(default=4)
@@ -633,6 +618,26 @@ class ReferenceWorker:
         session = getattr(self, "session", None)
         if session is not None:
             session.close_all()
+
+
+# The smoke app's binding. ``ReferenceWorker`` itself stays undecorated at module scope so the
+# app factory (``modal_app.factory.build_app``, PLAN.md D10) can decorate it for a deployed job
+# app too; a container finds it by name and resolves its app by the deployed app's name.
+ReferenceWorkerSmoke = app.cls(
+    image=hfref_image(),
+    gpu=GPU,
+    cpu=CPU_CORES,
+    memory=MEMORY_MIB,
+    volumes={str(WEIGHTS_MOUNT): weights.read_only(), str(GOLDEN_MOUNT): golden},
+    env=linked_offline_env(),
+    timeout=TIMEOUT_S,
+    startup_timeout=STARTUP_TIMEOUT_S,
+    scaledown_window=60,
+    max_containers=1,
+    block_network=True,  # proves no weight download can happen
+    # No ephemeral_disk: the link-farm layout copies nothing large (the 109 GB Captioner copy
+    # was the only reason; the WS-D copy layout with the FP32 Captioner would need ~110 GB).
+)(ReferenceWorker)
 
 
 @app.function(
