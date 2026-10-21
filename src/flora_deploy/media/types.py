@@ -36,17 +36,26 @@ class StreamIndex:
     cfr: bool  # == Video.cfr
     codec: str  # e.g. "h264", "av1"
     pix_fmt: str
-    starts_on_keyframe: bool  # stream-copy cut possible -> oracle-eligible
+    starts_on_keyframe: bool  # a stream-copy cut decodes exactly like the source -> eligible
     # Exact source timestamps (seconds in the source file) of every frame, for write-back.
     source_timestamps_s: tuple[float, ...] = ()
     # Added by WS-C (all defaulted, so existing constructors keep working). They carry what the
     # envelope checks and decoders need without reopening the file:
-    time_base: Fraction | None = None  # source == cut time_base; pts_us are exact multiples
+    # Source track time_base; pts_us are exact multiples. The cut keeps it except below a
+    # timescale of 10000, where movenc doubles the timescale (1/30 -> 1/15360): same rationals.
+    time_base: Fraction | None = None
     byte_size: int = 0  # sum of the episode's packet payloads (lower bound of the cut's size)
     video_streams: int = 1  # video streams NVIDIA's probe would see (the cut: always 1)
     missing_pts: bool = False  # a packet without a PTS was seen (probe rejects that)
-    colorspace: int | None = None  # container/bitstream tags; decide canonical_rgb eligibility
+    # Codec-parameter colour tags: advisory only. NVIDIA decides the canonical_rgb branch per
+    # decoded frame (media.py:85); never pre-select the branch from these.
+    colorspace: int | None = None
     color_range: int | None = None
+    # Absolute source pts (time_base units) of every frame, in presentation order: range decode
+    # checks decoded frames against these (not against the first decoded frame).
+    source_pts: tuple[int, ...] = ()
+    # Why a stream-copy cut is not exact (index.INELIGIBILITY_REASONS); () when eligible.
+    ineligible: tuple[str, ...] = ()
 
     @property
     def duration_s(self) -> float:
@@ -72,3 +81,8 @@ class EpisodeIndex:
     @property
     def oracle_eligible(self) -> bool:
         return self.envelope.ok and all(s.starts_on_keyframe for s in self.streams.values())
+
+    @property
+    def ineligibility(self) -> tuple[str, ...]:
+        """``role:reason`` for every camera whose cut would not be exact."""
+        return tuple(f"{r}:{x}" for r, s in sorted(self.streams.items()) for x in s.ineligible)

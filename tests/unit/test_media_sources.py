@@ -1,10 +1,11 @@
 from fractions import Fraction
+from pathlib import Path
 
 import pytest
 
 from flora_deploy.media import synth
 from flora_deploy.media.cuts import stream_copy_cut
-from flora_deploy.media.index import index_episode, index_stream
+from flora_deploy.media.index import ScanCache, index_episode, index_stream
 from flora_deploy.media.sources import (
     LeRobotV3Source,
     LeRobotV21Source,
@@ -12,6 +13,7 @@ from flora_deploy.media.sources import (
     SourceError,
     open_source,
     resolve_camera_map,
+    verify_episode,
 )
 from flora_deploy.media.synth import Spec
 
@@ -113,3 +115,87 @@ def test_vfr_episode_index_is_not_cfr(tmp_path):
     )
     ix = index_stream(type(Mp4DirSource(tmp_path).list_episodes()[0].cameras["main"])(str(p)))
     assert not ix.cfr and ix.rate != 30
+
+
+# ---------------------------------------------------------------------------------------------
+# Metadata is verified against the video, not trusted (golden-candidates §3.3)
+
+
+def _rewrite_v3(root, edit):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    f = root / "meta/episodes/chunk-000/file-000.parquet"
+    cols = pq.read_table(f).to_pydict()
+    edit(cols)
+    pq.write_table(pa.Table.from_pydict(cols), f)
+
+
+def test_v3_verify_episode_ok_and_wrong_file(tmp_path):
+    root = synth.lerobot_v3_tree(tmp_path / "ds", _episodes([10, 14]), ["t"])
+    src = open_source(root, camera_map=CMAP)
+    cache = ScanCache()
+    for ep in src.list_episodes():
+        verify_episode(ep, scans=cache)
+    assert cache.scans_done == 3
+
+    key = "videos/observation.images.top"
+    end = src.list_episodes()[1].cameras["main"].end_s
+
+    def past_end(cols):  # aloha_mobile_wipe_wine ep 43: the range starts where the file ends
+        cols[f"{key}/from_timestamp"][1] = end
+        cols[f"{key}/to_timestamp"][1] = end + 14 / 30
+
+    _rewrite_v3(root, past_end)
+    ep = open_source(root, camera_map=CMAP).list_episodes()[1]
+    with pytest.raises(SourceError, match="wrong file"):
+        verify_episode(ep)
+
+
+def test_v3_verify_episode_length_mismatch(tmp_path):
+    root = synth.lerobot_v3_tree(tmp_path / "ds", _episodes([10, 14]), ["t"])
+    _rewrite_v3(root, lambda cols: cols["length"].__setitem__(0, 11))
+    ep = open_source(root, camera_map=CMAP).list_episodes()[0]
+    with pytest.raises(SourceError, match="holds 10 frames"):
+        verify_episode(ep)
+    verify_episode(ep, check_length=False)
+
+
+def test_v3_null_column_is_source_error(tmp_path):
+    root = synth.lerobot_v3_tree(tmp_path / "ds", _episodes([6, 7]), ["t"])
+    key = "videos/observation.images.left/file_index"
+    _rewrite_v3(root, lambda cols: cols[key].__setitem__(1, None))
+    with pytest.raises(SourceError, match="null"):
+        open_source(root, camera_map=CMAP).list_episodes()
+
+
+def test_v3_reads_only_needed_columns(tmp_path, monkeypatch):
+    import pyarrow.parquet as pq
+
+    root = synth.lerobot_v3_tree(tmp_path / "ds", _episodes([6]), ["t"])
+    _rewrite_v3(root, lambda cols: cols.__setitem__("stats/action/mean", [[0.0] * 64]))
+    seen = []
+    real = pq.read_table
+    monkeypatch.setattr(pq, "read_table", lambda f, **kw: seen.append(kw) or real(f, **kw))
+    src = open_source(root, camera_map={"observation.images.top": "main"})
+    assert len(src.list_episodes()) == 1
+    cols = seen[0]["columns"]
+    assert "stats/action/mean" not in cols
+    assert "videos/observation.images.left/file_index" not in cols
+    assert "videos/observation.images.top/from_timestamp" in cols
+
+
+def test_v21_missing_video_is_source_error(tmp_path):
+    root = synth.lerobot_v21_tree(tmp_path / "ds", _episodes([5, 6]), ["t"])
+    ep = open_source(root, camera_map=CMAP).list_episodes()[1]
+    verify_episode(ep)
+    Path(ep.cameras["right_wrist"].uri).unlink()
+    with pytest.raises(SourceError, match="missing"):
+        verify_episode(ep)
+
+
+def test_mp4_dir_camera_stem_collision(tmp_path):
+    synth.encode(tmp_path / "ep" / "main.mp4", Spec(4))
+    synth.encode(tmp_path / "ep" / "main.mov", Spec(4))
+    with pytest.raises(SourceError, match="two files"):
+        Mp4DirSource(tmp_path).list_episodes()

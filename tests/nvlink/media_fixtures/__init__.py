@@ -209,6 +209,144 @@ def build_fixtures(root: Path) -> list[Episode]:
     return eps
 
 
+PROBE_FIELDS = ("rate", "pts_us", "duration_us", "size", "cfr")
+
+
+@dataclass
+class Adversarial:
+    """A source the index must either match NVIDIA on exactly, or refuse with ``reasons``."""
+
+    name: str
+    ref: SourceRef
+    reasons: frozenset[str] = frozenset()  # expected ineligibility reasons (empty = eligible)
+    frames: int | None = None  # frames the source decoder outputs for the range
+    # Whole-file sources: fields that must also equal NVIDIA probe(original file).
+    original_fields: tuple[str, ...] = ()
+    notes: str = ""
+
+
+def build_adversarial(root: Path) -> list[Adversarial]:
+    """Real-world shapes the clean fixtures miss (review of WS-C: H1, H2, M1, M2, L2, L3)."""
+    root.mkdir(parents=True, exist_ok=True)
+    sc = root / "scratch"
+    out: list[Adversarial] = []
+
+    # H1a: `ffmpeg -ss 1.5 -c copy` style trim - a 15-packet pre-roll flagged DISCARD.
+    base = synth.encode(sc / "trim_src.mp4", Spec(90, seed=50, gop=30))
+    trim = synth.remux_trimmed(base, root / "edit_trim.mp4", from_keyframe=1, trim_ticks=45 * 512)
+    out.append(
+        Adversarial(
+            "edit_trim",
+            SourceRef(str(trim)),
+            frozenset({"edit_list"}),
+            frames=45,
+            original_fields=PROBE_FIELDS,
+        )
+    )
+    # H1b: zero-length last sample -> movenc ends the edit list before it -> last packet DISCARD.
+    # The original's avg_frame_rate counts the hidden sample's zero stts, so only PTS/duration
+    # are compared with probe(original).
+    b0 = synth.encode(sc / "last0_src.mp4", Spec(40, seed=51, bframes=0))
+    last0 = synth.remux_with_last_duration(b0, root / "edit_last0.mp4", 0)
+    out.append(
+        Adversarial(
+            "edit_last0",
+            SourceRef(str(last0)),
+            frozenset({"edit_list"}),
+            frames=39,
+            original_fields=("pts_us", "duration_us", "size"),
+        )
+    )
+
+    # H2: x264 periodic intra refresh: sync samples every 30 frames, only frame 0 is an IDR.
+    ir = synth.encode(
+        root / "intra_refresh.mp4",
+        Spec(90, seed=52, bframes=0, x264_params="intra-refresh=1:keyint=30:scenecut=0"),
+    )
+    out.append(Adversarial("intra_refresh_ep0", SourceRef(str(ir), 0.0, 1.0), frames=30))
+    for k in (1, 2):
+        out.append(
+            Adversarial(
+                f"intra_refresh_ep{k}",
+                SourceRef(str(ir), float(k), k + 1.0),
+                frozenset({"not_random_access"}),
+                frames=30,
+            )
+        )
+    # M1: whole file that starts 10 packets into a GOP (segment split); h264 drops frames
+    # until the next IDR, so the file decodes to 60 frames, not 80 packets.
+    g = synth.encode(sc / "nokf_src.mp4", Spec(90, seed=53, gop=30, bframes=0))
+    nokf = synth.remux_drop_head(g, root / "nokf_whole.mp4", 10)
+    out.append(
+        Adversarial(
+            "nokf_whole",
+            SourceRef(str(nokf)),
+            frozenset({"not_keyframe"}),
+            frames=60,
+            original_fields=PROBE_FIELDS,
+        )
+    )
+    # M2: B-frame GOP split mid-pyramid: the range is not contiguous in decode order.
+    nc = synth.encode(root / "noncontig.mp4", Spec(90, seed=1, gop=30))
+    out.append(
+        Adversarial(
+            "noncontig",
+            SourceRef(str(nc), 1.0, 50 / 30),
+            frozenset({"non_contiguous"}),
+            frames=20,
+        )
+    )
+    # L3: .mov with an nclc colr box (no range field): frame color_range 0 in the source, 1 in
+    # the MP4 cut. Canonical-eligible both ways (BT.470BG), so pixels must not change.
+    mov = synth.encode(root / "colr.mov", Spec(40, seed=54, colorspace=5))
+    out.append(
+        Adversarial("mov_nclc", SourceRef(str(mov)), frames=40, original_fields=PROBE_FIELDS)
+    )
+    # L2: track timescale 30 (< 10000): the cut gets 1/15360.
+    ts = synth.encode(
+        root / "ts30.mp4",
+        Spec(45, seed=55, bframes=0, gop=15, time_base=Fraction(1, 30), track_timescale=30),
+    )
+    out.append(Adversarial("timescale_30", SourceRef(str(ts)), frames=45))
+    out.append(Adversarial("timescale_30_ep1", SourceRef(str(ts), 0.5, 1.5), frozenset(), 30))
+    # HEVC (bitstream RAP check: IRAP NAL types), closed GOP every 20 frames.
+    hevc = synth.encode(
+        root / "hevc.mp4",
+        Spec(
+            60,
+            seed=56,
+            codec="libx265",
+            codec_options={
+                "x265-params": "keyint=20:min-keyint=20:scenecut=0:bframes=0:log-level=error"
+            },
+        ),
+    )
+    for k in range(3):
+        out.append(
+            Adversarial(
+                f"hevc_ep{k}", SourceRef(str(hevc), k * 20 / 30, (k + 1) * 20 / 30), frames=20
+            )
+        )
+    return out
+
+
+MANY_LENGTHS = tuple(3 + (k * 5) % 9 for k in range(24))
+
+
+def build_many_episodes(root: Path) -> list[Adversarial]:
+    """A LeRobot-style v3 file: SVT-AV1 with g=2 (LeRobot's settings), many short episodes
+    encoded separately and concatenated."""
+    specs = [
+        Spec(n, codec="libsvtav1", size=(64, 64), seed=60 + k, gop=2)
+        for k, n in enumerate(MANY_LENGTHS)
+    ]
+    refs = _v3_file(root / "many.mp4", root / "scratch_many", specs)
+    return [
+        Adversarial(f"many_ep{k}", r, frames=n)
+        for k, (r, n) in enumerate(zip(refs, MANY_LENGTHS, strict=True))
+    ]
+
+
 def build_envelope_fixtures(root: Path) -> dict[str, dict[str, SourceRef]]:
     """Cameras -> refs for files NVIDIA must reject (or accept) at the envelope boundary."""
     root.mkdir(parents=True, exist_ok=True)

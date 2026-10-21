@@ -30,6 +30,9 @@ class Spec:
     bframes: int | None = None  # libx264 only
     colorspace: int | None = None  # AVColorSpace, e.g. 1 = BT.709 (non-canonical branch)
     color_range: int | None = None  # AVColorRange: 1 = MPEG/limited, 2 = JPEG/full
+    x264_params: str | None = None  # extra libx264 params, e.g. "intra-refresh=1:keyint=30"
+    track_timescale: int | None = None  # movenc video_track_timescale (e.g. 30: below 10000)
+    codec_options: Mapping[str, str] | None = None  # extra encoder options (e.g. libx265)
 
 
 def _frame_image(spec: Spec, i: int) -> np.ndarray:
@@ -44,7 +47,7 @@ def _frame_image(spec: Spec, i: int) -> np.ndarray:
 
 
 def encode(path: Path, spec: Spec) -> Path:
-    """Encode ``spec`` into an MP4 at ``path``."""
+    """Encode ``spec`` into an MP4 (or MOV, by suffix) at ``path``."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     opts: dict[str, str] = {}
@@ -52,13 +55,22 @@ def encode(path: Path, spec: Spec) -> Path:
         if spec.bframes is not None:
             opts["bf"] = str(spec.bframes)
         opts["preset"] = "veryfast"
+        params = []
         if spec.gop is not None:
-            opts["x264-params"] = "scenecut=0"  # keyframes only every `gop` frames
+            params.append("scenecut=0")  # keyframes only every `gop` frames
+        if spec.x264_params:
+            params.append(spec.x264_params)
+        if params:
+            opts["x264-params"] = ":".join(params)
     if spec.codec == "libsvtav1":
         opts["preset"] = "12"
     if spec.codec == "libaom-av1":
         opts["cpu-used"] = "8"
-    with av.open(str(path), "w") as out:
+    opts.update(spec.codec_options or {})
+    fmt_opts = {}
+    if spec.track_timescale is not None:
+        fmt_opts["video_track_timescale"] = str(spec.track_timescale)
+    with av.open(str(path), "w", options=fmt_opts) as out:
         stream = out.add_stream(spec.codec, rate=spec.rate, options=opts)
         stream.width, stream.height = spec.size
         stream.pix_fmt = "yuv420p"
@@ -137,6 +149,39 @@ def remux_with_last_duration(src: Path, dst: Path, last_duration: int) -> Path:
                 p.stream = ost
                 oc.mux(p)
     return dst
+
+
+def _remux(src: Path, dst: Path, edit) -> Path:
+    with av.open(str(src)) as ic:
+        ist = ic.streams.video[0]
+        pkts = [p for p in ic.demux(ist) if p.size and p.dts is not None]
+        with av.open(str(dst), "w") as oc:
+            ost = oc.add_stream_from_template(template=ist, opaque=True)
+            ost.time_base = ist.time_base
+            for p in edit(pkts):
+                p.stream = ost
+                oc.mux(p)
+    return Path(dst)
+
+
+def remux_trimmed(src: Path, dst: Path, from_keyframe: int, trim_ticks: int) -> Path:
+    """What ``ffmpeg -ss T -i src -c copy dst`` produces: packets from the ``from_keyframe``-th
+    keyframe on, shifted by ``-trim_ticks``. Pre-roll packets get negative pts, movenc writes an
+    edit list, and the mov demuxer flags them ``AV_PKT_FLAG_DISCARD``."""
+
+    def edit(pkts):
+        start = [i for i, p in enumerate(pkts) if p.is_keyframe][from_keyframe]
+        for p in pkts[start:]:
+            p.pts -= trim_ticks
+            p.dts -= trim_ticks
+            yield p
+
+    return _remux(src, dst, edit)
+
+
+def remux_drop_head(src: Path, dst: Path, n: int) -> Path:
+    """Copy ``src`` without its first ``n`` packets: a file that starts mid-GOP (segment split)."""
+    return _remux(src, dst, lambda pkts: pkts[n:])
 
 
 # ---------------------------------------------------------------------------------------------

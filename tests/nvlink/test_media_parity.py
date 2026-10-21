@@ -3,6 +3,7 @@ NVIDIA ``decode_selected`` on the cut; envelope verdicts == NVIDIA accept/raise.
 
 from __future__ import annotations
 
+from fractions import Fraction
 from pathlib import Path
 
 import av
@@ -12,6 +13,7 @@ import pytest
 from flora_deploy.media.cuts import stream_copy_cut
 from flora_deploy.media.index import (
     NotKeyframeAligned,
+    cut_timescale,
     envelope_checks,
     estimated_cut_bytes,
     index_stream,
@@ -69,7 +71,8 @@ def test_index_equals_probe_on_cut(nvm, fixtures):
                     s = c.streams.video[0]
                     assert idx.codec == s.codec_context.codec.canonical_name, where
                     assert idx.pix_fmt == s.codec_context.pix_fmt, where
-                    assert idx.time_base == s.time_base, where
+                    # movenc keeps the source timescale only when >= 10000 (docs/media-notes.md)
+                    assert s.time_base == Fraction(1, cut_timescale(idx.time_base)), where
                 assert estimated_cut_bytes(idx) >= cut.stat().st_size, where
                 checked += 1
     assert checked >= 2 * 25
