@@ -26,3 +26,16 @@ def nv_code():
         return path
 
     return get
+
+
+ORDER_ENV = "FLORA_TEST_ORDER"
+
+
+def pytest_collection_modifyitems(config, items):
+    """``FLORA_TEST_ORDER=reverse`` runs the collected tests in reverse order (CI's order gate,
+    ``docs/ci.md``): a test that only passes after another one has run is a leak, not a pass."""
+    order = os.environ.get(ORDER_ENV, "")
+    if order == "reverse":
+        items.reverse()
+    elif order:
+        raise pytest.UsageError(f"{ORDER_ENV}={order!r}; expected 'reverse' or unset")
