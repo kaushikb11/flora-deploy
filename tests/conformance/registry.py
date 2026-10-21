@@ -78,13 +78,17 @@ def _reward_specs() -> list[WorkerSpec]:
             for kind in ("reward.terminal", "reward.dense")]
 
 
-def segcap_fake_engine(script, *, concurrency: int = 2):
+def segcap_fake_engine(script, *, concurrency: int = 2, raises=None, sleeps=None):
     """The production ``FastExactEngine`` composite over the fake NVIDIA SEGCAP family of
     ``tests/unit/test_reference_concurrency`` (NVIDIA's call structure: ``api`` entry point,
     ``pipeline.Session``, ``asyncio.to_thread`` predictor, ``FLORA_RUNTIME`` events): resident
     ``CachedSession``, ``install_nvidia_entry`` + GPU lock (``generate_output`` lines on) +
     ``accel.gpu_thread``. ``script.interrupt_before`` raises ``KeyboardInterrupt`` inside NVIDIA's
-    ``pipeline.annotate`` for that episode (its main camera path names the uid)."""
+    ``pipeline.annotate`` for that episode (its main camera path names the uid). ``raises``
+    (uid substring -> exception factory) makes NVIDIA's ``annotate`` raise for that episode;
+    ``sleeps`` (uid substring -> seconds) makes it take that long first."""
+    import time
+
     from flora_deploy.accel import gpu_thread
     from flora_deploy.nv.session import CachedSession
     from flora_deploy.observe import Patcher, TimedLock
@@ -96,8 +100,15 @@ def segcap_fake_engine(script, *, concurrency: int = 2):
     original = nv.pipeline.annotate
 
     def annotate(videos, *a, **k):
-        if script.interrupt_before and script.interrupt_before in str(videos["main"].path):
+        main = str(videos["main"].path)
+        if script.interrupt_before and script.interrupt_before in main:
             raise KeyboardInterrupt("SIGINT")
+        for key, seconds in (sleeps or {}).items():
+            if key in main:
+                time.sleep(seconds)
+        for key, make in (raises or {}).items():
+            if key in main:
+                raise make()
         return original(videos, *a, **k)
 
     nv.pipeline.annotate = annotate
