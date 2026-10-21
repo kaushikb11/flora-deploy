@@ -134,3 +134,51 @@ Wave 2 total: **≈$15–30** (estimate). WS-D, WS-E and WS-H are written by sub
 2. **A Modal budget for wave 2** (proposed cap $40). I'll still announce each run before starting it.
 3. **Golden-dataset preference.** If you have your own data or camera setup, WS-F prioritizes it.
 4. **Standing push permission** for merges to `main` at review checkpoints, or ask each time.
+
+---
+
+## Status after waves 1–2 (2026-10-21)
+
+All merged to `main` (267 tests): WS0, WS-A/B/C/F, WS-D/E/H, Fix-A, Fix-C. Fix-B and Fix-images
+are running. Modal spend so far ≈ $8 (weights download, Gate C $0.86, reference $2.4, rewarder $1.9).
+
+| Result | Evidence | Consequence |
+|---|---|---|
+| 172 GiB of pinned weights on `flora-weights`, every byte verified; trust anchors pinned | WS-A, Fix-A | Done |
+| **Gate C passes** after wrapping NVIDIA's bare `<\|video_pad\|>` (44/44 requests: token ids, grids, bf16 pixels identical). Without the wrap, vLLM rejects every prompt. | `docs/gate-c.md` | The `balanced` path is viable |
+| **Rewarder: batched output == NVIDIA's scripts** (terminal, terminal+rationale, dense) | `docs/rewarder-smoke.md` | Reward stage is ready for v0.1 |
+| **Reference pipeline runs on Modal** (4 episodes, both models resident on H200) | `docs/reference-smoke.md` | The `exact` preset is viable |
+| **CPU dominates the reference run:** model generation is only 9–31% of each stage on 1080p clips | WS-D | Gate D effectively answered. The GPU idles most of the time in `exact` |
+| **Cold starts are large and variable:** reference startup 251 s (Captioner copy 123 s + NVIDIA manifest re-hash ~100 s); Rewarder engine startup 99 s → 929 s across runs (Volume read variance + compile) | WS-D, WS-H | Long-lived containers, compile cache and Volume throughput are now first-order cost items |
+| PNG compression size depends on the Pillow/zlib build and changes caption frame scale | WS-E | All processing must run in one pinned image (Fix-images) |
+
+## Next: wave 3 (finishes Phase 0) and Phase 1a
+
+### Wave 3 (parallel subagents)
+
+| WS | Builds | Spend |
+|---|---|---|
+| **W3-A: exact-preset concurrency** | N episode threads run NVIDIA's pipeline concurrently, while one **GPU lock** serializes every `generate()`. Each model call stays NVIDIA's batch-1 call, so outputs stay identical, and CPU work (decode, PNG/JPEG, resize) overlaps across episodes. Prove bit-identical output vs sequential runs and measure the speedup. Also tune `cpu=` cores and torch threads. | ≈$5 |
+| **W3-B: cold-start lab** | Break down and fix startup: Volume read throughput and variance (sequential vs parallel shard reads), `VLLM_CACHE_ROOT` on `flora-cache`, CUDA-graph capture cost, local-disk copy vs direct read, and whether NVIDIA's Captioner re-hash can run once per container lifetime instead of per load. Output: recommended startup recipe per worker + numbers. | ≈$8 |
+| **W3-C: golden staging** | From `docs/golden-candidates.md`: stage the ~100-episode selection + ~40 reward episodes into `flora-golden` (subsets only), run index + `verify_episode` + eligibility, make stream-copy cuts, write the golden manifest. CPU only. | ≈$2 |
+| **W3-D: measurement harness** | Per-component CPU timers around NVIDIA calls (sampling profiler for NVIDIA internals), token stats from NVIDIA audits, RSS, `/dev/shm`, CloudBucketMount throughput, all as structured events. Built into ReferenceWorker/RewardWorker as opt-in. | ≈$2 |
+| **Golden build (coordinator, after W3-A/C/D)** | Oracle ×2 on H200, ×1 on B200 (cross-GPU noise) + reward reference runs, using W3-A concurrency | **≈$100–150, separate approval** |
+| **Coordinator** | `docs/measurements-p0.md`; Gate D write-up; PLAN v4 (cost model from measured rates); P1a contracts | — |
+
+### Phase 1a → v0.1 `exact` (parallel subagents after coordinator contracts)
+
+Contracts first (coordinator): `flora_labels_v1` record schema, `Manifest`/`Shard`/`Receipt` types,
+`Store` interface (bucket + Volume backends), worker interface `run_shard(shard_id, cfg_hash)`,
+event schema.
+
+| WS | Owns |
+|---|---|
+| **P1a-1 config** | `flora.yaml` schema, presets, D11 config hash (incl. image fingerprint from Fix-images), `flora init` templates |
+| **P1a-2 store + planning** | bucket/Volume stores (whole-file, hash-prefix dirs), manifest + shard packing from index, attempts/quarantine/bisection (D15) |
+| **P1a-3 orchestrator** | non-preemptible orchestrator with Dict lease + continuation, stateless reconciler, chaining, GPU cap; fully testable with a fake Modal |
+| **P1a-4 budget + planner** | container-lifetime receipts, live `billing.rates()`, Environment budget backstop, `flora plan` / `flora estimate` from measured rates |
+| **P1a-5 workers** | exact segment+caption shard worker (W3-A concurrency, W3-B startup recipe), batched reward shard worker, compose/export (JSONL/Parquet) |
+| **P1a-6 CLI/SDK/docs** | `init/prepare/index/plan/deploy/run/status/resume/results/report/cancel`, SDK `submit/Job`, quickstart |
+| **Chaos (coordinator + 1 subagent)** | `simulate_preemption()` ×5, OOM injection, orchestrator kill, budget stop/resume on a 1,000-episode job (≈$20–40, approval) |
+
+Review: every branch gets an independent re-review subagent before merge (as with Fix-A/C).
