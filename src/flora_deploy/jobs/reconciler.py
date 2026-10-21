@@ -21,6 +21,7 @@ from flora_deploy.jobs.orchestrator import (
     ShardLedger,
     call_path,
     control_view,
+    deps_ready,
     read_controls,
     resolve,
 )
@@ -120,9 +121,10 @@ def reconcile(*, job_id: str, config_hash: str, store: Store, manifests: Manifes
         if sid not in children and status.get(sid) == "quarantined":
             children[sid] = tuple(c["shard_id"] for c in rec.detail.get("children", ()))
     satisfied, dead = resolve(shards, lambda sid: status.get(sid, "new"), children)
+    by_id = {s.shard_id: s for s in shards}
     for s in shards:
         if status[s.shard_id] == "new":
-            deps_ok = all(d in satisfied for d in s.depends_on)
+            deps_ok = deps_ready(s, by_id, satisfied, children)
             status[s.shard_id] = "pending" if deps_ok else "waiting"
 
     now = clock()
@@ -197,7 +199,11 @@ def reconcile(*, job_id: str, config_hash: str, store: Store, manifests: Manifes
 def _error_rate_problems(store: Store, paths: JobPaths, config_hash: str, shards, status,
                          max_error_rate: float, unplanned=None) -> list[str]:
     from flora_deploy.jobs.manifest import from_json
-    from flora_deploy.jobs.progress import error_rate_problems, with_unplanned
+    from flora_deploy.jobs.progress import (
+        error_rate_problems,
+        tally_exclusions,
+        with_unplanned,
+    )
     from flora_deploy.jobs.types import ShardReceipt
 
     planned: dict[str, set[str]] = {}
@@ -213,10 +219,7 @@ def _error_rate_problems(store: Store, paths: JobPaths, config_hash: str, shards
             if store.exists(p):
                 r = from_json(ShardReceipt, store.get_bytes(p))
                 excluded.setdefault(s.kind, set()).update(r.episodes_failed)
-    tallies = {}
-    for kind, eps in planned.items():
-        x = len(excluded.get(kind, set()) & eps)
-        tallies[kind] = {"planned": len(eps), "done": len(eps) - x, "excluded": x, "pending": 0}
+    tallies = tally_exclusions(planned, excluded)
     return error_rate_problems(with_unplanned(tallies, unplanned), max_error_rate)
 
 

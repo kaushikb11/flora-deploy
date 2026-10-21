@@ -423,18 +423,23 @@ def compose(store: Store, job_id: str, *, config_hash: str | None = None,
     resolved = progress.complete and not missing and not failed_shards
     unplanned = dict(getattr(manifest, "excluded", None) or {})
     problems = list(format_problems)
+    # an episode an upstream kind excluded (balanced caption of a failed segment) is excused
+    # here too, but counted once, at the upstream stage (``progress.UPSTREAM_KINDS``)
+    upstream = progress.upstream_excluded()
     for stage in stages:
         c = stage_summary[stage]
         c["unplanned"] = len(unplanned)
-        if not c["expected"]:
+        c["excused_upstream"] = up = sum(1 for _u, k in upstream if stage in stages_of(k))
+        expected = c["expected"] - up
+        if not expected:
             continue
-        excluded = c["excused"] + len(unplanned)
-        rate = excluded / (c["expected"] + len(unplanned))
+        excluded = c["excused"] - up + len(unplanned)
+        rate = excluded / (expected + len(unplanned))
         if c["records"] == 0:
             problems.append(f"{stage}: 0 records for {c['expected']} planned episodes "
                             f"({c['excused']} excluded, {c['missing']} missing)")
         elif rate > max_error_rate:
-            problems.append(f"{stage}: {excluded} of {c['expected'] + len(unplanned)} episodes "
+            problems.append(f"{stage}: {excluded} of {expected + len(unplanned)} episodes "
                             f"excluded ({rate:.0%} > {max_error_rate:.0%})"
                             + (f"; {len(unplanned)} left out of the plan" if unplanned else ""))
     status = ("partial" if not resolved else

@@ -199,19 +199,79 @@ def test_rubric_has_no_worker_yet(fake_workers_app):
 # refusals
 
 
-def test_balanced_is_refused():
+def balanced_cfg(**update):
     d = template("exact_mp4_dir.yaml")
     d.update(preset="balanced", allow_uncertified=True, resources={})
     d["modal"]["max_gpus"] = 4
-    cfg = parse_config(d)
-    receipts = {"captioner_bf16": "0" * 64, "tempseg_merged": "1" * 64}
-    # no SegmentWorker / CaptionWorker yet (P1b-1)
-    with pytest.raises(f.WorkerUnavailable, match="P1b-1"):
-        f.plan_app(cfg, derived_receipts=receipts)
-    # and without the opt-in, the certificate rule refuses first
-    strict = cfg.model_copy(update={"allow_uncertified": False})
+    d.update(update)
+    return parse_config(d)
+
+
+BAL_RECEIPTS = {"captioner_bf16": "0" * 64, "tempseg_merged": "1" * 64}
+
+
+def test_balanced_without_opt_in_is_refused_by_the_certificate_rule():
+    strict = balanced_cfg().model_copy(update={"allow_uncertified": False})
     with pytest.raises(f.DeployError, match="certificate"):
-        f.plan_app(strict, derived_receipts=receipts)
+        f.plan_app(strict, derived_receipts=BAL_RECEIPTS)
+
+
+def test_balanced_registers_segment_and_caption_workers():
+    import json
+
+    cfg = balanced_cfg()
+    plan = f.plan_app(cfg, derived_receipts=BAL_RECEIPTS)
+    assert set(plan.worker_classes) == set(cfg.pools())
+    assert plan.worker_classes["segment"] == "SegmentWorker"
+    assert plan.worker_classes["caption"] == "CaptionWorker"
+    seg, cap = plan.object("SegmentWorker"), plan.object("CaptionWorker")
+    assert (seg.gpu, cap.gpu) == ("L40S", "H100!")
+    assert seg.image == cap.image == "img_vllm"
+    assert seg.module == cap.module == "flora_deploy.modal_app.balanced_app"
+    assert seg.max_inputs is None and cap.max_inputs is None  # one shard per container
+    assert seg.scaledown_window == cap.scaledown_window == f.WORKER_SCALEDOWN_S
+    assert seg.timeout >= f.MIN_WORKER_TIMEOUT_S and seg.retries == f.WORKER_RETRIES
+    for o, kind, name, receipt in ((seg, "segment", "tempseg_merged", "1" * 64),
+                                   (cap, "caption", "captioner_bf16", "0" * 64)):
+        env = o.env
+        assert json.loads(env["FLORA_DERIVED_RECEIPTS"]) == {name: receipt}  # weights.derived
+        assert json.loads(env["FLORA_POOL_GPUS"]) == {kind: o.gpu}
+        assert json.loads(env["FLORA_KIND_MODES"]) == {kind: {}}
+        assert env["FLORA_EMBODIMENT"] == cfg.pipeline.embodiment
+        assert env["FLORA_SHARD_KINDS"] == kind and env["FLORA_PRESET"] == "balanced"
+        assert json.loads(env["FLORA_STAGE_HASHES"]) == {kind: plan.stage_hashes[kind]}
+        assert env["FLORA_DETERMINISM"] and env["FLORA_CACHE_MODE"] == "ro"
+        assert "FLORA_MEDIA_ROOT" in env and "FLORA_STORE" in env
+        from flora_deploy.layout import CACHE_MOUNT, WEIGHTS_MOUNT
+
+        assert o.volumes[str(WEIGHTS_MOUNT)].read_only and o.volumes[str(CACHE_MOUNT)].read_only
+    assert f.WARM_CACHE_FUNCTION not in {o.name for o in plan.objects}  # the lab writes it
+
+
+def test_balanced_needs_its_derived_receipts():
+    with pytest.raises(Exception, match="tempseg_merged|receipt"):
+        f.plan_app(balanced_cfg(), derived_receipts={"captioner_bf16": "0" * 64})
+
+
+def test_balanced_max_inputs_above_one_is_refused():
+    cfg = balanced_cfg(resources={"segment": {"max_inputs": 2}})
+    with pytest.raises(f.DeployError, match="one shard per container"):
+        f.plan_app(cfg, derived_receipts=BAL_RECEIPTS)
+
+
+def test_balanced_fake_models_plan_uses_cpu_fake_workers():
+    plan = f.plan_app(balanced_cfg(), fake_models=True)
+    assert plan.worker_classes["segment"] == "FakeSegmentWorker"
+    assert plan.worker_classes["caption"] == "FakeCaptionWorker"
+    for n in ("FakeSegmentWorker", "FakeCaptionWorker"):
+        o = plan.object(n)
+        assert o.gpu is None and o.image == "img_cpu" and o.env["FLORA_FAKE_MODELS"] == "1"
+
+
+def test_balanced_app_materializes():
+    app = f.build_app(balanced_cfg(), derived_receipts=BAL_RECEIPTS)
+    _funcs, classes = f.registered(app)
+    assert {"SegmentWorker", "CaptionWorker"} <= set(classes)
 
 
 def test_decorated_worker_is_refused():

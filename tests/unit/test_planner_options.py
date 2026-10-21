@@ -220,7 +220,7 @@ def test_never_recommends_an_unavailable_option():
     assert bal, "balanced must still be shown"
     for o in bal:
         why = " ".join(o.unavailable)
-        assert "uncertified" in why and "placeholder" in why and "factory" in why, why
+        assert "uncertified" in why and "placeholder" in why, why  # deployable since P1b-1
         assert any(f.startswith("unavailable:") for f in o.flags)
     best = recommended(opts)
     assert best is None or (best.preset == "exact" and not best.unavailable)

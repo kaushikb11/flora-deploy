@@ -198,11 +198,29 @@ class Progress:
     def poisoned(self) -> set[tuple[str, ShardKind]]:
         return {k for k, st in self.episodes.items() if st == "poison_pill"}
 
+    def upstream_excluded(self) -> set[tuple[str, ShardKind]]:
+        """(uid, kind) pairs excluded because an upstream kind (:data:`UPSTREAM_KINDS`) already
+        excluded the episode (a balanced ``caption`` of a failed / poison-pilled ``segment``)."""
+        out: set[tuple[str, ShardKind]] = set()
+        for (uid, kind), st in self.episodes.items():
+            if st in ("failed", "poison_pill") and any(
+                    self.episodes.get((uid, up)) in ("failed", "poison_pill")  # type: ignore[arg-type]
+                    for up in UPSTREAM_KINDS.get(kind, ())):
+                out.add((uid, kind))
+        return out
+
     def exclusions(self) -> dict[ShardKind, dict[str, int]]:
-        """Per kind: planned episodes, done, excluded (failed + poison-pilled), pending."""
+        """Per kind: planned episodes, done, excluded (failed + poison-pilled), pending, and
+        ``upstream``: episodes excluded at an upstream kind, which are left out of this kind's
+        planned / excluded counts (an episode is counted once, where it failed)."""
         out: dict[ShardKind, dict[str, int]] = {}
-        for (_uid, kind), st in self.episodes.items():
-            c = out.setdefault(kind, {"planned": 0, "done": 0, "excluded": 0, "pending": 0})
+        up = self.upstream_excluded()
+        for (uid, kind), st in self.episodes.items():
+            c = out.setdefault(kind, {"planned": 0, "done": 0, "excluded": 0, "pending": 0,
+                                      "upstream": 0})
+            if (uid, kind) in up:
+                c["upstream"] += 1
+                continue
             c["planned"] += 1
             c["done" if st == "done" else "pending" if st == "pending" else "excluded"] += 1
         return out
@@ -215,6 +233,30 @@ class Progress:
             return "incomplete"
         return "done" if not error_rate_problems(self.exclusions(), max_error_rate) \
             else "completed_with_errors"
+
+
+# Shard kind -> the kinds upstream of it (``Manifest`` ``depends_on``): an episode those excluded
+# is excluded downstream too (``attempts.upstream_excluded``), but counted once, upstream.
+UPSTREAM_KINDS: Mapping[str, tuple[str, ...]] = {"caption": ("segment",)}
+
+
+def tally_exclusions(planned: Mapping[str, set[str]], excluded: Mapping[str, set[str]]
+                     ) -> dict[str, dict[str, int]]:
+    """Per kind ``planned`` / ``done`` / ``excluded`` / ``pending`` (0) / ``upstream`` counts
+    for :func:`error_rate_problems`, from planned and excluded uid sets. Episodes an upstream
+    kind (:data:`UPSTREAM_KINDS`) excluded leave the downstream kind's counts (``upstream``),
+    so one failing episode is one exclusion, not one per stage. Shared by the orchestrator and
+    the reconciler (``Progress.exclusions`` applies the same rule)."""
+    out: dict[str, dict[str, int]] = {}
+    for kind, eps in planned.items():
+        up = {u for k in UPSTREAM_KINDS.get(kind, ()) for u in excluded.get(k, set())
+              if u in planned.get(k, set())}
+        x = excluded.get(kind, set()) & eps
+        inherited = x & up
+        own = eps - inherited
+        out[kind] = {"planned": len(own), "done": len(own - x), "excluded": len(x - inherited),
+                     "pending": 0, "upstream": len(inherited)}
+    return out
 
 
 def with_unplanned(exclusions: dict[str, dict[str, int]], unplanned: Mapping[str, str] | None
@@ -344,10 +386,12 @@ def derive(jf: JobFiles, manifest: Manifest, *, limit: int) -> Progress:
             for u in rec.detail.get("poisoned", ()):
                 mark(u, s.kind, "poison_pill")
 
-    def resolved(sid: str) -> bool:
+    def resolved(sid: str, downstream: Shard) -> bool:
+        """Per episode: ``downstream``'s episodes are terminal at the dependency's kind."""
         dep = shards.get(sid)
+        mine = set(downstream.episodes)
         return dep is not None and all(episodes.get((u, dep.kind)) in TERMINAL
-                                       for u in dep.episodes)
+                                       for u in dep.episodes if u in mine)
 
     # M3: a poison-pilled single-episode shard whose quarantine record is not listed yet
     poison: set[str] = set()
@@ -370,7 +414,7 @@ def derive(jf: JobFiles, manifest: Manifest, *, limit: int) -> Progress:
             st = "quarantined"
         elif starts >= limit:
             st = "quarantine_due"
-        elif not all(resolved(d) for d in s.depends_on):
+        elif not all(resolved(d, s) for d in s.depends_on):
             st = "blocked"
         else:
             st = "ready" if starts == 0 else "started"

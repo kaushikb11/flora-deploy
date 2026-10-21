@@ -223,12 +223,13 @@ def test_sdk_snippet_check_sees_every_keyword():
     assert funcs == [("submit", ["job_id", "bogus_kw"])]
 
 
-def test_readme_modal_flow_is_deployable(request):
-    """The "Run on Modal" flow (`flora init --template <t>` then `flora deploy`) plans an app.
-    xfail while a kind it needs has no worker (P1b-1); once wired it must pass (strict)."""
+def test_readme_modal_flow_is_deployable():
+    """The "Run on Modal" flow (`flora init --template <t>` then `flora deploy`) plans an app
+    that registers a worker class for every shard kind the template's preset runs (strict:
+    the balanced SegmentWorker / CaptionWorker are wired, P1b-1)."""
     from flora_deploy.cli.init import template_text
     from flora_deploy.config.schema import loads_config
-    from flora_deploy.modal_app.factory import PENDING_WORKERS, WorkerUnavailable, plan_app
+    from flora_deploy.modal_app.factory import PENDING_WORKERS, plan_app
 
     (block,) = [b for b in BASH if b.heading.startswith("Run on Modal")]
     argvs = [a for a in commands(block.code) if a[:2] == ["flora", "init"]]
@@ -237,12 +238,11 @@ def test_readme_modal_flow_is_deployable(request):
     template = argv[argv.index("--template") + 1]
     assert any(a[:2] == ["flora", "deploy"] for a in commands(block.code))
     cfg = loads_config(template_text(template), source=template)
-    pending = sorted(k for k in cfg.pools() if k in PENDING_WORKERS)
-    if pending:
-        request.applymarker(pytest.mark.xfail(reason="P1b-1 factory wiring pending",
-                                              raises=WorkerUnavailable, strict=True))
+    assert not sorted(k for k in cfg.pools() if k in PENDING_WORKERS)
     receipts = {"tempseg_merged": "a" * 64, "captioner_bf16": "b" * 64}
-    assert plan_app(cfg, store="s3://bucket/labels", derived_receipts=receipts)
+    plan = plan_app(cfg, store="s3://bucket/labels", derived_receipts=receipts)
+    assert set(plan.worker_classes) == set(cfg.pools())
+    assert {plan.object(n).name for n in plan.worker_classes.values()}
 
 
 def test_try_it_script_is_the_readme_block():

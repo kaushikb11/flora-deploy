@@ -468,6 +468,36 @@ def resolve(shards: Sequence[Shard], status: Callable[[str], str],
             {s.shard_id for s in shards if is_dead(s.shard_id)})
 
 
+def deps_ready(shard: Shard, by_id: Mapping[str, Shard], satisfied: set[str],
+               children_of: Mapping[str, Iterable[str]] | None = None) -> bool:
+    """Whether ``shard`` may run: **per episode**, every one of its episodes that a
+    ``depends_on`` shard holds is resolved there (a balanced ``caption`` shard needs a segment
+    record or a legitimate exclusion for each of its episodes, nothing more). A dependency is
+    resolved for an episode when it is satisfied, or when it was quarantined and bisected
+    (``children_of``: its children, from the ledgers) and the child holding that episode is
+    satisfied; an episode that no child holds was done in the parent before the bisection. An
+    unknown dependency or child (lagging manifest) means wait. The worker then reads the
+    records and exclusions (``attempts.upstream_excluded``)."""
+    mine = set(shard.episodes)
+    kids_of = children_of or {}
+    for d in shard.depends_on:
+        if d in satisfied:
+            continue
+        dep, kids = by_id.get(d), kids_of.get(d)
+        if dep is None or kids is None:
+            return False
+        holder: dict[str, str] = {}
+        for c in kids:
+            cs = by_id.get(c)
+            if cs is None:
+                return False
+            holder.update(dict.fromkeys(cs.episodes, c))
+        for u in dep.episodes:
+            if u in mine and holder.get(u) is not None and holder[u] not in satisfied:
+                return False
+    return True
+
+
 # ----------------------------------------------------------------------------------------------
 # Orchestrator
 # ----------------------------------------------------------------------------------------------
@@ -729,7 +759,11 @@ class Orchestrator:
     def _error_rate_problems(self, shards: Sequence[Shard]) -> list[str]:
         """The job-level error-rate guard (module docstring), from receipts and ledgers."""
         from flora_deploy.jobs.manifest import from_json
-        from flora_deploy.jobs.progress import error_rate_problems, with_unplanned
+        from flora_deploy.jobs.progress import (
+            error_rate_problems,
+            tally_exclusions,
+            with_unplanned,
+        )
         from flora_deploy.jobs.types import ShardReceipt
 
         base = self._planned.shards if self._planned is not None else shards
@@ -750,11 +784,7 @@ class Orchestrator:
                 if self.store.exists(p):
                     r = from_json(ShardReceipt, self.store.get_bytes(p))
                     excluded.setdefault(s.kind, set()).update(r.episodes_failed)
-        tallies = {}
-        for kind, eps in planned.items():
-            x = len(excluded.get(kind, set()) & eps)
-            tallies[kind] = {"planned": len(eps), "done": len(eps) - x, "excluded": x,
-                             "pending": 0}
+        tallies = tally_exclusions(planned, excluded)
         return error_rate_problems(with_unplanned(tallies, unplanned),
                                    self.settings.max_episode_error_rate)
 
@@ -953,11 +983,14 @@ class Orchestrator:
                         status: Callable[[str], str]) -> bool:
         """Spawn what fits. Returns False if the budget gate stopped the job."""
         in_flight = self._in_flight()
+        by_id = {s.shard_id: s for s in shards}
+        children = {sid: led.children for sid, led in self._ledgers.items()
+                    if led.status == "quarantined"}
         for s in shards:
             led = self._ledger(s)
             if led.status not in ("new", "retry") or s.shard_id in dead:
                 continue
-            if not all(d in satisfied for d in s.depends_on):
+            if s.depends_on and not deps_ready(s, by_id, satisfied, children):
                 continue
             pool = self.settings.pools[s.kind]
             if in_flight.get(s.kind, 0) >= pool.max_containers * pool.max_inputs:

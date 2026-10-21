@@ -79,6 +79,7 @@ from flora_deploy.jobs.types import (
     EpisodeError,
     Shard,
     ShardKind,
+    ShardReceipt,
     safe_key,
 )
 
@@ -498,16 +499,49 @@ def upstream_poisoned(jf: JobFiles, shard: Shard, upstream: Iterable[Shard]) -> 
     return out
 
 
-def write_upstream_failures(jf: JobFiles, shard: Shard, uids: Iterable[str], *,
-                            container_id: str = UPSTREAM_CONTAINER) -> str | None:
-    """Errors for episodes skipped because their upstream stage was poison-pilled."""
-    uids = [u for u in shard.episodes if u in set(uids)]
-    if not uids:
+def upstream_excluded(jf: JobFiles, shard: Shard, upstream: Iterable[Shard]) -> dict[str, str]:
+    """uid -> why, for the episodes of ``shard`` that its upstream stage legitimately excluded:
+    ``poison_pill`` (:func:`upstream_poisoned`) or ``nv_failure`` (in the ``episodes_failed`` of
+    a ``depends_on`` shard's receipt, or of the receipt of its single-episode bisection child).
+    A downstream shard (balanced ``caption``) never runs these; it reports them with
+    :func:`write_upstream_failures`, and the error-rate guard counts them once, at the upstream
+    kind (``progress.UPSTREAM_KINDS``). Reads with ``exists`` / ``get`` only (no ``list``)."""
+    upstream = list(upstream)
+    out = dict.fromkeys(sorted(upstream_poisoned(jf, shard, upstream)), "poison_pill")
+    mine = set(shard.episodes)
+    deps = [s for s in upstream if s.shard_id in set(shard.depends_on)]
+    for dep in deps:
+        holders = [dep]
+        if len(dep.episodes) > 1:
+            holders += [Shard(child_shard_id(dep.kind, u), dep.kind, (u,), 0.0,
+                              bisected_from=dep.shard_id) for u in dep.episodes if u in mine]
+        for h in holders:
+            path = jf.paths.receipt(jf.config_hash, h.kind, h.shard_id)
+            if not jf.store.exists(path):
+                continue
+            for u in from_json(ShardReceipt, jf.store.get_bytes(path)).episodes_failed:
+                if u in mine:
+                    out.setdefault(u, "nv_failure")
+    return out
+
+
+def write_upstream_failures(jf: JobFiles, shard: Shard, uids: Iterable[str] | Mapping[str, str],
+                            *, container_id: str = UPSTREAM_CONTAINER) -> str | None:
+    """Errors for episodes skipped because their upstream stage excluded them. ``uids``: a set
+    (poison-pilled upstream) or uid -> reason from :func:`upstream_excluded`; the error's kind
+    is that reason (``poison_pill`` / ``nv_failure``, both terminal and excused) and its
+    diagnostics say ``upstream: true``."""
+    why = dict(uids) if isinstance(uids, Mapping) else dict.fromkeys(uids, "poison_pill")
+    todo = [u for u in shard.episodes if u in why]
+    if not todo:
         return None
     path = jf.paths.errors(jf.config_hash, shard.kind, shard.shard_id, container_id, 0)
     errs = [EpisodeError(uid=u, stage=stage, shard_id=shard.shard_id, container_id=container_id,
-                         kind="poison_pill", message="upstream stage poison-pilled (D15)")
-            for u in uids for stage in stages_of(shard.kind)]
+                         kind="nv_failure" if why[u] == "nv_failure" else "poison_pill",
+                         message=("upstream stage poison-pilled (D15)" if why[u] != "nv_failure"
+                                  else "upstream stage excluded the episode (nv_failure)"),
+                         diagnostics={"upstream": True, "reason": why[u]})
+            for u in todo for stage in stages_of(shard.kind)]
     jf.store.put_bytes(path, "".join(
         json.dumps(asdict(e), sort_keys=True) + "\n" for e in errs).encode())
     return path

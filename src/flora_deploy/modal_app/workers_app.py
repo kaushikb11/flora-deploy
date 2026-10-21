@@ -316,23 +316,57 @@ class FakeFaultHook:
     def faults(self) -> dict[str, Any]:
         return getattr(self._local, "faults", {})
 
-    def start_shard(self, job_id: str, shard_id: str) -> None:
+    @property
+    def kind(self) -> str:
+        return getattr(self._local, "kind", "")
+
+    def start_shard(self, job_id: str, shard_id: str, kind: str = "") -> None:
         import json
 
         loc = self._local
-        loc.job_id, loc.shard_id, loc.seen = job_id, shard_id, 0
+        loc.job_id, loc.shard_id, loc.seen, loc.kind = job_id, shard_id, 0, kind
         p = fake_faults_path(job_id)
         try:
             loc.faults = json.loads(self.store.get_bytes(p)) if self.store.exists(p) else {}
         except (OSError, ValueError):
             loc.faults = {}
 
+    def poisoned(self, uid: str) -> bool:
+        """``poison``: a list of uids (any kind), or ``{"<kind>": [uid, ...]}`` (only workers
+        of that kind die there: e.g. a balanced episode poisoned at ``caption``, not at
+        ``segment``)."""
+        spec = self.faults.get("poison") or ()
+        if isinstance(spec, dict):
+            return uid in set(spec.get(self.kind, ()))
+        return uid in set(spec)
+
+    def bound(self) -> Callable[[str], None]:
+        """:meth:`before_episode` bound to this thread's shard, callable from any thread (the
+        balanced fake jobs run it off the event loop so a SIGINT can cancel the loop)."""
+        import threading
+
+        loc = self._local
+        state = {k: getattr(loc, k, None) for k in ("job_id", "shard_id", "seen", "faults",
+                                                     "kind")}
+        lock = threading.Lock()
+
+        def before(uid: str) -> None:
+            with lock:
+                for k, v in state.items():
+                    setattr(self._local, k, v)
+                try:
+                    self.before_episode(uid)
+                finally:
+                    state["seen"] = getattr(self._local, "seen", 0)
+
+        return before
+
     def before_episode(self, uid: str) -> None:
         import json
 
         self._local.seen = getattr(self._local, "seen", 0) + 1
         seen = self._local.seen
-        if uid in set(self.faults.get("poison", ())):
+        if self.poisoned(uid):
             print(f"fake-models: poison {uid} -> os._exit(137)", flush=True)
             commit = getattr(self.store, "commit", None)
             if callable(commit):
@@ -526,3 +560,82 @@ class FakeRewardWorker:
         runner = getattr(self, "runner", None)
         if runner is not None:
             runner.preempt()
+
+
+def fake_balanced_runner(kind: str, store: Store, env: Mapping[str, str], hook: FakeFaultHook,
+                         *, call_id: Callable[[], str | None] = lambda: "",
+                         fatal: Callable[[BaseException], None] | None = None) -> Any:
+    """The real ``BalancedShardRunner`` with ``local.balanced``'s fake job and engine; ``hook``
+    runs before each episode (bound per shard by :class:`FakeBalancedWorker`)."""
+    from flora_deploy.local import balanced as LB
+    from flora_deploy.workers_impl.certstamp import fake_stamp
+
+    gpu = gpu_name()
+    runner = LB.fake_balanced_runner(
+        kind, store, media_root=env.get("FLORA_MEDIA_ROOT"), gpu=gpu,
+        certificate=FAKE_CERTIFICATE, default_task=env.get("FLORA_INSTRUCTION_TEXT") or None,
+        before=lambda uid: hook_for_shard[0](uid), before_in_thread=True, call_id=call_id,
+        fatal=fatal, stamp=fake_stamp(env, gpu=gpu))
+    hook_for_shard: list[Callable[[str], None]] = [hook.before_episode]
+    runner.flora_hook_slot = hook_for_shard  # type: ignore[attr-defined]
+    return runner
+
+
+class _FakeBalancedWorker:
+    """Shared body of the fake ``segment`` / ``caption`` workers (``--fake-models``)."""
+
+    KIND = ""
+
+    def _start(self) -> None:
+        self.store, self.preflight = fake_preflight()
+        self.hook = FakeFaultHook(self.store)
+        self.runner = fake_balanced_runner(self.KIND, self.store, os.environ, self.hook,
+                                           call_id=modal.current_function_call_id, fatal=_die)
+        print(f"fake-models {self.KIND} worker: media={os.environ.get('FLORA_MEDIA_ROOT')} "
+              f"preflight={self.preflight}", flush=True)
+
+    def _run(self, job_id: str, shard_id: str, config_hash: str, token: str):
+        self.hook.start_shard(job_id, shard_id, self.KIND)
+        self.runner.flora_hook_slot[0] = self.hook.bound()
+        return self.runner.run_shard(job_id, shard_id, config_hash, token=token)
+
+    def _stop(self) -> None:
+        runner = getattr(self, "runner", None)
+        if runner is not None:
+            runner.preempt()
+
+
+class FakeSegmentWorker(_FakeBalancedWorker):
+    """Balanced ``segment`` worker of a ``--fake-models`` app (``local.balanced``)."""
+
+    KIND = "segment"
+
+    @modal.enter()
+    def start(self) -> None:
+        self._start()
+
+    @modal.method()
+    def run_shard(self, job_id: str, shard_id: str, config_hash: str, token: str = ""):
+        return self._run(job_id, shard_id, config_hash, token)
+
+    @modal.exit()
+    def stop(self) -> None:
+        self._stop()
+
+
+class FakeCaptionWorker(_FakeBalancedWorker):
+    """Balanced ``caption`` worker of a ``--fake-models`` app (``local.balanced``)."""
+
+    KIND = "caption"
+
+    @modal.enter()
+    def start(self) -> None:
+        self._start()
+
+    @modal.method()
+    def run_shard(self, job_id: str, shard_id: str, config_hash: str, token: str = ""):
+        return self._run(job_id, shard_id, config_hash, token)
+
+    @modal.exit()
+    def stop(self) -> None:
+        self._stop()

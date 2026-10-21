@@ -12,8 +12,8 @@ Two steps, so the same truth drives ``build_app``, ``flora deploy --dry-run`` an
 1. :func:`plan_app` turns a validated ``FloraConfig`` into an :class:`AppPlan`: plain, JSON-able
    option sets per Modal object (GPU, cpu, ``memory=(request, limit)``, containers,
    ``@modal.concurrent`` inputs, timeouts, retries, scaledown, Volumes, secret *names*, env).
-   It contacts nothing and refuses what cannot run: shard kinds without a worker class (balanced
-   ``segment``/``caption`` until P1b-1, ``reward.rubric``), uncertified presets without
+   It contacts nothing and refuses what cannot run: shard kinds without a worker class
+   (``reward.rubric``), uncertified presets without
    ``allow_uncertified`` (D9/D16), local stores, decorated (module-scope) workers, and inputs the
    containers cannot read (a local ``input.path`` that was not staged to a Volume).
 2. :func:`materialize` (``build_app``) applies the decorators to a fresh ``modal.App``. Still
@@ -22,7 +22,11 @@ Two steps, so the same truth drives ``build_app``, ``flora deploy --dry-run`` an
 Objects, by stable Modal name (``ModalSpawner`` looks classes up by ``AppPlan.worker_classes``):
 
 - one worker class per worker *class* used: ``segcap`` -> ``ReferenceWorker`` (img_hfref, the
-  exact worker), ``reward.terminal``/``reward.dense`` -> ``RewardWorker`` (img_vllm). Kinds that
+  exact worker), ``reward.terminal``/``reward.dense`` -> ``RewardWorker`` (img_vllm), balanced
+  ``segment`` -> ``SegmentWorker`` and ``caption`` -> ``CaptionWorker`` (img_vllm,
+  ``balanced_app``: one pool each, L40S / H100! by default; their env adds the recorded
+  derived-weight receipts ``FLORA_DERIVED_RECEIPTS``, the pool GPUs, the kinds' modes and the
+  embodiment, which the workers verify and stamp). Kinds that
   share a class share its containers: their pools must agree on GPU and ``max_inputs``; cpu and
   memory take the larger, ``max_containers`` the sum (the orchestrator caps each kind itself);
 - ``orchestrator_run`` (CPU, nonpreemptible, 24 h, ``modal.Retries``) and ``reconcile``; with
@@ -57,7 +61,8 @@ the measured container-s per video-s, upper quantile, times ``max_inputs``) plus
 **Fake models (H0, ``flora deploy --fake-models``).** ``plan_app(fake_models=True)`` plans the
 same app (orchestrator, reconciler, index function, store and media Volumes, secrets, env,
 timeouts, retries, container caps) but registers :data:`FAKE_WORKERS`: ``FakeSegcapWorker`` /
-``FakeRewardWorker`` (``workers_app``: the real shard runners with G2's fake engines) on
+``FakeRewardWorker`` / ``FakeSegmentWorker`` / ``FakeCaptionWorker`` (``workers_app``: the real
+shard runners with G2's fake engines, ``local.balanced`` for the balanced kinds) on
 ``img_cpu`` with no GPU and :data:`FAKE_WORKER_CPU` / :data:`FAKE_WORKER_MEMORY_GIB`. It
 hashes ``fake_models`` into every stage hash (``config.hashing``), fills missing derived-weight
 receipts with :data:`FAKE_RECEIPT`, names the app ``flora-<project>-fake-<digest>``, tags it
@@ -96,6 +101,7 @@ CACHE_MODE_ENV = "FLORA_CACHE_MODE"  # ro (workers: local copy, no commit) | rw 
 LOCAL_CACHE_ROOT = "/tmp/flora-cache"
 WARM_CACHE_FUNCTION = "warm_reward_cache"
 RECONCILE_EVERY = "*/10 * * * *"
+DERIVED_RECEIPTS_ENV = "FLORA_DERIVED_RECEIPTS"  # balanced workers: weights.derived they verify
 
 IMAGE_BUILDERS = {"img_cpu": "cpu_image", "img_hfref": "hfref_image", "img_vllm": "vllm_image"}
 
@@ -121,7 +127,7 @@ class WorkerRef:
     startup_timeout_s: int
     scaledown_window_s: int = WORKER_SCALEDOWN_S
     cache: bool = False  # mount flora-cache (compile/Triton caches)
-    recipe: Literal["segcap", "reward"] = "reward"  # container env recipe
+    recipe: Literal["segcap", "reward", "balanced"] = "reward"  # container env recipe
 
 
 WORKERS: dict[str, WorkerRef] = {
@@ -132,10 +138,13 @@ WORKERS: dict[str, WorkerRef] = {
                                  "img_vllm", startup_timeout_s=15 * 60, cache=True),
     "reward.dense": WorkerRef("flora_deploy.modal_app.workers_app", "RewardWorker", "img_vllm",
                               startup_timeout_s=15 * 60, cache=True),
+    # balanced (P1b-1): vLLM TempSeg / Captioner, one pool each (D8)
+    "segment": WorkerRef("flora_deploy.modal_app.balanced_app", "SegmentWorker", "img_vllm",
+                         startup_timeout_s=15 * 60, cache=True, recipe="balanced"),
+    "caption": WorkerRef("flora_deploy.modal_app.balanced_app", "CaptionWorker", "img_vllm",
+                         startup_timeout_s=15 * 60, cache=True, recipe="balanced"),
 }
 PENDING_WORKERS: dict[str, str] = {
-    "segment": "the balanced SegmentWorker lands with P1b-1",
-    "caption": "the balanced CaptionWorker lands with P1b-1",
     "reward.rubric": "there is no RubricWorker yet",
 }
 INDEX_FUNCTION: tuple[str, str] = ("flora_deploy.modal_app.index_app", "index_run_shard")
@@ -148,6 +157,10 @@ FAKE_WORKERS: dict[str, WorkerRef] = {
                                  "img_cpu", startup_timeout_s=15 * 60, cache=True),
     "reward.dense": WorkerRef("flora_deploy.modal_app.workers_app", "FakeRewardWorker",
                               "img_cpu", startup_timeout_s=15 * 60, cache=True),
+    "segment": WorkerRef("flora_deploy.modal_app.workers_app", "FakeSegmentWorker", "img_cpu",
+                         startup_timeout_s=8 * 60, recipe="balanced"),
+    "caption": WorkerRef("flora_deploy.modal_app.workers_app", "FakeCaptionWorker", "img_cpu",
+                         startup_timeout_s=8 * 60, recipe="balanced"),
 }
 FAKE_RECEIPT = "flora-fake-models"
 FAKE_CERTIFICATE = "fake-models"
@@ -376,6 +389,8 @@ def _recipe_env(recipe: str, determinism: str, cache_mode: str = "ro") -> dict[s
         from flora_deploy.modal_app.warm import linked_offline_env
 
         return {**linked_offline_env(), **det.container_env(determinism)}
+    if recipe == "balanced":  # compile caches: balanced_app.cache_env (read-only mount, M7)
+        return {CACHE_MODE_ENV: cache_mode, "TOKENIZERS_PARALLELISM": "false"}
     from flora_deploy.modal_app import rewarder_app as ra
 
     root = LOCAL_CACHE_ROOT if cache_mode == "ro" else None
@@ -444,6 +459,29 @@ def instruction_env(cfg: Any) -> dict[str, str]:
     if ins.source == "fixed" and ins.text:
         env["FLORA_INSTRUCTION_TEXT"] = ins.text
     return env
+
+
+def balanced_env(cfg: Any, kinds: list[str], pools: Mapping[str, PoolSettings],
+                 derived_receipts: Mapping[str, str]) -> dict[str, str]:
+    """What a balanced worker verifies and stamps (``modal_app.balanced_app``,
+    ``workers_impl.certstamp``): the recorded receipts of the derived weights its kinds need
+    (``weights.derived``), each kind's pool GPU (the engine's per-GPU limits and the
+    certification key), its output-affecting modes and the job's embodiment."""
+    from flora_deploy.config.hashing import kind_modes
+    from flora_deploy.config.presets import get_preset
+    from flora_deploy.workers_impl.certstamp import EMBODIMENT_ENV, KIND_MODES_ENV, POOL_GPUS_ENV
+
+    preset = get_preset(cfg.preset)
+    names = sorted({n for k in kinds for n in preset.derived_weights.get(k, ())})  # type: ignore[call-overload]
+    missing = [n for n in names if not derived_receipts.get(n)]
+    if missing:
+        raise DeployError(f"{', '.join(kinds)}: no recorded receipt for derived weight(s) "
+                          f"{missing} (run `flora prepare`, or pass --receipt NAME=<sha256>)")
+    return {DERIVED_RECEIPTS_ENV: json.dumps({n: derived_receipts[n] for n in names},
+                                             sort_keys=True),
+            POOL_GPUS_ENV: json.dumps({k: pools[k].gpu for k in kinds}, sort_keys=True),
+            KIND_MODES_ENV: json.dumps({k: kind_modes(cfg, k) for k in kinds}, sort_keys=True),
+            EMBODIMENT_ENV: str(cfg.pipeline.embodiment)}
 
 
 def plan_app(
@@ -601,6 +639,12 @@ def plan_app(
             from flora_deploy.workers_impl.segcap import SCHEDULING_ENV
 
             env[SCHEDULING_ENV] = json.dumps(exact_scheduling(cfg), sort_keys=True)  # G3 order
+        if ref.recipe == "balanced":
+            env.update(balanced_env(cfg, kinds, rs.pools, derived_receipts or {}))
+            if pool.max_inputs > 1:
+                raise DeployError(f"{cls_name}: max_inputs {pool.max_inputs} > 1, but a balanced "
+                                  "worker runs one shard per container (its episodes run "
+                                  "concurrently inside it)")
         timeout = worker_timeout_s(rs.shard_target_gpu_minutes, preset=cfg.preset,
                                    kinds=tuple(kinds), max_inputs=pool.max_inputs,
                                    startup_s=float(ref.startup_timeout_s) / 2)

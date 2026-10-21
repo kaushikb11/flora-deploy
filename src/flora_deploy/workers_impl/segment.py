@@ -439,11 +439,13 @@ class BalancedShardRunner:
                              start_k=start_k)
         active.sink = sink
 
-        poisoned: set[str] = set()  # step 3
+        poisoned: set[str] = set()  # step 3: excluded upstream (poison pill or nv_failure)
         if shard.depends_on:
             m = manifests.load()
-            poisoned = A.upstream_poisoned(jf, shard, m.shards) - done
-            A.write_upstream_failures(jf, shard, poisoned)
+            excluded = {u: why for u, why in A.upstream_excluded(jf, shard, m.shards).items()
+                        if u not in done}
+            A.write_upstream_failures(jf, shard, excluded)
+            poisoned = set(excluded)
 
         refs = {e.uid: e for e in manifests.base().episodes}
         todo = [u for u in shard.episodes if u not in done and u not in poisoned]

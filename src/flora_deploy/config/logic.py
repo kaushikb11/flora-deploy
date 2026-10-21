@@ -87,6 +87,8 @@ OUTPUT_MODULES: dict[str, tuple[str, ...]] = {
         "config/schema.py",  # output_settings / with_pipeline / to_run_settings
         "jobs/settings.py",  # RunSettings carries the modes to the workers
         "modal_app/factory.py",  # worker env (FLORA_DETERMINISM, FLORA_TERMINAL_MODE, ...)
+        # certification provenance stamped into records (embodiment, cert_key, gpu)
+        "workers_impl/certstamp.py",
     ),
     # NVIDIA's HF pipeline (exact segcap) and its output-identical runtime patches (D17).
     "nvidia-hf": (
@@ -98,7 +100,7 @@ OUTPUT_MODULES: dict[str, tuple[str, ...]] = {
         "workers_impl/exact_split.py",
     ),
     # vLLM TempSeg / Captioner (balanced): NVIDIA's input builders, captured and wrapped for vLLM
-    # (Gate C), on the same patch layer. No worker exists yet, so this is deliberately broad.
+    # (Gate C), on the same patch layer, and the SegmentWorker / CaptionWorker around them.
     "vllm-video": (
         *_VIDEO_PATH,
         "engines/__init__.py",
@@ -111,6 +113,8 @@ OUTPUT_MODULES: dict[str, tuple[str, ...]] = {
         "stages/caption.py",
         "workers_impl/segment.py",  # index-receipt -> NVIDIA arguments (profile, instruction)
         "workers_impl/caption.py",  # upstream segment records -> caption inputs
+        "workers_impl/balanced.py",  # accel episode scopes + record stamping around the jobs
+        "modal_app/balanced_app.py",  # derived weights, engine spec on the pool GPU, accel
     ),
     # NVIDIA's offline vLLM Rewarder recipe, and the worker that feeds it: camera order of the
     # collage, which file/cut is read, the task fallback, ``certified``, the settings it applies
@@ -188,6 +192,7 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     # local: the in-process runner, spawner, fault injection and fake engines (G2). Never on a
     # real run's path; fake outputs carry their own hash (fake receipts, local.runner)
     "local/__init__.py",
+    "local/balanced.py",  # fake balanced segment / caption jobs (fake models only)
     "local/engines.py",
     "local/fake_nvidia.py",
     "local/faults.py",

@@ -81,7 +81,7 @@ from flora_deploy.local.faults import FaultPlan, maybe_fail, note_episodes
 from flora_deploy.local.spawner import FileKV, LocalSpawner
 
 FAKE_RECEIPT = "flora-local-fake-models"
-SUPPORTED_KINDS = ("segcap", "reward.terminal", "reward.dense")
+SUPPORTED_KINDS = ("segcap", "segment", "caption", "reward.terminal", "reward.dense")
 LOCAL_DIR = ".flora-local"  # under the store root, outside the job tree (``flora/``)
 STATES = ("done", "completed_with_errors", "failed", "budget_stopped", "cancelled",
           "interrupted", "lease_held")
@@ -331,8 +331,8 @@ class LocalRunner:
         if unsupported:
             raise LocalRunError(f"the local fake runner has no engine for shard kind(s) "
                                 f"{unsupported} (supported: {', '.join(SUPPORTED_KINDS)}; use "
-                                "preset exact and stages segment/caption/reward.terminal/"
-                                "reward.dense)")
+                                "preset exact or balanced and stages segment/caption/"
+                                "reward.terminal/reward.dense)")
         self.budget_usd = budget_usd
         n = sum(p.max_containers * p.max_inputs for p in cfg.pools().values())
         self.max_workers = max_workers or 2 * n + 2
@@ -461,6 +461,17 @@ class LocalRunner:
         local_dir = str(self.local_dir / "containers" / container_id)
         media = str(self.media_root) if self.media_root is not None else None
         store = FaultStore(self.store)
+        if kind in ("segment", "caption"):  # balanced: the real BalancedShardRunner
+            from flora_deploy.local.balanced import fake_balanced_runner
+            from flora_deploy.local.faults import checkpoint, nv_rejects
+            from flora_deploy.workers_impl.certstamp import CertStamp
+
+            return fake_balanced_runner(
+                kind, store, media_root=media, gpu=pool.gpu, certificate=FAKE_CERTIFICATE,
+                default_task=instr.text, local_dir=local_dir, container_id=container_id,
+                before=checkpoint, rejects=nv_rejects, on_shard=note_episodes,
+                call_id=call_id, fatal=_container_exit,
+                stamp=CertStamp(cfg.pipeline.embodiment, None, pool.gpu))
         if kind == "segcap":
             s = SegcapWorkerSettings(
                 preset=cfg.preset, models=FAKE_MODELS["segcap"], gpu=pool.gpu,
