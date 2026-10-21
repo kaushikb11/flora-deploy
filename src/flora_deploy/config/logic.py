@@ -133,13 +133,19 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     # cli: argument parsing; every output-affecting choice goes through the (hashed) config
     "cli/__init__.py",
     "cli/_app.py",
+    "cli/cancel.py",
     "cli/deploy.py",
     "cli/index.py",
     "cli/init.py",
+    "cli/logs.py",
     "cli/plan.py",
     "cli/prepare.py",
+    "cli/report.py",
     "cli/results.py",
+    "cli/resume.py",
+    "cli/run.py",
     "cli/run_local.py",  # local runs only (fake models)
+    "cli/status.py",
     "config/__init__.py",
     "config/pins.py",  # hashed by value (nvidia_pins, decode)
     "config/presets.py",  # hashed by value (engine identity); pools are deliberately unhashed
@@ -195,6 +201,9 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     "planner/__init__.py",
     "planner/options.py",
     "planner/rates.py",
+    # sdk: client-side submit/status/report (and the deployed orchestrator's deps factory: it
+    # reads back the RunSettings the client planned); which shards run, never what they compute
+    "sdk.py",
     "prep/__init__.py",
     "prep/download.py",  # downloads are verified against the pins
     "prep/merge_tempseg.py",  # derived weights: hashed by receipt
