@@ -4,13 +4,18 @@ container is started; every call is a Volume metadata / file call.
 
 - writes: whole files through ``Volume.batch_upload(force=True)`` (atomic per file on v2);
 - reads: ``Volume.read_file`` (whole file);
-- listings: ``Volume.listdir(recursive=True)`` of the deepest directory the prefix names.
+- listings: ``Volume.listdir(recursive=True)``.
 
-**Listings are cached per directory** for the store object's lifetime (and dropped on every
-write through it), so ``exists`` on many files of one directory (receipts, markers) is one
-``listdir``, not one read each: ``flora status`` on a job with thousands of shard files makes
-O(directories) calls instead of O(files) (H0). Writes by *other* processes after a listing are
-not seen until :meth:`refresh`; a reader that polls (``Job.wait``) calls it every poll.
+**One snapshot per refresh (H0: ``flora status`` was slow).** Every call is a network round
+trip, and the job layout fans files out by shard id (``receipts/<kind>/<xx>/<yy>/<shard>.json``),
+so a status that probes thousands of shard files made one call each. This store instead lists
+the directory at most :data:`LIST_DEPTH` path components deep that holds the file (e.g.
+``flora/<job>/<stage_hash>/receipts/<kind>``) once, recursively, and answers ``exists`` / ``list``
+for everything below it from that listing; and it keeps what it read (files up to
+:data:`MAX_CACHED_FILE` bytes, :data:`MAX_CACHED_BYTES` in all), so a file read twice in one
+status is fetched once. Both caches are dropped by :meth:`refresh` and by every write through
+this store. Writes by *other* processes are seen after the next :meth:`refresh`; ``sdk.Job``
+refreshes at the start of every ``status()`` (so every ``wait`` poll).
 """
 
 from __future__ import annotations
@@ -24,6 +29,9 @@ from typing import Any
 from flora_deploy.jobs.stores.local import check_rel_path
 
 _FILE = 1  # modal.volume.FileEntryType.FILE
+LIST_DEPTH = 5  # flora/<job>/<hash>/<area>/<kind>
+MAX_CACHED_FILE = 1 << 20
+MAX_CACHED_BYTES = 64 << 20
 
 
 def _not_found(e: BaseException) -> bool:
@@ -38,7 +46,9 @@ class ClientVolumeStore:
         self.volume = volume
         self.root = root.strip("/")
         self._lock = threading.Lock()
-        self._dirs: dict[str, frozenset[str]] = {}  # store-relative dir -> files under it
+        self._dirs: dict[str, frozenset[str]] = {}  # listed dir -> store-relative files under it
+        self._reads: dict[str, bytes] = {}
+        self._read_bytes = 0
         self.calls = {"listdir": 0, "read_file": 0, "batch_upload": 0}
 
     @classmethod
@@ -65,9 +75,11 @@ class ClientVolumeStore:
         return self._abs(d)
 
     def refresh(self) -> None:
-        """Forget cached listings (see the module docstring)."""
+        """Drop the cached listings and reads (see the module docstring)."""
         with self._lock:
             self._dirs.clear()
+            self._reads.clear()
+            self._read_bytes = 0
 
     # Store ---------------------------------------------------------------------------------
     def put_bytes(self, path: str, data: bytes) -> None:
@@ -78,44 +90,63 @@ class ClientVolumeStore:
         self.refresh()
 
     def get_bytes(self, path: str) -> bytes:
+        with self._lock:
+            hit = self._reads.get(path)
+        if hit is not None:
+            return hit
         self.calls["read_file"] += 1
         try:
-            return b"".join(self.volume.read_file(self._abs(path)))
+            data = b"".join(self.volume.read_file(self._abs(path)))
         except Exception as e:
             if _not_found(e):
                 raise FileNotFoundError(path) from None
             raise
+        if len(data) <= MAX_CACHED_FILE:
+            with self._lock:
+                if self._read_bytes + len(data) <= MAX_CACHED_BYTES:
+                    self._reads[path] = data
+                    self._read_bytes += len(data)
+        return data
 
     def _files_under(self, d: str) -> frozenset[str]:
-        """Store-relative paths of every file under directory ``d`` (cached)."""
+        """Store-relative paths of every file under directory ``d``."""
+        files = self._listing(d)
+        if not d:
+            return files
+        pre = d + "/"
+        return frozenset(f for f in files if f.startswith(pre))
+
+    def _listing(self, d: str) -> frozenset[str]:
+        """Every file under ``d``'s ancestor at most :data:`LIST_DEPTH` components deep (a
+        superset of the files under ``d``), from one cached recursive listing."""
+        parts = d.split("/") if d else []
+        top = "/".join(parts[:LIST_DEPTH])
         with self._lock:
-            hit = self._dirs.get(d)
-        if hit is not None:
-            return hit
-        # a cached ancestor listing already holds everything below it
-        with self._lock:
-            for anc, files in self._dirs.items():
-                if not anc or d.startswith(anc + "/"):
-                    pre = d + "/"
-                    return frozenset(f for f in files if f.startswith(pre))
-        self.calls["listdir"] += 1
-        try:
-            entries = self.volume.listdir(self._abs_dir(d), recursive=True)
-        except Exception as e:
-            if not _not_found(e):
-                raise
-            entries = []
-        cut = len(self.root) + 1 if self.root else 0
-        files = frozenset(
-            e.path.lstrip("/")[cut:] for e in entries
-            if int(getattr(e.type, "value", e.type)) == _FILE)
-        with self._lock:
-            self._dirs[d] = files
+            files = self._dirs.get(top)
+            if files is None:  # a cached ancestor listing already holds everything below it
+                for anc, fs in self._dirs.items():
+                    if not anc or top.startswith(anc + "/"):
+                        files = fs
+                        break
+        if files is None:
+            self.calls["listdir"] += 1
+            try:
+                entries = self.volume.listdir(self._abs_dir(top), recursive=True)
+            except Exception as e:
+                if not _not_found(e):
+                    raise
+                entries = []
+            cut = len(self.root) + 1 if self.root else 0
+            files = frozenset(
+                e.path.lstrip("/")[cut:] for e in entries
+                if int(getattr(e.type, "value", e.type)) == _FILE)
+            with self._lock:
+                self._dirs[top] = files
         return files
 
     def exists(self, path: str) -> bool:
         check_rel_path(path)
-        return path in self._files_under(posixpath.dirname(path))
+        return path in self._listing(posixpath.dirname(path))
 
     def list(self, prefix: str) -> Iterator[str]:
         base = prefix.rstrip("/")
