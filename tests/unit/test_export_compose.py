@@ -274,13 +274,33 @@ def test_config_hash_mismatch_refused(store):
         compose(store, JOB, config_hash="cfgX")
 
 
-def test_store_from_uri(tmp_path):
+def test_store_from_uri(tmp_path, monkeypatch):
     a = store_from_uri(f"file://{tmp_path}/s")
     assert isinstance(a, LocalStore) and a.root == tmp_path / "s"
     assert isinstance(store_from_uri(str(tmp_path / "p")), LocalStore)
     (tmp_path / "vol").mkdir()
     v = store_from_uri("modal-volume://flora-state", volume_mount=str(tmp_path / "vol"))
     assert isinstance(v, VolumeStore)
-    for bad in ("modal-volume://nope-not-mounted", "s3://", "gs://x", "file://host/x"):
+    (tmp_path / "vol" / "sub").mkdir()
+    assert store_from_uri("modal-volume://flora-state/sub",
+                          volume_mount=str(tmp_path / "vol")).mount == tmp_path / "vol" / "sub"
+    # not mounted here (a laptop): the Modal client's Volume API, no container
+    import modal
+
+    from flora_deploy.jobs.stores import ClientVolumeStore
+    from tests.fakes.client_volume import FakeClientVolume
+
+    seen = {}
+
+    def from_name(name, environment_name=None, version=None):
+        seen.update(name=name, env=environment_name, version=version)
+        return FakeClientVolume()
+
+    monkeypatch.setattr(modal.Volume, "from_name", from_name)
+    c = store_from_uri("modal-volume://flora-results/jobs", volume_mount=str(tmp_path / "no"),
+                       environment="dev")
+    assert isinstance(c, ClientVolumeStore) and c.root == "jobs"
+    assert seen == {"name": "flora-results", "env": "dev", "version": 2}
+    for bad in ("modal-volume://", "s3://", "gs://x", "file://host/x"):
         with pytest.raises(ValueError):
             store_from_uri(bad)

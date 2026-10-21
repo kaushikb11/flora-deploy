@@ -185,6 +185,7 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     "jobs/store.py",
     "jobs/stores/__init__.py",
     "jobs/stores/bucket.py",
+    "jobs/stores/client_volume.py",  # a Volume through the Modal client (laptops); no outputs
     "jobs/stores/local.py",
     "jobs/stores/volume.py",
     # local: the in-process runner, spawner, fault injection and fake engines (G2). Never on a
