@@ -146,26 +146,19 @@ def needed_by_kind(cfg: Any) -> dict[str, list[str]]:
     return out
 
 
-def fake_receipt(name: str) -> str:
-    """The stand-in receipt of derived weight ``name`` in a fake-models deployment: fake
-    workers load no weights, and ``fake_models`` already keeps their config hash apart."""
-    import hashlib
-
-    return hashlib.sha256(f"flora-fake-models:{name}".encode()).hexdigest()
-
-
 def resolve(cfg: Any, overrides: Mapping[str, str] | None = None, *,
             fake_models: bool = False) -> dict[str, str]:
     """Receipts for ``cfg``: ``weights.derived`` from the config, then ``overrides`` on top.
     Raises ``MissingReceiptError`` naming what to run when one the config needs is missing,
-    except with ``fake_models``, where a missing one gets its :func:`fake_receipt`."""
+    except with ``fake_models``: fake workers load no weights, so a missing one is simply left
+    out, exactly as ``factory.plan_app(fake_models=True)`` plans it (same config hash)."""
     recorded = dict(cfg.weights.derived)
     over = {k: v for k, v in (overrides or {}).items() if v}
     check_overrides(over)
     out = {**recorded, **over}
     missing = [n for n in needed(cfg) if not out.get(n)]
     if missing and fake_models:
-        return {**out, **{n: fake_receipt(n) for n in missing}}
+        return out
     if missing:
         raise MissingReceiptError(
             f"preset {cfg.preset!r} with stages {list(cfg.pipeline.stages)} needs derived "

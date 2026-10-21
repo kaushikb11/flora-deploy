@@ -242,10 +242,18 @@ def test_fake_models_needs_no_real_receipts():
     cfg = parse_config(balanced())
     with pytest.raises(rc.MissingReceiptError):
         rc.resolve(cfg)  # real deployments still fail closed
-    got = rc.resolve(cfg, fake_models=True)
-    assert set(got) == set(rc.needed(cfg))
-    assert all(v == rc.fake_receipt(n) and len(v) == 64 for n, v in got.items())
+    assert rc.resolve(cfg, fake_models=True) == {}  # as plan_app(fake_models=True) plans it
     assert rc.resolve(cfg, {"captioner_bf16": PINNED}, fake_models=True)["captioner_bf16"] == PINNED
+
+
+def test_fake_deploy_hash_matches_the_in_process_fake_plan():
+    """H0: `deployed app == the client's plan` failed when the CLI invented fake receipts."""
+    from flora_deploy.modal_app.factory import plan_app
+
+    cfg = parse_config(balanced())
+    via_cli = plan_app(cfg, fake_models=True,
+                       derived_receipts=rc.resolve(cfg, fake_models=True))
+    assert via_cli.app_name == plan_app(cfg, fake_models=True).app_name
 
 
 def test_deploy_fake_models_dry_run_without_receipts(tmp_path):
