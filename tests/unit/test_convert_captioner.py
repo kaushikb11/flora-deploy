@@ -190,7 +190,8 @@ def _dpin(dest: Path):
     """A DerivedPin for this toy receipt (the real one pins the Volume's receipt)."""
     from flora_deploy.accel.captioner_load import pinned_derived
 
-    return replace(pinned_derived(), receipt_sha256=_sha(dest / cc.DERIVED_RECEIPT))
+    receipt = json.loads((dest / cc.DERIVED_RECEIPT).read_text())
+    return replace(pinned_derived(), content_sha256=cc.content_digest(receipt))
 
 
 def test_receipt_checks(fp32_snapshot, keep_patch, tmp_path):
@@ -211,8 +212,9 @@ def test_receipt_checks(fp32_snapshot, keep_patch, tmp_path):
     assert verify_derived(dest, pin=pin, derived_pin=dpin, full=False)["mode"] == "fast"
     with pytest.raises(DerivedReceiptError, match="manifest digest"):
         verify_derived(dest, derived_pin=dpin)  # the real pin's manifest digest differs
-    with pytest.raises(DerivedReceiptError, match="!= pinned"):
-        verify_derived(dest, pin=pin)  # the real receipt pin is not this toy receipt
+    with pytest.raises(DerivedReceiptError, match="pinned"):
+        verify_derived(dest, pin=pin)  # the real pin (unset, or not this toy build)
+    assert receipt["content_sha256"] == cc.content_digest(receipt)
 
     # Corrupt one data byte of the largest shard: the default (full) check sees it.
     shard = max(dest.glob("model-*.safetensors"), key=lambda p: p.stat().st_size)

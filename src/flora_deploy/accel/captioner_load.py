@@ -18,8 +18,10 @@ check, ``verify_cuda_residency`` and ``verify_gdn``.
 
 What is trusted, and why (``docs/captioner-bf16.md``):
 
-- **The receipt is pinned.** Its bytes must hash to ``DERIVED_PINS["captioner-bf16"]
-  .receipt_sha256`` in ``pins.py`` (``None`` fails closed). Its schema, ``ok``, converter
+- **The content is pinned.** The receipt's content digest (``convert_captioner.content_digest``:
+  the output-determining fields only, recomputed here from the bytes read; a stored
+  ``content_sha256`` must agree) must equal ``DERIVED_PINS["captioner-bf16"].content_sha256``
+  in ``pins.py`` (``None`` fails closed). Its schema, ``ok``, converter
   version (= ``CONVERTER_VERSION`` = the pin's), source revision and NVIDIA manifest digest must
   equal the pins.
 - **Every byte is hashed by default** (``verify_derived(full=True)``): the files on disk must be
@@ -69,7 +71,9 @@ from flora_deploy.prep.convert_captioner import (
     DERIVED_RECEIPT,
     RECEIPT_SCHEMA,
     SOURCE_KEY,
+    ContentDigestError,
     ConversionError,
+    checked_content_digest,
     read_header,
     tool_versions,
 )
@@ -153,7 +157,9 @@ def _hash_regular(path: Path, *, header_only: bool = False) -> tuple[str, Stamp,
 
 
 def _read_receipt(derived_dir: Path, dpin: DerivedPin) -> tuple[dict, str, Stamp]:
-    """The receipt parsed from exactly the bytes whose sha256 is checked against the pin."""
+    """The receipt parsed from exactly the bytes read once, its content digest **recomputed**
+    from them (a stored ``content_sha256`` must agree, and is never trusted alone) and checked
+    against the pin. Returns (receipt, receipt file sha256, stamp)."""
     path = derived_dir / DERIVED_RECEIPT
     try:
         fd, st = _open_regular(path)
@@ -165,19 +171,25 @@ def _read_receipt(derived_dir: Path, dpin: DerivedPin) -> tuple[dict, str, Stamp
     finally:
         os.close(fd)
     digest = hashlib.sha256(raw).hexdigest()
-    if dpin.receipt_sha256 is None:
+    if dpin.content_sha256 is None:
         raise DerivedReceiptError(
-            f"{derived_dir}: no receipt digest is pinned (pins.DERIVED_PINS[{dpin.key!r}]); "
+            f"{derived_dir}: no content digest is pinned (pins.DERIVED_PINS[{dpin.key!r}]); "
             "refusing to trust an unpinned derived checkpoint"
-        )
-    if digest != dpin.receipt_sha256:
-        raise DerivedReceiptError(
-            f"{derived_dir}: receipt sha256 {digest} != pinned {dpin.receipt_sha256}"
         )
     try:
         receipt = json.loads(raw)
     except ValueError as e:
         raise DerivedReceiptError(f"{path}: not JSON ({e})") from e
+    if not isinstance(receipt, dict):
+        raise DerivedReceiptError(f"{path}: not a JSON object")
+    try:
+        content = checked_content_digest(receipt)
+    except ContentDigestError as e:
+        raise DerivedReceiptError(f"{path}: {e}") from e
+    if content != dpin.content_sha256:
+        raise DerivedReceiptError(
+            f"{derived_dir}: content digest {content} != pinned {dpin.content_sha256}"
+        )
     return receipt, digest, _stamp(st)
 
 
@@ -552,7 +564,7 @@ class CaptionerBf16Patch:
             return {
                 "schema": PROVENANCE_SCHEMA,
                 "derived_dir": str(self.derived_dir),
-                "receipt_sha256_pinned": self._dpin.receipt_sha256,
+                "content_sha256_pinned": self._dpin.content_sha256,
                 "converter_version": CONVERTER_VERSION,
                 "full_verify": self.full_verify,
                 "full_verify_opt_out": not self.full_verify,

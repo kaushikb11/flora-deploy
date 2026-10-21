@@ -224,7 +224,7 @@ def _prepare_derived(config: Path, names: list[str], *, force: bool, quiet: bool
         name, path = s.build.name, s.build.receipt_path()
         row = {**s.as_dict(), "ok": False, "status": "error"}
         rows.append(row)
-        sha = s.receipt_sha256
+        sha, receipt = s.receipt_sha256, s.receipt
         if s.action != "reuse":
             r = built.get(name)
             if isinstance(r, BaseException):
@@ -242,9 +242,15 @@ def _prepare_derived(config: Path, names: list[str], *, force: bool, quiet: bool
                 row["error"] = f"no receipt at {path} after the build"
                 continue
             sha = receipt_sha256(raw)
+            try:
+                receipt = json.loads(raw)
+            except ValueError:
+                row["error"] = f"{path} is not valid JSON"
+                continue
         row["receipt_sha256"] = sha
         try:
-            rc.check_pinned(name, sha, where=f"the {name} receipt on the Volume ({path})")
+            row["content_sha256"] = rc.check_pinned(
+                name, receipt or {}, where=f"the {name} receipt on the Volume ({path})")
         except rc.ReceiptPinMismatch as e:
             row["error"] = str(e)
             continue
@@ -306,6 +312,10 @@ def prepare(
         False, "--only-derived", help="Build the derived weights only (snapshots prepared)."),
     force_derived: bool = typer.Option(
         False, "--force-derived", help="Rebuild the derived weights even if their receipts pass."),
+    show_receipt: bool = typer.Option(
+        False, "--show-receipt",
+        help="Read each derived weight's receipt from the Volume (no container, no build) and "
+             "print its receipt sha256 and recomputed content digest vs the pin."),
 ) -> None:
     """Download and verify the pinned Flora snapshots in your Modal Volume, then build the
     derived weights the config's preset needs and record their receipts in flora.yaml."""
@@ -327,6 +337,9 @@ def prepare(
                       "--only-derived or --force-derived[/red]")
         raise typer.Exit(code=2)
     pins = [p for p in PINS if not only or p.key in only]
+    if show_receipt:
+        _show_receipts(as_json=as_json)
+        return
 
     cfg, names = None, []
     if not skip_derived and not only:
@@ -380,6 +393,57 @@ def prepare(
         typer.echo(json.dumps(rows, indent=2))
     if not ok:
         raise typer.Exit(code=1)
+
+
+def show_receipt_rows() -> list[dict]:
+    """Per derived weight: the receipt on the Volume, its file sha256, its stored and
+    recomputed content digests and the pinned one. Read-only; no container."""
+    from flora_deploy.config.pins import DERIVED_PINS_BY_KEY
+    from flora_deploy.prep.convert_captioner import content_digest
+    from flora_deploy.prep.derived import DERIVED_BUILDS, receipt_sha256
+
+    rows = []
+    for name, b in DERIVED_BUILDS.items():
+        pin = DERIVED_PINS_BY_KEY.get(b.dirname)
+        row: dict = {"key": name, "path": b.receipt_path(),
+                     "content_sha256_pinned": pin.content_sha256 if pin else None}
+        rows.append(row)
+        try:
+            raw = _read_weights_file(b.receipt_path())
+        except Exception as e:  # noqa: BLE001
+            row["error"] = _error_text(e)
+            continue
+        if raw is None:
+            row["error"] = "no receipt on the Volume"
+            continue
+        row["receipt_sha256"] = receipt_sha256(raw)
+        try:
+            receipt = json.loads(raw)
+            row["content_sha256"] = content_digest(receipt)
+        except Exception as e:  # noqa: BLE001
+            row["error"] = _error_text(e)
+            continue
+        row["content_sha256_stored"] = receipt.get("content_sha256")
+        row["version"] = (receipt.get("converter") or receipt.get("merger") or {}).get("version")
+        row["stale"] = b.stale_reason(receipt)
+        row["matches_pin"] = (None if row["content_sha256_pinned"] is None
+                              else row["content_sha256"] == row["content_sha256_pinned"])
+    return rows
+
+
+def _show_receipts(*, as_json: bool) -> None:
+    from rich.markup import escape
+
+    rows = show_receipt_rows()
+    if as_json:
+        typer.echo(json.dumps(rows, indent=2))
+        return
+    for r in rows:
+        console.print(f"[bold]{r['key']}[/bold]  {escape(r['path'])}")
+        for k in ("error", "receipt_sha256", "content_sha256", "content_sha256_stored",
+                  "content_sha256_pinned", "version", "stale", "matches_pin"):
+            if k in r:
+                console.print(f"  {k}: {escape(str(r[k]))}")
 
 
 def _dry_run_snapshots(pins: list, *, as_json: bool) -> list[dict]:

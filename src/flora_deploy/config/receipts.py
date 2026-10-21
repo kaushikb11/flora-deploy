@@ -12,9 +12,10 @@ user's ``flora-weights`` Volume (``prep/convert_captioner.py``, ``prep/merge_tem
 
 :func:`resolve` merges those with explicit overrides (``--receipt NAME=HASH``,
 ``sdk.submit(receipts=...)``; an override wins) and refuses early when one the config needs is
-missing, or when a recorded receipt differs from the one pinned in ``pins.DERIVED_PINS`` (the
-runtime would refuse that copy anyway: ``accel/captioner_load.py``). Overrides are not checked
-against the pins: they are the explicit escape hatch (tests, a receipt being re-pinned).
+missing. A receipt identity names one build; what ``pins.DERIVED_PINS`` pins is the build's
+*content* (``prep.convert_captioner.content_digest``), which needs the receipt itself:
+``flora prepare`` checks it (:func:`check_pinned`) before it records the identity, and the
+runtime recomputes it at load (``accel/captioner_load.py``).
 
 The receipts enter the config hash through ``hashing.hash_document(derived_receipts=...)``
 (``derived_weights`` per shard kind), so the hash is the same whether a receipt comes from
@@ -57,31 +58,34 @@ def needed(cfg: Any) -> list[str]:
     return sorted({r for k in kinds for r in preset.derived_weights.get(k, ())})
 
 
-def check_pinned(name: str, sha256: str, *, where: str | None = None) -> None:
-    """Raise :class:`ReceiptPinMismatch` when ``name`` has a pinned receipt and ``sha256`` is
-    not it. Unpinned names (``receipt_sha256`` None, or no ``DerivedPin``) pass. ``where``
-    names the value in the message (default ``weights.derived.<name>``)."""
+def check_pinned(name: str, receipt: Mapping, *, where: str | None = None) -> str:
+    """The content digest of ``receipt`` (recomputed; a stored ``content_sha256`` must agree).
+    Raises :class:`ReceiptPinMismatch` when ``name`` has a pinned content digest and this is
+    not it, or the receipt cannot be digested. Unpinned names (``content_sha256`` None, or no
+    ``DerivedPin``) pass. ``where`` names the receipt in the message."""
+    from flora_deploy.prep.convert_captioner import ContentDigestError, checked_content_digest
+
+    label = where or f"the {name} receipt"
+    try:
+        content = checked_content_digest(receipt)
+    except ContentDigestError as e:
+        raise ReceiptPinMismatch(f"{label}: {e}") from None
     pin = DERIVED_PINS_BY_KEY.get(pin_key(name))
-    if pin is None or pin.receipt_sha256 is None or sha256 == pin.receipt_sha256:
-        return
+    if pin is None or pin.content_sha256 is None or content == pin.content_sha256:
+        return content
     raise ReceiptPinMismatch(
-        f"{where or f'{YAML_PATH}.{name}'} is {sha256}, but pins.DERIVED_PINS[{pin.key!r}] "
-        f"pins receipt "
-        f"{pin.receipt_sha256}. The workers load only the pinned {pin.key} copy, so this one "
-        "would be refused at load. The Volume holds a different build (a receipt records its "
-        "build time, so a rebuild never reproduces the pinned bytes): re-pin it after its "
-        f"identity proof (docs/{pin.key}.md), or restore the pinned build")
+        f"{label} has content digest {content}, but pins.DERIVED_PINS[{pin.key!r}] pins "
+        f"{pin.content_sha256}. The workers load only the pinned {pin.key} content, so this "
+        "build would be refused at load: its files, dtype policy, casts or sources differ from "
+        f"the proven build. Rebuild it (`flora prepare --force-derived`); if it still differs, "
+        f"the converter changed and needs a new identity proof (docs/{pin.key}.md)")
 
 
 def resolve(cfg: Any, overrides: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Receipts for ``cfg``: ``weights.derived`` from the config (checked against the pins),
-    then ``overrides`` on top. Raises ``MissingReceiptError`` naming what to run when one the
-    config needs is missing, ``ReceiptPinMismatch`` on a pin mismatch."""
+    """Receipts for ``cfg``: ``weights.derived`` from the config, then ``overrides`` on top.
+    Raises ``MissingReceiptError`` naming what to run when one the config needs is missing."""
     recorded = dict(cfg.weights.derived)
     over = {k: v for k, v in (overrides or {}).items() if v}
-    for name, sha in recorded.items():
-        if name not in over:
-            check_pinned(name, sha)
     out = {**recorded, **over}
     missing = [n for n in needed(cfg) if not out.get(n)]
     if missing:

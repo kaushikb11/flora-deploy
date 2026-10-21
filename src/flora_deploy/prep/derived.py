@@ -94,6 +94,7 @@ class DerivedStep:
     reason: str
     receipt_sha256: str | None  # of the receipt on the Volume, when it is reused
     est_usd: float  # 0 when reused
+    receipt: dict | None = None  # the parsed receipt, when it is reused
 
     def as_dict(self) -> dict[str, Any]:
         return {"key": self.build.name, "kind": "derived", "action": self.action,
@@ -120,12 +121,13 @@ def plan_derived(names: list[str], read: Callable[[str], bytes | None], *,
             why = "no receipt on the Volume"
         if raw is not None:
             try:
-                why = b.stale_reason(json.loads(raw)) or ""
+                parsed = json.loads(raw)
+                why = b.stale_reason(parsed) or ""
             except ValueError:
                 why = "receipt is not valid JSON"
             if not why and not force:
                 steps.append(DerivedStep(b, "reuse", "passing receipt on the Volume",
-                                         receipt_sha256(raw), 0.0))
+                                         receipt_sha256(raw), 0.0, parsed))
                 continue
         action: Action = "rebuild" if force and raw is not None else "build"
         steps.append(DerivedStep(b, action, why or "--force-derived", None, b.estimate_usd()))

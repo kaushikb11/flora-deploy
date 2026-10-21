@@ -79,13 +79,49 @@ def test_shapes():
         mt.check_shapes(targets, {"m.q.weight": [3, 5]}, shapes, 2)
 
 
-def test_merge_weight_is_fp32_sum():
+def _fixed_order_reference(w, a, b, scale):
+    """Merger v2 in plain Python floats (IEEE FP64): the same fixed-order sum, element by
+    element, then FP64 -> FP32."""
+    import struct as _struct
+
+    wl, al, bl = w.double().tolist(), a.double().tolist(), b.double().tolist()
+    out = []
+    for i, row in enumerate(wl):
+        out_row = []
+        for j, wij in enumerate(row):
+            acc = 0.0
+            for k in range(len(al)):
+                acc += bl[i][k] * al[k][j]  # exact product (FP32 x FP32 in FP64)
+            out_row.append(_struct.unpack("f", _struct.pack("f", acc * scale + wij))[0])
+        out.append(out_row)
+    return torch.tensor(out, dtype=torch.float32)
+
+
+def test_merge_weight_is_fixed_order_fp64_sum():
     g = torch.Generator().manual_seed(0)
     w = torch.randn(6, 5, generator=g).to(torch.bfloat16)
-    a, b = torch.randn(2, 5, generator=g), torch.randn(6, 2, generator=g)
+    a, b = torch.randn(3, 5, generator=g), torch.randn(6, 3, generator=g)
     got = mt.merge_weight(w, a, b, 2.0)
     assert got.dtype == torch.float32
-    assert torch.equal(got, w.float() + (b @ a) * 2.0)
+    assert torch.equal(got, _fixed_order_reference(w, a, b, 2.0))
+    # close to the FP32 matmul formula (v1), not necessarily equal to it
+    assert torch.allclose(got, w.float() + (b @ a) * 2.0, rtol=1e-6, atol=1e-6)
+
+
+def test_merge_weight_is_independent_of_threads_and_tiles():
+    g = torch.Generator().manual_seed(1)
+    w = torch.randn(257, 311, generator=g).to(torch.bfloat16)
+    a, b = torch.randn(32, 311, generator=g), torch.randn(257, 32, generator=g)
+    old = torch.get_num_threads()
+    try:
+        torch.set_num_threads(1)
+        ref = mt.merge_weight(w, a, b, 2.0).to(torch.bfloat16)
+        torch.set_num_threads(max(2, old))
+        for tile in (1, 311, 4096, mt.MERGE_TILE_ELEMENTS):
+            got = mt.merge_weight(w, a, b, 2.0, tile_elements=tile).to(torch.bfloat16)
+            assert torch.equal(got.view(torch.int16), ref.view(torch.int16)), tile
+    finally:
+        torch.set_num_threads(old)
 
 
 def test_key_coverage_and_dtype_plan():
@@ -244,8 +280,12 @@ def test_merge_end_to_end(snapshots, keep_patch, tmp_path):
                     assert t.dtype == torch.bfloat16
                 elif k in targets:
                     assert t.dtype == torch.bfloat16
-                    assert torch.equal(t.view(torch.int16),
-                                       ref[k].to(torch.bfloat16).view(torch.int16)), k
+                    # v2's fixed-order FP64 sum vs PEFT's FP32 (BLAS) merge, both rounded once:
+                    # equal except where FP32 rounding crossed a BF16 boundary (<= 1 ulp).
+                    peft = ref[k].to(torch.bfloat16).view(torch.int16).to(torch.int32)
+                    ulps = (t.view(torch.int16).to(torch.int32) - peft).abs()
+                    assert int(ulps.max()) <= 1, k
+                    assert float((ulps == 0).double().mean()) > 0.99, k
                     assert not torch.equal(t, base_sd[k])
                 else:
                     assert torch.equal(t.view(torch.int16), base_sd[k].view(torch.int16)), k

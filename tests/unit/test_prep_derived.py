@@ -19,6 +19,8 @@ from flora_deploy.config import receipts as rc
 from flora_deploy.config.pins import DERIVED_PINS_BY_KEY, PINS_BY_KEY
 from flora_deploy.config.schema import loads_yaml
 from flora_deploy.prep import derived as dv
+from flora_deploy.prep.convert_captioner import content_digest
+from tests.fakes.derived import captioner_receipt
 
 runner = CliRunner()
 TEMPLATE = "exact_mp4_dir.yaml"
@@ -26,7 +28,11 @@ TEMPLATE = "exact_mp4_dir.yaml"
 
 def receipt_bytes(name: str, **changes) -> bytes:
     b = dv.DERIVED_BUILDS[name]
-    doc: dict = {"ok": True, "kind": b.dirname, "created_utc": "t"}
+    doc: dict = {**captioner_receipt(), "kind": b.dirname}
+    if name == "tempseg_merged":
+        doc.pop("converter")
+        doc["base"] = {"pin": {}, "plan_digest": "p" * 64}
+        doc["lora"] = {"r": 32}
     for path, want in b.reuse_checks:
         node = doc
         for k in path[:-1]:
@@ -88,10 +94,10 @@ def fakes(monkeypatch):
 
 
 def pin_to(monkeypatch, name: str, raw: bytes) -> None:
-    """Pin ``name``'s receipt to ``raw`` (the real pin is the maintainer's own build)."""
+    """Pin ``name``'s content digest to that of the receipt ``raw``."""
     key = rc.pin_key(name)
     pins = dict(DERIVED_PINS_BY_KEY)
-    pins[key] = replace(pins[key], receipt_sha256=hashlib.sha256(raw).hexdigest())
+    pins[key] = replace(pins[key], content_sha256=content_digest(json.loads(raw)))
     monkeypatch.setattr(rc, "DERIVED_PINS_BY_KEY", pins)
 
 
@@ -205,9 +211,12 @@ def test_prepare_builds_and_records_receipts(tmp_path, monkeypatch, fakes):
     assert built.calls[-1] == (["captioner_bf16", "tempseg_merged"], True)
 
 
-def test_prepare_refuses_a_receipt_that_does_not_match_its_pin(tmp_path, fakes):
+def test_prepare_refuses_a_receipt_that_does_not_match_its_pin(tmp_path, monkeypatch, fakes):
     vol, built = fakes
     cfg = balanced_cfg(tmp_path)
+    pins = dict(DERIVED_PINS_BY_KEY)
+    pins["captioner-bf16"] = replace(pins["captioner-bf16"], content_sha256="f" * 64)
+    monkeypatch.setattr(rc, "DERIVED_PINS_BY_KEY", pins)
     res = runner.invoke(cli.app, ["prepare", "--only-derived", "--json", "-c", str(cfg)])
     assert res.exit_code == 1
     rows = {r["key"]: r for r in json.loads(res.stdout)}
@@ -262,3 +271,20 @@ def test_preset_without_derived_weights_builds_nothing(tmp_path, fakes):
     res = runner.invoke(cli.app, ["prepare", "--only-derived", "-c", str(cfg)])
     assert res.exit_code == 0, res.output
     assert built.calls == [] and "needs no derived weights" in res.output
+
+
+def test_show_receipt_is_read_only_and_recomputes_the_digest(tmp_path, fakes):
+    vol, built = fakes
+    raw = receipt_bytes("captioner_bf16")
+    vol.files[dv.DERIVED_BUILDS["captioner_bf16"].receipt_path()] = raw
+    res = runner.invoke(cli.app, ["prepare", "--show-receipt", "--json"])
+    assert res.exit_code == 0, res.output
+    rows = {r["key"]: r for r in json.loads(res.stdout)}
+    cap = rows["captioner_bf16"]
+    assert cap["receipt_sha256"] == hashlib.sha256(raw).hexdigest()
+    assert cap["content_sha256"] == content_digest(json.loads(raw))
+    assert cap["content_sha256_pinned"] == DERIVED_PINS_BY_KEY["captioner-bf16"].content_sha256
+    assert rows["tempseg_merged"]["error"] == "no receipt on the Volume"
+    assert built.calls == []  # nothing built
+    res = runner.invoke(cli.app, ["prepare", "--show-receipt"])
+    assert res.exit_code == 0 and "content_sha256:" in res.output

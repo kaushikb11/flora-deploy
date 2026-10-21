@@ -18,7 +18,7 @@ from flora_deploy.config.hashing import config_hash
 from flora_deploy.config.pins import DERIVED_PINS_BY_KEY
 from flora_deploy.config.schema import ConfigError, loads_yaml, parse_config
 
-PINNED = DERIVED_PINS_BY_KEY["captioner-bf16"].receipt_sha256
+PINNED = "0e91e467c7ffdb636573e779672d11b203571f7869ca94317f1005eb700d9c65"  # a receipt file sha
 TEMPSEG = "a" * 64
 runner = CliRunner()
 
@@ -98,17 +98,32 @@ def test_missing_receipt_says_run_flora_prepare():
 # --- pins ----------------------------------------------------------------------------------
 
 
-def test_pin_mismatch_is_a_hard_error():
-    cfg = parse_config(exact(captioner_bf16="1" * 64))
+def _receipt(**changes) -> dict:
+    from tests.fakes.derived import captioner_receipt
+
+    return {**captioner_receipt(), **changes}
+
+
+def test_pin_mismatch_is_a_hard_error(monkeypatch):
+    from dataclasses import replace
+
+    from flora_deploy.prep.convert_captioner import content_digest
+
+    good = _receipt()
+    pins = dict(DERIVED_PINS_BY_KEY)
+    pins["captioner-bf16"] = replace(pins["captioner-bf16"], content_sha256=content_digest(good))
+    monkeypatch.setattr(rc, "DERIVED_PINS_BY_KEY", pins)
+    assert rc.check_pinned("captioner_bf16", good) == content_digest(good)
+    other = _receipt(casts={"F32->BF16:loaded": 1})
     with pytest.raises(rc.ReceiptPinMismatch) as ei:
-        rc.resolve(cfg)
+        rc.check_pinned("captioner_bf16", other, where="the Volume receipt")
     msg = str(ei.value)
-    assert "weights.derived.captioner_bf16 is " + "1" * 64 in msg
-    assert f"pins.DERIVED_PINS['captioner-bf16'] pins receipt {PINNED}" in msg
-    # overriding the bad value on the command line replaces it
-    assert rc.resolve(cfg, {"captioner_bf16": PINNED}) == {"captioner_bf16": PINNED}
-    # names without a pinned receipt are not checked
-    rc.check_pinned("tempseg_merged", TEMPSEG)
+    assert f"the Volume receipt has content digest {content_digest(other)}" in msg
+    assert "pins.DERIVED_PINS['captioner-bf16'] pins " + content_digest(good) in msg
+    # a stale stored digest is a mismatch too; unpinned names pass
+    with pytest.raises(rc.ReceiptPinMismatch, match="stored content_sha256"):
+        rc.check_pinned("captioner_bf16", {**good, "content_sha256": "0" * 64})
+    rc.check_pinned("tempseg_merged", _receipt(kind="tempseg-merged"))
 
 
 # --- flora.yaml edit -----------------------------------------------------------------------
@@ -195,13 +210,6 @@ def test_deploy_missing_receipt_message(tmp_path):
     assert res.exit_code == 2
     out = " ".join(res.output.split())
     assert "captioner_bf16" in out and "Run `flora prepare`" in out
-
-
-def test_deploy_pin_mismatch_is_refused(tmp_path):
-    cfg = write_cfg(tmp_path, exact(captioner_bf16="1" * 64))
-    res = runner.invoke(cli, ["deploy", "-c", str(cfg), "--dry-run"])
-    assert res.exit_code == 2
-    assert "DERIVED_PINS['captioner-bf16']" in " ".join(res.output.split())
 
 
 def test_run_missing_receipt_message(tmp_path, monkeypatch):

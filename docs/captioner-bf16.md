@@ -89,11 +89,26 @@ module globals, and a unit test checks that against NVIDIA's bytecode.
 
 The checks (review 3, H1 and M1) run at install and again inside `Session.load`:
 
-- **Pinned receipt.** The bytes of `derived_receipt.json` must hash to
-  `DERIVED_PINS["captioner-bf16"].receipt_sha256` in `pins.py` (the value in the table above).
-  The receipt is parsed from exactly those bytes. A pin of `None` fails closed. The schema, `ok`,
-  converter version (code = pin = receipt), source revision and NVIDIA manifest digest must
-  equal the pins.
+- **Pinned content.** The pin is a *content digest*, not the sha256 of the receipt file.
+  `content_digest(receipt)` (`prep/convert_captioner.py`) is the sha256 of a canonical JSON of
+  only the fields that determine the output:
+  - the kind and the converter version;
+  - the source pin and NVIDIA's manifest digest;
+  - the dtype policy and the cast counts;
+  - the sorted (name, sha256, size, header sha256) of every file.
+
+  Timings, `created_utc`, tool versions and their build tags (`+cu130`), the platform, the
+  commit and dirty flag, and the module sha256 are left out. Every user's own build of the same
+  converter version therefore has the same content digest.
+  - The receipt stores `content_sha256` when it is written. The runtime always recomputes the
+    digest from the bytes it read, and refuses a receipt whose stored value disagrees.
+  - The recomputed digest must equal `DERIVED_PINS["captioner-bf16"].content_sha256` in
+    `pins.py`. A pin of `None` fails closed.
+  - The schema, `ok`, converter version (code = pin = receipt), source revision and NVIDIA
+    manifest digest must equal the pins.
+
+  The sha256 of the receipt file still identifies one build. `flora prepare` records it under
+  `weights.derived`, and the config hash includes it.
 - **Full hash by default.** The directory must hold exactly the receipt's files, all regular
   files: symlinks, directories and devices are refused, and files are opened with `O_NOFOLLOW`.
   Every byte of every file is sha256-hashed on 8 threads, and a file that changes while it is
@@ -178,8 +193,41 @@ uv run modal run src/flora_deploy/modal_app/convert_app.py --step identity
 `convert` reuses a passing receipt of the same converter version unless `--force` is given.
 Changing the converter, torch, transformers or the pins means re-running both steps. The runtime
 enforces this: after a re-run, update `DERIVED_PINS["captioner-bf16"]` in `pins.py`, setting
-`receipt_sha256` to the new receipt's sha256 and `proven_with` to the identity run's versions.
+`content_sha256` to the build's content digest and `proven_with` to the identity run's versions.
 Until then, every load fails closed.
+
+To read the digest, run the following. It starts no container and builds nothing: it is a
+Modal client read of the Volume.
+
+```
+uv run flora prepare --show-receipt          # --json for machine-readable output
+```
+
+The content digest of the 2026-10-21 build is not pinned yet. This doc does not record the
+per-file sha256s the digest covers, so it cannot be derived from here. `content_sha256` stays
+`None` until it is read with `--show-receipt`. Until then, every load fails closed.
+
+## Is the output byte-deterministic across machines?
+
+Yes, for a fixed converter version, torch version and source snapshot. Each tensor is handled
+in one of three ways:
+- copied byte for byte;
+- upcast exactly, from BF16 to FP32;
+- cast from FP32 to BF16 with `Tensor.to`.
+
+torch implements that cast as integer round-to-nearest-even on the FP32 bits. It does so in
+the scalar path (`c10::detail::round_to_nearest_even`) and in the AVX2/AVX-512 paths
+(`cvtfp32_bf16`) alike. The cast uses no floating-point arithmetic and no BF16 instructions, so
+there is no flush-to-zero. Every element is independent, so thread count, SIMD width and CPU
+features cannot change a byte.
+
+The one exception is NaN. The scalar path encodes it as `0x7FC0` and the SIMD path as `0xFFFF`,
+and which elements fall on the scalar tail depends on the SIMD width. The converter therefore
+refuses a NaN in any tensor it casts.
+
+Workers convert whole shards into separate files, and the safetensors header is encoded
+deterministically. A different torch version could in principle change the cast. That is why
+the content digest covers a single converter version and `proven_with` pins torch.
 
 ## Not done here
 
