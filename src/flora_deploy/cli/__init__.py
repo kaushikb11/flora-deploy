@@ -9,6 +9,7 @@ results). New commands go in their own modules and are imported here.
 from flora_deploy.cli import (  # noqa: F401  (registers commands)
     cancel,
     deploy,
+    doctor,
     index,
     init,
     logs,
