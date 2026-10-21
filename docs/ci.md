@@ -3,7 +3,10 @@
 `.github/workflows/ci.yml` runs on every push to `main` and every pull request. Each gate is its
 own named step (`Gate: ...`), so a red run says which guarantee broke, and steps run in order with
 `bash -eo pipefail`, so the first failing gate stops the job. Nothing in CI talks to Modal or
-needs a GPU. Tests marked `modal` never run in CI (`addopts = "-m 'not modal'"`).
+needs a GPU. Tests marked `modal` never run in CI. Locally, a plain `pytest` also skips `nvlink` and `torch`
+tests (`addopts = "-m 'not modal and not nvlink and not torch'"`); run them with
+`pytest -m "(nvlink or torch) and not modal"`, as the nvlink job does. An explicit `-m` replaces
+the default.
 
 The gates exist because reviews kept finding the same kinds of bug. Each one below names the
 review or commit that motivated it, so a gate is never dropped without knowing what it protects.

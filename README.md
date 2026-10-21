@@ -141,7 +141,9 @@ records = job.results("caption")
 
 ```bash
 uv sync --group dev
-uv run ruff check . && uv run pytest -q
+uv run ruff check . && uv run pytest -q -n auto   # CPU suite, ~25 s
+uv run python scripts/fetch_nv_code.py --with-processor
+uv run pytest -q -m "(nvlink or torch) and not modal"   # tests against NVIDIA's code
 ```
 
 Design notes live in [`docs/`](docs/).

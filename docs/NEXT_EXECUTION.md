@@ -87,7 +87,7 @@ Rules:
 
 - **Concurrency:** at most ~6 concurrent subagents, to avoid the session rate limit that paused agents twice. Wave A launches as the current agents finish.
 - **Ownership:** disjoint paths per agent. Shared files (`pyproject.toml`, `cli.py`, `pins.py`) are coordinator-owned or assigned to one agent per wave. `cli.py` is split into per-command modules (`cli/*.py`) during C0 to end conflicts.
-- **Merges:** independent re-review → merge → full suite (`pytest` incl. nvlink) → push. Conflicts are resolved by the coordinator.
+- **Merges:** independent re-review → merge → full suite (`pytest -n auto` plus `pytest -m "(nvlink or torch) and not modal"`) → push. Conflicts are resolved by the coordinator.
 - **Fidelity invariant:** anything labeled `exact` must be proven bit-identical to unmodified NVIDIA code (D17). `balanced` needs certificates. No exceptions.
 - **License:** no NVIDIA code, prompts or outputs in the repo; re-expressed glue is minimized (S1 removes the largest piece).
 

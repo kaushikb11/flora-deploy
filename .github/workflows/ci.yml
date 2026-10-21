@@ -80,8 +80,8 @@ jobs:
           code=$?
           set -e
           test "$code" -eq 3
-          uv run flora results --job local-demo --stage caption --store "$demo/faults"
-          uv run flora results --job local-demo --stage reward.terminal --store "$demo/faults"
+          uv run flora results --job local-demo.fake --stage caption --store "$demo/faults"
+          uv run flora results --job local-demo.fake --stage reward.terminal --store "$demo/faults"
       # README-as-test: run the README's "Try it locally" block exactly as written (minus the
       # clone + install lines, which this checkout already did) in an empty directory.
       - name: README "Try it locally" block
