@@ -306,6 +306,7 @@ def test_results_provenance():
     assert real["image_fingerprints"] == {"img_vllm": image_fingerprint("img_vllm")}
 
 
+@pytest.mark.torch
 def test_pixel_digests_catch_frame_order_and_resample():
     torch = pytest.importorskip("torch")
     g = torch.Generator().manual_seed(0)

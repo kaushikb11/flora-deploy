@@ -127,8 +127,38 @@ def test_provenance_not_in_effect_without_flags():
     assert rec["in_effect"] is False
 
 
+@pytest.mark.torch
 def test_real_torch_flags_shape():
     torch = pytest.importorskip("torch")
     f = d.flags(torch, {})
     assert set(f) >= {"deterministic_algorithms", "cudnn_deterministic", "sdpa",
                       "cublas_workspace_config", "optional_kernels"}
+
+
+@pytest.mark.torch
+def test_real_torch_deterministic_apply_then_drift_is_caught():
+    """Review 7 G4-5: real torch (CI's nvlink job), not a stand-in: apply() really switches the
+    process into deterministic mode, verify() passes, and one real flag flip is caught. Every
+    flag is restored afterwards."""
+    torch = pytest.importorskip("torch")
+    saved = (torch.are_deterministic_algorithms_enabled(),
+             torch.is_deterministic_algorithms_warn_only_enabled(),
+             torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark,
+             torch.backends.cuda.cudnn_sdp_enabled(), torch.backends.cuda.matmul.allow_tf32)
+    env = {d.CUBLAS_ENV: d.CUBLAS_WORKSPACE_CONFIG}
+    try:
+        rec = d.apply("deterministic", torch=torch, environ=env)
+        assert rec["in_effect"] is True
+        d.verify(rec, torch, env)
+        torch.backends.cuda.matmul.allow_tf32 = not saved[5]
+        with pytest.raises(d.DeterminismError, match="flags changed"):
+            d.verify(rec, torch, env)
+        torch.backends.cuda.matmul.allow_tf32 = saved[5]
+        torch.backends.cudnn.deterministic = False
+        with pytest.raises(d.DeterminismError, match="no longer in effect"):
+            d.verify(rec, torch, env)
+    finally:
+        torch.use_deterministic_algorithms(saved[0], warn_only=saved[1])
+        torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark = saved[2], saved[3]
+        torch.backends.cuda.enable_cudnn_sdp(saved[4])
+        torch.backends.cuda.matmul.allow_tf32 = saved[5]

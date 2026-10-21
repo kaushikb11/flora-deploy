@@ -595,6 +595,36 @@ def test_determinism_label_and_drift(tmp_path, monkeypatch):
     assert m is not None and m.error and "eterminism" in m.error
 
 
+
+def test_determinism_flag_drift_is_refused(tmp_path, monkeypatch):
+    """Review 7 G4-5: the drift branch itself. The stand-in is put in deterministic mode, so the
+    record is in effect at apply time; one flag then changes before the shard runs."""
+    import sys
+
+    from flora_deploy.accel import determinism as det
+
+    torch = _cpu_torch()
+    torch.are_deterministic_algorithms_enabled = lambda: True
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cuda.cudnn_sdp_enabled = lambda: False
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setenv(det.CUBLAS_ENV, det.CUBLAS_WORKSPACE_CONFIG)
+    record = det.provenance(det.DETERMINISTIC)
+    assert record["in_effect"] is True
+    det.verify(record)  # control: unchanged flags pass
+    eps = [("e0", receipt("e0"))]
+    store, shard = world(tmp_path, eps)
+    eng = segcap_fake_engine(Script())
+    eng.determinism = record
+    r, _ = runner(tmp_path, store, engine=eng, determinism="deterministic")
+    torch.backends.cuda.matmul.allow_tf32 = True  # drift after apply()
+    with pytest.raises(det.DeterminismError, match="flags changed") as ei:
+        r.run_shard(JOB, shard.shard_id, CFG)
+    assert "matmul_allow_tf32" in str(ei.value)
+    assert not records(store, shard)
+    m = marker(store)
+    assert m is not None and m.error and "flags changed" in m.error
+
 def test_determinism_mode_mismatch_is_refused(tmp_path):
     from flora_deploy.accel.determinism import DeterminismError
 

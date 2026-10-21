@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.torch  # CI runs these in the nvlink job (docs/ci.md)
 torch = pytest.importorskip("torch")
 from safetensors import safe_open  # noqa: E402
 from safetensors.torch import load_file, save_file  # noqa: E402

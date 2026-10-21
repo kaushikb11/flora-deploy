@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.torch  # CI runs these in the nvlink job (docs/ci.md)
 torch = pytest.importorskip("torch")
 pytest.importorskip("transformers")
 from safetensors import safe_open  # noqa: E402
