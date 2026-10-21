@@ -59,6 +59,8 @@ class RunSettings:
     # worker's GPU determinism mode and the reward.terminal mode. Workers apply exactly these.
     determinism: str = "nvidia"
     terminal_mode: str = "terminal"  # or "terminal_rationale"
+    # ``output.formats``: what compose writes (not hashed: outputs are rebuilt from the parts)
+    output_formats: tuple[str, ...] = ("jsonl", "parquet")
 
     def __post_init__(self) -> None:
         if self.budget_usd <= 0:

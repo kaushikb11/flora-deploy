@@ -22,6 +22,10 @@ kind           target   effect (the Modal behaviour it models)
                         call ``expired``); the orchestrator respawns. Default ``x1``.
 ``spawnerr``   shard    ``spawn`` itself raises a transient client error; the orchestrator
                         retries on its next tick. Default ``x1``.
+``timeout``    shard    the call hits its Modal ``timeout``: the container is killed at its first
+                        episode (no mark, so the start counts toward D15) and the call ends
+                        ``failed`` (``FunctionTimeoutError``); the orchestrator respawns it.
+                        Default ``x1``.
 ``nverr``      episode  the fake model rejects the episode with NVIDIA's ``ValueError`` semantics:
                         an ``EpisodeError(kind="nv_failure")``, excused in compose (the job then
                         ends ``completed_with_errors``). Default: every time.
@@ -44,7 +48,7 @@ import threading
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
-SHARD_FAULTS = ("preempt", "fail", "infra", "spawnerr")
+SHARD_FAULTS = ("preempt", "fail", "infra", "spawnerr", "timeout")
 EPISODE_FAULTS = ("oom", "nverr")
 FAULT_KINDS = SHARD_FAULTS + EPISODE_FAULTS
 FOREVER = -1
@@ -175,6 +179,7 @@ class ContainerContext:
     checkpoints: int = 0
     preempt_at: int | None = None  # checkpoint number at which this start is preempted
     fail_checked: bool = False
+    timeout: bool = False  # the ``timeout`` fault: killed at the first checkpoint
 
 
 _CURRENT = threading.local()
@@ -201,6 +206,8 @@ def checkpoint(uid: str) -> None:
     ctx.checkpoints += 1
     if ctx.cancelled.is_set():
         raise KeyboardInterrupt(f"call {ctx.call_id} cancelled")
+    if ctx.timeout:
+        raise ContainerCrash(f"container {ctx.container_id} killed: call timeout")
     if ctx.preempt_at is None:
         hit = ctx.faults.take("preempt", shard_id=ctx.shard_id)
         ctx.preempt_at = min(2, max(ctx.episodes, 1)) if hit else 0

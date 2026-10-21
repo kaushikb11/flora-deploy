@@ -37,7 +37,13 @@ so the SDK and the CLI are testable without Modal (``tests/fakes/flora_backend.p
 
 Exit codes the CLI derives from a state (:data:`EXIT_CODES`): ``done`` 0, ``failed`` 1,
 ``completed_with_errors`` 3, ``budget_stopped`` 4, ``cancelled`` (and other stops) 5; 2 is a usage
-error or a refusal. Same scheme as ``flora run --local`` and ``flora compose``.
+error, a refusal or an internal error. Same scheme as ``flora run --local`` and ``flora compose``.
+
+**Local jobs.** ``flora run --local`` writes a run spec too (``app_name: local`` and a ``local``
+section: config path, lease directory). :func:`open_job` opens it like any other; the lease is
+the local file KV, :meth:`Job.resume` runs the orchestrator in this process
+(``local.runner.launch_local``), :meth:`Job.cancel` writes the record (the calls of a local run
+live in its process) and :meth:`Job.logs` refuses (no Modal logs).
 """
 
 from __future__ import annotations
@@ -272,6 +278,8 @@ def settings_from_dict(d: Mapping[str, Any]) -> Any:
 
     kw = dict(d)
     kw["pools"] = {k: PoolSettings(**v) for k, v in dict(kw.get("pools", {})).items()}
+    if "output_formats" in kw:
+        kw["output_formats"] = tuple(kw["output_formats"])
     known = {f.name for f in dataclasses.fields(RunSettings)}
     return RunSettings(**{k: v for k, v in kw.items() if k in known})
 
@@ -439,6 +447,12 @@ class Job:
     def settings(self) -> Any:
         return settings_from_dict(self.spec["settings"])
 
+    @property
+    def is_local(self) -> bool:
+        """A ``flora run --local`` job (its run spec has a ``local`` section): its orchestrator
+        runs in a local process and its lease is a file KV next to the store."""
+        return bool(self.spec.get("local"))
+
     def _refresh(self) -> None:
         fn = getattr(self.store, "refresh", None)
         if callable(fn):
@@ -453,6 +467,11 @@ class Job:
     def _lease(self) -> Any:
         from flora_deploy.jobs.orchestrator import DictLease
 
+        if self.is_local:
+            from flora_deploy.local.spawner import FileKV
+
+            return DictLease(FileKV(self.spec["local"]["lease"]), f"orchestrator/{self.job_id}",
+                             clock=self.clock)
         kv = self.backend.lease_kv(self.environment)
         return None if kv is None else DictLease(kv, f"orchestrator/{self.job_id}",
                                                  clock=self.clock)
@@ -467,8 +486,8 @@ class Job:
 
     # -- status ----------------------------------------------------------------------------
     def status(self) -> JobView:
+        from flora_deploy.jobs.driver import budget_state_from_ledgers
         from flora_deploy.jobs.reconciler import reconcile
-        from flora_deploy.modal_app.orchestrator_app import budget_state_from_ledgers
 
         self._refresh()
         deps = self._deps()
@@ -495,11 +514,10 @@ class Job:
             done = _done_shards(self, manifest)
             if st.state not in STOPPED:
                 eta = _eta_s(gate, manifest.shards, done, settings)
+        from flora_deploy.export.compose import job_state
+
         summary = self.summary()
-        state = st.state
-        if summary is not None and state in ("done", "completed_with_errors"):
-            state = ("completed_with_errors" if summary.get("status") == "completed_with_errors"
-                     else state)
+        state = job_state(st.state, summary)
         return JobView(
             job_id=self.job_id, config_hash=self.config_hash, app_name=self.app_name,
             state=state, counts=st.counts, active_calls=st.active_calls,
@@ -515,7 +533,13 @@ class Job:
 
     # -- lifecycle -------------------------------------------------------------------------
     def launch(self, reason: str = "submit") -> str:
-        """Spawn the deployed orchestrator for this job (its lease keeps it single)."""
+        """Spawn the deployed orchestrator for this job (its lease keeps it single). A local job
+        runs its orchestrator in this process instead, until the job stops
+        (``local.runner.launch_local``)."""
+        if self.is_local:
+            from flora_deploy.local.runner import launch_local
+
+            return launch_local(self, reason=reason)
         call_id = self.backend.spawn(self.app_name, ORCHESTRATOR_FUNCTION, self.job_id,
                                      self.spec.get("factory", FACTORY), 0, True,
                                      environment=self.environment)
@@ -530,8 +554,10 @@ class Job:
         """Compose the job's parts into outputs (``flora compose``); returns the summary."""
         from flora_deploy.export.compose import compose
 
+        settings = self.settings
         res = compose(self.store, self.job_id, config_hash=self.config_hash, partial=partial,
-                      max_error_rate=self.settings.max_episode_error_rate)
+                      max_error_rate=settings.max_episode_error_rate,
+                      formats=settings.output_formats)
         return res.summary
 
     def wait(self, poll_s: float = 30.0, *, timeout_s: float | None = None,
@@ -575,14 +601,20 @@ class Job:
     def cancel(self, reason: str = "operator cancel") -> list[str]:
         """Write a ``cancel`` record (the orchestrator cancels its calls on its next tick). With
         no live orchestrator, cancels the recorded live calls directly. Returns the call ids
-        cancelled here."""
+        cancelled here. A job that already ended (done, completed_with_errors, failed,
+        cancelled) is left alone: cancelling it is a no-op (review 6 M1; the reconciler also
+        ignores a cancel that arrives after every shard was satisfied)."""
         from flora_deploy.jobs.orchestrator import utc, write_control
         from flora_deploy.jobs.types import ControlRecord
 
+        if self.status().state in TERMINAL:
+            return []
         write_control(self.store, JobPaths(self.job_id), ControlRecord(
             "cancel", self.job_id, reason, utc(self.clock()), {"config_hash": self.config_hash}))
         lease = self._lease()
         if lease is not None and lease.current() is not None:
+            return []
+        if self.is_local:  # a local job's calls died with the process that ran them
             return []
         deps = self._deps()
         cancelled = []
@@ -601,6 +633,23 @@ class Job:
         from flora_deploy.jobs.types import ControlRecord
 
         v = self.status()
+        self.check_resume(v, budget_usd)
+        if budget_usd is not None:
+            self.spec["settings"]["budget_usd"] = float(budget_usd)
+            write_run_spec(self.store, self.spec)
+        if v.state == "budget_stopped":
+            write_control(self.store, JobPaths(self.job_id), ControlRecord(
+                "resume", self.job_id, reason, utc(self.clock()),
+                {"config_hash": self.config_hash, "budget_usd": self.settings.budget_usd}))
+        if v.orchestrator_alive:
+            return None
+        return self.launch(reason="resume")
+
+    def check_resume(self, v: JobView, budget_usd: float | None = None) -> None:
+        """Raise :class:`FloraError` when :meth:`resume` would refuse (``flora resume`` and
+        ``flora run --local --resume`` share it): a finished, failed or cancelled job; a budget
+        that is not positive or below the spend; a budget stop whose projection is still over
+        the budget without a new one."""
         if v.state in TERMINAL:
             hint = {"cancelled": "a cancelled job stays cancelled; submit it with a new --job",
                     "failed": "shards failed for good (see `flora report`); fix the cause and "
@@ -612,18 +661,9 @@ class Job:
             if budget_usd < v.spend_usd:
                 raise FloraError(f"--budget-usd {budget_usd:g} is below the spend so far "
                                  f"(${v.spend_usd:,.2f})")
-            self.spec["settings"]["budget_usd"] = float(budget_usd)
-            write_run_spec(self.store, self.spec)
         elif v.state == "budget_stopped" and v.projected_usd > v.budget_usd:
             raise FloraError(f"job {self.job_id} stopped at its budget (${v.budget_usd:,.2f}; "
                              f"projected ${v.projected_usd:,.2f}); pass --budget-usd to raise it")
-        if v.state == "budget_stopped":
-            write_control(self.store, JobPaths(self.job_id), ControlRecord(
-                "resume", self.job_id, reason, utc(self.clock()),
-                {"config_hash": self.config_hash, "budget_usd": self.settings.budget_usd}))
-        if v.orchestrator_alive:
-            return None
-        return self.launch(reason="resume")
 
     def report(self) -> dict[str, Any]:
         """``flora report``: spend by kind and container, $/video-hour, errors, certification and
@@ -636,7 +676,7 @@ class Job:
             read_container_receipts,
             region_multiplier_for,
         )
-        from flora_deploy.modal_app.orchestrator_app import budget_state_from_ledgers
+        from flora_deploy.jobs.driver import budget_state_from_ledgers
 
         v = self.status()
         settings = self.settings
@@ -668,10 +708,13 @@ class Job:
                                          "stages": {}}
         errors: dict[str, Any] = {"files": len(v.errors), "notes": list(v.notes)}
         if summary is not None:
+            files = summary.get("files") or {
+                f"{st}.{fmt}": paths.output(self.config_hash, st, fmt)
+                for st in summary.get("stages", {}) for fmt in ("jsonl", "parquet")}
             for stage, c in summary.get("stages", {}).items():
-                outputs[stage] = {fmt: f"{self.store_uri.rstrip('/')}/"
-                                       f"{paths.output(self.config_hash, stage, fmt)}"
-                                  for fmt in ("jsonl", "parquet")}
+                outputs[stage] = {key.rsplit(".", 1)[1]: f"{self.store_uri.rstrip('/')}/{p}"
+                                  for key, p in sorted(files.items())
+                                  if key.rsplit(".", 1)[0] == stage}
                 certification["stages"][stage] = {
                     "certified_share": c.get("certified_share"),
                     "uncertified_reasons": c.get("uncertified_reasons", {})}
@@ -704,6 +747,9 @@ class Job:
         """App logs (``modal app logs``). ``kind``: ``orchestrator`` (the job's orchestrator
         launches) or a shard kind (its recorded calls, live ones first); default: the whole
         app (shared by every job of this config)."""
+        if self.is_local:
+            raise FloraError(f"job {self.job_id} ran locally (`flora run --local`): it has no "
+                             "Modal logs; its events were printed by that run (use --verbose)")
         if kind is None:
             yield from self.backend.logs(self.app_name, environment=self.environment,
                                          follow=follow, tail=tail)
@@ -793,9 +839,8 @@ def submit(cfg: Any, *, job_id: str | None = None, store: str | None = None,
     and so which deployment runs it). ``budget_usd`` overrides ``modal.budget_usd``."""
     from flora_deploy.config.hashing import MissingReceiptError
     from flora_deploy.config.schema import to_run_settings
-    from flora_deploy.jobs.indexing import load_indexes
-    from flora_deploy.jobs.manifest import build_manifest, load_manifest, save_manifest
     from flora_deploy.jobs.orchestrator import utc
+    from flora_deploy.jobs.planning import NothingToPlan, plan_job
     from flora_deploy.modal_app.factory import DeployError, deployment_path
 
     say = log or (lambda m: None)
@@ -830,19 +875,13 @@ def submit(cfg: Any, *, job_id: str | None = None, store: str | None = None,
                                stage_hashes=dict(plan.stage_hashes))
     if budget_usd is not None:
         settings = dataclasses.replace(settings, budget_usd=float(budget_usd))
-    paths = JobPaths(job_id)
     now = utc(time.time())
-    if st.exists(paths.config_manifest(plan.config_hash)):
-        manifest = load_manifest(st, job_id, plan.config_hash)
-        say(f"plan: reusing the stored manifest ({len(manifest.shards)} shards)")
-    else:
-        loaded = load_indexes(st, job_id, policy=cfg.pipeline.envelope)
-        if not loaded.indexes:
-            raise FloraError(f"job {job_id!r} has no indexed episodes in {plan.store.uri}; run "
-                             f"`flora index --job {job_id}` first")
-        manifest = build_manifest(loaded.indexes, settings, created_utc=now, pool=loaded.pools)
-        save_manifest(st, manifest)
-        say(f"plan: {len(manifest.episodes)} episodes, {len(manifest.shards)} shards")
+    try:
+        plan_job(st, settings, envelope=cfg.pipeline.envelope, created_utc=now,
+                 default_task=cfg.pipeline.episode_instruction.text, log=say)
+    except NothingToPlan as e:
+        raise FloraError(f"{e} in {plan.store.uri}; run `flora index --job {job_id}` first"
+                         ) from None
 
     spec_path = run_spec_path(job_id, plan.config_hash)
     if st.exists(spec_path):

@@ -89,6 +89,10 @@ class Manifest:
     # GPU-seconds per video-second each kind was packed with (``build_manifest(rates=)``), so
     # estimators can recover video seconds from ``Shard.est_gpu_seconds`` without guessing.
     rates: dict[str, float] = field(default_factory=dict)
+    # Indexed (or attempted) episodes left out of the plan, uid -> reason: index failures, source
+    # errors, envelope exclusions under ``enforce``, no task text for reward stages
+    # (``jobs.planning``). They count as exclusions in the error-rate guard.
+    excluded: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

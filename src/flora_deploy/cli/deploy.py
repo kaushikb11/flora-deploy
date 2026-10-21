@@ -92,8 +92,8 @@ def deploy(
     config: Annotated[Path, typer.Option("--config", "-c", help="flora.yaml")] = Path("flora.yaml"),
     store: Annotated[str | None, typer.Option(
         "--store", envvar="FLORA_STORE",
-        help="Job store seen by containers: modal-volume://name[/path] or s3|r2|gs://bucket"
-             "[/prefix] (default: output.sink).")] = None,
+        help="Job store seen by containers: modal-volume://name\\[/path] or s3|r2|gs://bucket"
+             "\\[/prefix] (default: output.sink).")] = None,
     bucket_secret: Annotated[str, typer.Option(
         help="Modal Secret holding the bucket credentials.")] = "flora-bucket",
     receipt: Annotated[list[str] | None, typer.Option(

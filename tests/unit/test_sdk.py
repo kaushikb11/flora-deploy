@@ -38,7 +38,8 @@ def test_submit_wait_results_report_end_to_end(tmp_path):
     assert v.counts["segcap"]["done"] == sum(v.counts["segcap"].values())
     assert v.spend_usd > 0 and v.budget_usd == 5.0 and v.eta_s is None
     recs = job.results("caption")
-    assert len(recs) == 6 and all(r.certified for r in recs)
+    # fake engines: never certified (review 6 M7)
+    assert len(recs) == 6 and {r.uncertified_reason for r in recs} == {"fake_models"}
 
     r = job.report()
     assert r["state"] == "done" and r["composed"]

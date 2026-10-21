@@ -30,7 +30,7 @@ from flora_deploy.cli._app import app, console
 JobArg = Annotated[str, typer.Argument(help="Job id (default at submit: the config's project).")]
 StoreOpt = Annotated[str | None, typer.Option(
     "--store", envvar="FLORA_STORE",
-    help="Job store: modal-volume://name[/path], s3://bucket[/prefix], file:///dir "
+    help="Job store: modal-volume://name\\[/path], s3://bucket\\[/prefix], file:///dir "
          "(default: the config's output.sink).")]
 ConfigOpt = Annotated[Path, typer.Option(
     "--config", "-c", help="flora.yaml (finds the store and Modal environment).")]

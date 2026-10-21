@@ -61,6 +61,7 @@ OUTPUT_MODULES: dict[str, tuple[str, ...]] = {
         "records.py",
         "jobs/types.py",
         "jobs/indexing.py",
+        "jobs/planning.py",  # which indexed episodes are planned (exclusions)
         "media/__init__.py",
         "media/types.py",
         "media/index.py",
@@ -164,6 +165,7 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     "jobs/attempts.py",
     "jobs/budget.py",
     "jobs/deps.py",
+    "jobs/driver.py",  # per-tick driver (refresh, transient retry), shared Modal/local
     "jobs/orchestrator.py",
     "jobs/progress.py",
     "jobs/reconciler.py",

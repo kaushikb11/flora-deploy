@@ -22,8 +22,10 @@ worker runners can run a whole job without Modal:
 * ``cancel`` / ``terminate``: the call polls ``cancelled`` immediately; the running container gets
   SIGINT at its next checkpoint (the runner flushes and marks it preempted, as ``@modal.exit``
   does) and is not restarted.
-* Faults (``infra``, ``spawnerr`` here; the rest in the engines' checkpoints) come from a
-  :class:`~flora_deploy.local.faults.FaultPlan`.
+* ``timeout`` (fault): the container is killed at its first checkpoint (no mark) and the call
+  ends ``failed`` with ``FunctionTimeoutError``, as ``status_from_get`` maps a Modal timeout.
+* Faults (``infra``, ``spawnerr``, ``timeout`` here; the rest in the engines' checkpoints) come
+  from a :class:`~flora_deploy.local.faults.FaultPlan`.
 
 The spawner never touches the store itself: everything the orchestrator learns comes from the
 runners' files and ``poll``, exactly as on Modal.
@@ -217,6 +219,7 @@ class LocalSpawner:
 
     def _loop(self, c: LocalCall) -> None:
         starts = 0
+        timeout = self.faults.take("timeout", shard_id=c.shard_id)
         while True:
             if c.cancel.is_set():
                 self._end(c, "cancelled", error="cancelled")
@@ -233,7 +236,8 @@ class LocalSpawner:
             c.containers.append(box.container_id)
             set_current(ContainerContext(call_id=c.call_id, container_id=box.container_id,
                                          shard_id=c.shard_id, shard_kind=c.kind,
-                                         faults=self.faults, cancelled=c.cancel))
+                                         faults=self.faults, cancelled=c.cancel,
+                                         timeout=timeout))
             try:
                 box.calls += 1
                 receipt = box.runner.run_shard(c.job_id, c.shard_id, c.config_hash,
@@ -247,6 +251,9 @@ class LocalSpawner:
                 continue  # Modal restarts the same call in a new container
             except ContainerCrash:  # OOM / SIGKILL: no mark; Modal restarts it, forever
                 c.crashes += 1
+                if timeout:  # Modal's timeout kills the container and fails the call
+                    self._end(c, "failed", error="FunctionTimeoutError: injected call timeout")
+                    return
                 time.sleep(self.restart_delay_s)
                 continue
             except Exception as exc:  # user-code exception: modal.Retries

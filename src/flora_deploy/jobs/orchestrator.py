@@ -729,10 +729,11 @@ class Orchestrator:
     def _error_rate_problems(self, shards: Sequence[Shard]) -> list[str]:
         """The job-level error-rate guard (module docstring), from receipts and ledgers."""
         from flora_deploy.jobs.manifest import from_json
-        from flora_deploy.jobs.progress import error_rate_problems
+        from flora_deploy.jobs.progress import error_rate_problems, with_unplanned
         from flora_deploy.jobs.types import ShardReceipt
 
         base = self._planned.shards if self._planned is not None else shards
+        unplanned = getattr(self._planned, "excluded", None) or {}
         planned: dict[str, set[str]] = {}
         for s in base:
             if not s.bisected_from:
@@ -754,7 +755,8 @@ class Orchestrator:
             x = len(excluded.get(kind, set()) & eps)
             tallies[kind] = {"planned": len(eps), "done": len(eps) - x, "excluded": x,
                              "pending": 0}
-        return error_rate_problems(tallies, self.settings.max_episode_error_rate)
+        return error_rate_problems(with_unplanned(tallies, unplanned),
+                                   self.settings.max_episode_error_rate)
 
     # budget hard cap ------------------------------------------------------------------------
     def budget_state(self) -> Any:

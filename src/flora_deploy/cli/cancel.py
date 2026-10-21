@@ -35,13 +35,20 @@ def cancel(
         raise fail(str(e)) from None
     if state in sdk.TERMINAL:
         raise fail(f"job {job} is already {state}; nothing to cancel")
-    if not yes and not typer.confirm(f"Cancel job {job} ({state})? It cannot be resumed."):
-        raise typer.Exit(code=1)
+    try:
+        ok = yes or typer.confirm(f"Cancel job {job} ({state})? It cannot be resumed.")
+    except typer.Abort:  # no answer (no terminal): declined
+        ok = False
+    if not ok:
+        raise typer.Exit(code=2)  # declined: a refusal, not a failed job
     try:
         cancelled = j.cancel(reason)
     except sdk.FloraError as e:
         raise fail(str(e)) from None
-    if cancelled:
+    if j.is_local:
+        console.print(f"cancel recorded for {job} (a local job: a running `flora run --local` "
+                      "stops on its next tick). Check with `flora status`", soft_wrap=True)
+    elif cancelled:
         console.print(f"cancelled {job}: no orchestrator was running; cancelled "
                       f"{len(cancelled)} live call(s)")
     else:

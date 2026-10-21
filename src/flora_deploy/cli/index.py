@@ -65,7 +65,7 @@ def index(
     job: Annotated[str | None, typer.Option("--job", help="Job id (default: project).")] = None,
     store: Annotated[str | None, typer.Option(
         "--store", envvar="FLORA_STORE",
-        help="Job store: file:///dir, s3://bucket[/prefix], modal-volume://name[/prefix] "
+        help="Job store: file:///dir, s3://bucket\\[/prefix], modal-volume://name\\[/prefix] "
              "(default: from output.sink).")] = None,
     limit: Annotated[int | None, typer.Option(help="Index only the first N episodes.")] = None,
     decode: Annotated[bool | None, typer.Option(

@@ -24,7 +24,7 @@ dependencies = [
 ]
 
 [project.scripts]
-flora = "flora_deploy.cli:app"
+flora = "flora_deploy.cli:main"
 
 [dependency-groups]
 dev = [

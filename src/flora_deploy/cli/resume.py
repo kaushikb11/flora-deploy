@@ -5,6 +5,9 @@ job's run spec, which the deployed orchestrator reads) and spawns the orchestrat
 none holds the lease (a dead orchestrator). With a live orchestrator it only writes the records.
 Refuses ``done``, ``completed_with_errors``, ``failed`` and ``cancelled`` jobs, and a budget
 stop whose projection is still over the budget without ``--budget-usd``.
+
+A local job (``flora run --local``) is resumed in this process: its orchestrator runs here until
+the job stops, then this prints its status and exits with its code.
 """
 
 from __future__ import annotations
@@ -34,6 +37,13 @@ def resume(
     except sdk.FloraError as e:
         raise fail(str(e)) from None
     budget = f" with budget ${j.settings.budget_usd:,.2f}" if budget_usd is not None else ""
+    if j.is_local and call_id is not None:
+        from flora_deploy.cli.run import print_view
+
+        v = j.status()
+        console.print(f"resumed {job}{budget} locally")
+        print_view(v)
+        raise typer.Exit(code=v.exit_code)
     if call_id is None:
         console.print(f"resumed {job}{budget}; its orchestrator is still running")
     else:
