@@ -156,7 +156,13 @@ def outcome(fn, *args, **kwargs):
     try:
         return "ok", fn(*args, **kwargs)
     except Exception as exc:  # noqa: BLE001 - compared between oracle and patch
-        return "raise", (type(exc), str(exc))
+        # the type NVIDIA's code raises (a patch re-raising NVIDIA's rejection uses the marker
+        # subclass, nv.errors.NvidiaSemanticsError), the recorded name, the message, and the
+        # failure class: a patch's copy of NVIDIA's rejection must stay NVIDIA's verdict
+        from flora_deploy.nv import errors as nv_errors
+
+        return "raise", (nv_errors.nvidia_type_name(exc), type(exc).__name__, str(exc),
+                         nv_errors.classify(exc))
 
 
 def assert_same_outcome(ref, got, where=""):
@@ -345,7 +351,7 @@ def test_transport_pool_identical(nv, workers):
         bad = {1: frames[1], 2: "not an image"}
         ref = outcome(original, bad)
         got = outcome(nv.pipeline.human_transport, bad)
-        assert ref[0] == got[0] == "raise" and ref[1][0] is got[1][0]
+        assert ref[0] == got[0] == "raise" and ref[1][:2] == got[1][:2]
 
 
 # ---------------------------------------------------------------------------------------------

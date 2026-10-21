@@ -17,6 +17,7 @@ from flora_deploy.records import Provenance, StageRecord
 from flora_deploy.stages import caption as C
 from flora_deploy.stages import segment as S
 from flora_deploy.workers_impl.segment import classify_error
+from tests.fakes import fake_nvidia as F
 
 EOS = 1
 
@@ -89,7 +90,12 @@ def test_engine_error_is_infra():
     assert classify_error(None, EngineBatchError("x")) == "infra"
     assert classify_error(None, ContextBudgetError("x", prompt_tokens=1, budget=1,
                                                    limit=1)) == "nv_failure"
-    assert classify_error(None, ValueError("NVIDIA InputError")) == "nv_failure"
+    try:  # NVIDIA's code raising a builtin (a registered NVIDIA root's frame)
+        F.nvidia_raise(ValueError("NVIDIA InputError"))
+    except ValueError as nv_exc:
+        assert classify_error(None, nv_exc) == "nv_failure"
+    # the same builtin from our frame is ours, not NVIDIA's verdict
+    assert classify_error(None, ValueError("NVIDIA InputError")) == "infra"
     assert classify_error(None, KeyError("x")) == "infra"
 
 

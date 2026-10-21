@@ -19,6 +19,16 @@ from flora_deploy.workers_impl.segment import (
     StageInfo,
 )
 from tests.conformance.worker_suite import WorkerSpec, World
+from tests.fakes import fake_nvidia as F
+
+
+def nv_raised(exc: BaseException) -> BaseException:
+    """``exc`` as raised by a frame of "NVIDIA's code" (a registered NVIDIA root)."""
+    try:
+        F.nvidia_raise(exc)
+    except BaseException as e:  # noqa: BLE001
+        return e
+    raise AssertionError("did not raise")
 
 
 class NullEngine:
@@ -98,8 +108,8 @@ def test_truncated_index_receipt_is_infra(tmp_path, monkeypatch):
 
 def test_nvidia_builtin_runtime_error_rejection_is_terminal(tmp_path, monkeypatch):
     bad = []
-    w = world(tmp_path, monkeypatch, exc_for=lambda uid: RuntimeError(
-        "The pipeline returned an invalid caption interval.") if uid in bad else None)
+    w = world(tmp_path, monkeypatch, exc_for=lambda uid: nv_raised(RuntimeError(
+        "The pipeline returned an invalid caption interval.")) if uid in bad else None)
     bad.append(w.uids[1])
     rec = w.run("ta-1")
     assert rec is not None and rec.episodes_failed == (w.uids[1],)
@@ -138,7 +148,7 @@ def test_cuda_fault_fails_fast_and_exits_container(tmp_path, monkeypatch):
     (RuntimeError("No common caption input geometry fits"), "nvidia", "nv_failure"),
     (RuntimeError("The pipeline returned an invalid caption interval."), "nvidia",
      "nv_failure"),
-    (ValueError("NVIDIA InputError"), "nvidia", "nv_failure"),
+    (nv_raised(ValueError("NVIDIA InputError")), "nvidia", "nv_failure"),
     (ValueError("no NVIDIA profile"), "inputs", "infra"),
     (ValueError("nan"), "records", "python"),
     (RuntimeError("CUDA error: device-side assert triggered"), "nvidia", "cuda_fatal"),
