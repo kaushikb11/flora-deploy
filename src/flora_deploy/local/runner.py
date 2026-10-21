@@ -472,23 +472,28 @@ class LocalRunner:
         local_dir = str(self.local_dir / "containers" / container_id)
         media = str(self.media_root) if self.media_root is not None else None
         store = FaultStore(self.store)
+        # the container env the factory sets for certification provenance, for this one kind
+        from flora_deploy.workers_impl import certstamp as CS
+
+        cenv = {CS.PRESET_ENV: cfg.preset, CS.SHARD_KINDS_ENV: kind,
+                **CS.cert_env(cfg, {kind: pool})}
         if kind in ("segment", "caption"):  # balanced: the real BalancedShardRunner
             from flora_deploy.local.balanced import fake_balanced_runner
             from flora_deploy.local.faults import checkpoint, nv_rejects
-            from flora_deploy.workers_impl.certstamp import CertStamp
 
             return fake_balanced_runner(
                 kind, store, media_root=media, gpu=pool.gpu, certificate=FAKE_CERTIFICATE,
                 default_task=instr.text, local_dir=local_dir, container_id=container_id,
                 before=checkpoint, rejects=nv_rejects, on_shard=note_episodes,
                 call_id=call_id, fatal=_container_exit,
-                stamp=CertStamp(cfg.pipeline.embodiment, None, pool.gpu))
+                stamp=CS.fake_stamp(kind, cenv, gpu=pool.gpu))
         if kind == "segcap":
             s = SegcapWorkerSettings(
                 preset=cfg.preset, models=FAKE_MODELS["segcap"], gpu=pool.gpu,
                 certificate=FAKE_CERTIFICATE, envelope=cfg.pipeline.envelope,
                 instruction_text=instr.text, media_root=media, local_dir=local_dir,
                 container_id=container_id)
+            s = CS.with_stamps(s, cenv, fake=True)
             return SegcapShardRunner(store, FakeSegcapEngine(), s, call_id=call_id,
                                      fatal=_container_exit)
         s = RewardWorkerSettings(
@@ -497,6 +502,7 @@ class LocalRunner:
             config_extra={"fake_models": FAKE_RECEIPT}, decoder="inline", workers=1,
             envelope=cfg.pipeline.envelope, default_task=instr.text, media_root=media,
             local_dir=local_dir, container_id=container_id)
+        s = CS.with_stamps(s, cenv, fake=True)
         runner = RewardShardRunner(store, RewardEngine(FakeLLM(), "fake-processor"), self.nv, s,
                                    call_id=call_id, fatal=_container_exit)  # as workers_app
         from_index = runner.episode_from_index

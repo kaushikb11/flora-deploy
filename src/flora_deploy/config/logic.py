@@ -85,10 +85,9 @@ OUTPUT_MODULES: dict[str, tuple[str, ...]] = {
         # mode is only as good as the code that applies it: the W2-merge bug (determinism and
         # terminal_rationale hashed but not applied) lived here, while these were non-output.
         "config/schema.py",  # output_settings / with_pipeline / to_run_settings
-        "workers_impl/binding.py",  # provenance.embodiment / cert_key / gpu of every record
         "jobs/settings.py",  # RunSettings carries the modes to the workers
         "modal_app/factory.py",  # worker env (FLORA_DETERMINISM, FLORA_TERMINAL_MODE, ...)
-        # certification provenance stamped into records (embodiment, cert_key, gpu)
+        # certification provenance stamped into every record (embodiment, cert_key, gpu)
         "workers_impl/certstamp.py",
     ),
     # NVIDIA's HF pipeline (exact segcap) and its output-identical runtime patches (D17).

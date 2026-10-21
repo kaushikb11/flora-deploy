@@ -230,9 +230,11 @@ class RewardWorker:
         engine, nv, self.startup = build_reward_engine(
             cache_mode=os.environ.get(CACHE_MODE_ENV, "ro"))
         self.startup["preflight"] = facts
+        from flora_deploy.workers_impl.certstamp import with_stamps
+
+        settings = with_stamps(reward_settings_from_env(env, gpu=gpu_name()), env)  # fail closed
         self.runner = RewardShardRunner(
-            store, engine, nv, reward_settings_from_env(gpu=gpu_name()),
-            call_id=modal.current_function_call_id, fatal=_die)
+            store, engine, nv, settings, call_id=modal.current_function_call_id, fatal=_die)
 
     @modal.method()
     def run_shard(self, job_id: str, shard_id: str, config_hash: str, token: str = ""):
@@ -464,6 +466,7 @@ def fake_segcap_runner(store: Store, env: Mapping[str, str], hook: FakeFaultHook
                        call_id: Callable[[], str | None] = lambda: "",
                        fatal: Callable[[BaseException], None] | None = None) -> Any:
     from flora_deploy.local.engines import FAKE_MODELS
+    from flora_deploy.workers_impl.certstamp import with_stamps
     from flora_deploy.workers_impl.segcap import SegcapShardRunner, SegcapWorkerSettings
 
     mode = configured_determinism_env(env)
@@ -472,6 +475,7 @@ def fake_segcap_runner(store: Store, env: Mapping[str, str], hook: FakeFaultHook
         gpu=gpu_name(), certificate=FAKE_CERTIFICATE, envelope=env.get("FLORA_ENVELOPE", "warn"),
         media_root=env.get("FLORA_MEDIA_ROOT"),
         instruction_text=env.get("FLORA_INSTRUCTION_TEXT") or None, determinism=mode)
+    settings = with_stamps(settings, env, fake=True)
     return SegcapShardRunner(store, fake_segcap_engine(mode, hook), settings, call_id=call_id,
                              fatal=fatal)
 
@@ -495,6 +499,9 @@ def fake_reward_runner(store: Store, env: Mapping[str, str], hook: FakeFaultHook
         reward_settings_from_env(env, gpu=gpu_name()), models=dict(FAKE_MODELS["reward"]),
         certificate=FAKE_CERTIFICATE, config_extra={"fake_models": FAKE_CERTIFICATE},
         decoder="inline", workers=1)
+    from flora_deploy.workers_impl.certstamp import with_stamps
+
+    settings = with_stamps(settings, env, fake=True)
     runner = RewardShardRunner(store, RewardEngine(FakeLLM(), "fake-processor"),
                                fake_rewarder_family(registry), settings, call_id=call_id,
                                fatal=fatal)
@@ -577,7 +584,7 @@ def fake_balanced_runner(kind: str, store: Store, env: Mapping[str, str], hook: 
         kind, store, media_root=env.get("FLORA_MEDIA_ROOT"), gpu=gpu,
         certificate=FAKE_CERTIFICATE, default_task=env.get("FLORA_INSTRUCTION_TEXT") or None,
         before=lambda uid: hook_for_shard[0](uid), before_in_thread=True, call_id=call_id,
-        fatal=fatal, stamp=fake_stamp(env, gpu=gpu))
+        fatal=fatal, stamp=fake_stamp(kind, env, gpu=gpu))
     hook_for_shard: list[Callable[[str], None]] = [hook.before_episode]
     runner.flora_hook_slot = hook_for_shard  # type: ignore[attr-defined]
     return runner

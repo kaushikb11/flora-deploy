@@ -465,13 +465,11 @@ def instruction_env(cfg: Any) -> dict[str, str]:
 
 def balanced_env(cfg: Any, kinds: list[str], pools: Mapping[str, PoolSettings],
                  derived_receipts: Mapping[str, str]) -> dict[str, str]:
-    """What a balanced worker verifies and stamps (``modal_app.balanced_app``,
-    ``workers_impl.certstamp``): the recorded receipts of the derived weights its kinds need
-    (``weights.derived``), each kind's pool GPU (the engine's per-GPU limits and the
-    certification key), its output-affecting modes and the job's embodiment."""
-    from flora_deploy.config.hashing import kind_modes
+    """What a balanced worker verifies (``modal_app.balanced_app``): the recorded receipts of
+    the derived weights its kinds need (``weights.derived``). The certification env (pool GPU,
+    modes, embodiment: :func:`workers_impl.certstamp.cert_env`) is set on every worker class
+    by :func:`plan_app`."""
     from flora_deploy.config.presets import get_preset
-    from flora_deploy.workers_impl.certstamp import EMBODIMENT_ENV, KIND_MODES_ENV, POOL_GPUS_ENV
 
     preset = get_preset(cfg.preset)
     names = sorted({n for k in kinds for n in preset.derived_weights.get(k, ())})  # type: ignore[call-overload]
@@ -480,10 +478,7 @@ def balanced_env(cfg: Any, kinds: list[str], pools: Mapping[str, PoolSettings],
         raise DeployError(f"{', '.join(kinds)}: no recorded receipt for derived weight(s) "
                           f"{missing} (run `flora prepare`, or pass --receipt NAME=<sha256>)")
     return {DERIVED_RECEIPTS_ENV: json.dumps({n: derived_receipts[n] for n in names},
-                                             sort_keys=True),
-            POOL_GPUS_ENV: json.dumps({k: pools[k].gpu for k in kinds}, sort_keys=True),
-            KIND_MODES_ENV: json.dumps({k: kind_modes(cfg, k) for k in kinds}, sort_keys=True),
-            EMBODIMENT_ENV: str(cfg.pipeline.embodiment)}
+                                             sort_keys=True)}
 
 
 def plan_app(
@@ -527,6 +522,7 @@ def plan_app(
     )
     from flora_deploy.modal_app import orchestrator_app as oa
     from flora_deploy.modal_app.images import image_fingerprint
+    from flora_deploy.workers_impl.certstamp import cert_env
 
     if determinism is not None and determinism not in det.MODES:
         raise DeployError(f"determinism {determinism!r}: use one of {', '.join(det.MODES)}")
@@ -632,7 +628,9 @@ def plan_app(
                "FLORA_OUTPUT_SETTINGS": json.dumps(outputs, sort_keys=True),
                "FLORA_SHARD_KINDS": ",".join(kinds),
                "FLORA_STAGE_HASHES": json.dumps({k: ch.stage_hashes[k] for k in kinds},
-                                                sort_keys=True)}
+                                                sort_keys=True),
+               # provenance every record carries (embodiment, cert_key, gpu), every kind
+               **cert_env(cfg, {k: rs.pools[k] for k in kinds})}
         if ref.recipe == "segcap":  # review 6 H2: one input per container, c episodes inside
             from flora_deploy.jobs.settings import EPISODE_CONCURRENCY_ENV, episode_concurrency
 

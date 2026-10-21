@@ -309,17 +309,17 @@ class ShardPartSink:
     advances ``k`` and counts the episodes as done / failed. A flush interrupted half-way leaves
     the pending files in place and the next flush rewrites the same paths whole, so calling it
     again (``finally``, ``@modal.exit``) is always safe. Records are re-stamped with the kind's
-    stage hash (``JobFiles.key``) and the kind's certification binding (``binding``:
-    ``workers_impl.binding``). ``failed`` holds terminal exclusions only; episodes with an
-    ``infra`` error are in ``infra`` (uid -> message) and never count as failed."""
+    stage hash (``JobFiles.key``) and the kind's certification provenance (``stamp``: a
+    ``workers_impl.certstamp.CertStamp``). ``failed`` holds terminal exclusions only; episodes
+    with an ``infra`` error are in ``infra`` (uid -> message) and never count as failed."""
 
     AREAS = ("part", "audit", "errors")
 
     def __init__(self, jf: A.JobFiles, kind: ShardKind, shard_id: str, container_id: str,
-                 local_dir: str | Path, *, start_k: int = 0, binding: Any = None):
+                 local_dir: str | Path, *, start_k: int = 0, stamp: Any = None):
         self.jf, self.kind, self.shard_id, self.container_id = jf, kind, shard_id, container_id
-        # ``workers_impl.binding.CertBinding`` of this kind: embodiment / cert_key / gpu
-        self.binding = binding
+        # ``workers_impl.certstamp.CertStamp`` of this kind: embodiment / cert_key / gpu
+        self.stamp = stamp
         self.local_dir = Path(local_dir) / safe_key(shard_id)
         self.k = start_k
         self.parts: list[str] = []
@@ -358,10 +358,9 @@ class ShardPartSink:
         keep = rec.provenance.engine_hash
         if keep is None and own and own not in (key, self.jf.config_hash):
             keep = own  # the stage's own hash is not lost (review 6 M3)
-        from flora_deploy.workers_impl.binding import stamp
-
-        return stamp(dataclasses.replace(rec, provenance=dataclasses.replace(
-            rec.provenance, config_hash=key, engine_hash=keep)), self.binding)
+        out = dataclasses.replace(rec, provenance=dataclasses.replace(
+            rec.provenance, config_hash=key, engine_hash=keep))
+        return out if self.stamp is None else self.stamp.apply(out)
 
     def add(self, records: Sequence[StageRecord] = (), audits: Sequence[dict] = (),
             errors: Sequence[EpisodeError] = ()) -> None:
@@ -501,8 +500,8 @@ class RewardWorkerSettings:
     tail_trim_s: float | None = None  # None: NVIDIA's DENSE_TAIL_TRIM_S
     envelope: str = "warn"  # D13: "ignore" certifies regardless of the envelope verdict
     default_task: str | None = None  # the fixed instruction (``FLORA_INSTRUCTION_TEXT``)
-    # shard kind -> ``workers_impl.binding.CertBinding`` stamped into its records
-    cert_bindings: Mapping[str, Any] = field(default_factory=dict)
+    # shard kind -> ``workers_impl.certstamp.CertStamp`` stamped into its records
+    cert_stamps: Mapping[str, Any] = field(default_factory=dict)
     media_root: str | None = None
     local_dir: str = "/tmp/flora-reward"
     container_id: str = field(default_factory=default_container_id)
@@ -640,7 +639,7 @@ class RewardShardRunner:
         ks = _container_ks(prior.parts, self.container_id)
         start_k = max([self._next_k.get(key, 0), *(k + 1 for k in ks)])
         sink = ShardPartSink(jf, shard.kind, shard.shard_id, self.container_id, s.local_dir,
-                             start_k=start_k, binding=s.cert_bindings.get(shard.kind))
+                             start_k=start_k, stamp=s.cert_stamps.get(shard.kind))
         active.sink = sink
 
         poisoned: set[str] = set()  # step 3

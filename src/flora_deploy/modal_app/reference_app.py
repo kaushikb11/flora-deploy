@@ -388,6 +388,9 @@ class ReferenceWorker:
             "cgroup_memory_max": _read_text("/sys/fs/cgroup/memory.max"),
             "gpu": _gpu_memory(),
         }
+        if job_worker_env():  # fail closed at start: its certification stamp must resolve
+            with self._runner_lock:
+                self.runner = self._shard_runner()
         print("exact worker ready:", {k: self.load_report[k] for k in ("enter_s", "marks_s")},
               flush=True)
 
@@ -677,6 +680,14 @@ class ReferenceWorker:
             store = self.job_store if self.job_store is not None else store_from_env()
         if settings is None:
             settings = segcap_settings_from_env()
+            if job_worker_env():  # provenance of every record (workers_impl.certstamp)
+                from flora_deploy.workers_impl.certstamp import pinned_content, with_stamps
+
+                # the loader refused anything but the pinned BF16 content (captioner_load);
+                # without it (FP32 lab profile) the key fails closed
+                content = (pinned_content(settings.preset, "segcap")
+                           if self.bf16 is not None else {})
+                settings = with_stamps(settings, derived_content=content)
         # CUDA fault -> _die after the marker is written (the container is replaced)
         return SegcapShardRunner(store, self.engine, settings,
                                  call_id=modal.current_function_call_id, fatal=_die)
