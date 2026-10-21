@@ -13,7 +13,8 @@ Layout (see ``config/templates/*.yaml`` for commented templates)::
     input: {format, repo, revision, path, cameras, stage_to}
     pipeline: {stages, embodiment, episode_instruction, envelope, shard_target_gpu_minutes,
                determinism, terminal_rationale}
-    resources: {<shard kind>: {gpu, gpu_count, max_containers, max_inputs, cpu, memory}}
+    resources: {<shard kind>: {gpu, gpu_count, max_containers, max_inputs, episode_concurrency,
+                               cpu, memory}}
     output: {sink, formats}
     retries: {max_starts_before_quarantine, max_episode_error_rate}
     observability: {log_level, heartbeat_s, progress}
@@ -221,6 +222,8 @@ class ResourceOverride(_Model):
     gpu_count: int | None = Field(None, ge=1, le=8)
     max_containers: int | None = Field(None, ge=1)
     max_inputs: int | None = Field(None, ge=1)
+    episode_concurrency: int | None = Field(
+        None, ge=1, le=64, description="episodes in flight inside one container (segcap)")
     cpu: float | None = Field(None, gt=0, le=512, allow_inf_nan=False,
                               description="physical cores")
     memory: float | None = Field(None, gt=0, le=4096, allow_inf_nan=False, description="GiB")
@@ -241,6 +244,7 @@ class ResourceOverride(_Model):
         fields = {
             "gpu": self.gpu, "gpu_count": self.gpu_count, "max_containers": self.max_containers,
             "max_inputs": self.max_inputs, "cpu_cores": self.cpu, "memory_gib": self.memory,
+            "episode_concurrency": self.episode_concurrency,
         }
         return replace(pool, **{k: v for k, v in fields.items() if v is not None})
 
@@ -311,6 +315,18 @@ class FloraConfig(_Model):
                 "caption" in self.pipeline.stages):
             raise ValueError("the exact preset runs NVIDIA's pipeline, which does segment and "
                              "caption together: list both or neither")
+        from flora_deploy.jobs.settings import IN_WORKER_CONCURRENCY
+
+        for kind, r in self.resources.items():  # review 6 H2
+            if kind in IN_WORKER_CONCURRENCY and (r.max_inputs or 1) > 1:
+                raise ValueError(
+                    f"resources.{kind}.max_inputs: {r.max_inputs}: the {kind} worker runs one "
+                    f"shard per container and its episodes concurrently in-process; set "
+                    f"`episode_concurrency: {r.max_inputs}` and `max_inputs: 1`")
+            if kind not in IN_WORKER_CONCURRENCY and r.episode_concurrency is not None:
+                raise ValueError(f"resources.{kind}.episode_concurrency: only "
+                                 f"{sorted(IN_WORKER_CONCURRENCY)} batch episodes in-process; "
+                                 "use max_inputs")
         pools = self.pools()
         bad_gpu = [p for k, pool in pools.items()
                    if (p := gpu_problem(self.preset, k, pool.gpu, pool.gpu_count))]

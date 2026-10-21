@@ -31,6 +31,7 @@ _VIDEO_PATH: tuple[str, ...] = (
     "nv/segment_glue.py",
     "nv/budget.py",
     "nv/capture.py",
+    "nv/errors.py",  # which failures are excused (nv_failure) and which are retried
     "accel/__init__.py",
     "accel/captioner_load.py",
     "accel/determinism.py",  # opt-in kernel selection (D-1) changes outputs
@@ -177,6 +178,7 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     # real run's path; fake outputs carry their own hash (fake receipts, local.runner)
     "local/__init__.py",
     "local/engines.py",
+    "local/fake_nvidia.py",
     "local/faults.py",
     "local/runner.py",
     "local/sample.py",

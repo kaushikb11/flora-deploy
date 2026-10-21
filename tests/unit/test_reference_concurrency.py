@@ -22,10 +22,7 @@ import pytest
 from flora_deploy.nv.session import CachedSession
 from flora_deploy.observe import Patcher, TimedLock
 from flora_deploy.stages import reference as ref
-
-
-class InputError(ValueError):
-    pass
+from tests.fakes.fake_nvidia import InputError  # NVIDIA's class, from a registered NVIDIA root
 
 
 class FakeProc:

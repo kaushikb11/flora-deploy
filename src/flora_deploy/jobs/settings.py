@@ -33,6 +33,27 @@ class PoolSettings:
     max_inputs: int = 1  # @modal.concurrent inputs per container
     cpu_cores: float = 8.0  # physical cores (billed whether used or not)
     memory_gib: float = 64.0
+    # Episodes in flight inside ONE input, for kinds whose worker batches in-process
+    # (:data:`IN_WORKER_CONCURRENCY`); None: that kind's measured default.
+    episode_concurrency: int | None = None
+
+
+# Kinds whose worker runs one shard per container (one Modal input: ``max_inputs`` must be 1) and
+# runs that shard's episodes concurrently in-process, and the measured default (review 6 H2: the
+# exact segcap rate "x4" is four episodes on one H200 under one GPU lock, rates.json).
+IN_WORKER_CONCURRENCY: dict[str, int] = {"segcap": 4}
+# How the factory hands it to such a worker (``modal_app.reference_app.episode_concurrency``).
+EPISODE_CONCURRENCY_ENV = "FLORA_EPISODE_CONCURRENCY"
+
+
+def episode_concurrency(kind: str, pool: PoolSettings) -> int:
+    """Episodes one container of ``kind`` runs at once: the concurrency its rates are measured at
+    (``planner.rates`` ``concurrency``). In-worker kinds: ``episode_concurrency`` (default
+    :data:`IN_WORKER_CONCURRENCY`); every other kind: one episode per Modal input, so
+    ``max_inputs``."""
+    if kind in IN_WORKER_CONCURRENCY:
+        return int(pool.episode_concurrency or IN_WORKER_CONCURRENCY[kind])
+    return max(int(pool.max_inputs), 1)
 
 
 @dataclass(frozen=True)

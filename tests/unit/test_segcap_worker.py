@@ -123,9 +123,23 @@ def marker(store, container="ta-1", cfg=CFG):
     return read_attempt(JobFiles(store, JOB, cfg), "segcap", SID, container)
 
 
-def nv_class(name, base=RuntimeError, module="flora_nv_segcap_78a0e4ac.batch_utils.models"):
-    """An exception class as the linked NVIDIA family defines it (aliased module)."""
-    return type(name, (base,), {"__module__": module})
+def nv_class(name):
+    """NVIDIA's exception class ``name``, from the registered stand-in for NVIDIA's code
+    (``tests.fakes.fake_nvidia``): what makes it NVIDIA's is where it was loaded from, not its
+    module name (review 6 H1; the real classes: ``tests/nvlink/test_nv_link_errors.py``)."""
+    from tests.fakes import fake_nvidia
+
+    return getattr(fake_nvidia, name)
+
+
+def from_nvidia_frame(exc):
+    """``exc`` as raised by a frame of NVIDIA's code (review 6 M2)."""
+    from tests.fakes import fake_nvidia
+
+    try:
+        fake_nvidia.nvidia_raise(exc)
+    except BaseException as e:  # noqa: BLE001
+        return e
 
 
 # --- inputs ---------------------------------------------------------------------------------
@@ -345,10 +359,9 @@ def test_fixed_instruction_needs_text(tmp_path):
 
 def test_classifier_table():
     t = ref_stage.transport_error
-    fine = nv_class("FineSegmentationOutputError", module="flora_nv_segcap_78a0e4ac.batch_utils."
-                    "vendor.production_adapter.core.flora_runtime.video_segmentation.fine_subtask")
+    fine = nv_class("FineSegmentationOutputError")
     ife = nv_class("InputErrorForModel")
-    inp = nv_class("InputError", ValueError, module="flora_nv_segcap_78a0e4ac.batch_utils.media")
+    inp = nv_class("InputError")
     long_call = {"gpu_calls": 3, "max_call_s": 300.4, "timing_dependent": True}
     short = {"gpu_calls": 3, "max_call_s": 12.0, "timing_dependent": False}
     cases = [
@@ -356,7 +369,10 @@ def test_classifier_table():
         (t(nv_class("FineWorkerError")("bad worker output")), None, "nv_failure"),
         (t(nv_class("U2WorkerError")("bad caption")), None, "nv_failure"),
         (t(inp("yam32 requires YAM and all three camera views.")), None, "nv_failure"),
-        (t(ValueError("camera roles must be main")), None, "nv_failure"),
+        (t(from_nvidia_frame(ValueError("camera roles must be main"))), None, "nv_failure"),
+        (t(from_nvidia_frame(AssertionError("slots duplicate evidence"))), None, "nv_failure"),
+        # never raised by NVIDIA's code (no NVIDIA frame): not NVIDIA's verdict (review 6 M2)
+        (t(ValueError("camera roles must be main")), None, "infra"),
         (t(RuntimeError("The pipeline returned an invalid caption interval.")), None,
          "nv_failure"),
         (t(ife("The model did not return a complete output for this input.")), short,
@@ -393,7 +409,7 @@ def test_classifier_table():
 
 
 def test_nvidia_family_rejection_is_terminal_with_timing(tmp_path):
-    fine = nv_class("FineSegmentationOutputError", module="flora_nv_segcap_78a0e4ac.fine")
+    fine = nv_class("FineSegmentationOutputError")
     eps = [("e0", receipt("e0")), ("e1", receipt("e1"))]
     store, shard = world(tmp_path, eps)
     eng = segcap_fake_engine(Script(), raises={"e1-": lambda: fine("not repaired")})

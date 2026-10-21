@@ -238,7 +238,8 @@ class ReferenceWorker:
             check_prep_receipt,
         )
 
-        self.profile = profile = ExactProfile.from_spec(self.disable, self.concurrency)
+        self.profile = profile = ExactProfile.from_spec(
+            self.disable, episode_concurrency(default=self.concurrency))
         # 1. model-cache layout (+ full prep-receipt validation, review2-wsd M5)
         if profile.linked_layout:
             from flora_deploy.modal_app.warm import build_linked_layout
@@ -945,6 +946,23 @@ def job_worker_env(env=None) -> bool:
     """Deployed as a job worker (the app factory set a job store), not the smoke app."""
     env = os.environ if env is None else env
     return bool(env.get("FLORA_STORE_KIND") or env.get("FLORA_STORE"))
+
+
+def episode_concurrency(env=None, *, default: int = 4) -> int:
+    """Episodes the engine runs at once inside one shard: the planned
+    ``resources.segcap.episode_concurrency`` the app factory passes as
+    ``FLORA_EPISODE_CONCURRENCY`` (review 6 H2: plan, factory and worker agree), else
+    ``default`` (the ``concurrency`` parameter of the smoke / lab apps)."""
+    from flora_deploy.jobs.settings import EPISODE_CONCURRENCY_ENV
+
+    env = os.environ if env is None else env
+    raw = env.get(EPISODE_CONCURRENCY_ENV)
+    if not raw:
+        return int(default)
+    value = int(raw)
+    if value < 1:
+        raise ValueError(f"{EPISODE_CONCURRENCY_ENV}={raw!r}: must be >= 1")
+    return value
 
 
 # The smoke app's binding. ``ReferenceWorker`` itself stays undecorated at module scope so the

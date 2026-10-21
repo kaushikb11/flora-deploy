@@ -191,7 +191,8 @@ def test_apply_option_round_trips_config():
     cfg = parse_config(new)
     pool = cfg.pools()["segcap"]
     assert pool.max_containers == o.kinds[0].containers
-    assert pool.max_inputs == o.kinds[0].max_inputs
+    # review 6 H2: the option's concurrency is episodes inside one input (segcap)
+    assert (pool.max_inputs, pool.episode_concurrency) == (1, o.kinds[0].max_inputs)
     assert cfg.modal.max_gpus >= o.peak_gpus and cfg.modal.budget_usd == 2500
     bal = plan_options(PlanRequest(WorkloadSummary.from_hours(100), presets=("balanced",),
                                    max_gpus=10))[0]

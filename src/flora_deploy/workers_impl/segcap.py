@@ -24,24 +24,33 @@ and the paths are re-keyed by the ``segcap`` stage hash from the config's manife
    on the resident models (``stages.reference.annotate_batch``). As **each** episode finishes (in
    its own thread) its ``segment`` and ``caption`` ``StageRecord``s and one audit line (NVIDIA's
    full result with our measurements and the runtime provenance) are appended and flushed whole
-   to the store. An episode NVIDIA rejects (``InputError``) and an input NVIDIA's semantics
-   reject (``ValueError``: a source-error receipt, no cameras, a cut that would not decode like
-   the source) become ``EpisodeError(kind="nv_failure")`` files, one per stage: terminal,
-   excused. **Infrastructure errors are not terminal**: an input that cannot be read (missing
+   to the store. NVIDIA's verdict on an episode (``nv.errors.classify`` is ``nv_failure``: a
+   class NVIDIA's code defines, or a builtin exception NVIDIA's own frame raised, identified by
+   where the code was loaded from) and an input NVIDIA's semantics reject (a source-error
+   receipt, a cut that would not decode like the source) become
+   ``EpisodeError(kind="nv_failure")`` files, one per stage: terminal, excused. A time stop or
+   a decode failure is only excused once it repeats (:data:`REPEAT_TERMINAL`).
+   **Infrastructure errors are not terminal**: an input that cannot be read (missing
    index receipt or media, a transient store or I/O error) is retried once in-process; a
-   persistent one, and an infra failure inside NVIDIA's run (e.g. a CUDA fault), is written to
-   ``errors/`` as ``kind="infra"`` for diagnosis, the finished episodes are flushed, and the
-   shard **raises** :class:`~flora_deploy.workers_impl.reward.ShardInfraError` instead of writing
-   a receipt (``modal.Retries`` / the orchestrator's bounded respawns retry it). After a CUDA
-   fault the container is unusable: ``SegcapShardRunner(fatal=...)`` (``os._exit`` in the Modal
-   worker) is called after the marker is written. A ``fixed`` instruction with no text anywhere
+   persistent one, and a non-NVIDIA failure inside NVIDIA's run (ours, the environment, the
+   GPU), is written to ``errors/`` as ``kind="infra"`` (``diagnostics["class"]``: the
+   classifier's verdict) for diagnosis, the finished episodes are flushed, and the shard
+   **raises** :class:`~flora_deploy.workers_impl.reward.ShardInfraError` instead of writing a
+   receipt (``modal.Retries`` / the orchestrator's bounded respawns retry it). After a CUDA fault
+   or a GPU OOM (``cuda_fatal`` / ``oom``) the batch stops, the marker is written with
+   ``crashed=True`` (D15-counted, so a deterministic fault is bisected down to a poison pill,
+   review 6 M1) and ``SegcapShardRunner(fatal=...)`` (``os._exit`` in the Modal worker)
+   replaces the container. A ``fixed`` instruction with no text anywhere
    is a configuration error (:class:`InstructionMissing`): the shard fails, nothing is excused.
    The runner refuses (``DeterminismError``) to run when the engine's D-1 determinism mode is not
    the configured one (``SegcapWorkerSettings.determinism``: ``RunSettings.determinism`` via
    ``FLORA_DETERMINISM``);
 5. ``KeyboardInterrupt`` (SIGINT) or :meth:`~SegcapShardRunner.preempt` (``@modal.exit``) flushes
    and calls ``attempts.mark_preempted`` for **every** shard in flight (``@modal.concurrent``
-   inputs); any other exception flushes, ``mark_exception``, re-raises;
+   inputs); Modal input cancellation (``InputCancellation``: quarantine, job cancel) cancels
+   the batch, marks the start preempted and writes nothing more for the shard (its queued
+   episodes never start, and the next shard waits for its in-flight ones: review 6 H3); any
+   other exception flushes, ``mark_exception``, re-raises;
 6. ``ShardReceipt`` LAST, ``parts`` = earlier parts + this container's own, ``config_hash`` = the
    stage hash (``JobFiles.key``), ``episodes_failed`` = terminal exclusions only.
 
@@ -73,6 +82,7 @@ from flora_deploy.jobs.orchestrator import utc
 from flora_deploy.jobs.store import Store
 from flora_deploy.jobs.types import EpisodeError, EpisodeRef, ShardReceipt, safe_key
 from flora_deploy.media.types import SourceRef
+from flora_deploy.nv import errors as nv_errors
 from flora_deploy.records import Provenance
 from flora_deploy.workers_impl.reward import (
     INPUT_RETRIES,
@@ -165,30 +175,13 @@ class InputRejected(ValueError):
 # whose GPU-lock hold reached this is a time stop, not an input-determined rejection.
 NVIDIA_MAX_TIME_S = 300.0
 TIME_STOP_S = NVIDIA_MAX_TIME_S - 10.0
-# The linked family's modules are imported under ``flora_nv_<family>_<rev8>``
-# (``nv.linker.ALIAS_PREFIX``): an exception class defined there is NVIDIA's own.
-NV_MODULE_PREFIX = "flora_nv_"
-# NVIDIA rejections raised as builtin RuntimeError (no class of their own): episode semantics.
-NVIDIA_EPISODE_REJECTIONS = (
-    "The pipeline returned an invalid caption interval.",  # api.py
-    "No common caption input geometry fits",  # vendor/robot_caption_geometry.py
-)
-# Never an episode verdict: the GPU, the runtime or I/O failed (retry; CUDA faults exit).
-INFRA_TYPE_NAMES = frozenset({"OutOfMemoryError", "AcceleratorError", "NotReady",
-                              "CudaError", "CUDAError"})
 INCOMPLETE_OUTPUT = "did not return a complete output"
-
-
-def _split_type(type_name: str) -> tuple[str, str]:
-    module, _, name = type_name.rpartition(".")
-    return module, name
-
-
-def _builtin_oserror(module: str, name: str) -> bool:
-    import builtins
-
-    cls = getattr(builtins, name, None) if module in ("builtins", "") else None
-    return isinstance(cls, type) and issubclass(cls, OSError)
+# A verdict that may be timing- or I/O-determined (a time stop; a decode failure that a short read
+# on a Volume can cause) is retried, and becomes terminal once the same episode got it this many
+# times (counted from this shard's error files, every container): review 6 L1 / L2.
+REPEAT_TERMINAL = 2
+DECODE_MARKERS = ("could not be decoded", "Invalid data found", "InvalidDataError", "demuxed")
+SUSPECT_FLAGS = ("time_stop", "decode_suspect")
 
 
 def classify_input_error(exc: BaseException) -> str:
@@ -206,47 +199,46 @@ def classify_input_error(exc: BaseException) -> str:
     return "infra"
 
 
-def classify_nvidia_error(err: BaseException, timing: Mapping[str, Any] | None = None
-                          ) -> tuple[str, dict[str, Any]]:
-    """NVIDIA phase: ``(kind, diagnostics)`` for the error an episode raised inside NVIDIA's
-    ``annotate`` (``stages.reference.transport_error``: the original qualified type name and
-    message). ``timing``: the episode's GPU-call evidence (:meth:`FastExactEngine.
-    episode_timing`). In order:
-
-    1. CUDA / torch / OOM / ``NotReady`` / ``OSError`` → ``infra``;
-    2. ``InputErrorForModel`` "did not return a complete output" whose longest call reached
-       NVIDIA's ``max_time`` → ``infra`` (``time_stop``: timing-, not input-determined);
-    3. NVIDIA's input rejections (``InputError``, ``InputErrorForModel``, ``ValueError``) →
-       ``nv_failure``;
-    4. a class defined in the linked NVIDIA family (``flora_nv_*`` modules, e.g.
-       ``FineSegmentationOutputError``, ``FineWorkerError``, ``U2WorkerError``) → ``nv_failure``;
-    5. NVIDIA's known builtin-``RuntimeError`` episode rejections → ``nv_failure``;
-    6. anything else (our code, an unknown builtin error) → ``infra``."""
-    from flora_deploy.stages.reference import NvidiaInputError
-
+def _decode_suspect(err: BaseException) -> bool:
     type_name = getattr(err, "type_name", None) or \
         f"{type(err).__module__}.{type(err).__qualname__}"
     message = str(getattr(err, "message", None) or err)
-    module, name = _split_type(type_name)
-    diag: dict[str, Any] = {}
-    if timing:
-        diag.update(timing)
-    root = module.split(".", 1)[0]
-    if (cuda_fatal(message) or "out of memory" in message.lower() or name in INFRA_TYPE_NAMES
-            or root == "torch" or _builtin_oserror(module, name)):
+    return type_name.split(".", 1)[0] == "av" or any(m in message for m in DECODE_MARKERS)
+
+
+def classify_nvidia_error(err: BaseException, timing: Mapping[str, Any] | None = None
+                          ) -> tuple[str, dict[str, Any]]:
+    """NVIDIA phase: ``(EpisodeError kind, diagnostics)`` for the error an episode raised inside
+    NVIDIA's ``annotate`` (``stages.reference.transport_error``, original attached). ``timing``:
+    the episode's GPU-call evidence (:meth:`FastExactEngine.episode_timing`).
+
+    The verdict is the shared classifier's (``nv.errors.classify``: NVIDIA's code by where it
+    was loaded from), recorded as ``diagnostics["class"]``: only ``nv_failure`` is terminal;
+    ``infra``, ``python``, ``cuda_fatal`` and ``oom`` are retried (the last two also replace the
+    container and count toward D15, :class:`SegcapShardRunner`). Two NVIDIA verdicts are only
+    *suspect* (``infra`` here, terminal once repeated: :data:`REPEAT_TERMINAL`):
+
+    - ``time_stop``: ``InputErrorForModel`` "did not return a complete output" whose failing
+      (last) GPU call reached NVIDIA's ``max_time`` (timing-, not input-determined);
+    - ``decode_suspect``: a decode failure (PyAV, "could not be decoded", ...), which a short
+      read of the media can cause."""
+    cls = nv_errors.classify(err)
+    type_name = getattr(err, "type_name", None) or \
+        f"{type(err).__module__}.{type(err).__qualname__}"
+    message = str(getattr(err, "message", None) or err)
+    diag: dict[str, Any] = dict(timing or {})
+    diag["class"] = cls
+    if cls != "nv_failure":
         return "infra", diag
-    if name == "InputErrorForModel" and INCOMPLETE_OUTPUT in message and timing \
-            and float(timing.get("max_call_s") or 0.0) >= TIME_STOP_S:
+    last = (timing or {}).get("last_call_s", (timing or {}).get("max_call_s"))
+    if type_name.rpartition(".")[2] == "InputErrorForModel" and INCOMPLETE_OUTPUT in message \
+            and float(last or 0.0) >= TIME_STOP_S:
         diag["time_stop"] = True
         return "infra", diag
-    if isinstance(err, NvidiaInputError | ValueError):
-        return "nv_failure", diag
-    if root.startswith(NV_MODULE_PREFIX):
-        return "nv_failure", diag
-    if module in ("builtins", "") and name == "RuntimeError" and \
-            message.strip() in NVIDIA_EPISODE_REJECTIONS:
-        return "nv_failure", diag
-    return "infra", diag
+    if _decode_suspect(err):
+        diag["decode_suspect"] = True
+        return "infra", diag
+    return "nv_failure", diag
 
 
 # ---------------------------------------------------------------------------
@@ -337,7 +329,10 @@ class FastExactEngine:
     _audits: int = 0
     _drift: str | None = None
     _calls: dict = field(default_factory=dict, init=False, repr=False)
+    # one cancel event per batch (review 6 H3): a new batch never clears an older one's, so the
+    # queued episodes of a cancelled batch can never be revived by the next shard
     _cancel: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
+    _thread: threading.Thread | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.gpu_lock is not None:
@@ -402,11 +397,19 @@ class FastExactEngine:
         times = list(self._calls.get(threading.get_ident(), ()))
         longest = max(times, default=0.0)
         return {"gpu_calls": len(times), "max_call_s": round(longest, 3),
+                "last_call_s": round(times[-1], 3) if times else 0.0,
                 "timing_dependent": longest > TIMING_FLAG_S}
 
     def cancel(self) -> None:
-        """Queued episodes of the running batch never start (``@modal.exit``)."""
+        """Queued episodes of the running batch never start (``@modal.exit``, cancellation)."""
         self._cancel.set()
+
+    def _drain(self) -> None:
+        """Wait (interruptibly) for an earlier, cancelled batch's in-flight episodes: one batch
+        on the GPU at a time, whatever happened to the input that started it."""
+        prev = self._thread
+        while prev is not None and prev.is_alive():
+            prev.join(0.2)
 
     def _on_start(self, ep: dict) -> None:
         if self._cancel.is_set():
@@ -421,10 +424,17 @@ class FastExactEngine:
         if self.gpu_thread is not None and gt._find_mark(self.nv.pipeline.generate) \
                 is not self.gpu_thread:
             raise RuntimeError("gpu_thread is on but NVIDIA generate() does not run on it")
+        self._drain()
         self._audit()
-        self._cancel.clear()
+        self._cancel = cancel = threading.Event()  # never clear(): see the field
         box: dict[str, Any] = {}
         finished = threading.Event()
+        on_start = self._on_start
+
+        def start(ep: dict) -> None:
+            if cancel.is_set():  # this batch's own event, whatever batch runs now
+                raise BatchCancelled(f"episode {ep.get('episode')!r} not started: interrupted")
+            on_start(ep)
 
         def run() -> None:
             try:
@@ -433,18 +443,19 @@ class FastExactEngine:
                     concurrency=min(self.concurrency, max(len(items), 1)),
                     gpu_lock=self.gpu_lock, clones=self.clones, accel=self.accel,
                     sampler=self.sampler_factory() if self.sampler_factory else None,
-                    progress=self.progress, on_start=self._on_start, on_done=on_done)
+                    progress=self.progress, on_start=start, on_done=on_done)
             except BaseException as exc:  # noqa: BLE001 - handed to the caller below
                 box["exc"] = exc
             finally:
                 finished.set()
 
-        threading.Thread(target=run, name="flora-batch", daemon=True).start()
+        self._thread = threading.Thread(target=run, name="flora-batch", daemon=True)
+        self._thread.start()
         try:
-            while not finished.wait(0.2):  # interruptible: SIGINT lands here
+            while not finished.wait(0.2):  # interruptible: SIGINT / InputCancellation land here
                 pass
         except BaseException:
-            self._cancel.set()  # queued episodes never start; in-flight ones flush on their own
+            cancel.set()  # queued episodes never start; in-flight ones finish on their own
             raise
         if "exc" in box:
             raise box["exc"]
@@ -492,6 +503,48 @@ class ConcurrentShardRefused(RuntimeError):
     """A second shard arrived while one runs: the segcap worker runs one shard per container
     (its engine and GPU-lock statistics are per batch). Use ``resources.segcap.max_inputs: 1``;
     episode concurrency inside the shard is ``FastExactEngine.concurrency``."""
+
+
+def input_cancelled(exc: BaseException) -> bool:
+    """Modal cancelled this input (``modal.exception.InputCancellation``, raised in the input's
+    thread by ``FunctionCall.cancel()``), or an asyncio cancellation reached the call."""
+    import asyncio
+
+    if isinstance(exc, asyncio.CancelledError):
+        return True
+    try:
+        from modal.exception import InputCancellation
+    except ImportError:  # pragma: no cover - modal is a dependency
+        return False
+    return isinstance(exc, InputCancellation)
+
+
+@dataclass
+class _SegcapActive(_Active):
+    cancelled: bool = False  # Modal cancelled the input: nothing more is written for it
+    crash: str | None = None  # an episode hit ``cuda_fatal`` / ``oom`` (nv.errors)
+    crash_message: str | None = None
+
+
+def prior_suspects(jf: A.JobFiles, shard) -> dict[str, dict[str, int]]:
+    """``uid -> {flag: count}`` of the suspect verdicts (:data:`SUSPECT_FLAGS`) this shard's
+    earlier starts recorded (its ``errors/`` files, every container)."""
+    prefix = jf.paths.errors(jf.config_hash, shard.kind, shard.shard_id, "x", 0)
+    prefix = prefix[:-len("x-0.jsonl")]
+    out: dict[str, dict[str, int]] = {}
+    for path in jf.store.list(prefix):
+        try:
+            errs = P.read_errors(jf, path)
+        except Exception:  # noqa: BLE001 - a torn file only loses evidence; never fails a shard
+            continue
+        for e in errs:
+            if e.stage != "segment":  # one error per stage: count each episode once
+                continue
+            for flag in SUSPECT_FLAGS:
+                if e.diagnostics.get(flag):
+                    c = out.setdefault(e.uid, {})
+                    c[flag] = c.get(flag, 0) + 1
+    return out
 
 
 class SegcapShardRunner:
@@ -552,7 +605,7 @@ class SegcapShardRunner:
             jf, shard.kind, shard_id, self.container_id, started_utc=utc(self.clock()),
             orchestrator_attempt=A.token_attempt(token), token=token,
             call_id=self.call_id() or "")
-        active = _Active(jf, shard, marker)
+        active = _SegcapActive(jf, shard, marker)
         with self._lock:
             self._active[id(active)] = active
         try:
@@ -562,10 +615,28 @@ class SegcapShardRunner:
             raise
         except Exception as exc:
             msg = f"{type(exc).__name__}: {exc}"
-            self._end(active, error=msg)
             infra = exc.infra.values() if isinstance(exc, ShardInfraError) else ()
-            if self.fatal is not None and (cuda_fatal(msg) or any(map(cuda_fatal, infra))):
+            crash = active.crash or ("cuda_fatal" if cuda_fatal(msg) or any(
+                map(cuda_fatal, infra)) else None)
+            if crash:  # review 6 M1: a crash that leaves a mark counts toward D15
+                msg = f"{crash}: {active.crash_message or msg}"
+            self._end(active, error=msg, crashed=bool(crash))
+            if crash and self.fatal is not None:
                 self.fatal(exc)  # the engine is unusable: replace the container
+            raise
+        except BaseException as exc:
+            # review 6 H3: Modal input cancellation (``FunctionCall.cancel()``: quarantine, job
+            # cancel) raises ``InputCancellation``, neither Exception nor KeyboardInterrupt. Stop
+            # the batch (queued episodes never start), drop whatever the cancelled shard would
+            # still write, and mark the start (not a crash: the orchestrator stopped it). Any
+            # other BaseException is a dying process (SystemExit, a modelled crash): no mark.
+            if not input_cancelled(exc):
+                raise
+            active.cancelled = True
+            cancel = getattr(self.engine, "cancel", None)
+            if callable(cancel):
+                cancel()
+            self._end(active, preempted=True)
             raise
         finally:
             with self._lock:
@@ -589,13 +660,13 @@ class SegcapShardRunner:
 
     # -- internals -----------------------------------------------------------------------
 
-    def _end(self, active: _Active, *, preempted: bool = False, error: str | None = None
-             ) -> bool:
+    def _end(self, active: _Active, *, preempted: bool = False, error: str | None = None,
+             crashed: bool = False) -> bool:
         with self._lock:
             if active.ended:
                 return False
             active.ended = True
-        if active.sink is not None:
+        if active.sink is not None and not getattr(active, "cancelled", False):
             try:
                 active.sink.flush()
             except Exception:  # noqa: BLE001 - the mark below matters more; parts are redone
@@ -607,7 +678,7 @@ class SegcapShardRunner:
                              marker=active.marker)
         else:
             A.mark_exception(jf, kind, sid, self.container_id, ended_utc=now,
-                             error=error or "error", marker=active.marker)
+                             error=error or "error", marker=active.marker, crashed=crashed)
         return True
 
     def inputs_from_index(self, ref: EpisodeRef) -> SegcapInputs:
@@ -665,8 +736,13 @@ class SegcapShardRunner:
                 raise
             except Exception as exc:  # noqa: BLE001 - becomes this episode's EpisodeError
                 kind = classify_input_error(exc)
-                if kind == "nv_failure":
-                    return self._errors(shard, ref.uid, exc, "inputs", kind)
+                if kind == "nv_failure" and not (_decode_suspect(exc) and
+                                                 attempt < INPUT_RETRIES):
+                    return self._errors(shard, ref.uid, exc, "inputs", kind,
+                                        **({"attempts": attempt + 1} if attempt else {}))
+                if kind == "nv_failure":  # review 6 L2: a decode failure is re-read once first
+                    attempt += 1
+                    continue
                 if attempt >= INPUT_RETRIES:
                     return self._errors(shard, ref.uid, exc, "inputs", kind,
                                         attempts=attempt + 1)
@@ -715,13 +791,29 @@ class SegcapShardRunner:
         if errors:
             sink.add(errors=errors)
             sink.flush()
+        suspects = prior_suspects(jf, shard)  # review 6 L1 / L2: repeated suspect verdicts
+        audit_dir = jf.paths.area_prefix(jf.config_hash, "audit", shard.kind)
 
         def on_done(item: dict, result: dict | None, err: Exception | None) -> None:
+            if getattr(active, "cancelled", False):  # the input was cancelled: write nothing
+                return
             uid = item["episode"]
             timing_of = getattr(self.engine, "episode_timing", None)
             gpu_timing = timing_of() if callable(timing_of) else None
             if err is not None:  # nv_failure: terminal; infra (CUDA, I/O, time stop): raise
                 kind, diag = classify_nvidia_error(err, gpu_timing)
+                for flag in SUSPECT_FLAGS:
+                    n = suspects.get(uid, {}).get(flag, 0) + 1
+                    if diag.get(flag) and n >= REPEAT_TERMINAL:  # the same verdict again
+                        kind, diag["repeats"] = "nv_failure", n
+                if diag.get("class") in nv_errors.CRASH_KINDS and active.crash is None:
+                    # review 6 M1: the CUDA context / GPU memory is gone; stop the batch, the
+                    # shard raises and the container is replaced (a D15-counted start)
+                    active.crash = diag["class"]
+                    active.crash_message = f"{uid}: {getattr(err, 'message', None) or err}"
+                    cancel = getattr(self.engine, "cancel", None)
+                    if callable(cancel):
+                        cancel()
                 sink.add(errors=self._errors(shard, uid, err, "nvidia", kind, **diag))
                 sink.flush()
                 return
@@ -737,7 +829,10 @@ class SegcapShardRunner:
             certified, reason = certification(ref, s.envelope)
             records = stage_records(result, uid=uid, dataset=ref.dataset,
                                     episode_id=ref.episode_id, provenance=self._provenance(inp),
-                                    certified=certified, uncertified_reason=reason)
+                                    certified=certified, uncertified_reason=reason,
+                                    # the same from every shard and container (compose
+                                    # compares records): the kind's audit area + the uid
+                                    audit_ref=f"{audit_dir}#uid={uid}")
             # review 4 M4: calls near NVIDIA's max_time=300 are timing-, not input-determined
             timing = [i for i, c in enumerate(result.get("flora_reference", {})
                                               .get("model_calls", []))

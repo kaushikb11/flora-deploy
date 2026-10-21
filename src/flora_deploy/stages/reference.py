@@ -806,12 +806,15 @@ class NvidiaError(RuntimeError):
     client process, so they cannot be unpickled there. This builtin-based class carries the
     original qualified type name and message and pickles by value."""
 
-    def __init__(self, type_name: str, message: str):
+    def __init__(self, type_name: str, message: str, origin: str | None = None):
         super().__init__(f"{type_name}: {message}")
         self.type_name, self.message = type_name, message
+        # who raised it (``nv.errors.origin``: nv / ours / lib / other), computed where the
+        # original traceback was still available; ``nv.errors.classify`` reads it
+        self.origin = origin
 
     def __reduce__(self):
-        return (type(self), (self.type_name, self.message))
+        return (type(self), (self.type_name, self.message, self.origin))
 
 
 class NvidiaInputError(NvidiaError):
@@ -822,13 +825,24 @@ _INPUT_ERRORS = ("InputError", "InputErrorForModel")
 
 
 def transport_error(e: BaseException) -> NvidiaError:
+    """The picklable form of ``e``. In this process the original stays attached
+    (``__cause__``, with its traceback) so ``nv.errors.classify`` can tell NVIDIA's frames from
+    ours; across a process boundary the ``origin`` it computed here travels instead."""
     if isinstance(e, NvidiaError):
         return e
+    from flora_deploy.nv import errors as nv_errors
+
     cls = type(e)
     name = f"{cls.__module__}.{cls.__qualname__}"
     kind = NvidiaInputError if cls.__name__ in _INPUT_ERRORS or isinstance(e, ValueError) \
         else NvidiaError
-    return kind(name, str(e))
+    try:
+        where = nv_errors.origin(e)
+    except Exception:  # noqa: BLE001 - provenance only; never mask the episode's error
+        where = None
+    out = kind(name, str(e), where)
+    out.__cause__ = e
+    return out
 
 
 def new_run_id(prefix: str = "exact") -> str:
