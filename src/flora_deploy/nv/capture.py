@@ -1,4 +1,4 @@
-"""Capture the processor call NVIDIA's input builders make, as a vLLM-ready request (PLAN.md §6.2).
+"""Capture the processor call NVIDIA's input builders make, as a vLLM-ready request (PLAN-v3 §6.2).
 
 NVIDIA's builders (``preprocessing.temporal_inputs``, ``preprocessing.three_view_caption_inputs``,
 ``flora_unified.unified_input.processor_inputs``) all end in one call::

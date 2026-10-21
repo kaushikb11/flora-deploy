@@ -15,7 +15,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from typing import Any
 
-from flora_deploy.jobs.stores.local import check_rel_path
+from flora_deploy.jobs.stores.local import check_list_prefix, check_rel_path
 
 _MISSING = {"404", "NoSuchKey", "NotFound"}
 
@@ -77,6 +77,7 @@ class BucketStore:
 
     def list(self, prefix: str) -> Iterator[str]:
         """Paginated ``list_objects_v2``; yields paths relative to the store prefix."""
+        check_list_prefix(prefix)
         kwargs: dict[str, Any] = {"Bucket": self.bucket, "Prefix": self.prefix + prefix,
                                   "MaxKeys": self.page_size}
         n = len(self.prefix)

@@ -209,7 +209,9 @@ def test_gpu_memory_is_per_device_not_summed():
                 {"reward.terminal": {"gpu": "L40S", "gpu_count": 2}}):
         with pytest.raises(ConfigError, match="GPU"):
             parse_config(with_(base(), "resources", res))
-    rubric = with_(base(), "pipeline.stages", ["reward.rubric"])
+    rubric = with_(with_(base(), "pipeline.stages", ["reward.rubric"]), "pipeline.rubric",
+                   {"robot": "arm", "cameras": [{"role": "main", "description": "a camera"}],
+                    "steps": [{"action": "Grasp", "grading": [{"label": "no", "points": 0.0}]}]})
     assert parse_config(rubric).pools()["reward.rubric"].gpu_count == 2
     with pytest.raises(ConfigError, match="tensor-parallel"):
         parse_config(with_(rubric, "resources", {"reward.rubric": {"gpu_count": 1}}))
@@ -283,7 +285,7 @@ def test_balanced_pools():
     rs = to_run_settings(parse_config(d), "j", derived_receipts=RECEIPTS)
     assert {k: p.gpu for k, p in rs.pools.items()} == {
         "segment": "L40S", "caption": "H100!", "reward.terminal": "H100!", "reward.dense": "H100!"}
-    assert rs.pools["segment"].max_inputs == 3 and rs.pools["segment"].cpu_cores == 6.0
+    assert rs.pools["segment"].max_inputs == 3 and rs.pools["segment"].cpu_cores == 8.0
 
 
 def test_explicit_config_hash_and_settings_passthrough():

@@ -444,6 +444,16 @@ def check_weights(p: Probes, cfg: Any) -> list[Check]:
                              "prepared"))
     if not derived:
         return out
+    from flora_deploy.config.receipts import needed_by_kind, unpinned, unpinned_message
+
+    bad = unpinned(derived)
+    if bad:  # the workers refuse these at start (review 10 M1); plan / deploy refuse them too
+        kinds = needed_by_kind(cfg)
+        out.append(Check("weights.derived.pins", "fail",
+                         f"derived weight(s) with no pinned content digest: "
+                         f"{', '.join(n.replace('_', '-') for n in bad)}",
+                         " ".join(unpinned_message(n, kinds=kinds.get(n, ()),
+                                                   preset=cfg.preset) for n in bad)))
     weights = getattr(cfg, "weights", None)
     have = getattr(weights, "derived", None) if weights is not None else None
     if not have:  # nothing recorded yet: the usual state before `flora prepare`

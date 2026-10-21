@@ -1,4 +1,5 @@
-"""Output record schema ``flora_labels_v1`` (PLAN.md §6.6): one record per episode per stage.
+"""Output record schema ``flora_labels_v1`` (docs/output-format.md): one record per episode
+per stage.
 
 Records are JSON-serializable dataclasses. Workers append them to local part-files (JSONL) and copy
 the parts whole to the store; ``compose`` dedupes by ``(episode_id, stage)``. NVIDIA-specific
@@ -76,10 +77,11 @@ class DenseReward:
 
 @dataclass(frozen=True)
 class RubricReward:
-    scores: tuple[float, ...]
-    total: float
-    samples: int
-    medoid_index: int
+    scores: tuple[float, ...]  # NVIDIA's medoid sample, one score per rubric step
+    total: float  # round(sum(scores), 4), as NVIDIA's rubric_reward.py writes it
+    samples: int  # answers sampled (NVIDIA's --num-samples, 9)
+    medoid_index: int  # index of the medoid among all samples
+    parsed_samples: int | None = None  # samples NVIDIA's parse_rubric accepted (medoid pool)
 
 
 @dataclass(frozen=True)

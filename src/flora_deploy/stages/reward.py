@@ -1,6 +1,6 @@
 """Terminal and dense rewards, batched across episodes, on NVIDIA's offline-``LLM`` recipe.
 
-PLAN.md §6.4 step 4 and D14. Prompts, frame sampling, collage, regexes, parsers, probability
+PLAN-v3.md §6.4 step 4 and D14. Prompts, frame sampling, collage, regexes, parsers, probability
 renormalization and dense stitching all come from NVIDIA's Rewarder ``batch_utils``, linked at
 runtime. This module changes *how requests are grouped*, isolates failures per episode and
 persists results per round:
@@ -53,8 +53,9 @@ per-frame scores at the middle of each 0.5 s step (the convention NVIDIA's ``per
 per second). ``tests/nvlink/test_reward_parity.py`` runs NVIDIA's real scripts and is the drift
 guard for all of them.
 
-Rubric rewards are **deferred** (PLAN.md P2: TP=2, ``max_model_len`` 98304, one video per camera):
-``check_mode("rubric")`` raises ``NotImplementedError``.
+Rubric rewards are a different recipe (TP=2, ``max_model_len`` 98304, one video per camera, 9
+samples per episode) and live in ``stages.rubric``: ``check_mode("rubric")`` here raises
+``NotImplementedError`` naming it.
 
 Prefix caching. NVIDIA's engine has ``enable_prefix_caching=True`` (hybrid "align" mode, where a
 hit can change numerics). The shared text before the video is 104-413 tokens, below one KV block
@@ -106,8 +107,9 @@ GiB = 1 << 30
 def check_mode(mode: str) -> str:
     if mode in DEFERRED_MODES:
         raise NotImplementedError(
-            "rubric rewards are deferred (PLAN.md P2: TP=2, max_model_len 98304, one video per "
-            "camera); stages.reward implements terminal, terminal_rationale and dense only"
+            "rubric rewards run in stages.rubric (TP=2, max_model_len 98304, one video per "
+            "camera, 9 samples); stages.reward implements terminal, terminal_rationale and "
+            "dense only"
         )
     if mode not in MODES:
         raise ValueError(f"unknown reward mode {mode!r}; expected one of {MODES}")

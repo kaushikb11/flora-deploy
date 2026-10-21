@@ -52,6 +52,7 @@ import tempfile
 import time
 import uuid
 from collections import Counter
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -297,12 +298,33 @@ def plans(cfg_path: Path, mode: str | None = None) -> dict[str, Any]:
     mode = mode or (DETERMINISM if cfg.preset == "exact" else "nvidia")
     receipts = {"captioner_bf16": FAKE_RECEIPT, "tempseg_merged": FAKE_RECEIPT}
     fake = plan_app(cfg, determinism=mode, fake_models=True)
-    real = plan_app(cfg, determinism=mode, derived_receipts=receipts)
-    out = {"cfg": cfg, "fake": fake, "real": real, "real_nvidia": None, "fake_nvidia": None}
-    if cfg.preset == "exact":
-        out["real_nvidia"] = plan_app(cfg, determinism="nvidia", derived_receipts=receipts)
-        out["fake_nvidia"] = plan_app(cfg, determinism="nvidia", fake_models=True)
+    with standin_pins():  # comparison plans only, never deployed
+        real = plan_app(cfg, determinism=mode, derived_receipts=receipts)
+        out = {"cfg": cfg, "fake": fake, "real": real, "real_nvidia": None, "fake_nvidia": None}
+        if cfg.preset == "exact":
+            out["real_nvidia"] = plan_app(cfg, determinism="nvidia", derived_receipts=receipts)
+            out["fake_nvidia"] = plan_app(cfg, determinism="nvidia", fake_models=True)
     return out
+
+
+@contextlib.contextmanager
+def standin_pins() -> Iterator[None]:
+    """A stand-in content digest for every unpinned derived weight, for the *real* comparison
+    plans only (``plan_app`` refuses an unpinned one, review 10 M1; these plans are compared
+    with the fake app, never deployed)."""
+    from dataclasses import replace
+
+    from flora_deploy.config.pins import DERIVED_PINS_BY_KEY
+
+    saved = dict(DERIVED_PINS_BY_KEY)
+    for k, p in saved.items():
+        if p.content_sha256 is None:
+            DERIVED_PINS_BY_KEY[k] = replace(p, content_sha256="0" * 63 + "1")
+    try:
+        yield
+    finally:
+        DERIVED_PINS_BY_KEY.clear()
+        DERIVED_PINS_BY_KEY.update(saved)
 
 
 # ---------------------------------------------------------------------------------------------

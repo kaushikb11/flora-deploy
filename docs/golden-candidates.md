@@ -1,7 +1,7 @@
 # Golden-set candidates (WS-F)
 
 Research date: 2026-10-21. Scope: public datasets that can stand in for each Flora embodiment
-pool in the P0 golden set (PLAN §9), checked against the envelope rules in PLAN §1.1.
+pool in the P0 golden set (archive/PLAN-v3.md §9), checked against the envelope rules in archive/PLAN-v3.md §1.1.
 This file holds dataset facts and links only. It contains no NVIDIA prompts or code.
 
 **How the facts were collected.**
@@ -47,7 +47,7 @@ Coverage:
 
 ---
 
-## 2. Envelope reminders (PLAN §1.1, §9)
+## 2. Envelope reminders (archive/PLAN-v3.md §1.1, §9)
 
 Oracle-eligible episodes must meet all of these:
 - ≤120 s, ≥4 fps, ≤4096 px per side, ≤7200 frames, ≤256 MiB per file;
@@ -149,7 +149,7 @@ The Rewarder's camera order is left, center, right. TempSeg's is main, left wris
 | [aloha_mobile_shrimp](https://huggingface.co/datasets/lerobot/aloha_mobile_shrimp) | Apache-2.0 | 18 | 75 s | high, L/R wrist | 1.32 GB |
 
 - All episodes within a repo have the same length (fixed-length teleop), and all are ≤120 s.
-- **Role map:** `cam_high→main`, `cam_left_wrist→left_wrist`, `cam_right_wrist→right_wrist`. Drop `cam_low` (static only) and record that it was dropped (PLAN §9).
+- **Role map:** `cam_high→main`, `cam_left_wrist→left_wrist`, `cam_right_wrist→right_wrist`. Drop `cam_low` (static only) and record that it was dropped (archive/PLAN-v3.md §9).
 - moov check over all episodes of cups_open, cabinet, coffee, shrimp and wipe_wine (≈850 episode-camera pairs): every start is on a sync sample, every episode is CFR (tb 1/12800, delta 256), and x-cam is equal. GOP is 2 frames (LeRobot's encoder default), so nearly any frame-aligned start is a keyframe.
 - **Metadata defect found:** in `aloha_mobile_wipe_wine`, episode 43 `cam_high` says `file_index 0, from 1118.0 s`. That file holds exactly 55,900 frames (1118.0 s), so the episode actually starts at file-001 0.0 s (file-001 holds 7 × 26 s = 182 s). The wrist cameras for ep 43 are correct. **The index pass must check each episode's range against the real sample table, not trust `meta/episodes`.**
 - Per-camera file rollover differs (13/18 shrimp, 19/85 cabinet and 6/50 wipe_wine episodes have cameras in different `(chunk, file)` slots). The timestamps still match after episode-relative alignment.
@@ -273,7 +273,7 @@ Notes:
 
 ## 5. Uncovered or weak pools
 
-- **Real `dex` and `tianji` rigs.** Flora's reference camera semantics for these pools aren't public. Unitree G1 (Dex3/Inspire) and DingYFa's `tianji_arm` are structurally valid 3-view stand-ins (on key, CFR, x-cam equal). Certificates for these pools stay "stand-in" until users run `flora golden` on their own data (PLAN §9).
+- **Real `dex` and `tianji` rigs.** Flora's reference camera semantics for these pools aren't public. Unitree G1 (Dex3/Inspire) and DingYFa's `tianji_arm` are structurally valid 3-view stand-ins (on key, CFR, x-cam equal). Certificates for these pools stay "stand-in" until users run `flora golden` on their own data (archive/PLAN-v3.md §9).
 - **`yam32`** has no dedicated data. It is the same YAM/ALOHA-style data restricted to long episodes. Real YAM long data (NMotion, Public-YAM-runs) fails the duration cap or the license check.
 - **Human egocentric under a permissive license.** None found that is ungated, ≤120 s and has task text. WGO-Bench is NC-SA, EgoDex is NC-ND, HomER upstream has no license, and Egocentric-10K is gated with 180 s clips and no tasks. NC terms are probably fine for internal evaluation, but the golden **outputs** must not be redistributed in the repo.
 - **Rubric mode** has no exact public counterpart (see §3.6).
@@ -290,12 +290,12 @@ Notes:
 - **Keyframe alignment.**
   - Every LeRobot v3 file checked put an episode start on a sync sample: GOP 2 (LeRobot AV1/H.264 default) or a forced key at joins (jnogga).
   - Datasets with long GOPs that pack episodes without forcing keys would fail. None were seen, but the index pass must check every episode.
-  - `stss` marks sync samples. For AV1, confirm that these are true `KEY_FRAME`s (not intra-only or S-frames). For H.264, confirm IDR rather than recovery-point I-frames, in L0 (PLAN §1.1 "open-GOP per dataset").
+  - `stss` marks sync samples. For AV1, confirm that these are true `KEY_FRAME`s (not intra-only or S-frames). For H.264, confirm IDR rather than recovery-point I-frames, in L0 (archive/PLAN-v3.md §1.1 "open-GOP per dataset").
 - **Metadata errors.** `aloha_mobile_wipe_wine` ep 43 shows that `meta/episodes` can point at the wrong file. Validate every `(file, from, to)` against the real sample table.
 - **VFR inside "CFR" sets.** RoboRewardBench clipped files have dropped frames.
 - **AV1 decode.** Roughly half the selection is AV1 (ALOHA, EgoDex, Unitree, Galaxea, allenai).
   - H100/A100 have no NVDEC AV1, so decode is CPU (dav1d), or uses L4/L40S/B200.
-  - decord probably can't read AV1, which matters for the rubric path (PLAN §1.1). Pick rubric episodes from H.264 sources, as RoboRewardBench and RoboArena are.
+  - decord probably can't read AV1, which matters for the rubric path (archive/PLAN-v3.md §1.1). Pick rubric episodes from H.264 sources, as RoboRewardBench and RoboArena are.
 - **Color tags.**
   - HomER is BT.601 tv range.
   - DROID/RoboReward files carry unspecified range (`0`).

@@ -15,6 +15,7 @@ import pytest
 
 from flora_deploy.nv import Family
 from flora_deploy.nv.linker import load_family, verify_code_manifest
+from tests.nvtext import nv_output
 
 pytestmark = pytest.mark.nvlink
 
@@ -81,7 +82,7 @@ def test_rewarder_conflicts_with_segcap(nv_code):
         """,
         "segcap", seg, "rewarder", rew,
     )
-    assert out.returncode == 0, out.stderr
+    assert out.returncode == 0, nv_output(out.stderr, "subprocess stderr")
     assert out.stdout.startswith("CONFLICT"), out.stdout
 
     out = run_isolated(
@@ -101,7 +102,7 @@ def test_rewarder_conflicts_with_segcap(nv_code):
         """,
         rew, seg, nv_code("captioner_code"),
     )
-    assert out.returncode == 0, out.stderr
+    assert out.returncode == 0, nv_output(out.stderr, "subprocess stderr")
     assert out.stdout.split() == ["CONFLICT", "CONFLICT"]
 
 
@@ -119,7 +120,7 @@ def test_same_family_from_two_snapshots_conflicts(nv_code):
         """,
         nv_code("tempseg_code"), nv_code("captioner_code"),
     )
-    assert out.returncode == 0, out.stderr
+    assert out.returncode == 0, nv_output(out.stderr, "subprocess stderr")
     assert out.stdout.strip() == "CONFLICT"
 
 
@@ -139,7 +140,7 @@ def test_foreign_adapter_module_conflicts(nv_code, tmp_path):
         """,
         nv_code("tempseg_code"), tmp_path,
     )
-    assert out.returncode == 0, out.stderr
+    assert out.returncode == 0, nv_output(out.stderr, "subprocess stderr")
     assert out.stdout.strip() == "CONFLICT True"
 
 
@@ -167,7 +168,7 @@ def test_tampered_vendor_fails_nvidia_bootstrap(nv_code, tmp_path):
         """,
         copy,
     )
-    assert out.returncode == 0, out.stderr
+    assert out.returncode == 0, nv_output(out.stderr, "subprocess stderr")
     assert out.stdout.splitlines() == ["MANIFEST", "BOOTSTRAP RuntimeError True", "[]"]
 
 
@@ -230,7 +231,7 @@ def test_planted_file_in_segcap_snapshot_is_refused(nv_code, tmp_path, planted):
     target = copy / "batch_utils" / planted
     target.write_text("HIJACKED = True\n")
     out = run_isolated(PLANTED, copy, "segcap")
-    assert out.returncode == 0, out.stderr
+    assert out.returncode == 0, nv_output(out.stderr, "subprocess stderr")
     lines = out.stdout.splitlines()
     assert lines[0].startswith("REFUSED") and "not listed" in lines[0], lines
     assert planted in lines[0] and lines[1] == "[]"
@@ -240,13 +241,13 @@ def test_planted_file_in_rewarder_snapshot_is_refused(nv_code, tmp_path):
     copy = _copy_code(nv_code, "rewarder", tmp_path)
     (copy / "batch_utils" / "transformers.py").write_text("HIJACKED = True\n")
     out = run_isolated(PLANTED, copy, "rewarder")
-    assert out.returncode == 0, out.stderr
+    assert out.returncode == 0, nv_output(out.stderr, "subprocess stderr")
     assert out.stdout.startswith("REFUSED") and "code_tree_sha256" in out.stdout
     edited = _copy_code(nv_code, "rewarder", tmp_path / "b")
     core = edited / "batch_utils" / "core.py"
     core.write_text(core.read_text() + "\n# local edit\n")
     out = run_isolated(PLANTED, edited, "rewarder")
-    assert out.stdout.startswith("REFUSED"), out.stdout + out.stderr
+    assert out.stdout.startswith("REFUSED"), nv_output(out.stdout + out.stderr)
 
 
 def test_rewritten_manifests_are_refused(nv_code, tmp_path):
@@ -304,7 +305,7 @@ def test_lazy_vendor_imports_are_verified_and_write_no_bytecode(nv_code, tmp_pat
         """,
         copy, shadow, json.dumps(names),
     )
-    assert out.returncode == 0, out.stderr
+    assert out.returncode == 0, nv_output(out.stderr, "subprocess stderr")
     result = json.loads(out.stdout)
     assert result["shadowed"] == [] and result["outside"] == []
     assert result["audited"] > 30 and result["dont_write_bytecode"] is False

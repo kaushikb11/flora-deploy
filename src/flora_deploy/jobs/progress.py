@@ -1,4 +1,4 @@
-"""Job progress derived purely from store files (PLAN.md §8): no in-memory or Modal Dict state.
+"""Job progress derived purely from store files (PLAN.md §2): no in-memory or Modal Dict state.
 
 Inputs: the manifest, receipts (``exists``/``get``: read-after-write), attempt markers, parts,
 quarantine ``ControlRecord``s and error files (``list``: possibly lagging).

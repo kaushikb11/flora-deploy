@@ -56,6 +56,7 @@ class RateEntry:
     requires: tuple[str, ...] = ()  # worker features the rate depends on
     excludes: tuple[str, ...] = ()  # features under which the rate is invalid (measured without)
     source: str | None = None  # where the measurement lives (doc / run id); see MEASURED_SLOTS
+    n: int | None = None  # samples (jobs) behind a measured rate; shown with it (n=1: ±50%+)
 
     def usable(self, features: Features | None = None) -> bool:
         f = resolve_features(features)
@@ -73,6 +74,7 @@ class StartupEntry:
     provenance: str
     date: str
     source: str | None = None
+    n: int | None = None  # containers behind a measured cold start
 
 
 # Rows a later measurement wave flips from ``placeholder`` to ``measured`` by editing rates.json

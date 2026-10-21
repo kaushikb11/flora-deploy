@@ -1,4 +1,4 @@
-"""``flora-orchestrator`` Modal app: the job loop as a non-preemptible CPU function (PLAN.md §7/§8).
+"""``flora-orchestrator`` Modal app: the job loop as a non-preemptible CPU function (PLAN.md §2).
 
 - ``run(job_id, factory)``: acquires the per-job Dict lease, drives the
   :class:`~flora_deploy.jobs.orchestrator.Orchestrator` with :class:`ModalSpawner` through
@@ -58,7 +58,7 @@ from flora_deploy.jobs.orchestrator import (
 from flora_deploy.jobs.reconciler import reconcile as reconcile_status
 from flora_deploy.jobs.reconciler import revive_if_needed
 from flora_deploy.jobs.spawner import CallStatus
-from flora_deploy.jobs.types import ShardReceipt
+from flora_deploy.jobs.types import ShardReceipt, safe_key
 from flora_deploy.modal_app.images import cpu_image
 
 APP_NAME = "flora-orchestrator"
@@ -215,10 +215,17 @@ class ModalSpawner:
 # ----------------------------------------------------------------------------------------------
 
 
+# The deps factories a ``factory`` argument or a watch-Dict entry may select (review 11b F4): a
+# Dict value never names arbitrary code for the scheduled reconciler to call.
+FACTORIES: frozenset[str] = frozenset({"flora_deploy.sdk:deployed_deps"})
+
+
 def load_factory(path: str) -> Callable[[str], OrchestratorDeps]:
     mod, _, fn = path.partition(":")
     if not mod or not fn:
         raise ValueError(f"factory must look like 'package.module:function', got {path!r}")
+    if path not in FACTORIES:
+        raise ValueError(f"factory {path!r} is not one of the allowed {sorted(FACTORIES)}")
     return getattr(importlib.import_module(mod), fn)
 
 
@@ -339,6 +346,7 @@ def reconcile_all(entries: Iterable[tuple[str, str]], reconcile_one: Callable[..
     out: dict[str, Any] = {}
     for job_id, factory in entries:
         try:
+            safe_key(job_id)  # Dict keys are job ids; never a path or an argument otherwise
             st = reconcile_one(job_id, factory, True)
         except Exception as exc:  # one broken job never stops the others
             out[job_id] = {"error": repr(exc)}

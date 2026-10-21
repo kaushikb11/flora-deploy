@@ -1,4 +1,4 @@
-"""Worker contract (PLAN.md §7/§8): what every GPU shard worker exposes to the orchestrator.
+"""Worker contract (PLAN.md §2): what every GPU shard worker exposes to the orchestrator.
 
 A worker class (Modal Cls, defined at module scope, decorated by the app factory) implements
 ``ShardWorker``. One call processes one shard idempotently (helpers in ``jobs.attempts`` /

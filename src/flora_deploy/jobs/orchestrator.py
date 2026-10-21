@@ -1,4 +1,4 @@
-"""Shard orchestrator (PLAN.md §8, D6, D15): a deterministic, restartable scheduling loop.
+"""Shard orchestrator (PLAN.md §2, D6, D15): a deterministic, restartable scheduling loop.
 
 Everything the loop decides is driven by store files plus a :class:`~flora_deploy.jobs.spawner.
 Spawner`; nothing lives only in memory. A restarted orchestrator rebuilds its view from:

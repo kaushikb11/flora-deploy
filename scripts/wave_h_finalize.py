@@ -19,11 +19,16 @@ and balanced jobs (``reports/wave-h/records/{exact,noise,balanced}/<job>/<stage>
    ``measured`` with source and date, and their per-kind startup rows are written. It refuses
    (all or nothing for the slot) when a sample is too small to state a range: fewer than
    :data:`MIN_RATE_SAMPLES` jobs or containers, under :data:`MIN_VIDEO_S` video seconds, a
-   missing receipt field, or a GPU other than the preset's pool.
+   report without the per-container receipt fields (:data:`RECEIPT_FIELDS`, from
+   ``sdk.Job.report()``), or a worker on a GPU other than the preset's pool (that job's
+   samples are dropped and named).
 2. **Certificates** (``config/certificates/``). ``flora certify`` per balanced job (one
    embodiment per config) and stage, with the oracle, the noise run (where it repeated that job),
-   the L0 JSON and the pinned derived-weight content digests, stamped with the run's own time so
-   a re-run reproduces the same certificate ids. Metrics only; a ``fail`` is never written here.
+   the L0 JSON and the derived-weight content digests the run used (else the pinned ones),
+   stamped with the run's own time so a re-run reproduces the same certificate ids. Metrics
+   only; a ``fail`` is never written here. A certificate written earlier is replaced only by
+   a new one with the same key; one whose inputs are missing now, or that certify refused,
+   is kept.
 3. **Report** (``docs/wave-h-report.md``): spend per step (tracked vs billed, with the billing
    lag), measured $/video-h for ``exact`` and ``balanced`` at list prices (formula shown), L0,
    Gate A with the ``dt_bias`` plugin recommendation (the rule in ``docs/balanced-engines.md``)
@@ -42,6 +47,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -57,14 +63,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import wave_h as wh  # noqa: E402 - the runbook's state format, caps and constants
 
-MIN_RATE_SAMPLES = 2  # jobs (rate) and containers (cold start) per (preset, kind, GPU)
+MIN_RATE_SAMPLES = 1  # jobs (rate) and containers (cold start) per (preset, kind, GPU)
 MIN_VIDEO_S = 30.0  # video seconds behind a rate
 UNCERTAINTY_FLOOR = 0.25  # the error band never claims better than +/-25% from this few samples
+SINGLE_SAMPLE_FLOOR = 0.50  # one sample states no range: its band is +/-50%, stated with n=1
 BILLING_MISMATCH = 0.25  # reconciled billed vs tracked: relative gap flagged as a mismatch
 BILLING_MISMATCH_USD = 0.05  # ... and absolute gap
 STEP_PRESET = {"exact_e2e": "exact", "noise": "exact", "balanced": "balanced"}
 PRESET_KINDS = {"exact": ("segcap",), "balanced": ("segment", "caption")}
 CERT_STAGES = ("segment", "caption")
+DEFERRED = "deferred to the certified run"
 LAB_KINDS = {"segment": "tempseg", "caption": "captioner"}
 SETS = {"exact": "exact_e2e", "noise": "noise", "balanced": "balanced"}
 BLOCK_RESULTS = "results"
@@ -107,6 +115,15 @@ class Paths:
         self.engines_doc = self.engines_doc or r / "docs" / "balanced-engines.md"
         self.readme = self.readme or r / "README.md"
         self.manifest = self.manifest or w / "finalize.json"
+
+    def rel(self, p: str | Path) -> str:
+        """``p`` as the committed files may name it: relative to the root, never a local
+        absolute path (outside the root: its name only)."""
+        p = Path(p)
+        try:
+            return p.resolve().relative_to(self.root.resolve()).as_posix()
+        except ValueError:
+            return f"<outside the repository>/{p.name}"
 
 
 # ---------------------------------------------------------------------------------------------
@@ -180,6 +197,8 @@ class Measurement:
         if not xs:
             return None
         mean = sum(xs) / len(xs)
+        if len(xs) == 1:
+            return SINGLE_SAMPLE_FLOOR
         return round(max(UNCERTAINTY_FLOOR, (max(xs) - min(xs)) / mean if mean else 1.0), 2)
 
     @property
@@ -199,8 +218,7 @@ class Measurement:
         out = list(self.problems)
         what = f"{self.preset} {self.kind} on {self.gpu}"
         if self.n < MIN_RATE_SAMPLES:
-            out.append(f"{what}: {self.n} job sample(s); an error band needs a range, so at "
-                       f"least {MIN_RATE_SAMPLES}")
+            out.append(f"{what}: {self.n} job sample(s); at least {MIN_RATE_SAMPLES}")
         if self.video_s < MIN_VIDEO_S:
             out.append(f"{what}: {self.video_s:.1f} video s behind the rate; at least "
                        f"{MIN_VIDEO_S:.0f} s")
@@ -229,12 +247,30 @@ def pool_gpu(preset: str, kind: str) -> str:
     return get_preset(preset).pools[kind].gpu or ""
 
 
-def kind_of(c: Mapping[str, Any], preset: str) -> str | None:
-    if c.get("kind"):
-        return str(c["kind"])
-    hits = [k for k in PRESET_KINDS[preset] if strip_gpu(pool_gpu(preset, k)) ==
-            strip_gpu(c.get("gpu"))]
-    return hits[0] if len(hits) == 1 else None
+# The per-container receipt contract: ``flora report``'s ``spend.containers`` entries
+# (``sdk.Job.report()``), which ``scripts/wave_h.py`` keeps as ``jobs.<job>.containers``. Each
+# entry must carry these; anything less is refused by name, never measured as zero.
+RECEIPT_FIELDS = ("kind", "startup_s", "busy_s", "seconds")
+CONTRACT = ("Job.report() per-container receipts (spend.containers: "
+            + ", ".join(RECEIPT_FIELDS) + ")")
+
+
+def ran_on(c: Mapping[str, Any]) -> str | None:
+    """The GPU a receipt's container ran on: ``gpu_seen`` (its shard receipts'
+    ``nvidia-smi`` name, ``jobs.containers``) when known, else ``gpu`` (its pool's)."""
+    return c.get("gpu_seen") or c.get("gpu")
+
+
+def same_gpu(ran: str | None, pool: str) -> bool:
+    """``ran`` (a receipt's GPU, possibly ``nvidia-smi``'s name) is the pool's GPU."""
+    from flora_deploy.engines.offline_llm import EngineArgsError, normalize_gpu
+
+    if not ran:
+        return False
+    try:
+        return normalize_gpu(str(ran)) == normalize_gpu(pool)
+    except EngineArgsError:
+        return strip_gpu(ran) == strip_gpu(pool)
 
 
 def job_video_s(r: Mapping[str, Any]) -> float | None:
@@ -257,17 +293,30 @@ def measure(st: wh.State) -> dict[tuple[str, str], Measurement]:
             if r.get("state") not in ("done", "completed_with_errors"):
                 continue
             where = f"{step}.jobs.{job}"
+            kinds = PRESET_KINDS[preset]
             video = job_video_s(r)
+            containers = list(r.get("containers") or ())
+            if not containers:
+                for kind in kinds:
+                    out[(preset, kind)].problems.append(
+                        f"{where}: `flora report` lists no per-container receipts; the rates "
+                        f"need {CONTRACT}")
+                continue
             per: dict[str, list[tuple[int, Mapping[str, Any]]]] = {}
-            for i, c in enumerate(r.get("containers") or ()):
-                k = kind_of(c, preset)
-                if k is None:
-                    for m in (out[(preset, kk)] for kk in PRESET_KINDS[preset]):
-                        m.problems.append(f"{where}.containers[{i}]: no `kind` and GPU "
-                                          f"{c.get('gpu')!r} names no single pool")
+            broken = False
+            for i, c in enumerate(containers):
+                lacks = [f for f in RECEIPT_FIELDS if c.get(f) is None]
+                if lacks:
+                    broken = True
+                    for kind in kinds:
+                        out[(preset, kind)].problems.append(
+                            f"{where}.containers[{i}]: receipt lacks "
+                            + ", ".join(f"`{f}`" for f in lacks) + f" (the {CONTRACT})")
                     continue
-                per.setdefault(k, []).append((i, c))
-            for kind in PRESET_KINDS[preset]:
+                per.setdefault(str(c["kind"]), []).append((i, c))
+            if broken:
+                continue
+            for kind in kinds:
                 m = out[(preset, kind)]
                 cs = per.get(kind, [])
                 if not cs:
@@ -277,26 +326,15 @@ def measure(st: wh.State) -> dict[tuple[str, str], Measurement]:
                     m.problems.append(f"{where}: no video seconds (`video_s` / "
                                       "`video_hours.done`)")
                     continue
-                busy, ok = 0.0, True
-                for i, c in cs:
-                    g = strip_gpu(c.get("gpu"))
-                    if g != m.gpu:
-                        m.problems.append(f"{where}.containers[{i}]: ran on {c.get('gpu')!r}, "
-                                          f"not the {preset} {kind} pool's {m.gpu}")
-                        ok = False
-                    for f in ("busy_s", "startup_s"):
-                        if c.get(f) is None:
-                            m.problems.append(f"{where}.containers[{i}]: no `{f}`")
-                            ok = False
-                    if ok:
-                        busy += float(c["busy_s"])
-                        m.startups.append(float(c["startup_s"]))
-                        secs = c.get("seconds")
-                        if secs is None and c.get("usd") is not None:
-                            secs = float(c["usd"]) / wh.pool_container(kind, preset).usd_per_s()
-                        m.container_s += float(secs or 0.0)
-                if ok:
-                    m.samples.append((job, busy, video))
+                wrong = [(i, c) for i, c in cs if not same_gpu(ran_on(c), m.gpu)]
+                if wrong:  # a worker on another GPU: this job's rates are not this pool's
+                    m.problems += [f"{where}: {kind} rates refused: container "
+                                   f"{c.get('container_id', i)} ran on {ran_on(c)!r}, not "
+                                   f"the {preset} {kind} pool's {m.gpu}" for i, c in wrong]
+                    continue
+                m.samples.append((job, sum(float(c["busy_s"]) for _, c in cs), video))
+                m.startups += [float(c["startup_s"]) for _, c in cs]
+                m.container_s += sum(float(c["seconds"]) for _, c in cs)
     return out
 
 
@@ -317,21 +355,27 @@ def updated_rates(data: Mapping[str, Any], ms: Mapping[tuple[str, str], Measurem
     for preset, kind in MEASURED_SLOTS:
         m = ms[(preset, kind)]
         lo, hi = min(m.rates), max(m.rates)
+        band = (f"{m.rate} from one job: no range, so the error band is "
+                f"±{SINGLE_SAMPLE_FLOOR:.0%}" if m.n == 1
+                else f"{lo:.3f}-{hi:.3f} per job, {m.rate} over all; error band "
+                     f"max({UNCERTAINTY_FLOOR:.0%}, range/mean)")
         prov = (f"Wave H-lite run {run_id}, `preset: {preset}` deployed with flora deploy/run: "
-                f"{m.n} jobs ({m.video_s:.1f} video s) on {m.gpu}, busy container-s per video-s "
-                f"{lo:.3f}-{hi:.3f} per job, {m.rate} over all; error band max(25%, range/mean); "
-                f"excludes @enter (startup row) and idle ({source})")
+                f"n={m.n} job(s) ({m.video_s:.1f} video s) on {m.gpu}, busy container-s per "
+                f"video-s {band}; excludes @enter (startup row) and idle ({source})")
         rows = [r for r in new["rates"] if r["preset"] == preset and r["kind"] == kind]
         if len(rows) != 1:
             raise SystemExit(f"rates.json: expected one {preset} {kind} row, found {len(rows)}")
         rows[0].update(container_s_per_video_s=m.rate, uncertainty=m.uncertainty,
-                       status="measured", source=source, date=date,
+                       status="measured", source=source, date=date, n=m.n,
                        image=engine_image(preset, kind), provenance=prov)
+        k = len(m.startups)
+        spread = (f"{m.startups[0]:.0f} s, one container: no range, so the error band is "
+                  f"±{SINGLE_SAMPLE_FLOOR:.0%}" if k == 1
+                  else f"{min(m.startups):.0f}-{max(m.startups):.0f} s")
         srow = {"preset": preset, "kind": kind, "startup_s": m.startup_s,
-                "uncertainty": m.startup_uncertainty, "status": "measured",
-                "provenance": (f"Wave H-lite run {run_id}: @modal.enter of {len(m.startups)} "
-                               f"fresh {m.gpu} containers, {min(m.startups):.0f}-"
-                               f"{max(m.startups):.0f} s ({source})"),
+                "uncertainty": m.startup_uncertainty, "status": "measured", "n": k,
+                "provenance": (f"Wave H-lite run {run_id}: spawn to first attempt of n={k} "
+                               f"fresh {m.gpu} container(s), {spread} ({source})"),
                 "date": date, "source": source}
         existing = [r for r in new["startup"] if r["preset"] == preset and r["kind"] == kind]
         if existing:
@@ -363,6 +407,14 @@ def derived_content_default() -> dict[str, str]:
         if pin is not None and pin.content_sha256:
             out[name] = pin.content_sha256
     return out
+
+
+def derived_content_used(st: wh.State) -> dict[str, str]:
+    """The derived content digests the balanced step's workers verified (``wave_h.py`` records
+    them as ``derived_content``), else the pinned ones."""
+    s = st.steps.get("balanced")
+    used = (s.result.get("derived_content") if s else None) or {}
+    return dict(used) if used else derived_content_default()
 
 
 def lab_result(paths: Paths, st: wh.State, kind: str) -> dict[str, Any] | None:
@@ -430,9 +482,13 @@ def certify_all(paths: Paths, st: wh.State, out_dir: Path, *, derived: Mapping[s
             cfg = r.get("cfg")
             ex = record_path(paths, "exact", job, stage)
             bal = record_path(paths, "balanced", job, stage)
-            missing = [str(p) for p in (ex, bal) if not p.exists()]
+            if not ex.exists():  # a balanced-only session: certification comes later
+                o["deferred"] = (f"{DEFERRED} (no oracle records: {paths.rel(ex)}; the exact "
+                                 "run that certifies it has not run)")
+                continue
+            missing = [paths.rel(p) for p in (ex, bal) if not p.exists()]
             if not cfg or not Path(cfg).exists():
-                missing.append(f"balanced.jobs.{job}.cfg ({cfg})")
+                missing.append(f"balanced.jobs.{job}.cfg ({paths.rel(cfg) if cfg else None})")
             if missing:
                 o["refused"] = "missing input: " + ", ".join(missing) + " (run with --fetch)"
                 continue
@@ -452,18 +508,31 @@ def certify_all(paths: Paths, st: wh.State, out_dir: Path, *, derived: Mapping[s
                 args += ["--derived-content", f"{name}={digest}"]
             code, text = cli(args)
             o["exit"] = code
-            start = text.find("[")
-            certs = None
-            if start >= 0:
-                try:
-                    certs = json.loads(text[start:])
-                except ValueError:
-                    certs = None
-            if not certs:
-                o["refused"] = " ".join(text.split())[-600:] or f"flora certify exited {code}"
-                continue
-            o["cert"] = certs[0]
+            o["output"] = text  # console only (print_findings); never in a written file
+            cert = parse_certificate(text, stage)
+            verdict = cert.get("verdict") if cert else None
+            if cert is None:
+                o["refused"] = f"flora certify exited {code} without a certificate"
+            elif (code, verdict) not in ((0, "certified"), (0, "provisional"), (1, "fail")):
+                o["refused"] = f"flora certify exited {code} with verdict {verdict}"
+            else:
+                o["cert"] = cert
     return outcomes
+
+
+def parse_certificate(text: str, stage: str) -> dict[str, Any] | None:
+    """The one certificate ``flora certify --json`` printed for ``stage``, else None."""
+    start = text.find("[")
+    if start < 0:
+        return None
+    try:
+        certs = json.loads(text[start:])
+    except ValueError:
+        return None
+    if (not isinstance(certs, list) or len(certs) != 1 or not isinstance(certs[0], dict)
+            or certs[0].get("stage") != stage):
+        return None
+    return certs[0]
 
 
 def missing_for_certified(cert: Mapping[str, Any]) -> list[str]:
@@ -598,6 +667,10 @@ def cert_rows(outcomes: Sequence[Mapping[str, Any]]) -> tuple[list[list[str]], l
     rows, missing = [], []
     for o in outcomes:
         c = o.get("cert")
+        if o.get("deferred"):
+            rows.append([o["stage"], o["job"], "-", "deferred", "-", "-", "-"])
+            missing.append(f"{o['stage']} ({o['job']}): {o['deferred']}")
+            continue
         if c is None:
             rows.append([o["stage"], o["job"], "-", "refused", "-", "-", "-"])
             missing.append(f"{o['stage']} ({o['job']}): refused: {o.get('refused')}")
@@ -614,11 +687,14 @@ def cert_rows(outcomes: Sequence[Mapping[str, Any]]) -> tuple[list[list[str]], l
 
 
 def overall_verdict(outcomes: Sequence[Mapping[str, Any]]) -> str:
-    vs = [o["cert"]["verdict"] if o.get("cert") else "refused" for o in outcomes]
+    vs = [o["cert"]["verdict"] if o.get("cert") else "refused" for o in outcomes
+          if not o.get("deferred")]
     for v in ("refused", "fail", "provisional"):
         if v in vs:
             return v
-    return "certified" if vs else "none"
+    if not vs:
+        return "deferred" if outcomes else "none"
+    return "certified"
 
 
 @dataclass
@@ -657,8 +733,9 @@ def render_report(f: Findings) -> str:
 
     L += ["", "## Measured rates", "",
           "Container-seconds per video-second: busy seconds over video seconds, one sample per "
-          "job. Cold start: `@modal.enter` per container. Error band: max(25%, range / mean).",
-          ""]
+          "job. Cold start: spawn to first attempt, one sample per container. Error band: "
+          f"max({UNCERTAINTY_FLOOR:.0%}, range / mean); a single sample (n=1) has no range, so "
+          f"its band is ±{SINGLE_SAMPLE_FLOOR:.0%}.", ""]
     rows = []
     for (preset, kind), m in sorted(f.ms.items()):
         s = m.summary()
@@ -745,13 +822,18 @@ def close_marker(name: str) -> str:
 
 def replace_block(text: str, name: str, body: str) -> str:
     """``body`` between the ``<!-- wave-h:name -->`` and ``<!-- /wave-h:name -->`` markers
-    (exactly that block; everything else is kept). No markers: refused, nothing inserted."""
-    start = text.find(f"<!-- wave-h:{name}")
-    end = text.find(close_marker(name), max(start, 0))
-    if start < 0 or end < 0:
-        raise SystemExit(f"no `<!-- wave-h:{name} -->` ... `{close_marker(name)}` block to fill")
-    start = text.index("\n", start) + 1
-    return text[:start] + body.rstrip("\n") + "\n" + text[end:]
+    (exactly that block; everything else is kept). The markers are whole lines (the open one
+    may carry a note: ``<!-- wave-h:name (note) -->``), exactly one of each, open before close.
+    Anything else is refused and nothing is inserted."""
+    n = re.escape(name)
+    opens = list(re.finditer(rf"^<!-- wave-h:{n}(?: [^>]*)? -->[ \t]*$", text, re.M))
+    closes = list(re.finditer(rf"^{re.escape(close_marker(name))}[ \t]*$", text, re.M))
+    if len(opens) != 1 or len(closes) != 1 or closes[0].start() < opens[0].end():
+        raise SystemExit(f"need exactly one `<!-- wave-h:{name} -->` line followed by one "
+                         f"`{close_marker(name)}` line to fill (found {len(opens)} open, "
+                         f"{len(closes)} close)")
+    start = opens[0].end() + 1
+    return text[:start] + body.rstrip("\n") + "\n" + text[closes[0].start():]
 
 
 def results_block(f: Findings) -> str:
@@ -835,7 +917,7 @@ def analyze(paths: Paths, *, derived: Mapping[str, str] | None = None, cert_tmp:
         RateTable.from_dict(new, source=str(paths.rates))  # the loader must accept it
         outputs[paths.rates] = dump_json(new)
     outcomes = certify_all(paths, st, cert_tmp,
-                           derived=derived_content_default() if derived is None else derived,
+                           derived=derived_content_used(st) if derived is None else derived,
                            cli=cli)
     labs = {k: lab_result(paths, st, k) for k in ("tempseg", "captioner")}
     billing, warnings = billing_rows(st)
@@ -881,6 +963,36 @@ def print_findings(f: Findings, out=print) -> None:
         out("  missing for certified:")
         for m in missing:
             out(f"    - {m}")
+    for o in f.outcomes:  # the console only: certify's own words never reach a written file
+        if o.get("refused") and o.get("output"):
+            out(f"  flora certify output, {o['stage']} ({o['job']}): "
+                + " ".join(str(o["output"]).split())[-400:])
+
+
+def cert_key(c: Mapping[str, Any]) -> tuple[Any, ...]:
+    """What a certificate is for: a newer one with the same key replaces it."""
+    return (c.get("preset"), c.get("stage"), c.get("kind"), c.get("gpu"),
+            tuple(c.get("covered_pools") or ()), c.get("engine_spec_hash"))
+
+
+def superseded(cert_dir: Path, prev: Sequence[str], new: Sequence[Path]) -> list[Path]:
+    """The certificates this script wrote before that a certificate of this run replaces:
+    same :func:`cert_key`, another id. A certificate nothing new replaced (its inputs are
+    missing, certify refused) is kept: nothing is ever removed implicitly."""
+    keys = {cert_key(json.loads(p.read_text(encoding="utf-8"))) for p in new}
+    ids = {p.stem for p in new}
+    out = []
+    for i in prev:
+        p = cert_dir / f"{i}.json"
+        if i in ids or not p.exists():
+            continue
+        try:
+            old = json.loads(p.read_text(encoding="utf-8"))
+        except ValueError:
+            continue  # not ours to judge: left in place
+        if cert_key(old) in keys:
+            out.append(p)
+    return out
 
 
 def main(argv: list[str] | None = None, *, cli: Callable[[list[str]], tuple[int, str]] = run_cli
@@ -910,8 +1022,8 @@ def main(argv: list[str] | None = None, *, cli: Callable[[list[str]], tuple[int,
         if paths.manifest.exists():
             prev = json.loads(paths.manifest.read_text(encoding="utf-8")).get("certificates", [])
         ids = sorted(p.stem for p in certs)
-        stale = [paths.certs / f"{i}.json" for i in prev if i not in ids
-                 and (paths.certs / f"{i}.json").exists()]
+        stale = superseded(paths.certs, prev, certs)
+        owned_ids = sorted((set(prev) - {s.stem for s in stale}) | set(ids))
         changed = {p: t for p, t in outputs.items()
                    if not p.exists() or p.read_text(encoding="utf-8") != t}
         new_certs = [c for c in certs if not (paths.certs / c.name).exists()
@@ -937,7 +1049,7 @@ def main(argv: list[str] | None = None, *, cli: Callable[[list[str]], tuple[int,
                 shutil.copyfile(c, paths.certs / c.name)
             for s in stale:
                 s.unlink()
-            man = dump_json({"run_id": f.st.run_id, "certificates": ids})
+            man = dump_json({"run_id": f.st.run_id, "certificates": owned_ids})
             if not paths.manifest.exists() or paths.manifest.read_text(encoding="utf-8") != man:
                 paths.manifest.parent.mkdir(parents=True, exist_ok=True)
                 paths.manifest.write_text(man, encoding="utf-8")

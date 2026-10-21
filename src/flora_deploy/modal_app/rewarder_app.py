@@ -149,9 +149,9 @@ MAX_EPISODE_S = 120.0
 
 def probe_stream(path: Path) -> dict[str, Any]:
     """Frame count (packets), rate, size, codec and a constant-frame-rate check."""
-    import av
+    from flora_deploy.media.avsafe import open_input
 
-    with av.open(str(path)) as container:
+    with open_input(path) as container:
         stream = container.streams.video[0]
         rate = stream.average_rate or stream.guessed_rate
         pts = sorted(p.pts for p in container.demux(stream) if p.size and p.pts is not None)

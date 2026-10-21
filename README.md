@@ -91,6 +91,10 @@ scores = pd.read_parquet("terminal.parquet")       # flora results reward.termin
 labels = captions.merge(scores[["uid", "terminal_score"]], on="uid")
 ```
 
+Training on LeRobot? `flora export --to lerobot --out labeled/` writes the labels into a copy of
+your dataset: subtasks and success scores per episode, dense rewards per frame
+([`docs/export.md`](docs/export.md)).
+
 Every record has a `uid` (the episode) to join stages on, plus provenance: which models, engine and
 GPU produced it. Field reference: [`docs/output-format.md`](docs/output-format.md).
 

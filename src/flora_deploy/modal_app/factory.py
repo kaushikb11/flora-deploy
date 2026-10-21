@@ -1,4 +1,4 @@
-"""App factory (PLAN.md D10, §7): one deployed Modal app per config, built by ``build_app(cfg)``.
+"""App factory (PLAN.md D10, §2): one deployed Modal app per config, built by ``build_app(cfg)``.
 
 Modal finds a container's code by module + qualname, so every worker class and function is
 defined **undecorated at module scope** (``reference_app.ReferenceWorker``,
@@ -13,7 +13,7 @@ Two steps, so the same truth drives ``build_app``, ``flora deploy --dry-run`` an
    option sets per Modal object (GPU, cpu, ``memory=(request, limit)``, containers,
    ``@modal.concurrent`` inputs, timeouts, retries, scaledown, Volumes, secret *names*, env).
    It contacts nothing and refuses what cannot run: shard kinds without a worker class
-   (``reward.rubric``), uncertified presets without
+   (``PENDING_WORKERS``), uncertified presets without
    ``allow_uncertified`` (D9/D16), local stores, decorated (module-scope) workers, and inputs the
    containers cannot read (a local ``input.path`` that was not staged to a Volume).
 2. :func:`materialize` (``build_app``) applies the decorators to a fresh ``modal.App``. Still
@@ -22,7 +22,9 @@ Two steps, so the same truth drives ``build_app``, ``flora deploy --dry-run`` an
 Objects, by stable Modal name (``ModalSpawner`` looks classes up by ``AppPlan.worker_classes``):
 
 - one worker class per worker *class* used: ``segcap`` -> ``ReferenceWorker`` (img_hfref, the
-  exact worker), ``reward.terminal``/``reward.dense`` -> ``RewardWorker`` (img_vllm), balanced
+  exact worker), ``reward.terminal``/``reward.dense`` -> ``RewardWorker`` (img_vllm),
+  ``reward.rubric`` -> ``RubricWorker`` (img_vllm, TP=2; the rubric spec arrives with the
+  kinds' modes in the certification env), balanced
   ``segment`` -> ``SegmentWorker`` and ``caption`` -> ``CaptionWorker`` (img_vllm,
   ``balanced_app``: one pool each, L40S / H100! by default; their env adds the recorded
   derived-weight receipts ``FLORA_DERIVED_RECEIPTS``, the pool GPUs, the kinds' modes and the
@@ -143,10 +145,11 @@ WORKERS: dict[str, WorkerRef] = {
                          startup_timeout_s=15 * 60, cache=True, recipe="balanced"),
     "caption": WorkerRef("flora_deploy.modal_app.balanced_app", "CaptionWorker", "img_vllm",
                          startup_timeout_s=15 * 60, cache=True, recipe="balanced"),
+    # NVIDIA's rubric recipe: TP=2 on its own pool (H100!:2); no flora-cache (see workers_app)
+    "reward.rubric": WorkerRef("flora_deploy.modal_app.workers_app", "RubricWorker", "img_vllm",
+                               startup_timeout_s=20 * 60),
 }
-PENDING_WORKERS: dict[str, str] = {
-    "reward.rubric": "there is no RubricWorker yet",
-}
+PENDING_WORKERS: dict[str, str] = {}
 INDEX_FUNCTION: tuple[str, str] = ("flora_deploy.modal_app.index_app", "index_run_shard")
 
 # --fake-models (H0): CPU workers with G2's fake engines behind the real shard runners.
@@ -157,6 +160,8 @@ FAKE_WORKERS: dict[str, WorkerRef] = {
                                  "img_cpu", startup_timeout_s=15 * 60, cache=True),
     "reward.dense": WorkerRef("flora_deploy.modal_app.workers_app", "FakeRewardWorker",
                               "img_cpu", startup_timeout_s=15 * 60, cache=True),
+    "reward.rubric": WorkerRef("flora_deploy.modal_app.workers_app", "FakeRubricWorker",
+                               "img_cpu", startup_timeout_s=15 * 60),
     "segment": WorkerRef("flora_deploy.modal_app.workers_app", "FakeSegmentWorker", "img_cpu",
                          startup_timeout_s=8 * 60, recipe="balanced"),
     "caption": WorkerRef("flora_deploy.modal_app.workers_app", "FakeCaptionWorker", "img_cpu",
@@ -216,7 +221,7 @@ class StoreSpec:
                 "FLORA_STORE_BUCKET": str(self.bucket), "FLORA_STORE_PREFIX": self.root}
 
 
-_VOLUME_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_VOLUME_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 
 
 def parse_store(uri: str, *, bucket_secret: str = DEFAULT_BUCKET_SECRET) -> StoreSpec:
@@ -464,12 +469,19 @@ def instruction_env(cfg: Any) -> dict[str, str]:
 
 
 def balanced_env(cfg: Any, kinds: list[str], pools: Mapping[str, PoolSettings],
-                 derived_receipts: Mapping[str, str]) -> dict[str, str]:
+                 derived_receipts: Mapping[str, str], *, fake_models: bool = False
+                 ) -> dict[str, str]:
     """What a balanced worker verifies (``modal_app.balanced_app``): the recorded receipts of
     the derived weights its kinds need (``weights.derived``). The certification env (pool GPU,
     modes, embodiment: :func:`workers_impl.certstamp.cert_env`) is set on every worker class
-    by :func:`plan_app`."""
+    by :func:`plan_app`.
+
+    A derived weight without a pinned content digest (``pins.DERIVED_PINS``) is refused here,
+    at plan time (``flora plan`` / ``deploy`` / ``run``, ``sdk.submit``), with the steps that
+    fix it: the workers refuse it at start, which would be a billed GPU start per shard (review
+    10 M1). ``fake_models`` reads no weights, so it skips that check."""
     from flora_deploy.config.presets import get_preset
+    from flora_deploy.config.receipts import UnpinnedDerivedWeight, require_pinned
 
     preset = get_preset(cfg.preset)
     names = sorted({n for k in kinds for n in preset.derived_weights.get(k, ())})  # type: ignore[call-overload]
@@ -477,6 +489,13 @@ def balanced_env(cfg: Any, kinds: list[str], pools: Mapping[str, PoolSettings],
     if missing:
         raise DeployError(f"{', '.join(kinds)}: no recorded receipt for derived weight(s) "
                           f"{missing} (run `flora prepare`, or pass --receipt NAME=<sha256>)")
+    if not fake_models:
+        kinds_of = {n: [k for k in kinds if n in preset.derived_weights.get(k, ())]  # type: ignore[call-overload]
+                    for n in names}
+        try:
+            require_pinned(names, kinds_of=kinds_of, preset=cfg.preset)
+        except UnpinnedDerivedWeight as e:
+            raise DeployError(str(e)) from None
     return {DERIVED_RECEIPTS_ENV: json.dumps({n: derived_receipts[n] for n in names},
                                              sort_keys=True)}
 
@@ -643,7 +662,8 @@ def plan_app(
 
             env[SCHEDULING_ENV] = json.dumps(exact_scheduling(cfg), sort_keys=True)  # G3 order
         if ref.recipe == "balanced":
-            env.update(balanced_env(cfg, kinds, rs.pools, derived_receipts or {}))
+            env.update(balanced_env(cfg, kinds, rs.pools, derived_receipts or {},
+                                    fake_models=fake_models))
             if pool.max_inputs > 1:
                 raise DeployError(f"{cls_name}: max_inputs {pool.max_inputs} > 1, but a balanced "
                                   "worker runs one shard per container (its episodes run "

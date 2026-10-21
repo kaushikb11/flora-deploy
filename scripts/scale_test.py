@@ -139,20 +139,27 @@ INDEX_UNIT_S = (120.0, 600.0)  # nominal / upper per unit (download 200 MB + pro
 FAKE_RATE = (0.05, 3.0)  # container-s per video-s, relative uncertainty
 FAKE_STARTUP = (45.0, 1.0)  # startup s, relative uncertainty
 
-# Caps (USD). real: each step's upper projection rounded up (wh.honest_caps); global = their sum.
-# These are proposals: the user approves them before the first --yes-spend.
-CAPS_USD: dict[str, dict[str, float]] = {
-    "real": {"verify": 0.0, "index": 0.15, "plan": 0.0, "deploy": 0.05, "run": 18.50,
-             "report": 0.0},
-    "fake-modal": {"verify": 0.0, "index": 0.0, "plan": 0.0, "deploy": 0.05, "run": 0.40,
-                   "report": 0.0},
-    "local": dict.fromkeys(STEPS, 0.0),
-}
-GLOBAL_CAP_USD = {"real": 18.70, "fake-modal": 0.45, "local": 0.0}
+# Caps (USD). Never hard-coded: each step's cap is its own upper projection (:func:`project`,
+# at today's pinned prices and rates) rounded up to $0.10, and the global cap is their sum
+# (:func:`global_cap`); the plan prints both for the user to approve before the first
+# --yes-spend. A price change moves the caps with the projection instead of breaking the stop
+# rules. ``CAPS_USD[mode]`` overrides them (tests; an explicitly lower cap).
+CAP_STEP_USD = 0.10
+CAPS_USD: dict[str, dict[str, float]] = {}
 
 
 def caps(mode: str) -> dict[str, float]:
-    return CAPS_USD[mode]
+    if mode in CAPS_USD:
+        return dict(CAPS_USD[mode])
+    if mode == "local":
+        return dict.fromkeys(STEPS, 0.0)
+    return {s: round(math.ceil(p.usd_upper / CAP_STEP_USD - 1e-9) * CAP_STEP_USD, 2)
+            for s, p in projections(mode).items()}
+
+
+def global_cap(mode: str) -> float:
+    """The global cap: the sum of the step caps."""
+    return round(sum(caps(mode).values()), 2)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -223,6 +230,27 @@ def pools_for(mode: str) -> dict[str, tuple[wh.Container, int]]:
         else:
             c = wh.Container(None, 0.0, 0.0)  # local threads: no Modal money
         out[kind] = (c, int(p["max_containers"]))
+    return out
+
+
+CPU_CLASS = "cpu"  # the app's CPU functions: orchestrator_run, reconcile, reconcile_watched
+
+
+def container_rates(mode: str) -> dict[str, float]:
+    """$/s of one container per class, at ``jobs.budget``'s pinned list prices: each pool's
+    kind as deployed in ``mode``, and :data:`CPU_CLASS` for the orchestrator and reconciler
+    (``modal_app.orchestrator_app`` resources at the non-preemptible CPU / memory rate; any
+    container no attempt marker names is priced as one of these)."""
+    from flora_deploy.jobs.budget import pinned_rates
+    from flora_deploy.modal_app import orchestrator_app as oa
+
+    if mode == "local":
+        return dict.fromkeys((*POOLS, CPU_CLASS), 0.0)
+    r = pinned_rates()
+    out = {k: r.per_second(c.gpu, 1 if c.gpu else 0, c.cpu, c.memory_gib)
+           for k, (c, _) in pools_for(mode).items()}
+    out[CPU_CLASS] = r.per_second(None, 0, float(oa.CPU_CORES), oa.MEMORY_MIB / 1024,
+                                  preemptible=False)
     return out
 
 
@@ -353,7 +381,7 @@ def planner_options(mode: str = "real") -> list[Any]:
                                                "episodes": DATASET["total_episodes"]}]})
     req = PlanRequest(workload=w, stages=("segment", "caption"),
                       presets=("balanced", "exact"), max_gpus=MAX_GPUS,
-                      budget_usd=GLOBAL_CAP_USD["real"])
+                      budget_usd=global_cap("real"))
     bal = get_preset("balanced").pools
     from dataclasses import replace
 
@@ -502,12 +530,16 @@ def read_shard_files(store: Any, job_id: str, config_hash: str, manifest: Any
 
 def measure(files: Mapping[str, Sequence[Mapping[str, Any]]], durations: Mapping[str, float],
             containers: Mapping[str, Mapping[str, float]] | None = None, *,
-            usd_per_s: Mapping[str, float] | None = None) -> dict[str, Any]:
+            usd_per_s: Mapping[str, float] | None = None,
+            run_start: float | None = None) -> dict[str, Any]:
     """Per pool: containers, container-seconds, busy seconds, utilization, cold starts, idle
     tails and their cost, video-s per container-s, peak concurrency; plus pipelining.
 
     ``containers``: ``{container_id: {"start": t, "end": t}}`` from ``modal container list``
-    samples; without it (local) a container's life is its first start to its last end."""
+    samples; without it (local) a container's life is its first start to its last end.
+    ``run_start``: when ``run`` launched the job. ``time_to_peak_s`` is from it to the moment
+    the pool first ran ``max_containers`` containers (None: no run start, or never reached).
+    ``preempted_recovered``: preempted starts whose shard a later attempt finished."""
     kind_of: dict[str, str] = {}
     spans: dict[str, list[tuple[float, float, str]]] = {}
     receipts = {(r["shard_id"], r["container_id"]): r for r in files.get("receipts", [])}
@@ -517,6 +549,12 @@ def measure(files: Mapping[str, Sequence[Mapping[str, Any]]], durations: Mapping
             if c.get("outcome") == "spawned" and c.get("call_id") and c.get("utc"):
                 spawned[c["call_id"]] = _t(c["utc"])  # type: ignore[assignment]
     preempted: dict[str, int] = {}
+    recovered: dict[str, int] = {}
+    finished_after: dict[tuple[str, str], list[float]] = {}
+    for rc in files.get("receipts", []):
+        ft = _t(rc.get("finished_utc"))
+        if ft is not None:
+            finished_after.setdefault((rc["kind"], rc["shard_id"]), []).append(ft)
     latency: dict[str, list[float]] = {}
     for a in files.get("attempts", []):
         cid, kind = a["container_id"], a["kind"]
@@ -526,6 +564,10 @@ def measure(files: Mapping[str, Sequence[Mapping[str, Any]]], durations: Mapping
         t1 = _t(r["finished_utc"]) if r else _t(a.get("ended_utc"))
         if a.get("preempted"):
             preempted[kind] = preempted.get(kind, 0) + 1
+            done = [ft for ft in finished_after.get((kind, a["shard_id"]), ())
+                    if t0 is None or ft > t0]
+            if done and (a["shard_id"], cid) not in receipts:
+                recovered[kind] = recovered.get(kind, 0) + 1
         if t0 is not None and t1 is not None and t1 >= t0:
             spans.setdefault(cid, []).append((t0, t1, a["shard_id"]))
         if t0 is not None and a.get("call_id") in spawned:
@@ -547,17 +589,19 @@ def measure(files: Mapping[str, Sequence[Mapping[str, Any]]], durations: Mapping
         idle = [life[c][1] - max(s[1] for s in spans[c]) for c in cids]
         events = sorted([(life[c][0], 1) for c in cids] + [(life[c][1], -1) for c in cids])
         peak = cur = 0
-        t_peak = None
+        t_full = None  # first moment the pool ran max_containers
         for t, d in events:
             cur += d
-            if cur > peak:
-                peak, t_peak = cur, t
+            peak = max(peak, cur)
+            if t_full is None and cur >= POOLS[kind]["max_containers"]:
+                t_full = t
         starts = [s[0] for c in cids for s in spans[c]]
         ends = [s[1] for c in cids for s in spans[c]]
         rate = (usd_per_s or {}).get(kind, 0.0)
         out["pools"][kind] = {
             "containers": len(cids), "peak_concurrent": peak,
-            "time_to_peak_s": round(t_peak - min(starts), 1) if t_peak and starts else None,
+            "time_to_peak_s": (round(t_full - run_start, 1)
+                               if t_full is not None and run_start is not None else None),
             "container_s": round(cs, 1), "busy_s": round(busy, 1),
             "utilization": round(busy / cs, 3) if cs else None,
             "video_s": round(video, 1),
@@ -568,7 +612,8 @@ def measure(files: Mapping[str, Sequence[Mapping[str, Any]]], durations: Mapping
             "cold_start_s": _quant(cold), "spawn_to_start_s": _quant(latency.get(kind, [])),
             "idle_tail_s": _quant(idle), "idle_s": round(sum(idle), 1),
             "idle_usd": round(sum(idle) * rate, 4), "usd": round(cs * rate, 4),
-            "preempted_starts": preempted.get(kind, 0), "shards_done": len(rs)}
+            "preempted_starts": preempted.get(kind, 0),
+            "preempted_recovered": recovered.get(kind, 0), "shards_done": len(rs)}
     seg = out["pools"].get("segment", {})
     seg_sp = [s for c, k in kind_of.items() if k == "segment" for s in spans.get(c, [])]
     cap_sp = [s for c, k in kind_of.items() if k == "caption" for s in spans.get(c, [])]
@@ -637,14 +682,21 @@ def evaluate(r: Mapping[str, Any], mode: str) -> list[dict[str, Any]]:
         add(f"{kind}: autoscaled to max_containers", p.get("peak_concurrent"), f">= {want}",
             p.get("peak_concurrent", 0) >= want if mode != "local" else None)
         t = p.get("time_to_peak_s")
-        add(f"{kind}: time to peak", t, f"<= {CRITERIA['time_to_peak_max_s']} s",
-            None if t is None or mode == "local" else t <= CRITERIA["time_to_peak_max_s"])
+        reached = p.get("peak_concurrent", 0) >= want
+        # from the run start to max_containers; a pool that never got there fails, it is not
+        # measured to a lower peak
+        add(f"{kind}: time to peak", t, f"<= {CRITERIA['time_to_peak_max_s']} s from the run "
+            "start", None if mode == "local" else
+            (False if not reached else None if t is None
+             else t <= CRITERIA["time_to_peak_max_s"]))
         u = p.get("utilization")
         add(f"{kind}: utilization (busy / container-s)", u, f">= {CRITERIA['utilization_min']}",
             None if u is None or mode == "local" else u >= CRITERIA["utilization_min"])
-        add(f"{kind}: preemption recovered", p.get("preempted_starts"), ">= 1 preempted start, "
-            "shard still done", (p.get("preempted_starts", 0) >= 1)
-            if f"preempt_{kind}" in (r.get("chaos") or {}) else None)
+        n_pre, n_rec = p.get("preempted_starts", 0), p.get("preempted_recovered", 0)
+        add(f"{kind}: preemption recovered", f"{n_rec}/{n_pre}", ">= 1 preempted start, each "
+            "shard finished by a later attempt",
+            (n_pre >= 1 and n_rec == n_pre) if f"preempt_{kind}" in (r.get("chaos") or {})
+            else None)
     pl = m.get("pipelining") or {}
     v = pl.get("first_caption_after_first_segment_s")
     add("pipelining: first caption after first segment shard", v,
@@ -735,6 +787,25 @@ class Ctx:
 
 def _flora() -> str:
     return h0.flora_bin()
+
+
+APP_DEPLOYED, APP_STOPPED = "deployed", "stopped"
+
+
+def app_state(st: wh.State) -> str | None:
+    """Whether the deployed app is live: ``deploy``'s ``app_state`` (None: never recorded)."""
+    s = st.steps.get("deploy")
+    return (s.result or {}).get("app_state") if s else None
+
+
+def mark_app(st: wh.State, state: str, path: Path | None = None) -> None:
+    """Record the app's state: :data:`APP_DEPLOYED` after ``flora deploy``,
+    :data:`APP_STOPPED` once anything ran ``modal app stop`` on it (``run``'s ``finally``, or
+    the cleanup of a killed run). A stopped app makes the next pass deploy again."""
+    s = st.step("deploy")
+    s.result = {**(s.result or {}), "app_state": state}
+    if path is not None:
+        wh.save_state(st, path)
 
 
 def run_verify(ctx: Ctx) -> dict[str, Any]:
@@ -846,6 +917,7 @@ class Monitor:
         self.samples: list[dict[str, Any]] = []
         self.status_s: list[float] = []
         self.containers: dict[str, dict[str, float]] = {}
+        self.kinds: dict[str, str] = {}  # container_id -> pool kind (attempt markers)
         self.t0 = time.time()
 
     def status(self) -> dict[str, Any] | None:
@@ -889,10 +961,36 @@ class Monitor:
                 rec["end"] = now
         return n
 
+    def unmatched(self) -> bool:
+        return any(cid not in self.kinds for cid in self.containers)
+
     def observed_usd(self) -> float:
-        """Container-seconds seen so far, each at the costliest pool's $/s (kinds unknown)."""
-        top = max(self.rates.values(), default=0.0)
-        return sum((c["end"] - c["start"]) * top for c in self.containers.values())
+        """Container-seconds seen so far, each at its own class's $/s (:func:`container_rates`):
+        a container an attempt marker names at its pool's rate, any other at the CPU
+        (orchestrator / reconciler) rate. A worker still in its cold start is not named yet;
+        the cancel rule's slack (every pool container for ``CLIENT_SLACK_S``) covers it."""
+        cpu = self.rates.get(CPU_CLASS, 0.0)
+        return sum((c["end"] - c["start"]) * self.rates.get(self.kinds.get(cid, CPU_CLASS), cpu)
+                   for cid, c in self.containers.items())
+
+
+def _container_kinds(ctx: Ctx) -> dict[str, str]:
+    """``container_id -> kind`` from the job's attempt markers (MODAL_TASK_ID per attempt)."""
+    from flora_deploy import sdk
+    from flora_deploy.jobs.store import JobPaths
+
+    job = sdk.open_job(ctx.job_id, store=ctx.store_uri)
+    m = job._deps().manifests.load()
+    paths = JobPaths(ctx.job_id, config_hash=job.config_hash,
+                     stage_hashes=dict(m.stage_hashes))
+    out: dict[str, str] = {}
+    for kind in POOLS:
+        for f in job.store.list(paths.area_prefix(job.config_hash, "attempts", kind)):
+            with contextlib.suppress(Exception):
+                cid = json.loads(job.store.get_bytes(f)).get("container_id")
+                if cid:
+                    out[str(cid)] = kind
+    return out
 
 
 def _running_container(ctx: Ctx, kind: str) -> str | None:
@@ -945,8 +1043,8 @@ def run_run(ctx: Ctx) -> dict[str, Any]:
     """``flora run`` + live polling + chaos + compose; the in-step stop rules."""
     mode, fl = ctx.mode, _flora()
     pools = pools_for(mode)
-    rates = {k: c.usd_per_s() for k, (c, _) in pools.items()}
-    budget = wh.step_budget(ctx.st, "run", caps=caps(mode), global_cap=GLOBAL_CAP_USD[mode])
+    rates = container_rates(mode)
+    budget = wh.step_budget(ctx.st, "run", caps=caps(mode), global_cap=global_cap(mode))
     if mode != "local" and budget < 0.05:
         return {"ok": False, "error": f"budget left ${budget:.2f}", "tracked_usd": 0.0,
                 "apps": []}
@@ -962,33 +1060,36 @@ def run_run(ctx: Ctx) -> dict[str, Any]:
     proc: subprocess.Popen | None = None
     orch: dict[str, Any] = {}
     logs = {"run": ctx.work / "flora-run.log", "resume": ctx.work / "flora-resume.log"}
-    if mode == "local":
-        inject = "preempt:segment-*x1,preempt:caption-*x1"
-        args = [fl, "run", "--local", "--fake-models", "--config", str(ctx.cfg), "--job",
-                ctx.job_id, "--store", str(ctx.work / "store"), "--inject", inject, "--json"]
-        chaos.fired.update({"preempt_segment": {"inject": inject},
-                            "preempt_caption": {"inject": inject}})
-        proc = _popen(args, ctx.work, logs["run"])
-    else:
-        ctx.note_app(app)  # type: ignore[arg-type]
-        if mode == "fake-modal":
-            from flora_deploy.modal_app.workers_app import fake_faults_path
-
-            store = _fake_store(ctx)
-            store.put_bytes(fake_faults_path(ctx.job_id),
-                            json.dumps({"preempt": {"segment": 2, "caption": 2}}).encode())
-            chaos.fired.update({"preempt_segment": {"fake_faults": "segment@2"},
-                                "preempt_caption": {"fake_faults": "caption@2"}})
-        ctx.sh([fl, "run", "--config", str(ctx.cfg), "--detach", "--job", ctx.job_id,
-                "--budget", f"{budget:.2f}", "--poll", str(ctx.poll_s), *_modal_flags(ctx)],
-               timeout=900)
-    t0 = time.time()
+    t0 = out["started_at"] = time.time()  # the run's start: time to peak counts from here
     killed_at: float | None = None
     resume_proc: subprocess.Popen | None = None
     end_state = None
     try:
+        if mode == "local":
+            inject = "preempt:segment-*x1,preempt:caption-*x1"
+            args = [fl, "run", "--local", "--fake-models", "--config", str(ctx.cfg), "--job",
+                    ctx.job_id, "--store", str(ctx.work / "store"), "--inject", inject, "--json"]
+            chaos.fired.update({"preempt_segment": {"inject": inject},
+                                "preempt_caption": {"inject": inject}})
+            proc = _popen(args, ctx.work, logs["run"])
+        else:
+            ctx.note_app(app)  # type: ignore[arg-type]
+            if mode == "fake-modal":
+                from flora_deploy.modal_app.workers_app import fake_faults_path
+
+                store = _fake_store(ctx)
+                store.put_bytes(fake_faults_path(ctx.job_id),
+                                json.dumps({"preempt": {"segment": 2, "caption": 2}}).encode())
+                chaos.fired.update({"preempt_segment": {"fake_faults": "segment@2"},
+                                    "preempt_caption": {"fake_faults": "caption@2"}})
+            ctx.sh([fl, "run", "--config", str(ctx.cfg), "--detach", "--job", ctx.job_id,
+                    "--budget", f"{budget:.2f}", "--poll", str(ctx.poll_s), *_modal_flags(ctx)],
+                   timeout=900)
         while True:
             mon.poll_containers()
+            if app is not None and mon.unmatched():
+                with contextlib.suppress(Exception):  # polled again next time
+                    mon.kinds.update(_container_kinds(ctx))
             s = mon.status() or {}
             ctx.log(f"  [{s.get('t', 0):7.1f}s] {s.get('state')} {json.dumps(s.get('counts'))} "
                     f"spend ${s.get('spend_usd') or 0:.2f} alive={s.get('orchestrator_alive')}")
@@ -1047,19 +1148,28 @@ def run_run(ctx: Ctx) -> dict[str, Any]:
                 break
             time.sleep(ctx.poll_s)
     finally:
-        for p in (proc, resume_proc):
-            if p is not None:
-                with contextlib.suppress(Exception):
-                    p.wait(timeout=600)
-        t = time.time()
-        comp = ctx.sh([fl, "compose", "--job", ctx.job_id, "--store", ctx.store_uri],
-                      check=False, timeout=3600)
-        out["compose_s"], out["compose_rc"] = round(time.time() - t, 2), comp.returncode
-        if app is not None:
-            ctx.sh(["modal", "app", "stop", "--yes", app], check=False, timeout=120)
+        try:
+            for p in (proc, resume_proc):
+                if p is not None:
+                    with contextlib.suppress(Exception):
+                        p.wait(timeout=600)
+            t = time.time()
+            try:
+                comp = ctx.sh([fl, "compose", "--job", ctx.job_id, "--store", ctx.store_uri],
+                              check=False, timeout=3600)
+                out["compose_rc"] = comp.returncode
+            finally:
+                out["compose_s"] = round(time.time() - t, 2)
+        finally:  # whatever compose did: the app and its reconciler cron go down (M4)
+            if app is not None:
+                try:
+                    ctx.sh(["modal", "app", "stop", "--yes", app], check=False, timeout=120)
+                finally:
+                    mark_app(ctx.st, "stopped", ctx.state_path)
     out.update(state=end_state, chaos=chaos.fired, orchestrator=orch, samples=mon.samples,
                status_s=[round(x, 2) for x in mon.status_s], containers=mon.containers,
-               wall_s=round(time.time() - t0, 1), observed_usd=round(mon.observed_usd(), 4))
+               container_kinds=mon.kinds, wall_s=round(time.time() - t0, 1),
+               observed_usd=round(mon.observed_usd(), 4))
     rep = subprocess.run([fl, "report", ctx.job_id, *ctx.store_args(), "--json"], cwd=ctx.work,
                          capture_output=True, text=True, timeout=900)
     try:
@@ -1149,9 +1259,8 @@ def run_report(ctx: Ctx) -> dict[str, Any]:
     manifest = job._deps().manifests.load()
     files = read_shard_files(job.store, ctx.job_id, job.config_hash, manifest)
     dur = {e.uid: e.duration_s for e in manifest.episodes}
-    pools = pools_for(ctx.mode)
     meas = measure(files, dur, run.get("containers") or None,
-                   usd_per_s={k: c.usd_per_s() for k, (c, _) in pools.items()})
+                   usd_per_s=container_rates(ctx.mode), run_start=run.get("started_at"))
     summary = job.summary() or {}
     stages = summary.get("stages", {})
     records = {"missing": sum(int(c.get("missing", 0)) for c in stages.values()),
@@ -1196,7 +1305,7 @@ def render_report(st: wh.State, mode: str, projs: Mapping[str, wh.Projection]) -
     c = caps(mode)
     lines = [f"# Scale test report ({mode})", "",
              "Generated by `scripts/scale_test.py` (plan: `docs/scale-test.md`). Numbers only.", "",
-             f"Run `{st.run_id}`: spent **${st.spent:.2f}** of the ${GLOBAL_CAP_USD[mode]:.2f} "
+             f"Run `{st.run_id}`: spent **${st.spent:.2f}** of the ${global_cap(mode):.2f} "
              "global cap.", "",
              "| step | status | cap | projected (upper) | attempts | tracked |",
              "|---|---|---|---|---|---|"]
@@ -1223,7 +1332,7 @@ def render_report(st: wh.State, mode: str, projs: Mapping[str, wh.Projection]) -
 
 
 def print_plan(st: wh.State, mode: str, projs: Mapping[str, wh.Projection], out=print) -> None:
-    c, g = caps(mode), GLOBAL_CAP_USD[mode]
+    c, g = caps(mode), global_cap(mode)
     out(f"Scale test ({mode}) run {st.run_id}: spent ${st.spent:.2f} of ${g:.2f}")
     if mode == "real":
         d = DATASET
@@ -1256,6 +1365,10 @@ def print_plan(st: wh.State, mode: str, projs: Mapping[str, wh.Projection], out=
     honest = wh.honest_caps(projs)
     out(f"  total: nominal ${nominal:.2f}, upper ${upper:.2f}; global cap ${g:.2f}; honest "
         f"caps {honest}")
+    how = ("overridden" if mode in CAPS_USD else
+           f"each step's upper projection, ceil ${CAP_STEP_USD:.2f}; global = their sum")
+    out(f"  caps ({how}): " + ", ".join(f"{k} ${v:.2f}" for k, v in c.items())
+        + f"; global ${g:.2f}")
     if mode != "local":
         out(f"  wall: nominal {run_wall_s(mode) / 60:.0f} min, upper "
             f"{run_wall_s(mode, upper=True) / 60:.0f} min")
@@ -1274,6 +1387,13 @@ def print_options(out=print) -> None:
         kinds = ", ".join(f"{k.kind} {k.containers}x{k.gpu}" for k in o.kinds)
         out(f"    {o.name:28s} ${o.cost_usd:7.2f} (${o.cost_low_usd:.2f}-${o.cost_high_usd:.2f})"
             f" {o.wall_s / 3600:5.2f} h  {kinds}  [{o.status}; {o.rate_status}]")
+
+
+def run_projection(st: wh.State, mode: str, projs: Mapping[str, wh.Projection]
+                   ) -> wh.Projection:
+    """The ``run`` step's projection, at the indexed video length once ``index`` ran."""
+    v = st.step("index").result.get("video_s")
+    return project("run", mode, float(v)) if v else projs["run"]
 
 
 def state_path(mode: str) -> Path:
@@ -1332,29 +1452,51 @@ def main(argv: list[str] | None = None) -> int:
     for app in killed:
         subprocess.run(["modal", "app", "stop", "--yes", app], capture_output=True, text=True)
         print(f"stopped {app} (left by a killed run)")
+    if killed and mode != "local":
+        mark_app(st, APP_STOPPED)
     wh.save_state(st, spath)
     os.chdir(work)  # relative input.path is hashed against the cwd
     ctx = Ctx(mode, st, work, spath, args.poll or POLL_S[mode])
-    c, gcap = caps(mode), GLOBAL_CAP_USD[mode]
+    c, gcap = caps(mode), global_cap(mode)
     rc = 0
+    selected = set(STEPS) if not args.only else {args.only}
+    if args.only and args.only != "verify" and st.step("verify").status != "done":
+        selected.add("verify")  # nothing is spent past an unchecked dataset pin (L1)
+        print("--only: the dataset pin (verify) is not done; checking it first")
     for name in STEPS:
-        if args.only and name != args.only:
+        if name not in selected:
             continue
         s = st.step(name)
-        if s.status == "done":
+        redeploy = (name == "deploy" and mode != "local" and s.status == "done"
+                    and st.step("run").status != "done" and app_state(st) != APP_DEPLOYED)
+        if s.status == "done" and not redeploy:
             print(f"skip {name}: done")
             continue
         if mode != "local":
             wh.refresh_billing(st)
-        p = projs[name]
-        if name == "run" and st.step("index").result.get("video_s"):
-            p = project("run", mode, float(st.step("index").result["video_s"]))
+        if redeploy:
+            try:  # no app is brought up for a run its stop rule would refuse
+                wh.check_before(st, "run", run_projection(st, mode, projs), caps=c,
+                                global_cap=gcap)
+            except wh.StopRule:
+                print("skip redeploy: the run step's stop rule refuses it")
+                continue
+            print(f"deploy again: the app is {app_state(st) or 'not known to be live'} "
+                  "(an earlier run stopped it)")
+            s.notes.append(f"redeploy: app {app_state(st) or 'state unknown'}")
+        p = run_projection(st, mode, projs) if name == "run" else projs[name]
         s.projected_usd, s.projected_upper_usd = p.usd, p.usd_upper
         try:
             wh.check_before(st, name, p, caps=c, global_cap=gcap)
         except wh.StopRule as e:
             s.status, rc = "stopped", 3
             s.notes.append(f"stop rule before: {e}")
+            break
+        if name == "run" and mode != "local" and app_state(st) != APP_DEPLOYED:
+            s.notes.append(f"refused: the app is not deployed (app {app_state(st)}); run "
+                           "without --only so deploy runs first")
+            print(f"refuse run: {s.notes[-1]}")
+            rc = 1
             break
         att = wh.Attempt(started=time.time(), rate_usd_per_s=p.peak_usd_per_s,
                          budget_usd=round(wh.step_budget(st, name, caps=c, global_cap=gcap), 4))
@@ -1370,10 +1512,14 @@ def main(argv: list[str] | None = None) -> int:
             att.tracked_usd = round(float(res.get("tracked_usd") or 0.0), 4)
             att.report_error = bool(res.get("report_error"))
             att.status = s.status = "done" if res.get("ok") else "failed"
+            if name == "deploy" and res.get("ok") and mode != "local":
+                mark_app(st, APP_DEPLOYED)
         except Exception as e:  # noqa: BLE001 - recorded; the runbook stops
             att.status = s.status = "failed"
             att.report_error = mode != "local"  # unknown spend: charged its budget
             s.notes.append(f"error: {e!r}")
+            if name in ("deploy", "run") and mode != "local":
+                mark_app(st, APP_STOPPED)  # not known to be live: the next pass deploys
         att.finished = time.time()
         for a in s.result.get("apps", ()):
             if a not in att.apps:

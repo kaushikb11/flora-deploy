@@ -67,9 +67,9 @@ def test_dry_run_numbers_fit_the_caps_honestly():
         for name, p in ps.items():
             assert p.usd_upper >= p.usd >= 0
             assert p.usd_upper <= sc.caps(mode)[name] + 1e-9, (mode, name)
-        assert sum(p.usd_upper for p in ps.values()) <= sc.GLOBAL_CAP_USD[mode] + 1e-9
+        assert sum(p.usd_upper for p in ps.values()) <= sc.global_cap(mode) + 1e-9
     real = sc.projections("real")
-    assert sc.wh.honest_caps(real)["global"] <= sc.GLOBAL_CAP_USD["real"]
+    assert sc.wh.honest_caps(real)["global"] <= sc.global_cap("real")
     run = real["run"]
     gpus = {i["gpu"] for i in run.items}
     assert {"L40S", "H100"} <= gpus  # balanced pools, priced as deployed
@@ -113,7 +113,7 @@ def test_config_is_valid_for_every_mode(tmp_path, monkeypatch):
 
 def test_stop_rule_refuses_a_step_whose_upper_projection_is_over_its_cap(offline, tmp_path,
                                                                         monkeypatch):
-    monkeypatch.setitem(sc.CAPS_USD, "real", {**sc.CAPS_USD["real"], "run": 1.0})
+    monkeypatch.setitem(sc.CAPS_USD, "real", {**sc.caps("real"), "run": 1.0})
     state = tmp_path / "state.json"
     assert sc.main(["--yes-spend", "--state", str(state), "--work", str(tmp_path / "w")]) == 3
     assert offline == ["verify", "index", "plan", "deploy"]  # run never started
@@ -130,7 +130,7 @@ def test_stop_rule_uses_the_global_cap_minus_cumulative_spend(offline, tmp_path,
     st.step("verify").status = "done"
     st.step("index").status = "done"
     st.step("index").attempts.append(wh.Attempt(started=1.0, status="done", tracked_usd=
-                                                sc.GLOBAL_CAP_USD["real"] - 1.0))
+                                                sc.global_cap("real") - 1.0))
     wh.save_state(st, state)
     assert sc.main(["--yes-spend", "--state", str(state), "--work", str(tmp_path / "w")]) == 3
     st = wh.load_state(state)
@@ -155,7 +155,7 @@ def test_in_step_budget_is_cap_minus_earlier_attempts():
     st = wh.State("r", 0.0, "2026-10-22")
     s = st.step("run")
     s.attempts.append(wh.Attempt(started=1.0, status="failed", tracked_usd=4.0))
-    left = wh.step_budget(st, "run", caps=sc.caps("real"), global_cap=sc.GLOBAL_CAP_USD["real"])
+    left = wh.step_budget(st, "run", caps=sc.caps("real"), global_cap=sc.global_cap("real"))
     assert left == pytest.approx(sc.caps("real")["run"] - 4.0)
 
 
@@ -196,7 +196,9 @@ def test_resume_skips_done_steps_and_retries_the_failed_one(offline, tmp_path, m
     st.billed_at = first.last_activity + wh.BILLING_LAG_S + 1
     wh.save_state(st, state)
     assert sc.main(["--yes-spend", "--state", str(state), "--work", work]) == 0
-    assert offline == ["report"]  # verify..deploy done before; run retried by `flaky`
+    # verify..plan done before; deploy again (the failed run stopped the app, M3) only now
+    # that the run fits; run retried by `flaky`
+    assert offline == ["deploy", "report"]
     st = wh.load_state(state)
     assert [a.status for a in st.step("run").attempts] == ["failed", "done"]
     # cumulative: the retry adds to the first attempt instead of replacing it
@@ -222,7 +224,7 @@ def test_killed_process_is_marked_and_its_apps_stopped(offline, tmp_path, monkey
     st = wh.load_state(state)
     a0 = st.step("run").attempts[0]
     assert a0.status == "killed" and a0.charged(None) == pytest.approx(0.05)
-    assert offline == ["run", "report"]
+    assert offline == ["deploy", "run", "report"]  # its app was stopped: deployed again
 
 
 def test_report_mode_rewrites_from_state_only(offline, tmp_path):
@@ -343,3 +345,201 @@ def test_criteria_verdicts():
     assert v["spend within the upper projection"] == "PASS"
     local = {x["criterion"]: x["verdict"] for x in sc.evaluate(r, "local")}
     assert local["segment: autoscaled to max_containers"] == "n.a."
+
+
+# --------------------------------------------------------------------------------------------
+# Review 11a
+
+
+def test_observed_spend_prices_each_container_at_its_own_class():
+    """M2: the orchestrator and reconcilers at the non-preemptible CPU rate, L40S workers at
+    L40S, H100 at H100 (``jobs.budget`` pinned prices); not everything at H100."""
+    from flora_deploy.jobs.budget import pinned_rates
+    from flora_deploy.modal_app import orchestrator_app as oa
+
+    r = pinned_rates()
+    rates = sc.container_rates("real")
+    cpu = r.per_second(None, 0, oa.CPU_CORES, oa.MEMORY_MIB / 1024, preemptible=False)
+    assert rates[sc.CPU_CLASS] == pytest.approx(cpu)
+    assert cpu == pytest.approx(3 * r.per_second(None, 0, oa.CPU_CORES, oa.MEMORY_MIB / 1024))
+    from flora_deploy.config.presets import get_preset
+
+    seg = get_preset("balanced").pools["segment"]
+    assert rates["segment"] == pytest.approx(
+        r.per_second("L40S", 1, seg.cpu_cores, seg.memory_gib))
+    mon = sc.Monitor(None, "app", rates)  # type: ignore[arg-type]
+    mon.containers = {"ta-orch": {"start": 0.0, "end": 3600.0},
+                      "ta-seg": {"start": 0.0, "end": 3600.0},
+                      "ta-cap": {"start": 0.0, "end": 1800.0}}
+    mon.kinds = {"ta-seg": "segment", "ta-cap": "caption"}
+    want = 3600 * cpu + 3600 * rates["segment"] + 1800 * rates["caption"]
+    assert mon.observed_usd() == pytest.approx(want)
+    assert mon.observed_usd() < 3600 * 2.5 * rates["caption"]  # the old all-H100 figure
+
+
+class _Harness:
+    """``run_run`` in real mode with every Modal / flora call faked."""
+
+    def __init__(self, monkeypatch, tmp_path, *, states=("done",), containers=None,
+                 compose_timeout=False):
+        self.calls: list[list[str]] = []
+        st = wh.State("r1", 0.0, "2026-10-22")
+        st.step("deploy").status = "done"
+        st.step("deploy").result = {"ok": True, "app_state": "deployed"}
+        self.ctx = sc.Ctx("real", st, tmp_path, tmp_path / "state.json", 0.0)
+        states = list(states)
+
+        def sh(args, *, timeout=1800, check=True):
+            self.calls.append(list(args))
+            if compose_timeout and "compose" in args:
+                raise sc.subprocess.TimeoutExpired(args, timeout)
+            return type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        self.ctx.sh = sh  # type: ignore[method-assign]
+        monkeypatch.setattr(sc, "_app_name", lambda ctx: "flora-app")
+        monkeypatch.setattr(sc, "_flora", lambda: "flora")
+        monkeypatch.setattr(sc, "_container_kinds", lambda ctx: {})
+        monkeypatch.setattr(sc.time, "sleep", lambda s: None)
+
+        def poll(mon):
+            mon.containers.update(containers or {})
+            return len(mon.containers)
+
+        def status(mon):
+            s = {"t": 0.0, "state": states.pop(0) if len(states) > 1 else states[0],
+                 "counts": {}, "spend_usd": 0.0}
+            mon.samples.append(s)
+            return s
+
+        monkeypatch.setattr(sc.Monitor, "poll_containers", poll)
+        monkeypatch.setattr(sc.Monitor, "status", status)
+        monkeypatch.setattr(sc.subprocess, "run", lambda args, **kw: type(
+            "P", (), {"returncode": 0, "stdout": "{}", "stderr": ""})())
+
+    def stopped(self) -> bool:
+        return ["modal", "app", "stop", "--yes", "flora-app"] in self.calls
+
+
+def test_cpu_containers_do_not_trip_the_cancel_rule(monkeypatch, tmp_path):
+    """M2: an hour of orchestrator + reconciler containers is cents, not an H100-hour each."""
+    cpu = {f"ta-cpu{i}": {"start": 0.0, "end": 3600.0} for i in range(4)}
+    h = _Harness(monkeypatch, tmp_path, states=("running", "done"), containers=cpu)
+    out = sc.run_run(h.ctx)
+    assert "stopped" not in out, out.get("stopped")
+    assert not any("cancel" in c for c in h.calls)
+    assert out["observed_usd"] == pytest.approx(4 * 3600 * sc.container_rates("real")["cpu"],
+                                                abs=1e-3)
+
+
+def test_a_compose_timeout_still_stops_the_app(monkeypatch, tmp_path):
+    """M4: the app (and its reconciler cron) is stopped whatever compose does."""
+    h = _Harness(monkeypatch, tmp_path, compose_timeout=True)
+    with pytest.raises(sc.subprocess.TimeoutExpired):
+        sc.run_run(h.ctx)
+    assert h.stopped()
+    assert h.ctx.st.step("deploy").result["app_state"] == "stopped"  # M3: recorded
+
+
+def test_a_retry_after_a_failed_run_redeploys_the_stopped_app(offline, tmp_path):
+    """M3: the failed run's ``finally`` ran ``modal app stop``; the retry deploys again."""
+    state = tmp_path / "state.json"
+    st = wh.load_state(state)
+    for s in ("verify", "index", "plan", "deploy"):
+        st.step(s).status = "done"
+    st.step("deploy").result = {"ok": True, "app_state": "stopped"}
+    st.step("run").status = "failed"
+    wh.save_state(st, state)
+    assert sc.main(["--yes-spend", "--state", str(state), "--work", str(tmp_path / "w")]) == 0
+    assert offline == ["deploy", "run", "report"]
+    st = wh.load_state(state)
+    assert st.step("deploy").result["app_state"] == "deployed"
+    assert len(st.step("deploy").attempts) == 1
+
+
+def test_a_run_step_that_raises_marks_the_app_stopped_and_only_run_refuses(offline, tmp_path,
+                                                                           monkeypatch):
+    def boom(ctx):
+        raise RuntimeError("client died")
+
+    monkeypatch.setitem(sc.RUNNERS, "run", boom)
+    state = tmp_path / "state.json"
+    work = str(tmp_path / "w")
+    assert sc.main(["--yes-spend", "--state", str(state), "--work", work]) == 1
+    st = wh.load_state(state)
+    assert st.step("deploy").result["app_state"] == "stopped"
+    st.billed_at = st.step("run").attempts[0].last_activity + wh.BILLING_LAG_S + 1
+    wh.save_state(st, state)
+    offline.clear()
+    monkeypatch.setitem(sc.RUNNERS, "run", lambda ctx: {"ok": True, "tracked_usd": 0.0,
+                                                        "apps": []})
+    assert sc.main(["--yes-spend", "--only", "run", "--state", str(state), "--work", work]) == 1
+    assert offline == []
+    assert "not deployed" in wh.load_state(state).step("run").notes[-1]
+
+
+def test_only_index_checks_the_dataset_pin_first(offline, tmp_path):
+    """L1: ``--only`` never spends past an unverified pin."""
+    state = tmp_path / "state.json"
+    assert sc.main(["--yes-spend", "--only", "index", "--state", str(state),
+                    "--work", str(tmp_path / "w")]) == 0
+    assert offline == ["verify", "index"]
+
+    def bad(ctx):
+        offline.append("verify")
+        return {"ok": False, "problems": ["blob differs"], "tracked_usd": 0.0, "apps": []}
+
+    offline.clear()
+    state2 = tmp_path / "state2.json"
+    sc.RUNNERS["verify"] = bad
+    assert sc.main(["--yes-spend", "--only", "index", "--state", str(state2),
+                    "--work", str(tmp_path / "w")]) == 1
+    assert offline == ["verify"]  # index never started
+
+
+def _ts(t: float) -> str:
+    return wh.time.strftime("%Y-%m-%dT%H:%M:%SZ", wh.time.gmtime(1_800_000_000.0 + t))
+
+
+def test_time_to_peak_is_measured_from_the_run_start():
+    """L2: the first container's cold start counts; a peak below max_containers is no peak."""
+    files: dict = {"attempts": [], "receipts": [], "ledgers": []}
+    cont = {}
+    for i, (cid, start) in enumerate([("a", 100), ("b", 400), ("c", 700)]):
+        files["attempts"].append({"container_id": cid, "kind": "segment", "shard_id": f"s{i}",
+                                  "started_utc": _ts(start + 60), "ended_utc": _ts(start + 900)})
+        files["receipts"].append({"container_id": cid, "kind": "segment", "shard_id": f"s{i}",
+                                  "finished_utc": _ts(start + 900), "episodes_done": []})
+        cont[cid] = {"start": 1_800_000_000.0 + start, "end": 1_800_000_000.0 + start + 960}
+    m = sc.measure(files, {}, cont, run_start=1_800_000_000.0)
+    assert m["pools"]["segment"]["time_to_peak_s"] == 700
+    assert sc.measure(files, {}, cont)["pools"]["segment"]["time_to_peak_s"] is None
+    two = {k: v for k, v in cont.items() if k != "c"}
+    files2 = {k: [x for x in v if x.get("container_id") != "c"] for k, v in files.items()}
+    m2 = sc.measure(files2, {}, two, run_start=1_800_000_000.0)
+    assert m2["pools"]["segment"]["time_to_peak_s"] is None  # never reached 3 containers
+    r = {"measure": m2, "state": "done"}
+    v = {x["criterion"]: x["verdict"] for x in sc.evaluate(r, "real")}
+    assert v["segment: time to peak"] == "FAIL"
+
+
+def test_preemption_counts_only_when_the_shard_finished_later():
+    """L3: a preempted start whose shard never got a receipt is not a recovery."""
+    files = {"attempts": [
+        {"container_id": "a", "kind": "segment", "shard_id": "s1", "started_utc": _ts(10),
+         "ended_utc": _ts(50), "preempted": True}],
+        "receipts": [], "ledgers": []}
+    m = sc.measure(files, {})
+    assert m["pools"]["segment"]["preempted_starts"] == 1
+    assert m["pools"]["segment"]["preempted_recovered"] == 0
+    r = {"measure": m, "chaos": {"preempt_segment": {}}, "state": "failed"}
+    v = {x["criterion"]: x["verdict"] for x in sc.evaluate(r, "real")}
+    assert v["segment: preemption recovered"] == "FAIL"
+    files["attempts"].append({"container_id": "b", "kind": "segment", "shard_id": "s1",
+                              "started_utc": _ts(60)})
+    files["receipts"].append({"container_id": "b", "kind": "segment", "shard_id": "s1",
+                              "finished_utc": _ts(90), "episodes_done": []})
+    m = sc.measure(files, {})
+    assert m["pools"]["segment"]["preempted_recovered"] == 1
+    v = {x["criterion"]: x["verdict"] for x in sc.evaluate({"measure": m, "chaos": {
+        "preempt_segment": {}}}, "real")}
+    assert v["segment: preemption recovered"] == "PASS"

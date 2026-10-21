@@ -1,4 +1,5 @@
-"""The ``exact`` reference stage: NVIDIA's own TempSeg -> Captioner pipeline (PLAN.md §4, §6.5).
+"""The ``exact`` reference stage: NVIDIA's own TempSeg -> Captioner pipeline (PLAN.md §2;
+PLAN-v3.md §6.5).
 
 Modal-agnostic pieces used by ``modal_app/reference_app.py`` (``docs/exact-worker.md``):
 
@@ -1451,7 +1452,7 @@ ALOHA_REPO = "lerobot/aloha_static_coffee"
 ALOHA_REVISION = "7da22eb685a613a28bcc58aa0bf7d1094578234a"  # tag v2.1 (codebase_version v2.1)
 ALOHA_LICENSE = "MIT"
 ALOHA_EPISODE = 0
-# PLAN.md §9: main=cam_high; cam_low is dropped.
+# PLAN-v3.md §9: main=cam_high; cam_low is dropped.
 ALOHA_ROLES = {"main": "cam_high", "left_wrist": "cam_left_wrist", "right_wrist": "cam_right_wrist"}
 HUMAN_COUNT = 3
 HUMAN_MIN_S, HUMAN_MAX_S = 20.0, 90.0

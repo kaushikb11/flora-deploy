@@ -15,7 +15,7 @@ Three facts shape everything below:
 
 | Caller | Stages | Latency need | Shape |
 |---|---|---|---|
-| Eval harness / RL (PLAN §2 persona) | `reward.terminal`, `reward.dense` | Seconds to minutes | Many requests, often in groups |
+| Eval harness / RL (PLAN.md §1 users) | `reward.terminal`, `reward.dense` | Seconds to minutes | Many requests, often in groups |
 | Active-learning loop | Rewards first, then segment/caption on the episodes it picks | Minutes | Async, in batches |
 | Teleop labeling UI | segment → caption (full pipeline) | Under 60 s once warm, with a visible "warming" state | One episode at a time, a human waiting |
 
@@ -42,7 +42,7 @@ JobRequest{stages, episode: {id, videos: {main, left_wrist?, right_wrist?} -> al
 - Responses carry `StageRecord.to_json()` unchanged (`records.py:85-107`), so `certified` / `uncertified_reason` travel exactly as in batch.
 - `provenance.source` is `{role: {uri: "online://<sha256>", range_s}}`.
 
-**Auth.** Use Modal proxy auth (`requires_proxy_auth=True`, with `Modal-Key`/`Modal-Secret` headers) on the gateway, and never ship a public mode. On top of that, keep a token → quota table in a `modal.Dict` for our own rate limits (PLAN §1.3: Modal's own concurrency cap is not a rate limit).
+**Auth.** Use Modal proxy auth (`requires_proxy_auth=True`, with `Modal-Key`/`Modal-Secret` headers) on the gateway, and never ship a public mode. On top of that, keep a token → quota table in a `modal.Dict` for our own rate limits (archive/PLAN-v3.md §1.3: Modal's own concurrency cap is not a rate limit).
 
 **Idempotency.** `request_key = sha256(stages, per-file content sha256, range, task, embodiment, profile, options, stage hash / cert_key of the serving stack)`.
 - Finished results are cached at `flora/online/<deployment>/results/<key>.json` in the user's bucket. `Idempotency-Key` maps to a `job_id` in the Dict.
@@ -78,8 +78,8 @@ JobRequest{stages, episode: {id, videos: {main, left_wrist?, right_wrist?} -> al
 
 **Video upload:**
 - Never send video bodies through the web endpoint. `POST /v1/uploads` returns presigned PUTs to `<bucket>/flora/online/uploads/<sha256>.mp4` (the user's bucket is the state of record, D6). The no-bucket fallback is `modal volume put` to `flora-online`.
-- Requests may only name keys under the configured prefixes. There is no arbitrary fetch (PLAN P3).
-- Limits: 256 MiB per file (NVIDIA's envelope cap, PLAN:91), a configurable duration cap (default 300 s), and three cameras at most.
+- Requests may only name keys under the configured prefixes. There is no arbitrary fetch (archive/PLAN-v3.md P3).
+- Limits: 256 MiB per file (NVIDIA's envelope cap, archive/PLAN-v3.md §1.1), a configurable duration cap (default 300 s), and three cameras at most.
 
 **Cold starts:**
 - Measured: Rewarder 229 s with a warm compile cache and prefetch, 318 s cold. Balanced is projected at about 130 s (`planner/rates.json` startup).
@@ -119,10 +119,10 @@ Conditions:
 
 | Service | Pool | $/h idle |
 |---|---|---|
-| Segment | L40S, 6 cores, 48 GiB | ≈ $2.61 |
-| Caption | H100!, 8 cores, 64 GiB | ≈ $4.84 |
+| Segment | L40S, 8 cores, 48 GiB | ≈ $2.71 |
+| Caption | H100!, 8 cores, 96 GiB | ≈ $5.10 |
 | Reward | H100!, 8 cores, 80 GiB | ≈ $4.97 |
-| **All three warm** | | **≈ $12.4/h (≈ $300/day)** |
+| **All three warm** | | **≈ $12.8/h (≈ $307/day)** |
 
 **Marginal cost per 60 s episode** (placeholder or measured rates): segment ≈ $0.02, caption ≈ $0.08, terminal ≈ $0.005, dense ≈ $0.014.
 

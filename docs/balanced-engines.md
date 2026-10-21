@@ -163,8 +163,10 @@ Notes:
 - The startup recipe follows `docs/cold-start.md`: a t=0 `warm.start_prefetch`, plus
   `VLLM_CACHE_ROOT`, `TRITON_CACHE_DIR`, `CUDA_CACHE_PATH` and `XDG_CACHE_HOME` under
   `flora-cache:/balanced/<kind>[-dtbias]/`.
-- Container memory is 48 GiB for TempSeg on L40S (19 GB weights) and 96 GiB for the Captioner on
-  H100 (55 GB weights).
+- Container shapes, the same in `balanced_lab` and in the deployed pools
+  (`config/presets.py`): TempSeg on L40S with 8 cores, 48 GiB (19 GB weights); the Captioner on
+  H100 with 8 cores, 96 GiB (55 GB weights, hashed in full while vLLM loads). The memory limit
+  is 1.25x the request (`factory.MEMORY_LIMIT_FACTOR`). The planner prices these shapes.
 
 **`dt_bias` FP32 plugin** (`engines/patches/dt_bias_fp32.py`): it is **off by default**. It acts
 only when both of these hold:

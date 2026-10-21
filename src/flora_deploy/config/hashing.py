@@ -31,7 +31,8 @@ Per shard kind:
 - the stages it produces in this job; its logic-group digest (``config/logic.py``);
 - ``modes``: the output-affecting run modes of that kind (review 4): ``determinism`` for the
   NVIDIA HF worker (``segcap``; D-1 "deterministic" is a different reference) and
-  ``terminal_mode`` for ``reward.terminal`` (score only, NVIDIA's default, or with rationale);
+  ``terminal_mode`` for ``reward.terminal`` (score only, NVIDIA's default, or with rationale)
+  and ``rubric`` for ``reward.rubric`` (``pipeline.rubric``: robot, cameras, steps);
 - engine name, versions, patches, engine args (for vLLM video engines incl. the Gate C-required
   ``mm_processor_cache_gb=0``), sampling, mm_kwargs, and the ``image_fingerprint()`` of its image;
   for the balanced vLLM video kinds also the worker's full ``EngineSpec.hashed()`` on the
@@ -76,7 +77,7 @@ from flora_deploy.config.pins import PINS_BY_KEY, RUNTIME
 from flora_deploy.config.presets import EngineIdentity, get_preset, shard_kinds_for
 
 HASH_SCHEMA = "flora-config-hash/v3"  # v3: per-kind ``modes``, input ``content``
-IMAGE_ARCH = "x86_64"  # every Modal image is x86_64 (PLAN.md §7)
+IMAGE_ARCH = "x86_64"  # every Modal image is x86_64 (PLAN-v3.md §7)
 
 # Shard kind -> the shard kinds whose outputs it consumes (``jobs.manifest``).
 KIND_DEPENDS_ON: dict[str, tuple[str, ...]] = {"caption": ("segment",)}
@@ -175,6 +176,10 @@ def kind_modes(cfg, kind: str) -> dict[str, Any]:
     if kind == "reward.terminal":
         modes["terminal_mode"] = ("terminal_rationale" if cfg.pipeline.terminal_rationale
                                   else "terminal")
+    if kind == "reward.rubric":  # NVIDIA's rubric job fields: the prompt (stages.rubric)
+        from flora_deploy.config.schema import rubric_spec
+
+        modes["rubric"] = rubric_spec(cfg)
     return modes
 
 

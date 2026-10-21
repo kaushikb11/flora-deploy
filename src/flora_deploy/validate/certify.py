@@ -1,4 +1,4 @@
-"""Gate certificate generator (PLAN.md §9, D9, D16): ``balanced`` vs ``exact``, within noise.
+"""Gate certificate generator (PLAN.md §4, D9, D16): ``balanced`` vs ``exact``, within noise.
 
 Inputs, all ``flora_labels_v1`` records (JSONL):
 
@@ -104,7 +104,7 @@ class CertifyRefused(CertifyError):
 class Thresholds:
     """The pass-rule knobs, bounded by ``certkey.POLICY`` (out of bounds: ``CertifyError``)."""
 
-    tolerance: float = 1.5  # PLAN.md §9: <= 1.5x oracle noise
+    tolerance: float = 1.5  # PLAN.md §4: <= 1.5x oracle noise
     min_samples: int = MIN_SAMPLES_FLOOR  # balanced-vs-exact episodes per (stage, pool)
     min_noise_samples: int = MIN_NOISE_SAMPLES_FLOOR  # exact-vs-exact episodes per stage
     min_coverage: float = 1.0  # share of exact episodes the balanced run labelled

@@ -82,7 +82,8 @@ from flora_deploy.local.faults import FaultPlan, maybe_fail, note_episodes
 from flora_deploy.local.spawner import FileKV, LocalSpawner
 
 FAKE_RECEIPT = "flora-local-fake-models"
-SUPPORTED_KINDS = ("segcap", "segment", "caption", "reward.terminal", "reward.dense")
+SUPPORTED_KINDS = ("segcap", "segment", "caption", "reward.terminal", "reward.dense",
+                   "reward.rubric")
 LOCAL_DIR = ".flora-local"  # under the store root, outside the job tree (``flora/``)
 STATES = ("done", "completed_with_errors", "failed", "budget_stopped", "cancelled",
           "interrupted", "lease_held")
@@ -337,7 +338,7 @@ class LocalRunner:
             raise LocalRunError(f"the local fake runner has no engine for shard kind(s) "
                                 f"{unsupported} (supported: {', '.join(SUPPORTED_KINDS)}; use "
                                 "preset exact or balanced and stages segment/caption/"
-                                "reward.terminal/reward.dense)")
+                                "reward.terminal/reward.dense/reward.rubric)")
         self.budget_usd = budget_usd
         n = sum(p.max_containers * p.max_inputs for p in cfg.pools().values())
         self.max_workers = max_workers or 2 * n + 2
@@ -496,12 +497,15 @@ class LocalRunner:
             s = CS.with_stamps(s, cenv, fake=True)
             return SegcapShardRunner(store, FakeSegcapEngine(), s, call_id=call_id,
                                      fatal=_container_exit)
+        from flora_deploy.config.schema import rubric_spec
+
+        rubric = rubric_spec(cfg) if kind == "reward.rubric" else None
         s = RewardWorkerSettings(
             terminal_mode=output_settings(cfg)["terminal_mode"], preset=cfg.preset,
             models=FAKE_MODELS["reward"], gpu=pool.gpu, certificate=FAKE_CERTIFICATE,
             config_extra={"fake_models": FAKE_RECEIPT}, decoder="inline", workers=1,
             envelope=cfg.pipeline.envelope, default_task=instr.text, media_root=media,
-            local_dir=local_dir, container_id=container_id)
+            local_dir=local_dir, container_id=container_id, rubric=rubric)
         s = CS.with_stamps(s, cenv, fake=True)
         runner = RewardShardRunner(store, RewardEngine(FakeLLM(), "fake-processor"), self.nv, s,
                                    call_id=call_id, fatal=_container_exit)  # as workers_app

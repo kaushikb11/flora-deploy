@@ -64,7 +64,7 @@ class StreamIndex:
 
 @dataclass(frozen=True)
 class EnvelopeVerdict:
-    """NVIDIA's validated operating envelope, evaluated per episode (PLAN.md §1.1, D13)."""
+    """NVIDIA's validated operating envelope, evaluated per episode (PLAN.md D13; PLAN-v3 §1.1)."""
 
     ok: bool
     reasons: tuple[str, ...] = ()  # machine-readable, e.g. "duration_gt_120s", "not_cfr"

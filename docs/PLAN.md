@@ -45,7 +45,7 @@ internal milestones only.
 ### Presets (`config/presets.py`)
 | Preset | Status | Engines | Default pools | Use |
 |---|---|---|---|---|
-| **`balanced`** | **the product**; uncertified until P1b-2 | vLLM 0.24.0 offline `LLM` + micro-batcher (TempSeg merged FP32→BF16, Captioner BF16); Rewarder on NVIDIA's own vLLM recipe | `segment` L40S (6 cores, 48 GiB) · `caption` H100! (8, 64 GiB) · rewards H100! (8, 80 GiB) | all labeling |
+| **`balanced`** | **the product**; uncertified until P1b-2 | vLLM 0.24.0 offline `LLM` + micro-batcher (TempSeg merged FP32→BF16, Captioner BF16); Rewarder on NVIDIA's own vLLM recipe | `segment` L40S (8 cores, 48 GiB) · `caption` H100! (8, 96 GiB) · rewards H100! (8, 80 GiB) | all labeling |
 | `exact` | the certification reference | NVIDIA's HF code via `CachedSession`, OPT-1/OPT-2 identity-proven patches | `segcap` H200 (8 cores, 96 GiB) · rewards H100! | oracle and noise runs for certification; gold labels |
 | `budget` | declared, not available | FP8 / B200 kernels | — | P4 |
 | `interactive` | declared, not available | AsyncLLM servers | — | §9 step 5 |
@@ -181,8 +181,8 @@ GiB-hour; live `billing.rates()` when available). Container time per video-secon
 | `exact` segcap, longest-first | H200, 8 cores, 96 GiB ($5.69/h) | 6.4 | measured (P1a-5s, one 6-episode shard) | **$36.4** |
 | `exact` segcap, plan order | same | 7.0 | measured + model | ≈ $40 |
 | `exact`, long-lived warm containers, c=8 | same | ≈ 2.5 | projected (needs a GPU measurement) | ≈ $14 |
-| `balanced` segment | L40S, 6 cores, 48 GiB ($2.62/h) | 0.5 | **placeholder, ±100%** | ≈ $1.3 |
-| `balanced` caption | H100!, 8 cores, 64 GiB ($4.84/h) | 1.0 | **placeholder, ±100%** | ≈ $4.8 |
+| `balanced` segment | L40S, 8 cores, 48 GiB ($2.71/h) | 0.5 | **placeholder, ±100%** | ≈ $1.4 |
+| `balanced` caption | H100!, 8 cores, 96 GiB ($5.10/h) | 1.0 | **placeholder, ±100%** | ≈ $5.1 |
 | `reward.terminal` | H100!, 8 cores, 80 GiB ($4.97/h) | 0.055 | measured (WS-H, 3 samples) | ≈ $0.27 |
 | `reward.dense` | same | 0.165 | measured (WS-H, 3 samples) | ≈ $0.82 |
 

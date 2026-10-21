@@ -120,8 +120,10 @@ def _build() -> dict[str, PresetSpec]:
         available=True,
         stage_kinds={"segment": "segment", "caption": "caption", **reward_stage_kinds},
         pools={
-            "segment": PoolSettings(gpu="L40S", cpu_cores=6.0, memory_gib=48.0),
-            "caption": PoolSettings(gpu="H100!", cpu_cores=8.0, memory_gib=64.0),
+            # the shapes balanced_lab validated (review 10 M2): TempSeg L40S 8 cores 48 GiB,
+            # Captioner H100 8 cores 96 GiB (55 GB weights hashed in full while vLLM loads)
+            "segment": PoolSettings(gpu="L40S", cpu_cores=8.0, memory_gib=48.0),
+            "caption": PoolSettings(gpu="H100!", cpu_cores=8.0, memory_gib=96.0),
             **_REWARDS,
         },
         engines={"segment": vllm, "caption": vllm, **reward_engines},

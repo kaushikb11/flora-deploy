@@ -143,7 +143,12 @@ def test_preempt_oom_poison_bisection_and_episode_errors(demo, clean, tmp_path):
     assert s["errors"]["by_kind"] == {"nv_failure": 1, "poison_pill": 2}
     assert res.counts("bisected") == 1 and res.counts("poisoned") == 1
     assert res.counts("call_expired") == 1 and res.counts("spawn_error") == 1
-    assert res.spawner["preemptions"] == 1 and res.spawner["crashes"] >= 6
+    # D15 needs K counted starts per shard (the parent, then its ep003 child), but the K-th
+    # start can be cancelled by the quarantine before it reaches ep003 and crashes, so the crash
+    # count is >= 2 x (K - 1), not 2 x K: timing-dependent under xdist load (as Fix-8a). The
+    # start markers are the deterministic count.
+    k = 3  # local_demo.yaml retries.max_starts_before_quarantine
+    assert res.spawner["preemptions"] == 1 and res.spawner["crashes"] >= 2 * (k - 1)
     # its batch-mate ep002 finished before the crash and was kept, not redone
     bis = next(e for e in res.events if e["event"] == "bisected")
     assert bis["children"] == [f"segcap-ep-{uid3}"] and len(bis["done"]) == 1
@@ -153,6 +158,9 @@ def test_preempt_oom_poison_bisection_and_episode_errors(demo, clean, tmp_path):
     marks = A.markers(jf, "segcap", seg0)
     assert any(m.preempted for m in marks)
     assert A.counted_starts(jf, "segcap", seg0) == len(marks) - 1 == 1
+    parent = next(e["shard_id"] for e in res.events if e["event"] == "bisected")
+    assert A.counted_starts(jf, "segcap", parent) >= k  # quarantined only after K starts
+    assert A.counted_starts(jf, "segcap", f"segcap-ep-{uid3}") >= k  # then poison-pilled
     same_as_clean(res, clean, missing={(uid3, "segment"), (uid3, "caption"),
                                        (uid5, "reward.dense")})
 
@@ -295,13 +303,17 @@ def test_cli_refuses_what_local_mode_cannot_do(tmp_path):
     assert missing.exit_code == 2 and "--sample-data" in missing.output
 
 
-def test_unsupported_kinds_and_states(tmp_path):
+def test_unsupported_kinds_and_states(tmp_path, monkeypatch):
+    import flora_deploy.local.runner as LR
+
     text = TEMPLATE.read_text().replace("stages: [segment, caption, reward.terminal, "
-                                        "reward.dense]", "stages: [reward.rubric]")
+                                        "reward.dense]", "stages: [reward.terminal]")
     text = text.split("resources:")[0] + "output:" + text.split("output:")[1]
     (tmp_path / "flora.yaml").write_text(text)
+    monkeypatch.setattr(LR, "SUPPORTED_KINDS", ("segcap",))  # every kind has a fake engine now
     with pytest.raises(LocalRunError, match="no engine"):
         LocalRunner(tmp_path / "flora.yaml")
+    monkeypatch.undo()
     with pytest.raises(LocalRunError, match="fake-models"):
         LocalRunner(TEMPLATE, fake_models=False)
     # the orchestrator's verdict, downgraded only by compose's own rate guard (review 6 H2)

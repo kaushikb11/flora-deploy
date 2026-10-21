@@ -1,4 +1,4 @@
-"""Manifest planning (PLAN.md §8 "Planning"): episode index receipts + ``RunSettings`` → shards.
+"""Manifest planning (PLAN.md §2 "plan"): episode index receipts + ``RunSettings`` → shards.
 
 * Every episode gets ``episode_uid(dataset, episode_id)``; duplicate uids are an error.
 * Envelope policy (D13): ``enforce`` drops out-of-envelope episodes from the manifest; ``warn``

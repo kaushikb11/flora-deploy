@@ -28,7 +28,12 @@ from flora_deploy.media.sources.base import (
     resolve_camera_map,
     task_text,
 )
-from flora_deploy.media.sources.lerobot_v21 import load_info, video_keys
+from flora_deploy.media.sources.lerobot_v21 import (
+    check_camera_keys,
+    load_info,
+    video_keys,
+    video_ref,
+)
 from flora_deploy.media.types import SourceRef
 
 DEFAULT_VIDEO_PATH = "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
@@ -46,6 +51,7 @@ class LeRobotV3Source:
         if not self.template:
             raise SourceError(f"{self.root}: dataset stores no videos (video_path is null)")
         self.roles = resolve_camera_map(video_keys(self.info), camera_map)
+        check_camera_keys(self.root, self.roles)
         self.name = name or self.root.name
 
     def _columns(self) -> list[str]:
@@ -94,10 +100,9 @@ class LeRobotV3Source:
                 nulls = [c for c in cols + ts if row[c] is None]
                 if nulls:
                     raise SourceError(f"episode {e}: null values in {nulls}")
-                rel = self.template.format(
-                    video_key=key, chunk_index=int(row[cols[0]]), file_index=int(row[cols[1]])
-                )
-                cams[role] = SourceRef(str(self.root / rel), float(row[ts[0]]), float(row[ts[1]]))
+                uri = video_ref(self.root, self.template, video_key=key,
+                                chunk_index=int(row[cols[0]]), file_index=int(row[cols[1]]))
+                cams[role] = SourceRef(uri, float(row[ts[0]]), float(row[ts[1]]))
             out.append(
                 EpisodeRef(
                     episode_id=f"episode_{e:06d}",

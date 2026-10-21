@@ -1,4 +1,4 @@
-"""The ``flora index`` job (PLAN.md §8 "index", D7, D13): dataset -> per-episode index receipts.
+"""The ``flora index`` job (PLAN.md §2 "index", D7, D13): dataset -> per-episode index receipts.
 
 Modal-agnostic. ``modal_app/index_app.py`` runs the same three steps on CPU containers and
 ``flora index --local`` runs them in-process:
@@ -214,9 +214,10 @@ def episode_to_dict(ep: Any, root: Path) -> dict:
 
 
 def episode_from_dict(d: Mapping[str, Any], root: Path):
+    from flora_deploy.media.safepath import contain
     from flora_deploy.media.sources import EpisodeRef as SourceEpisode
 
-    cams = {role: SourceRef(str(Path(root) / rel), s, e)
+    cams = {role: SourceRef(str(contain(root, rel)), s, e)
             for role, (rel, s, e) in d["cameras"].items()}
     return SourceEpisode(episode_id=d["episode_id"], cameras=cams, task=d.get("task"),
                          extra=dict(d.get("extra") or {}))
@@ -253,7 +254,9 @@ class LocalFiles(DatasetFiles):
                 .list_episodes()]
 
     def ensure(self, rel: str) -> Path:
-        return self.root / rel  # verify_episode reports a missing file
+        from flora_deploy.media.safepath import contain
+
+        return contain(self.root, rel)  # verify_episode reports a missing file
 
     def revision(self) -> str:
         """Digest of the metadata contents and every other file's (path, size)."""
@@ -311,13 +314,14 @@ class HubFiles(DatasetFiles):
     def _list_mp4_dir(self) -> list[dict]:
         """Mp4DirSource reads names only: run it over a skeleton of empty files (task ``.txt``
         files are fetched for real), then map the paths back to the dataset root."""
+        from flora_deploy.media.safepath import contain
         from flora_deploy.media.sources.mp4_dir import VIDEO_SUFFIXES
 
         skel = self.mirror.local.parent / f"{self.spec.key}.skeleton"
         shutil.rmtree(skel, ignore_errors=True)
         for path in self.hub.list_files(self.spec.repo, self.spec.revision, self.mirror.sub):
             rel = self._sub(path)
-            dest = skel / rel
+            dest = contain(skel, rel)
             dest.parent.mkdir(parents=True, exist_ok=True)
             if Path(rel).suffix.lower() in VIDEO_SUFFIXES:
                 dest.touch()

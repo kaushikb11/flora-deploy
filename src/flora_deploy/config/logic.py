@@ -68,6 +68,8 @@ OUTPUT_MODULES: dict[str, tuple[str, ...]] = {
         "media/index.py",
         "media/rangedecode.py",
         "media/cuts.py",
+        "media/avsafe.py",  # which inputs the decoder opens (format/protocol whitelists)
+        "media/safepath.py",  # which dataset files a template or uri may name
         "media/sources/__init__.py",
         "media/sources/base.py",
         "media/sources/lerobot_v21.py",
@@ -96,6 +98,9 @@ OUTPUT_MODULES: dict[str, tuple[str, ...]] = {
         "modal_app/reference_app.py",
         "modal_app/warm.py",  # build_linked_layout: which weight files NVIDIA's loader sees
         "workers_impl/segcap.py",  # segcap records, certification, provenance (P1a-5s)
+        # ShardPartSink (stage-hash + cert stamp on every record), VideoResolver (which file /
+        # cut NVIDIA reads), the input-retry rules: shared by every worker kind
+        "workers_impl/reward.py",
         # G3 split TempSeg/Captioner steps (proof only, unwired); conservative
         "workers_impl/exact_split.py",
     ),
@@ -115,6 +120,9 @@ OUTPUT_MODULES: dict[str, tuple[str, ...]] = {
         "workers_impl/segment.py",  # index-receipt -> NVIDIA arguments (profile, instruction)
         "workers_impl/caption.py",  # upstream segment records -> caption inputs
         "workers_impl/balanced.py",  # accel episode scopes + record stamping around the jobs
+        # classify_input_error (via segment.py): which input failures are excused (nv_failure)
+        "workers_impl/segcap.py",
+        "workers_impl/reward.py",  # ShardPartSink, VideoResolver (as for nvidia-hf)
         "modal_app/balanced_app.py",  # derived weights, engine spec on the pool GPU, accel
     ),
     # NVIDIA's offline vLLM Rewarder recipe, and the worker that feeds it: camera order of the
@@ -131,6 +139,22 @@ OUTPUT_MODULES: dict[str, tuple[str, ...]] = {
         "modal_app/workers_app.py",
         "modal_app/warm.py",  # build_linked_layout: which weight files the engine loads
     ),
+    # NVIDIA's rubric recipe (TP=2, 9 samples, medoid) in its own group, so a rubric change does
+    # not invalidate finished terminal / dense shards. It runs inside the reward worker (same
+    # runner, sink, index-receipt inputs and NVIDIA's Rewarder family), and the failure
+    # classifier decides which episodes are excused.
+    "rubric": (
+        "stages/__init__.py",
+        "stages/reward.py",  # Episode, certification, part sinks, prefix-cache reset
+        "stages/rubric.py",
+        "workers_impl/__init__.py",
+        "workers_impl/reward.py",
+        "jobs/manifest.py",
+        "modal_app/rewarder_app.py",
+        "modal_app/workers_app.py",
+        "modal_app/warm.py",
+        "nv/errors.py",
+    ),
 }
 
 # Logic group of each shard kind (on top of ``common``).
@@ -140,7 +164,7 @@ KIND_GROUPS: dict[str, str] = {
     "caption": "vllm-video",
     "reward.terminal": "reward",
     "reward.dense": "reward",
-    "reward.rubric": "reward",
+    "reward.rubric": "rubric",
 }
 
 # Reviewed and judged not to change outputs (or hashed by value elsewhere in the document).
@@ -158,6 +182,7 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     "cli/certify.py",
     "cli/deploy.py",
     "cli/doctor.py",  # preflight checks; metadata calls only
+    "cli/export.py",  # `flora export`: copies composed records into a dataset copy
     "cli/index.py",
     "cli/init.py",
     "cli/logs.py",
@@ -176,11 +201,14 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     # export: rebuilt from the parts on every export, never mixed into stored results
     "export/__init__.py",
     "export/compose.py",
+    "export/hub.py",  # dataset card and Hub upload of an export
+    "export/lerobot.py",  # writes composed records into a copy of the source dataset
     "export/results.py",
     # jobs: orchestration (which shard runs where, when, how often), not what a shard computes
     "jobs/__init__.py",
     "jobs/attempts.py",
     "jobs/budget.py",
+    "jobs/containers.py",  # per-container facts for reports, from markers / receipts / ledgers
     "jobs/deps.py",
     "jobs/driver.py",  # per-tick driver (refresh, transient retry), shared Modal/local
     "jobs/orchestrator.py",
@@ -220,6 +248,7 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     "modal_app/orchestrator_app.py",
     "modal_app/perf_lab.py",
     "modal_app/prep_app.py",
+    "modal_app/smoke_app.py",  # CPU image smoke (checks only, writes nothing)
     "observe/__init__.py",
     "observe/aggregate.py",  # statistics over events
     "observe/sampler.py",  # resource sampling

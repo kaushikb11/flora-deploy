@@ -1,4 +1,4 @@
-"""Job-system contracts (PLAN.md §8, D6, D15). Owned by P1a-2/P1a-3; changes need review.
+"""Job-system contracts (PLAN.md §2, D6, D15). Owned by P1a-2/P1a-3; changes need review.
 
 All job state is files in a ``Store`` (the user's bucket by default). Status is always *derived*
 from these files; nothing here is held only in memory or in Modal Queue/Dict.
@@ -32,12 +32,12 @@ ShardKind = Literal["segment", "caption", "segcap", "reward.terminal", "reward.d
 
 MAX_STARTS_BEFORE_QUARANTINE = 3  # D15
 
-_SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
+_SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}\Z")
 
 
 def safe_key(value: str) -> str:
     """Validate a path component (shard ids, uids, container ids). Raises ValueError."""
-    if not _SAFE.match(value) or ".." in value:
+    if not _SAFE.fullmatch(value) or ".." in value:
         raise ValueError(f"unsafe key {value!r}: use [A-Za-z0-9._-], max 200 chars")
     return value
 

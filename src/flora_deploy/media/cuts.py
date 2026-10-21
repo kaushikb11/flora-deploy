@@ -25,6 +25,7 @@ from pathlib import Path
 
 import av
 
+from flora_deploy.media.avsafe import open_input
 from flora_deploy.media.index import (
     MediaError,
     NotKeyframeAligned,
@@ -58,7 +59,7 @@ def stream_copy_cut(source: SourceRef, dest: Path, *, scan: StreamScan | None = 
     try:
         for seek in (first > 0, False):
             written = 0
-            with av.open(scan.path) as ic:
+            with open_input(scan.path) as ic:
                 ist = ic.streams[scan.stream_index]
                 packets = demux_range(ic, ist, scan, first, last, seek=seek)
                 try:

@@ -16,6 +16,10 @@ error isolation, NVIDIA's request grouping) is the production code:
   generation and NVIDIA's parsers/stitcher are fakes. ``stages.reward.sampling_params`` imports
   ``vllm``; when it is not installed, :func:`vllm_shim` puts a two-class stand-in into
   ``sys.modules`` for the duration of the run (it is removed afterwards).
+* **reward.rubric** → the same fake family adds NVIDIA's rubric interface (``core.rubric_*``,
+  ``split_thinking`` / ``parse_rubric`` / ``medoid``, a ``rubric_reward`` module with
+  ``base_parser`` / ``main`` / ``video_inputs``) under the real ``stages.rubric.run``; the
+  fake LLM answers ``n`` samples per request, some of them unparseable.
 
 Outputs are pure functions of the decoded video frames (sha256 over the decoded RGB arrays) plus
 the instruction/task, so a re-run, a preempted-and-restarted shard or a bisection child yields
@@ -29,8 +33,11 @@ so fake outputs can never mix with real ones in one store.
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import hashlib
+import json
+import re
 import sys
 import threading
 import types
@@ -85,7 +92,7 @@ def decode(path: str) -> Decoded:
     """Every frame of the first video stream (PyAV), cached by (path, size, mtime)."""
     import os
 
-    import av
+    from flora_deploy.media.avsafe import open_input
 
     st = os.stat(path)
     key = (path, st.st_size, st.st_mtime_ns)
@@ -94,7 +101,7 @@ def decode(path: str) -> Decoded:
         if hit is not None:
             _CACHE.move_to_end(key)
             return hit
-    with av.open(path) as c:
+    with open_input(path) as c:
         s = c.streams.video[0]
         rate = s.average_rate or s.guessed_rate or 30
         frames = [f.to_ndarray(format="rgb24") for f in c.decode(s)]
@@ -323,11 +330,130 @@ def fake_rewarder_family(registry: EpisodeRegistry | None = None) -> SimpleNames
                 "invalid_clips": sum(not a.valid for a in answers), "trim": trim}
 
     engine = SimpleNamespace(
-        render=lambda proc, messages, thinking=False: f"{proc}|{messages}|thinking={thinking}",
+        render=lambda proc, messages, thinking=False, vision_ids=False:
+        f"{proc}|{messages}|thinking={thinking}|vision_ids={vision_ids}",
         COLLAGE_VIDEO_SIZE={"shortest_edge": 48, "longest_edge": 192})
+    _add_fake_rubric(core)
     return SimpleNamespace(core=core, engine=engine,
                            dense_reward=SimpleNamespace(summarize=summarize),
+                           rubric_reward=_fake_rubric_module(registry),
                            pool_initializer=lambda: {})
+
+
+RUBRIC_ALLOWED = "ALLOWED="  # the fake prompt carries each step's allowed values (JSON)
+
+
+def _add_fake_rubric(core: SimpleNamespace) -> None:
+    """NVIDIA's rubric functions (``core.rubric_header`` ... ``medoid``), same signatures."""
+
+    def steps(rubric):
+        out = []
+        for item in rubric:
+            points = [float(g["points"]) for g in item["grading"]]
+            if not points:
+                raise NvidiaValueError("every rubric step needs at least one allowed value")
+            out.append({"action": str(item["action"]),
+                        "max_score": float(item.get("max_score", max(points))),
+                        "points": points})
+        if not out:
+            raise NvidiaValueError("the rubric has no steps")
+        return out
+
+    def rubric_header(robot, cameras):
+        if not 1 <= len(cameras) <= 4:
+            raise NvidiaValueError("1 to 4 camera videos are supported")
+        return f"[fake header: {robot}; {', '.join(cameras)}]\n\n"
+
+    def rubric_prompt(task, rubric, header, task_name=None):
+        allowed = json.dumps([s["points"] for s in steps(rubric)])
+        return f"{header}Task: {task_name or task}\n{RUBRIC_ALLOWED}{allowed}\n"
+
+    def rubric_messages(prompt, video_paths, fps=2.0, max_frames=166):
+        content = [{"type": "video", "video": str(p), "fps": fps, "max_frames": max_frames}
+                   for p in video_paths]
+        content.append({"type": "text", "text": prompt})
+        return [{"role": "user", "kind": "rubric", "content": content}]
+
+    def split_thinking(text):
+        before, closed, after = text.partition("</think>")
+        if not closed:
+            return "", before.replace("<think>", "", 1).strip() or None
+        return after.strip(), before.replace("<think>", "", 1).strip() or None
+
+    def parse_rubric(answer, rubric):
+        st = steps(rubric)
+        m = re.search(r"ANSWER:\s*(\[[^\]]*\])", answer or "")
+        values = None
+        if m:
+            try:
+                values = [float(v) for v in json.loads(m.group(1))]
+            except (ValueError, TypeError):
+                values = None
+        ok = values is not None and len(values) == len(st)
+        vals = list(values or []) + [0.0] * len(st)
+        return [min(max(0.0, vals[i]), st[i]["max_score"]) for i in range(len(st))], ok
+
+    def medoid(vectors):
+        if not vectors:
+            raise NvidiaValueError("no parsed rubric answers")
+        return min(range(len(vectors)), key=lambda i: (sum(
+            sum(abs(x - y) for x, y in zip(vectors[i], o, strict=False)) for o in vectors), i))
+
+    core.RUBRIC_FPS, core.RUBRIC_MAX_FRAMES = 2.0, 8
+    core.rubric_header, core.rubric_prompt = rubric_header, rubric_prompt
+    core.rubric_messages, core.split_thinking = rubric_messages, split_thinking
+    core.parse_rubric, core.medoid = parse_rubric, medoid
+
+
+def _fake_rubric_module(registry: EpisodeRegistry) -> SimpleNamespace:
+    """NVIDIA's ``rubric_reward`` module interface: ``base_parser`` / ``main`` (only argument
+    parsing: ``stages.rubric.nvidia_recipe`` reads the defaults through it) and
+    ``video_inputs(messages)`` (one ``(frames, metadata)`` per camera, fake-decoded)."""
+    mod = SimpleNamespace()
+
+    def base_parser(description, *, tensor_parallel_size=1):
+        p = argparse.ArgumentParser(description=description)
+        for flag in ("--jobs", "--output", "--model"):
+            p.add_argument(flag)
+        p.add_argument("--tensor-parallel-size", type=int, default=tensor_parallel_size)
+        p.add_argument("--gpu-memory-utilization", type=float, default=0.88)
+        p.add_argument("--max-num-seqs", type=int, default=8)
+        p.add_argument("--seed", type=int, default=0)
+        return p
+
+    def main(argv=None):
+        p = mod.base_parser("fake rubric", tensor_parallel_size=2)
+        p.add_argument("--num-samples", type=int, default=9)
+        p.add_argument("--fps", type=float, default=2.0)
+        p.add_argument("--max-frames", type=int, default=8)
+        p.add_argument("--temperature", type=float, default=1.0)
+        p.add_argument("--max-new-tokens", type=int, default=64)
+        p.add_argument("--max-model-len", type=int, default=4096)
+        p.add_argument("--max-num-batched-tokens", type=int, default=1024)
+        p.set_defaults(gpu_memory_utilization=0.85)
+        p.parse_args(argv)
+        return 0
+
+    def video_inputs(messages):
+        videos = [c for c in messages[-1]["content"] if c.get("type") == "video"]
+        paths = [v["video"] for v in videos]
+        uid = registry.uid(paths) or "|".join(paths)
+        checkpoint(uid)
+        if nv_rejects(uid):
+            raise FakeNvidiaInputError(f"{paths[0]}: fake decoder rejected the video")
+        out = []
+        for v in videos:
+            d = decode(v["video"])
+            step = max(int(round(d.fps / float(v["fps"]))), 1)
+            idx = list(range(0, d.num_frames, step))[: int(v["max_frames"])]
+            out.append((d.frames[idx], {"fps": d.fps / step, "frames_indices": idx,
+                                        "total_num_frames": d.num_frames,
+                                        "duration": d.duration_s, "do_sample_frames": False}))
+        return out
+
+    mod.base_parser, mod.main, mod.video_inputs = base_parser, main, video_inputs
+    mod.load_llm = lambda *a, **kw: FakeLLM()
+    return mod
 
 
 class _Tokenizer:
@@ -362,11 +488,32 @@ class FakeLLM:
               alt: SimpleNamespace(logprob=-1.5 - (d % 5) / 10)}
         return text, [score], [lp]
 
+    def _rubric(self, prompt: str, videos: list, n: int) -> SimpleNamespace:
+        """``n`` samples; every 4th (by content) stops inside its thinking (unparseable)."""
+        m = re.search(re.escape(RUBRIC_ALLOWED) + r"(\[\[.*?\]\])", prompt)
+        allowed = json.loads(m.group(1)) if m else [[0.0]]
+        d = _h(prompt, *(_digest_frames(f) for f, _m in videos))
+        outs = []
+        for i in range(n):
+            if _h(d, i) % 4 == 0:
+                text, reason = f"<think>fake trace {i} cut off", "length"
+            else:
+                pick = [vals[_h(d, i, j) % len(vals)] for j, vals in enumerate(allowed)]
+                text, reason = f"<think>fake trace {i}</think>\nANSWER: {json.dumps(pick)}", "stop"
+            outs.append(SimpleNamespace(text=text, token_ids=[0] * (8 + i), logprobs=None,
+                                        finish_reason=reason))
+        return SimpleNamespace(prompt=prompt, prompt_token_ids=[0] * (len(prompt) // 4),
+                               outputs=outs)
+
     def generate(self, requests, params, use_tqdm=True):
         self.calls += 1
         outs = []
         for r in requests:
             self.requests += 1
+            if "'kind': 'rubric'" in r["prompt"]:
+                outs.append(self._rubric(r["prompt"], r["multi_modal_data"]["video"],
+                                         int(getattr(params, "n", 1) or 1)))
+                continue
             frames = r["multi_modal_data"]["video"][0]
             text, ids, lps = self._answer(r["prompt"], frames)
             outs.append(SimpleNamespace(

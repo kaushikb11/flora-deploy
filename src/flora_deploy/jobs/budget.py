@@ -1,4 +1,4 @@
-"""Budget accounting and the orchestrator's budget gate (PLAN.md §8 "Budget").
+"""Budget accounting and the orchestrator's budget gate (PLAN.md §2, §5).
 
 * **Rates** (:class:`Rates`): $/s per GPU type, per physical core and per GiB of memory, plus a
   region multiplier and the non-preemptible CPU/memory multiplier. Live prices come from
@@ -569,7 +569,7 @@ def project(*, spent: float, pending: Sequence[Shard], in_flight: Mapping[str, i
 class ProjectionBudgetGate:
     """``BudgetGate`` for the orchestrator, plus the hard-cap hook :meth:`overspend`.
 
-    Per tick the Modal orchestrator (``modal_app.orchestrator_app.drive_tick``) calls
+    Per tick the orchestrator driver (``jobs.driver.TickDriver``, Modal and local) calls
     :meth:`refresh` (drop cached reads), then :meth:`overspend` with the orchestrator's call
     history (:class:`BudgetState`; it also :meth:`observe`\\ s it) and cancels what it returns;
     then ``tick()`` calls :meth:`admit` before each spawn.
@@ -682,10 +682,6 @@ class ProjectionBudgetGate:
                 self.billing_error = repr(exc)
             self._billing_at = now
         return self._billing_usd
-
-    def note_done(self, shard_id: str) -> None:
-        """Optional hint (e.g. from the orchestrator's events) so a lagging list is not needed."""
-        self._done.add(shard_id)
 
     # orchestrator state ---------------------------------------------------------------------
     def observe(self, state: BudgetState) -> None:

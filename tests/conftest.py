@@ -45,6 +45,39 @@ def nv_code():
     return get
 
 
+# Failures of tests that run NVIDIA's code are redacted (tests/nvtext.py, review 11b F3): CI logs
+# are public, and a traceback through batch_utils or an assertion on a rendered prompt would print
+# NVIDIA's licensed text. FLORA_SHOW_NV_OUTPUT=1 shows the full report locally.
+REDACT_MARKERS = ("nvlink", "torch")
+_NVLINK_DIR = Path(__file__).parent / "nvlink"
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    from tests import nvtext
+
+    outcome = yield
+    rep = outcome.get_result()
+    if (rep.failed and not nvtext.show()
+            and any(item.get_closest_marker(m) for m in REDACT_MARKERS)):
+        if call.excinfo is not None:
+            rep.longrepr = nvtext.redact_excinfo(call.excinfo)
+        rep.sections = [(name, "[captured output hidden]") for name, _ in rep.sections]
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_make_collect_report(collector):
+    from tests import nvtext
+
+    outcome = yield
+    rep = outcome.get_result()
+    path = Path(str(getattr(collector, "path", "")))
+    if rep.failed and not nvtext.show() and path.is_relative_to(_NVLINK_DIR):
+        rep.longrepr = (f"collection of {path.name} failed; report redacted (tests/nvtext.py, "
+                        f"set {nvtext.SHOW_ENV}=1 locally)")
+        rep.sections = []
+
+
 ORDER_ENV = "FLORA_TEST_ORDER"
 
 
@@ -102,3 +135,19 @@ def pytest_sessionfinish(session, exitstatus):
             for line in missing:
                 tr.write_line(line)
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
+@pytest.fixture
+def tempseg_pinned(monkeypatch):
+    """A stand-in ``DERIVED_PINS["tempseg-merged"]`` content digest. Until merger v2 is built
+    and pinned, ``plan_app`` refuses a real balanced ``segment`` plan (review 10 M1); tests of
+    the planned app itself use this."""
+    from dataclasses import replace
+
+    from flora_deploy.config.pins import DERIVED_PINS_BY_KEY
+
+    pin = DERIVED_PINS_BY_KEY["tempseg-merged"]
+    if pin.content_sha256 is None:
+        pin = replace(pin, content_sha256="c" * 64)
+        monkeypatch.setitem(DERIVED_PINS_BY_KEY, "tempseg-merged", pin)
+    return pin

@@ -735,12 +735,3 @@ def worker_init(family: Family | str, code_dir: Path | str,
     """Process-pool initializer: link ``family`` from ``code_dir`` in the worker, with every
     check ``load_family`` runs in the parent (spawn and forkserver children start empty)."""
     load_family(family, code_dir, pinned_digests=pinned_digests)
-
-
-def _reset_for_tests() -> None:
-    """Forget the loaded family (unit tests only; does not undo NVIDIA's side effects)."""
-    global _LOADED
-    with _LOCK:
-        if _LOADED is not None and _LOADED._finder in sys.meta_path:
-            sys.meta_path.remove(_LOADED._finder)
-        _LOADED = None

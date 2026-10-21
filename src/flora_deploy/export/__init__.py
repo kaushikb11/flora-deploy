@@ -1,4 +1,4 @@
-"""Compose and export (PLAN.md §6.6): receipts' parts → deduped ``flora_labels_v1`` outputs.
+"""Compose and export (``output-format.md``): receipts' parts → deduped ``flora_labels_v1`` outputs.
 
 ``compose`` writes per-stage JSONL + Parquet and a ``summary.json`` under
 ``JobPaths.output(<config_hash>, ...)``; ``results`` reads them back (``flora results``).

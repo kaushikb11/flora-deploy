@@ -85,7 +85,9 @@ def run_worker(code_dir: Path, jobs: Path, mode: str) -> dict:
         [sys.executable, __file__, str(code_dir), str(jobs), mode],
         capture_output=True, text=True, timeout=600,
     )
-    assert out.returncode == 0, out.stderr[-4000:]
+    from tests.nvtext import nv_output  # not at module level: this file also runs as a script
+
+    assert out.returncode == 0, nv_output(out.stderr, "worker stderr")
     return json.loads(out.stdout.strip().splitlines()[-1])
 
 

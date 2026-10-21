@@ -64,13 +64,13 @@ KEY_FIELDS = ("schema", "preset", "kind", "engine", "vllm_engine", "nvidia_pins"
 # and this key code (its semantics are versioned by ``KEY_SCHEMA``).
 CERT_LOGIC_EXCLUDE = frozenset({"config/logic.py", "config/hashing.py", "validate/certkey.py"})
 
-_HEX64 = re.compile(r"^[0-9a-f]{64}$")
-_STAMP = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+_HEX64 = re.compile(r"^[0-9a-f]{64}\Z")
+_STAMP = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\Z")
 
 # ---------------------------------------------------------------------------------------------
 # Policy (H3, M4): what a certificate must meet to match. docs/certification.md, "Policy".
 
-TOLERANCE_BOUNDS = (1.0, 2.0)  # PLAN.md §9 uses 1.5
+TOLERANCE_BOUNDS = (1.0, 2.0)  # PLAN.md §4 uses 1.5
 MIN_SAMPLES_FLOOR = 10  # candidate episodes per (stage, embodiment pool)
 MIN_NOISE_SAMPLES_FLOOR = 5  # noise-run episodes per stage
 MIN_COVERAGE = 1.0
@@ -91,7 +91,7 @@ NOISE_FLOOR: dict[str, float] = {
     "length_mismatch": 0.0,  # step count is fixed by the video length
 }
 SLACK_MAX: dict[str, float] = dict(NOISE_FLOOR)  # --slack may at most add one floor
-# Absolute bars from PLAN.md §2 ("terminal E[s] MAE <= 0.05"), on top of the noise rule.
+# Absolute bars from PLAN-v3.md §2 ("terminal E[s] MAE <= 0.05"), on top of the noise rule.
 ABSOLUTE_CAPS: dict[str, float] = {"expected_score_abs_delta": 0.05}
 
 POLICY: dict[str, Any] = {

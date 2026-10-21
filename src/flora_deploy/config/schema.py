@@ -12,7 +12,8 @@ Layout (see ``config/templates/*.yaml`` for commented templates)::
     allow_uncertified: false             # required for balanced until its certificates exist
     input: {format, repo, revision, path, cameras, stage_to}
     pipeline: {stages, embodiment, episode_instruction, envelope, shard_target_gpu_minutes,
-               determinism, terminal_rationale, exact_scheduling}
+               determinism, terminal_rationale, exact_scheduling,
+               rubric: {robot, cameras: [{role, description}], header, task_name, steps}}
     resources: {<shard kind>: {gpu, gpu_count, max_containers, max_inputs, episode_concurrency,
                                cpu, memory}}
     output: {sink, formats}
@@ -70,14 +71,20 @@ Embodiment = Literal["human", "yam", "yam32", "dex", "tianji"]
 OutputFormat = Literal["parquet", "jsonl", "lerobot"]
 Determinism = Literal["nvidia", "deterministic"]  # accel.determinism.MODES
 
-_SHA = re.compile(r"^[0-9a-f]{40}$")
+_SHA = re.compile(r"^[0-9a-f]{40}\Z")
 # Tokens an instruction must not contain: NVIDIA's processor and our vLLM wrap treat them as
 # structure, not text (nv.capture.vllm_prompt refuses them per episode; refuse them up front).
 INSTRUCTION_FORBIDDEN_TOKENS = (*FORBIDDEN_PROMPT_TOKENS, VIDEO_TOKEN)
 # Sane upper bounds: a typo (or ``.inf``) must not disable a hard cap.
 MAX_BUDGET_USD = 1_000_000.0
 MAX_GPUS = 4096
-_TAG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
+_TAG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,62}")
+# Modal environment names (modal 1.6.2 ``_utils/name_utils.is_valid_environment_name``, periods
+# allowed as for existing environments): 1-64 chars, alphanumeric first, no ``en-`` prefix (that
+# is an environment id). The value reaches ``--emit`` source and copy-paste shell hints.
+_MODAL_ENV = re.compile(r"(?!(?i:en-))[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+_TAG_VALUE = re.compile(r"[A-Za-z0-9._-]{1,63}")  # modal.\_utils.name_utils.check_tag_dict
+_REGION = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")  # e.g. us-east, eu-west-1
 
 
 class ConfigError(ValueError):
@@ -98,12 +105,30 @@ class ModalSection(_Model):
     tags: dict[str, str] = Field(default_factory=dict)
     environment_budget_factor: float = Field(1.2, ge=1.0, le=10.0, allow_inf_nan=False)
 
+    @field_validator("environment")
+    @classmethod
+    def _environment(cls, v: str) -> str:
+        if not _MODAL_ENV.fullmatch(v):
+            raise ValueError(f"environment {v!r} is not a Modal environment name: 1-64 chars of "
+                             "[A-Za-z0-9._-], starting alphanumeric, not 'en-...'")
+        return v
+
+    @field_validator("region")
+    @classmethod
+    def _region(cls, v: str | None) -> str | None:
+        if v is not None and not _REGION.fullmatch(v):
+            raise ValueError(f"region {v!r} must match [a-z0-9-], max 63 chars")
+        return v
+
     @field_validator("tags")
     @classmethod
     def _tags(cls, v: dict[str, str]) -> dict[str, str]:
-        bad = [k for k in v if not _TAG.match(k)]
+        bad = [k for k in v if not _TAG.fullmatch(k)]
         if bad:
             raise ValueError(f"tag keys {bad} must match [A-Za-z0-9._-], max 63 chars")
+        bad = [k for k, val in v.items() if not _TAG_VALUE.fullmatch(val)]
+        if bad:
+            raise ValueError(f"tag values of {bad} must match [A-Za-z0-9._-], max 63 chars")
         return v
 
 
@@ -200,6 +225,89 @@ class ExactScheduling(_Model):
     episode_order: Literal["plan", "longest_first"] = "plan"
 
 
+def _no_special_tokens(text: str | None, where: str) -> str | None:
+    if text is not None:
+        bad = [t for t in INSTRUCTION_FORBIDDEN_TOKENS if t in text]
+        if bad:
+            raise ValueError(f"{where} contains special token(s) {bad}, which NVIDIA's "
+                             "processor treats as video structure")
+    return text
+
+
+class RubricGrade(_Model):
+    label: str = Field(min_length=1)
+    points: float = Field(ge=0, allow_inf_nan=False)
+
+    @field_validator("label")
+    @classmethod
+    def _label(cls, v: str) -> str:
+        return _no_special_tokens(v, "rubric grading label") or v
+
+
+class RubricStep(_Model):
+    """One step of NVIDIA's rubric job (``batch_utils/rubric_reward.py``): ``action``, the
+    allowed ``grading`` values and an optional ``max_score`` (NVIDIA's default: the largest
+    allowed value)."""
+
+    action: str = Field(min_length=1)
+    grading: tuple[RubricGrade, ...] = Field(min_length=1)
+    max_score: float | None = Field(None, ge=0, allow_inf_nan=False)
+
+    @field_validator("action")
+    @classmethod
+    def _action(cls, v: str) -> str:
+        return _no_special_tokens(v, "rubric action") or v
+
+
+class RubricCamera(_Model):
+    """One rubric video, in prompt order ("Video 1", "Video 2", ...): the camera ``role`` it is
+    read from and NVIDIA's ``cameras`` description (not needed with ``header``)."""
+
+    role: CameraRole
+    description: str | None = None
+
+    @field_validator("description")
+    @classmethod
+    def _description(cls, v: str | None) -> str | None:
+        return _no_special_tokens(v, "rubric camera description")
+
+
+class RubricSection(_Model):
+    """``reward.rubric`` (NVIDIA's ``rubric_reward.py`` job fields, one rubric per job): the
+    robot and one description per camera, or the full ``header`` paragraph instead; the
+    ``steps``; an optional ``task_name``. Hashed into the reward.rubric stage hash
+    (``config.hashing.kind_modes``): it is the prompt."""
+
+    robot: str | None = None
+    cameras: tuple[RubricCamera, ...] = Field(min_length=1, max_length=4)
+    header: str | None = None
+    task_name: str | None = None
+    steps: tuple[RubricStep, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _form(self) -> RubricSection:
+        for name in ("robot", "header", "task_name"):
+            _no_special_tokens(getattr(self, name), f"rubric.{name}")
+        roles = [c.role for c in self.cameras]
+        if len(set(roles)) != len(roles):
+            raise ValueError(f"rubric.cameras lists a role more than once: {roles}")
+        if self.header is not None:
+            if not self.header.strip():
+                raise ValueError("rubric.header is empty; leave it out instead")
+            if self.robot is not None or any(c.description for c in self.cameras):
+                raise ValueError("rubric: give `header` or `robot` + camera descriptions, "
+                                 "not both")
+        elif not (self.robot and self.robot.strip()) or not all(
+                (c.description or "").strip() for c in self.cameras):
+            raise ValueError("rubric: NVIDIA's rubric prompt needs `robot` and a `description` "
+                             "for every camera (or the full `header`)")
+        return self
+
+    @property
+    def roles(self) -> tuple[str, ...]:
+        return tuple(c.role for c in self.cameras)
+
+
 class PipelineSection(_Model):
     stages: tuple[Stage, ...] = Field(min_length=1)
     embodiment: Embodiment
@@ -216,6 +324,17 @@ class PipelineSection(_Model):
     # G3: exact segcap episode start order (longest-first). Not hashed: inputs to
     # every model call are unchanged (see ExactScheduling).
     exact_scheduling: ExactScheduling = Field(default_factory=ExactScheduling)
+    # NVIDIA's rubric job fields for `reward.rubric` (hashed into its stage hash).
+    rubric: RubricSection | None = None
+
+    @model_validator(mode="after")
+    def _rubric(self) -> PipelineSection:
+        if "reward.rubric" in self.stages and self.rubric is None:
+            raise ValueError("stage reward.rubric needs `pipeline.rubric` (robot, cameras, "
+                             "steps): NVIDIA's rubric prompt is built from it")
+        if self.rubric is not None and "reward.rubric" not in self.stages:
+            raise ValueError("pipeline.rubric only applies with stage reward.rubric")
+        return self
 
     @field_validator("stages")
     @classmethod
@@ -293,7 +412,7 @@ class OutputSection(_Model):
 # Every derived-weight receipt name a preset can need (``PresetSpec.derived_weights``).
 DERIVED_WEIGHT_NAMES: tuple[str, ...] = tuple(sorted(
     {n for p in PRESETS.values() for names in p.derived_weights.values() for n in names}))
-_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}\Z")
 
 
 class WeightsSection(_Model):
@@ -452,10 +571,10 @@ class FloraConfig(_Model):
 # kind loads its model on one device: NVIDIA's reward `load_llm` keeps `tensor_parallel_size` 1
 # and our engine spec passes it unchanged; NVIDIA's HF loader would shard `segcap` over several
 # GPUs with `device_map="balanced"`, which is not the validated single-H200 reference.
-TP_GPUS: dict[str, int] = {"reward.rubric": 2}  # NVIDIA's rubric settings: TP=2 (PLAN.md §7)
-_REPO_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
+TP_GPUS: dict[str, int] = {"reward.rubric": 2}  # NVIDIA's rubric settings: TP=2 (PLAN.md §8)
+_REPO_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}\Z")
 # A bucket/volume name right after the scheme; file:// takes an absolute path (file:///x).
-_SINK = re.compile(r"^((s3|r2|gs|volume)://[^\s/]|file:///?[^\s/])[^\s]*$")
+_SINK = re.compile(r"^((s3|r2|gs|volume)://[^\s/]|file:///?[^\s/])[^\s]*\Z")
 
 
 def per_device_gpu_problem(preset: str, kind: str, gpu: str, gpu_count: int) -> str | None:
@@ -502,6 +621,11 @@ def review4_problems(cfg: FloraConfig) -> list[str]:
             # NVIDIA: "The 32-second profile requires three synchronized camera views."
             problems.append("embodiment 'yam32' needs 3 camera views (main, left_wrist, "
                             "right_wrist)")
+    rubric = cfg.pipeline.rubric
+    if rubric is not None and cams is not None and set(rubric.roles) != set(cams.values()):
+        problems.append(f"pipeline.rubric.cameras {list(rubric.roles)} must name exactly the "
+                        f"input camera roles {sorted(set(cams.values()))} (NVIDIA's rubric "
+                        "prompt describes every video it is shown)")
     if not _SINK.match(cfg.output.sink):
         problems.append(f"output.sink {cfg.output.sink!r}: needs a bucket or path after the "
                         "scheme, and no whitespace")
@@ -533,6 +657,14 @@ def output_settings(cfg: FloraConfig) -> dict[str, Any]:
     return {"determinism": cfg.pipeline.determinism,
             "terminal_mode": ("terminal_rationale" if cfg.pipeline.terminal_rationale
                               else "terminal")}
+
+
+def rubric_spec(cfg: FloraConfig) -> dict[str, Any] | None:
+    """``pipeline.rubric`` as plain JSON (``None`` keys dropped, so NVIDIA's ``max_score``
+    default applies), in config order: what the reward.rubric worker builds NVIDIA's job from
+    (``stages.rubric.RubricSpec``) and what its stage hash binds."""
+    r = cfg.pipeline.rubric
+    return None if r is None else r.model_dump(mode="json", exclude_none=True)
 
 
 def with_pipeline(cfg: FloraConfig, **fields: Any) -> FloraConfig:

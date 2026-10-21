@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from flora_deploy.media.safepath import UnsafePath, check_key, contain, format_template
 from flora_deploy.media.sources.base import (
     CameraMap,
     EpisodeRef,
@@ -44,6 +45,24 @@ def video_keys(info: dict) -> list[str]:
     return [k for k, f in info.get("features", {}).items() if f.get("dtype") == "video"]
 
 
+def check_camera_keys(root: Path, roles: dict[str, str]) -> None:
+    """Camera keys fill the ``video_path`` template: one safe path component each."""
+    for key in roles:
+        try:
+            check_key(key)
+        except UnsafePath as e:
+            raise SourceError(f"{root}: {e}") from None
+
+
+def video_ref(root: Path, template: str, **fields: str | int) -> str:
+    """``root / template.format(**fields)``, refusing anything outside ``root``
+    (``media.safepath``: the template and its values come from the dataset)."""
+    try:
+        return str(contain(root, format_template(template, **fields)))
+    except UnsafePath as e:
+        raise SourceError(f"{root}: {e}") from None
+
+
 class LeRobotV21Source:
     def __init__(self, root: str | Path, *, camera_map: CameraMap | None = None, name: str = ""):
         self.root = Path(root)
@@ -56,6 +75,7 @@ class LeRobotV21Source:
             raise SourceError(f"{self.root}: dataset stores no videos (video_path is null)")
         self.chunks_size = int(self.info.get("chunks_size", 1000))
         self.roles = resolve_camera_map(video_keys(self.info), camera_map)
+        check_camera_keys(self.root, self.roles)
         self.name = name or self.root.name
 
     def list_episodes(self) -> list[EpisodeRef]:
@@ -70,10 +90,9 @@ class LeRobotV21Source:
             e = int(row["episode_index"])
             cams = {}
             for key, role in self.roles.items():
-                rel = self.template.format(
-                    episode_chunk=e // self.chunks_size, video_key=key, episode_index=e
-                )
-                cams[role] = SourceRef(str(self.root / rel))
+                cams[role] = SourceRef(video_ref(
+                    self.root, self.template, episode_chunk=e // self.chunks_size,
+                    video_key=key, episode_index=e))
             out.append(
                 EpisodeRef(
                     episode_id=f"episode_{e:06d}",

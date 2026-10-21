@@ -28,6 +28,7 @@ from flora_deploy.nv import Family
 from flora_deploy.nv.capture import CaptureProcessor, metadata_to_dict, replay
 from flora_deploy.nv.linker import load_family
 from flora_deploy.nv.session import CachedSession
+from tests.nvtext import assert_same_text
 
 pytestmark = pytest.mark.nvlink
 
@@ -195,7 +196,7 @@ def test_capture_parity(nv, procs, monkeypatch, case_id):
     for ref, req in zip(reference, captured, strict=True):
         # 1. exactly what NVIDIA handed to the real processor
         assert ref["modes"] == {"RGB"}
-        assert req.prompt == ref["kwargs"]["text"][0]
+        assert_same_text(req.prompt, ref["kwargs"]["text"][0], "prompt")  # never print it
         assert len(req.videos) == len(ref["frames"])
         for (frames, md), ref_frames, ref_md in zip(req.videos, ref["frames"], ref["metadata"],
                                                     strict=True):

@@ -55,7 +55,8 @@ Parquet layout (one table per stage; JSON columns are canonical JSON strings):
   ``nv_metadata`` (JSON); a record without segments is one row with null segment columns;
 * ``reward.terminal``: ``terminal_score, terminal_expected_score, terminal_probabilities,
   terminal_rationale``; ``reward.dense``: ``dense_segments`` (JSON), ``dense_per_step``;
-  ``reward.rubric``: ``rubric_scores, rubric_total, rubric_samples, rubric_medoid_index``.
+  ``reward.rubric``: ``rubric_scores, rubric_total, rubric_samples, rubric_medoid_index,
+  rubric_parsed_samples``.
 """
 
 from __future__ import annotations
@@ -126,6 +127,7 @@ REWARD_COLS: dict[str, list[pa.Field]] = {
         pa.field("rubric_total", pa.float64()),
         pa.field("rubric_samples", pa.int32()),
         pa.field("rubric_medoid_index", pa.int32()),
+        pa.field("rubric_parsed_samples", pa.int32()),
     ],
 }
 # Which record payload field each stage's own columns cover (the rest goes to ``extra``).
@@ -211,7 +213,8 @@ def flatten(rec: StageRecord, pool: str | None = None) -> list[dict[str, Any]]:
     else:
         r = rec.rubric
         row.update(rubric_scores=list(r.scores) if r else None, rubric_total=r and r.total,
-                   rubric_samples=r and r.samples, rubric_medoid_index=r and r.medoid_index)
+                   rubric_samples=r and r.samples, rubric_medoid_index=r and r.medoid_index,
+                   rubric_parsed_samples=r.parsed_samples if r else None)
     return [row]
 
 

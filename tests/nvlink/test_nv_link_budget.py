@@ -29,6 +29,7 @@ from flora_deploy.nv.budget import (
 )
 from flora_deploy.nv.capture import CaptureProcessor, replay
 from flora_deploy.nv.session import CachedSession
+from tests.nvtext import nv_output
 
 pytestmark = pytest.mark.nvlink
 
@@ -174,7 +175,7 @@ def test_linker_gaps_closed_on_a_scratch_copy(nv_dirs):  # noqa: F811
 
     out = subprocess.run([sys.executable, "-c", ISOLATED, str(nv_dirs["tempseg_code"])],
                          capture_output=True, text=True, timeout=300)
-    assert out.returncode == 0, out.stderr[-3000:]
+    assert out.returncode == 0, nv_output(out.stderr, "subprocess stderr")
     lines = out.stdout.split("\n")
     assert "BUDGETS_FROM_EXECUTED_BYTES" in lines
     assert "FINDER_REASSERTED" in lines

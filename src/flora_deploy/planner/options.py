@@ -1,4 +1,4 @@
-"""`flora plan` options (PLAN.md §2 "Requirement presets"): workload + presets + deadline + budget
+"""`flora plan` options (PLAN.md §1 "Presets"): workload + presets + deadline + budget
 + GPU cap → 2–4 options with estimated cost, wall-clock, peak GPUs and certification status.
 
 Model, per option (one preset at one episode concurrency per container):
@@ -71,7 +71,20 @@ def rates_label(option: PlanOption) -> str:
     """How to present an option's numbers: ``measured`` only when every rate it rests on was
     measured; otherwise ``estimate (<worst status>)``, so placeholder or projected rates are
     never shown as measurements."""
-    return "measured" if option.rate_status == "measured" else f"estimate ({option.rate_status})"
+    if option.rate_status != "measured":
+        return f"estimate ({option.rate_status})"
+    notes = [k.rate_samples for k in option.kinds if k.rate_samples]
+    if not notes:
+        return "measured"
+    if len(set(notes)) == 1 and len(notes) == len(option.kinds):
+        return f"measured ({notes[0]})"
+    return "measured (" + "; ".join(f"{k.kind} {k.rate_samples}" for k in option.kinds
+                                    if k.rate_samples) + ")"
+
+
+def samples_note(n: int | None, uncertainty: float) -> str:
+    """``n=1, ±50%``: how many samples a measured rate rests on, and its band."""
+    return f"n={n}, ±{uncertainty:.0%}" if n is not None else ""
 
 
 # ----------------------------------------------------------------------------------------------
@@ -152,6 +165,7 @@ class KindPlan:
     cost_usd: float
     rate_status: str
     rate_provenance: str
+    rate_samples: str = ""  # measured rates: "n=1, ±50%" (planner/rates.json `n`)
 
 
 @dataclass(frozen=True)
@@ -228,6 +242,7 @@ class _Kind:
     provenance: str
     n: int = 1
     requires: tuple[str, ...] = ()
+    samples: str = ""  # "n=1, ±50%" for a measured rate that names its sample count
 
     def finish(self, which: int = 1, n: int | None = None) -> float:
         return self.startup[which] + self.work[which] / (n or self.n)
@@ -242,6 +257,7 @@ def _kinds(req: PlanRequest, table: RateTable, rates: Rates, preset: str, conc: 
         lo = mid = hi = 0.0
         worst, prov, used_c = "measured", [], 1
         needs: set[str] = set()
+        notes: list[str] = []
         for g in req.workload.groups:
             e = table.rate(preset, kind, g.cameras, conc, features)
             needs.update(e.requires)
@@ -254,13 +270,16 @@ def _kinds(req: PlanRequest, table: RateTable, rates: Rates, preset: str, conc: 
                 worst = e.status
             if e.provenance not in prov:
                 prov.append(e.provenance)
+            note = samples_note(e.n, e.uncertainty) if e.status == "measured" else ""
+            if note and note not in notes:
+                notes.append(note)
         st = table.startup_for(preset, kind)
         u = st.uncertainty
         startup = (st.startup_s / (1 + u), st.startup_s, st.startup_s * (1 + u))
         cap = max(1, math.ceil(req.workload.episodes / used_c))
         out.append(_Kind(kind, pool, used_c, (lo, mid, hi), startup, cap,
                          rates.pool_per_second(pool), worst, " | ".join(prov),
-                         requires=tuple(sorted(needs))))
+                         requires=tuple(sorted(needs)), samples="; ".join(notes)))
     return out
 
 
@@ -371,7 +390,7 @@ def build_option(req: PlanRequest, table: RateTable, rates: Rates, preset: str, 
         max_inputs=k.conc, cpu_cores=k.pool.cpu_cores, memory_gib=k.pool.memory_gib,
         work_s=round(k.work[1], 3), startup_s=k.startup[1], finish_s=round(k.finish(1), 3),
         cost_usd=round(k.per_s * (k.work[1] + k.n * k.startup[1]), 4), rate_status=k.status,
-        rate_provenance=k.provenance) for k in kinds)
+        rate_provenance=k.provenance, rate_samples=k.samples) for k in kinds)
     main_c = max(k.conc for k in kinds)
     suffix = "".join(f" +{f}" for f in missing)
     return PlanOption(

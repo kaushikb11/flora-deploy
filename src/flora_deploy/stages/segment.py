@@ -1,4 +1,4 @@
-"""``balanced`` segment stage: NVIDIA's segmenter on vLLM through the micro-batcher (PLAN.md §6.3).
+"""``balanced`` segment stage: NVIDIA's segmenter on vLLM through the micro-batcher (PLAN-v3 §6.3).
 
 NVIDIA's code does all of the work except running the model:
 
@@ -31,7 +31,7 @@ more ``apredict`` rounds) and repairs exactly as on its own sync path. Any NVIDI
 fails the episode, as in ``pipeline.segment``. Engine (infrastructure) failures raise
 ``EngineRequestError``.
 
-LICENSE REVIEW FLAG (PLAN.md §11): ``pool_for`` restates one line of ``pipeline.annotate``
+LICENSE REVIEW FLAG (PLAN.md §7): ``pool_for`` restates one line of ``pipeline.annotate``
 (``'yam32' if long_windows else PROFILE_POOLS[profile]``), and ``segment_episode`` the shape of
 ``pipeline.segment`` (source, binding, segmenter, the returned rows). Everything else calls
 NVIDIA's functions. ``tests/nvlink/test_balanced_nvlink.py`` checks the result against NVIDIA's

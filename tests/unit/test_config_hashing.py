@@ -317,7 +317,10 @@ def test_missing_logic_module_fails_closed(pkg_copy):
 def test_adding_a_reward_stage_keeps_finished_segcap_shards():
     a = sh(set_(base(), "pipeline.stages", ["segment", "caption"]))
     b = sh(base())
-    c = sh(set_(base(), "pipeline.stages", ["segment", "caption", "reward.rubric"]))
+    c = sh(set_(set_(base(), "pipeline.stages", ["segment", "caption", "reward.rubric"]),
+                "pipeline.rubric", {"robot": "arm", "cameras": [{"role": r, "description": r}
+                                  for r in ("main", "left_wrist", "right_wrist")],
+              "steps": [{"action": "Grasp", "grading": [{"label": "no", "points": 0.0}]}]}))
     assert a["segcap"] == b["segcap"] == c["segcap"]
     assert set(b) == {"segcap", "reward.terminal", "reward.dense"}
     assert h(set_(base(), "pipeline.stages", ["segment", "caption"])) != BASE  # job hash moves

@@ -1,4 +1,4 @@
-"""Golden-set staging (PLAN.md §9, W3-C): selection data -> per-episode oracle inputs + manifest.
+"""Golden-set staging (PLAN-v3.md §9, W3-C): selection data -> per-episode oracle inputs + manifest.
 
 The selection is data (``golden_selection_v1.json``, next to this module): every episode names
 its dataset (repo + pinned revision + format + license), the episode, the camera key -> role
@@ -60,8 +60,8 @@ PROFILES = ("human", "yam", "dex", "tianji")
 ROLES = ("main", "left_wrist", "right_wrist")
 REWARD_MODES = ("terminal", "rubric", "dense")
 MAX_EPISODE_S = 120.0
-_SHA = re.compile(r"^[0-9a-f]{40}$")
-_SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_SHA = re.compile(r"^[0-9a-f]{40}\Z")
+_SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 CUT_CHECK_FIELDS = ("rate", "frames", "duration_us", "size", "cfr", "codec", "pix_fmt",
                     "pts_us_sha256")
 
@@ -381,8 +381,11 @@ class DatasetMirror:
         return f"{self.sub}/{rel}" if self.sub else rel
 
     def fetch(self, rel: str) -> Path:
-        """Download ``rel`` (relative to the dataset root) unless it is already local."""
-        dest = self.root / rel
+        """Download ``rel`` (relative to the dataset root) unless it is already local. ``rel``
+        comes from dataset metadata: it must stay under the mirror (``media.safepath``)."""
+        from flora_deploy.media.safepath import contain
+
+        dest = contain(self.root, rel)
         if not dest.is_file():
             got = self.hub.download(self.ds["repo"], self.ds["revision"], self.repo_path(rel),
                                     self.local)

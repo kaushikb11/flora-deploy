@@ -4,7 +4,7 @@ The real implementation (P1a-3) wraps Modal: ``Cls.from_name(...).run_shard.spaw
 ``FunctionCall.from_id(call_id).get(timeout=0)``, ``.cancel()``. Tests use
 ``tests/fakes/modal.py::FakeSpawner``. The orchestrator must rely only on this protocol.
 
-Status mapping the real implementation must honor (PLAN.md §1.3; the code and the exception
+Status mapping the real implementation must honor (PLAN-v3.md §1.3; the code and the exception
 table live in ``modal_app/orchestrator_app.py::status_from_get``):
 - a still-running call: ``FunctionCall.get(timeout=0)`` raises the **builtin** ``TimeoutError``
   (modal 1.6.2), *not* ``modal.exception.TimeoutError`` → ``pending``;

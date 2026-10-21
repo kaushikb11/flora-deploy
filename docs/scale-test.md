@@ -126,14 +126,18 @@ It also adds one replacement start plus one lost shard per preemption, and the r
 | Step | Cap | Nominal | Upper |
 |---|---|---|---|
 | verify (Hub metadata) | $0 | $0 | $0 |
-| index (13 CPU units; **placeholder** 120 s / 600 s each) | $0.15 | $0.03 | $0.14 |
+| index (13 CPU units; **placeholder** 120 s / 600 s each) | $0.20 | $0.03 | $0.14 |
 | plan | $0 | $0 | $0 |
-| deploy (image builds; **placeholder**) | $0.05 | $0.00 | $0.01 |
-| run | **$18.50** | **$9.11** | **$18.45** |
+| deploy (image builds; **placeholder**) | $0.10 | $0.00 | $0.01 |
+| run | **$19.40** | **$9.55** | **$19.34** |
 | report | $0 | $0 | $0 |
-| **total** | global **$18.70** | **$9.14** | **$18.60** |
+| **total** | global **$19.70** | **$9.58** | **$19.49** |
 
-How the run's nominal $9.11 breaks down:
+Caps are derived, not chosen: each step's cap is its upper projection rounded up to $0.10, and
+the global cap is their sum. `scripts/scale_test.py --dry-run` prints the current numbers, which
+move with the rate table (these are from 2026-10-22, with balanced rates still placeholders).
+
+How the run's nominal cost breaks down (at the earlier $9.11 estimate):
 
 | Pool | Item | Cost |
 |---|---|---|

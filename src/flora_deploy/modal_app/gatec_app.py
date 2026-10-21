@@ -1,4 +1,4 @@
-"""``flora-gatec``: Gate C on Modal (PLAN.md §9). vLLM 0.24.0 model inputs vs NVIDIA's HF call.
+"""``flora-gatec``: Gate C on Modal (PLAN.md §8). vLLM 0.24.0 model inputs vs NVIDIA's HF call.
 
 Two stages, so request building (CPU, NVIDIA's single-threaded decode and PNG work) never holds
 a GPU:

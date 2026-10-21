@@ -367,3 +367,28 @@ Print the framework version.
 ```
 flora version
 ```
+
+### `flora export`
+
+Write a job's labels into a copy of its LeRobot dataset (the source is never modified).
+
+```
+flora export [OPTIONS]
+```
+
+| Argument / option | Default | |
+|---|---|---|
+| `--out` | required | New directory for the labeled copy. |
+| `--job` |  | Job id (default: the config's project). |
+| `--store` (env `FLORA_STORE`) |  | Job store: file:///dir (or a path), s3://bucket[/prefix], modal-volume://name (default: the config's output.sink, then &lt;config dir&gt;/flora-local-store). |
+| `--config`, `-c` | `flora.yaml` | flora.yaml (finds the store and Modal environment). |
+| `--env` (env `MODAL_ENVIRONMENT`) |  | Modal environment of a modal-volume store. |
+| `--to` | `lerobot` | Target format (lerobot). |
+| `--stages` |  | Stages to export (repeat or comma-separate): segment, caption, reward.terminal, reward.dense. Default: every composed one. |
+| `--source` |  | Local copy of the source dataset (default: the job's dataset; a Hub dataset is fetched at its pinned revision, meta/ and data/ only). |
+| `--include-videos` | off | Copy the videos too (default: reference the source). |
+| `--allow-uncertified` | off | Export uncertified records (recorded in the metadata). |
+| `--allow-fake` | off | Export fake-model records (recorded in the metadata). |
+| `--push-to-hub` |  | Upload the export to this dataset repo (user/repo). |
+| `--public` | off | With --push-to-hub: make the repo public (default private). |
+| `--config-hash` |  | Config hash (default: the job manifest's). |

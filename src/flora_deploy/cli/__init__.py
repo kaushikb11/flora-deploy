@@ -22,6 +22,7 @@ from flora_deploy.cli import (  # noqa: F401  (registers commands)
     certify,
     deploy,
     doctor,
+    export,
     index,
     init,
     logs,

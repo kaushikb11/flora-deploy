@@ -1,40 +1,60 @@
-"""Wave H-lite runbook (``docs/archive/NEXT_EXECUTION.md``, 2026-10-22; ``docs/wave-h-runbook.md``).
+"""Wave H-lite runbook, one embodiment (``human``) plus the lab checks (``docs/wave-h-runbook.md``).
 
 Usage::
 
     uv run python scripts/wave_h.py --dry-run              # plan + estimates; spends nothing
+    uv run python scripts/wave_h.py --dry-run --offline    # ... without reading the Volume
     uv run python scripts/wave_h.py --yes-spend            # run (resumes: skips done steps)
-    uv run python scripts/wave_h.py --yes-spend --only certify
-    uv run python scripts/wave_h.py --report               # rewrite docs/wave-h-report.md
+    uv run python scripts/wave_h.py --yes-spend --only balanced
+    uv run python scripts/wave_h.py --report               # rewrite reports/wave-h/runbook.md
+    uv run python scripts/wave_h.py --plan full --dry-run  # the later certified run
 
-Steps, in order (each with a projected-spend stop rule before it and a spend check after it):
+**Plans** (``--plan``, :data:`PLANS`). ``balanced-only`` (the default; the user's decision of
+2026-10-22) runs steps 0 -> a -> d and nothing else; (b), (e) and (f) are listed as "deferred to
+the certified run" and never run. Its global cap is the sum of those three steps' upper
+projections rounded up to $0.10 (:func:`plan_global_cap`). ``full`` runs every step under
+:data:`GLOBAL_CAP_USD`. Both share the state file, so a later ``--plan full`` skips what
+``balanced-only`` finished.
 
+Six ``human`` golden episodes (:data:`EPISODES`, ``docs/golden-manifest-v1.md``), one job and one
+app per stage. Steps, in order (each with a projected-spend stop rule before it and a spend
+check after it):
+
+0. ``tempseg`` (CPU merge + one L40S check): build TempSeg with merger v2
+   (``convert_app.py::tempseg --step merge``), run its equivalence check (``--step
+   equivalence``), print the receipt's content digest (``flora prepare --show-receipt``) and
+   **stop** (exit 4): the operator pins ``pins.DERIVED_PINS["tempseg-merged"].content_sha256``,
+   commits, and re-runs. The step is done once the pin matches the receipt on the Volume; it
+   never rebuilds a receipt it already reported. Every step that needs TempSeg refuses until
+   then (:func:`require_tempseg_pin`);
 a. ``preflight``: balanced preflight (CPU): derived weight dirs, receipts, EOS ids
    (``balanced_lab.preflight``);
-b. ``exact_e2e``: the ``exact`` **oracle**, end to end on the 6 H0 episodes
-   (``h0_rehearsal.EPISODES``) through the real ``flora index -> plan -> deploy -> run`` path, in
-   NVIDIA's **default mode** (``determinism: nvidia``: the outputs users compare with), one H200
-   container per app (two apps: one embodiment per config; run one after the other, each app
-   stopped as soon as its job is composed, so two H200 cold starts);
-c. ``rewards``: ``reward.terminal`` + ``reward.dense`` on 3 of those episodes, one H100 container
-   (``max_inputs: 2`` so both kinds share it);
+b. ``exact_e2e``: the ``exact`` **oracle** on the 6 episodes through the real ``flora index ->
+   plan -> deploy -> run`` path, in NVIDIA's **default mode** (``determinism: nvidia``), one
+   H200 app, stopped as soon as its job is composed;
 d. ``balanced``: ``preset: balanced`` (``allow_uncertified: true``) through the same real
-   ``flora deploy`` / ``flora run`` on the same episodes and jobs as (b) (``SegmentWorker`` on
-   L40S, ``CaptionWorker`` on H100), then the ``balanced_lab`` L0 input parity + Gate A on 6
-   captured requests (``balanced_lab.run_tempseg`` / ``run_captioner``);
+   ``flora deploy`` / ``flora run`` on the same 6 episodes, taken from :data:`EPISODES` (the
+   golden selection) directly, never from (b)'s state (one app: ``SegmentWorker`` on L40S,
+   ``CaptionWorker`` on H100); then, **only if that job finished**, the ``balanced_lab`` L0
+   input parity + Gate A on 6 captured requests (``run_tempseg`` / ``run_captioner``). The
+   ``flora-cache`` compile cache has no warm entry for either balanced engine yet, so (d) is
+   priced with a cold-compile startup (:data:`COLD_COMPILE_FACTOR`). The deployed workers mount
+   ``flora-cache`` read-only and never write it back; the lab calls write
+   ``flora-cache:/balanced/<engine>`` and commit it, which is what later runs can start from;
 e. ``certify``: offline provisional certification of ``balanced`` from (b) + (d) ($0);
-f. ``noise``: the oracle's ``human`` job **repeated** (same config file, staged data, stage hash,
-   GPU and default mode; a new job id), compared with (b): the noise floor; (e) is re-evaluated.
-   The cheapest valid repeat: certification needs the noise run to repeat the oracle (Fix-Cert),
-   and the input content is hashed, so a smaller dataset would be another stage hash. With 2
-   noise episodes (< 5) the certificate is provisional by design.
+f. ``noise``: (b)'s job **repeated** (same config file, staged data, stage hash, GPU and
+   default mode; a new job id): the noise floor; (e) is re-evaluated. Its episodes are a subset
+   of the oracle's (Fix-Cert H2) by being all of them: the input content is hashed, so a strict
+   subset would be another stage hash, which ``flora certify`` refuses.
+
+(The step letters keep their earlier names; the reward step was dropped with the yam job.)
 
 **Derived weights** are resolved the way ``flora deploy`` resolves them
 (:func:`resolve_receipts`): each needed receipt is read from the ``flora-weights`` Volume,
 ``config.receipts.check_pinned`` checks its content digest against ``pins.DERIVED_PINS`` and its
 file sha256 is written into the generated config's ``weights.derived``; ``flora deploy`` /
-``flora run`` then read it from there (``config.receipts.resolve``). Step (d) also refuses a
-derived weight with no pinned content digest (the balanced workers fail closed on it).
+``flora run`` then read it from there (``config.receipts.resolve``). An unpinned one is refused
+with ``config.receipts.unpinned_message`` (``plan_app`` refuses it too, review 10 M1).
 
 **Spend.** Every attempt of a step is kept (:class:`Attempt`); a step's spend is the sum over its
 attempts, so a retry adds instead of overwriting. Tracked cost is container-seconds x list $/h
@@ -42,21 +62,29 @@ attempts, so a retry adds instead of overwriting. Tracked cost is container-seco
 ``elapsed x the step's peak $/s`` so a killed process leaves its spend behind. An attempt that was
 killed, or whose ``flora report`` failed, is charged the most it was allowed to spend (its
 budget) until billing, read again before every step for **every** app seen so far, is at least
-:data:`BILLING_LAG_S` past it. The global figure is ``max(sum of charged attempts, billed delta of
-all apps)``; the global cap is checked on it.
+:data:`BILLING_LAG_S` past it. An attempt that failed **before it noted any app** started
+nothing and is charged $0 (review 10 L1). The global figure is ``max(sum of charged attempts,
+billed delta of all apps)``; the global cap is checked on it.
 
-**Stop rules.** Before a step: its **upper** projection (upper rate quantiles, both cold starts,
+**Stop rules.** Before a step: its **upper** projection (upper rate quantiles, every cold start,
 the scale-down tail and :data:`CLIENT_SLACK_S` per app) must fit its cap and the global cap minus
 the cumulative spend. During a step: GPU wall time is bounded by ``(remaining step cap - slack x
 $/s) / $/s`` (``flora run --budget`` plus a client-side deadline that cancels the job and stops
-the app; lab calls get the same deadline as their timeout). After a step: tracked/billed spend
-over the step cap or the global cap stops the runbook. The dry run prints nominal and upper costs
-per step and, when the upper total does not fit :data:`GLOBAL_CAP_USD`, the minimum honest cap.
+the app; lab and conversion calls get the same deadline as their timeout). After a step:
+tracked/billed spend over the step cap or the global cap stops the runbook. The dry run prints
+nominal and upper costs per step.
 
-**State** is ``reports/wave-h/state.json`` (git-ignored: it names private episodes); the report
-``docs/wave-h-report.md`` holds numbers only. A step that finished is never re-run; a stopped,
-failed or killed step is retried on the next ``--yes-spend`` (a killed step's apps are stopped
-first).
+**State** is ``reports/wave-h/state.json`` (git-ignored: it names private episodes). Per job it
+records what ``scripts/wave_h_finalize.py`` reads: ``state``, ``spend``, ``video_s``, ``cfg``,
+``job_id``, the record JSONL paths (``records``: where ``wave_h_finalize.py --fetch`` exports
+them) and per container ``kind``, ``gpu``, ``startup_s``, ``busy_s``, ``seconds`` (``flora
+report``'s, ``jobs.containers``: derived from the attempt markers, shard receipts and call
+ledgers; :func:`job_record` cuts them at the app stop);
+the balanced step also records the derived content digests its workers verified
+(``derived_content``). This script's own summary goes to ``reports/wave-h/runbook.md``
+(git-ignored); ``docs/wave-h-report.md`` is ``wave_h_finalize.py``'s. A step that finished is
+never re-run; a stopped, failed or killed step is retried on the next ``--yes-spend`` (a killed
+step's apps are stopped first).
 """
 
 from __future__ import annotations
@@ -78,33 +106,65 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import h0_rehearsal as h0  # noqa: E402 - the same episodes, staging and configs as H0
+import h0_rehearsal as h0  # noqa: E402 - the same staging and configs as H0
 
 STATE = ROOT / "reports" / "wave-h" / "state.json"
-REPORT = ROOT / "docs" / "wave-h-report.md"
+REPORT = ROOT / "reports" / "wave-h" / "runbook.md"  # docs/wave-h-report.md: wave_h_finalize.py
+RECORDS = ROOT / "reports" / "wave-h" / "records"  # wave_h_finalize.py --fetch writes here
 STORE_VOLUME = "flora-wave-h"
 MEDIA_VOLUME = "flora-wave-h-media"
-GLOBAL_CAP_USD = 3.20
-# Per-step caps (USD). (b): $1.80, set by the user for two H200 cold starts (nominal $1.19),
-# below its honest upper ($2.55 with 240 s client slack per app). The others are their upper
-# projections rounded up (``honest_caps``). Their sum does NOT fit the $3.20 global cap: the dry
-# run says so and names the minimum honest cap; the stop rules then refuse the first step that
-# does not fit. Raising the caps is the user's decision.
-CAPS_USD = {"preflight": 0.05, "exact_e2e": 1.80, "rewards": 0.90, "balanced": 4.35,
-            "certify": 0.0, "noise": 1.20}
+EMBODIMENT = "human"
+JOB = "human"  # the one job (key in each step's ``jobs``, shared with wave_h_finalize.py)
+# Six of the seven staged ``human`` golden episodes (docs/golden-manifest-v1.md: 7 selected, 7
+# staged, all oracle-eligible): the EgoDex three, and three HomER rows (VFR, one without
+# instruction text). The longest, ``homer_40`` (59.6 s), is left out to keep the cost down.
+EPISODES: tuple[str, ...] = (
+    "human/egodex_add_remove_lid/episode_000014",
+    "human/egodex_braid_unbraid/episode_000001",
+    "human/egodex_make_sandwich/episode_000002",
+    "human/wgo/homer_52",
+    "human/wgo/homer_53",
+    "human/wgo/homer_50",
+)
+NOISE_EPISODES = EPISODES  # (f) repeats the oracle job: all of its episodes
+# Plans (``--plan``). balanced-only: the user's decision of 2026-10-22 (run the GPU session
+# balanced only, now; the oracle, certification and noise move into one later certified run).
+PLANS: dict[str, tuple[str, ...]] = {
+    "balanced-only": ("tempseg", "preflight", "balanced"),
+    "full": ("tempseg", "preflight", "exact_e2e", "balanced", "certify", "noise"),
+}
+DEFAULT_PLAN = "balanced-only"
+DEFERRED_NOTE = "deferred to the certified run"
+# Per-step caps (USD): each step's upper projection, priced on the golden selection's expected
+# durations x (1 + DURATION_HEADROOM) (the staged human files run ~5% longer in all), rounded up
+# to 5 cents (``honest_caps``); (d)'s includes the cold compile (:data:`COLD_COMPILE_FACTOR`).
+# Global cap: ``--plan balanced-only`` (default) uses the sum of its steps' upper projections
+# rounded up to $0.10 (:func:`plan_global_cap`); ``--plan full`` the earlier $6.50, which the
+# full plan's upper total does not fit (the dry run says so, and the stop rule refuses the first
+# step whose upper projection no longer fits the cap left). Raising a cap is the user's decision.
+DURATION_HEADROOM = 0.10
+CAPS_USD = {"tempseg": 0.75, "preflight": 0.05, "exact_e2e": 3.30, "balanced": 3.70,
+            "certify": 0.0, "noise": 3.30}
+GLOBAL_CAP_USD = 6.50  # --plan full; balanced-only derives its own (plan_global_cap)
+# Cold compile (image smoke, 2026-10-22): ``flora-cache`` holds no compile cache for
+# balanced/tempseg or balanced/captioner at the current image key, so (d)'s first L40S and H100
+# engine starts compile from scratch (torch.compile, Triton, CUDA graphs). The balanced startup
+# row of planner/rates.json (130 s, projected with a warm cache) is scaled by the Rewarder's
+# measured cold/warm @enter ratio, 318 s / 229 s (docs/rewarder-smoke.md, docs/cold-start.md).
+COLD_COMPILE_FACTOR = 318.0 / 229.0
 LAB_MAX_S = 600  # (d): <= 10 min per lab call
 LAB_EXPECTED_S = {"tempseg": 420, "captioner": 480}  # two engine loads + 6 episodes each
 LAB_SLACK_S = 60  # lab: client timeout -> cancel -> container gone
+TEMPSEG_APP = "flora-convert"  # modal_app/convert_app.py
+MERGE_EXPECTED_S, MERGE_MAX_S = 300, 1200  # v2: FP64 merge, "a few minutes" (tempseg-merge.md)
+EQUIV_EXPECTED_S, EQUIV_MAX_S = 240, 600  # v1: 142 s + image start on one L40S
 IDLE_AFTER_JOB_S = 30  # last receipt -> compose -> `modal app stop`
 CLIENT_SLACK_S = 240  # per app: `flora run` timeout margin, then cancel + `modal app stop`
 BILLING_LAG_S = 3600  # Modal billing covers complete hours only
 HEARTBEAT_S = 30.0
 ORACLE_DETERMINISM = "nvidia"  # Fix-Cert: oracle and noise run in NVIDIA's default mode
-NOISE_JOB = "human"  # the oracle job (f) repeats
-REWARD_EPISODES = ("yam/aloha_static_cups_open/episode_000000",
-                   "yam/aloha_static_towel/episode_000000",
-                   "single_view_robot/wgo/robointer_droid_000010")
-NOISE_EPISODES = h0.EPISODES[NOISE_JOB]
+NOISE_JOB = JOB  # the oracle job (f) repeats
+NEEDS_PIN = 4  # exit code: step 0 built TempSeg; pin its content digest, then re-run
 # Provisional thresholds (until the S2b noise floor exists): balanced vs exact must be within
 # NOISE_FACTOR x the measured exact-vs-exact noise, or these absolute bounds without one.
 NOISE_FACTOR = 2.0
@@ -144,6 +204,8 @@ def pool_container(kind: str, preset: str = "exact") -> Container:
 
 LAB = {"tempseg": Container("L40S", 8.0, 48.0), "captioner": Container("H100", 8.0, 96.0)}
 PREFLIGHT = Container(None, 2.0, 4.0)
+MERGE = Container(None, 8.0, 32.0)  # convert_app.MERGE_CPU / MERGE_MEMORY_MIB
+EQUIV = Container("L40S", 8.0, 48.0)  # convert_app.EQUIV_GPU / EQUIV_MEMORY_MIB
 
 
 @dataclass
@@ -173,13 +235,40 @@ def durations(manifest: Mapping[str, Any]) -> dict[str, float]:
     return {e["id"]: float(e["duration_s"]) for e in manifest["episodes"]}
 
 
+def episodes_in(manifest: Mapping[str, Any]) -> tuple[str, ...]:
+    """The :data:`EPISODES` the manifest has staged (all six, per golden-manifest-v1)."""
+    have = durations(manifest)
+    return tuple(e for e in EPISODES if e in have)
+
+
+def missing_episodes(manifest: Mapping[str, Any]) -> tuple[str, ...]:
+    have = durations(manifest)
+    return tuple(e for e in EPISODES if e not in have)
+
+
+def offline_manifest(headroom: float = 0.0) -> dict[str, Any]:
+    """The golden selection's expected durations (``validate/golden_selection_v1.json``) as a
+    manifest, for a dry run that reads no Volume; ``headroom`` scales them up."""
+    from importlib import resources
+
+    sel = json.loads((resources.files("flora_deploy.validate")
+                      / "golden_selection_v1.json").read_text())
+    eps = []
+    for e in sel["episodes"]:
+        gid = f"{e['pool']}/{e['dataset']}/{e['slug']}"
+        if e.get("expected_s") is not None:
+            eps.append({"id": gid, "duration_s": round(float(e["expected_s"]) * (1 + headroom),
+                                                       2)})
+    return {"episodes": eps, "offline": True}
+
+
 def exact_job_seconds(video_s: float, table: Any = None) -> tuple[float, float]:
     """Nominal and upper container-seconds of one exact segcap job in one container (startup,
     work, idle until ``modal app stop``; upper: upper quantiles plus :data:`CLIENT_SLACK_S`)."""
     from flora_deploy.planner.rates import RateTable
 
     t = table or RateTable.load()
-    e = t.rate("exact", "segcap", 3, 1)
+    e = t.rate("exact", "segcap", 1, 1)
     st = t.startup_for("exact", "segcap")
     nominal = st.startup_s + video_s * e.container_s_per_video_s + IDLE_AFTER_JOB_S
     upper = (st.startup_s * (1 + st.uncertainty)
@@ -188,24 +277,14 @@ def exact_job_seconds(video_s: float, table: Any = None) -> tuple[float, float]:
     return nominal, upper
 
 
-def reward_job_seconds(video_s: float, table: Any = None) -> tuple[float, float]:
-    """Both reward kinds in one container (``max_inputs: 2``)."""
-    from flora_deploy.planner.rates import RateTable
-
-    t = table or RateTable.load()
-    st = t.startup_for("exact", "reward.terminal")
-    work = sum(t.rate("exact", k, 3, 1).container_s_per_video_s * video_s
-               for k in ("reward.terminal", "reward.dense"))
-    unc = max(t.rate("exact", k, 3, 1).uncertainty for k in ("reward.terminal", "reward.dense"))
-    return (st.startup_s + work + IDLE_AFTER_JOB_S,
-            st.startup_s * (1 + st.uncertainty) + work * (1 + unc) + IDLE_AFTER_JOB_S
-            + CLIENT_SLACK_S)
-
-
-def balanced_job_seconds(video_s: float, table: Any = None) -> dict[str, tuple[float, float]]:
+def balanced_job_seconds(video_s: float, table: Any = None, *,
+                         compile_factor: float = COLD_COMPILE_FACTOR
+                         ) -> dict[str, tuple[float, float]]:
     """One balanced job (one app): kind -> (nominal, upper) container-seconds. Each pool has
-    its own cold start; the segment container then idles through the scale-down window while
-    captions run (the caption shards wait for it); both stay up through the client slack."""
+    its own cold start, its startup scaled by ``compile_factor`` (a cold compile cache:
+    :data:`COLD_COMPILE_FACTOR`); the segment container then idles through the scale-down
+    window while captions run (the caption shards wait for it); both stay up through the client
+    slack."""
     from flora_deploy.jobs.settings import WORKER_SCALEDOWN_S
     from flora_deploy.planner.rates import RateTable
 
@@ -213,9 +292,9 @@ def balanced_job_seconds(video_s: float, table: Any = None) -> dict[str, tuple[f
     out: dict[str, tuple[float, float]] = {}
     work: dict[str, tuple[float, float, float]] = {}
     for kind in ("segment", "caption"):
-        e = t.rate("balanced", kind, 3, 1)
+        e = t.rate("balanced", kind, 1, 1)
         st = t.startup_for("balanced", kind)
-        work[kind] = (st.startup_s, video_s * e.container_s_per_video_s,
+        work[kind] = (st.startup_s * compile_factor, video_s * e.container_s_per_video_s,
                       max(e.uncertainty, st.uncertainty))
     cap_nominal = work["caption"][0] + work["caption"][1]
     for kind, (start, w, unc) in work.items():
@@ -230,42 +309,39 @@ def project(step: str, manifest: Mapping[str, Any]) -> Projection:
     """What ``step`` is expected to cost (nominal rates; ``usd_upper``: upper quantiles plus
     every cold start, scale-down tail and client slack the step can incur)."""
     dur = durations(manifest)
+    eps = episodes_in(manifest)
+    v = sum(dur[i] for i in eps)
     p = Projection(step)
-    if step == "preflight":
+    if step == "tempseg":
+        p.add("convert_app tempseg --step merge (merger v2)", MERGE, MERGE_EXPECTED_S,
+              upper_s=MERGE_MAX_S + LAB_SLACK_S)
+        p.add("convert_app tempseg --step equivalence", EQUIV, EQUIV_EXPECTED_S,
+              upper_s=EQUIV_MAX_S + LAB_SLACK_S)
+        p.peak_usd_per_s = max(MERGE.usd_per_s(), EQUIV.usd_per_s())  # one after the other
+    elif step == "preflight":
         p.add("balanced_lab.preflight", PREFLIGHT, 90.0, upper_s=90.0 + LAB_SLACK_S)
         p.peak_usd_per_s = PREFLIGHT.usd_per_s()
     elif step == "exact_e2e":
-        for job, ids in h0.EPISODES.items():
-            v = sum(dur[i] for i in ids)
-            nominal, upper = exact_job_seconds(v)
-            p.add(f"segcap {job} ({len(ids)} ep, {v:.1f} s, cold start)",
-                  pool_container("segcap"), nominal, upper_s=upper)
-        p.peak_usd_per_s = pool_container("segcap").usd_per_s()  # apps run one at a time
-    elif step == "rewards":
-        v = sum(dur[i] for i in REWARD_EPISODES)
-        nominal, upper = reward_job_seconds(v)
-        c = pool_container("reward.terminal")
-        p.add(f"reward.terminal+dense ({len(REWARD_EPISODES)} ep, {v:.1f} s)", c, nominal,
-              upper_s=upper)
-        p.peak_usd_per_s = c.usd_per_s()
+        nominal, upper = exact_job_seconds(v)
+        p.add(f"segcap {JOB} ({len(eps)} ep, {v:.1f} s, cold start)", pool_container("segcap"),
+              nominal, upper_s=upper)
+        p.peak_usd_per_s = pool_container("segcap").usd_per_s()
     elif step == "balanced":
         seg, cap = pool_container("segment", "balanced"), pool_container("caption", "balanced")
-        for job, ids in h0.EPISODES.items():
-            v = sum(dur[i] for i in ids)
-            secs = balanced_job_seconds(v)
-            p.add(f"balanced segment {job} ({len(ids)} ep, {v:.1f} s, cold start)", seg,
-                  secs["segment"][0], upper_s=secs["segment"][1])
-            p.add(f"balanced caption {job} ({len(ids)} ep, {v:.1f} s, cold start)", cap,
-                  secs["caption"][0], upper_s=secs["caption"][1])
+        secs = balanced_job_seconds(v)
+        p.add(f"balanced segment {JOB} ({len(eps)} ep, {v:.1f} s, cold compile)", seg,
+              secs["segment"][0], upper_s=secs["segment"][1])
+        p.add(f"balanced caption {JOB} ({len(eps)} ep, {v:.1f} s, cold compile)", cap,
+              secs["caption"][0], upper_s=secs["caption"][1])
         for kind in ("tempseg", "captioner"):
-            p.add(f"balanced lab {kind} (L0 + Gate A)", LAB[kind], LAB_EXPECTED_S[kind],
-                  upper_s=LAB_MAX_S + LAB_SLACK_S)
+            p.add(f"balanced lab {kind} (L0 + Gate A; only after the job is done)", LAB[kind],
+                  LAB_EXPECTED_S[kind], upper_s=LAB_MAX_S + LAB_SLACK_S)
         p.peak_usd_per_s = max(seg.usd_per_s() + cap.usd_per_s(),
                                max(c.usd_per_s() for c in LAB.values()))
     elif step == "noise":
-        v = sum(dur[i] for i in NOISE_EPISODES)
-        nominal, upper = exact_job_seconds(v)
-        p.add(f"segcap {NOISE_JOB} repeat ({len(NOISE_EPISODES)} ep, {v:.1f} s, cold start)",
+        nv = sum(dur[i] for i in NOISE_EPISODES if i in dur)
+        nominal, upper = exact_job_seconds(nv)
+        p.add(f"segcap {NOISE_JOB} repeat ({len(eps)} ep, {nv:.1f} s, cold start)",
               pool_container("segcap"), nominal, upper_s=upper)
         p.peak_usd_per_s = pool_container("segcap").usd_per_s()
     elif step == "certify":
@@ -273,6 +349,20 @@ def project(step: str, manifest: Mapping[str, Any]) -> Projection:
     else:
         raise KeyError(step)
     return p
+
+
+def deferred_steps(plan: str) -> tuple[str, ...]:
+    """The steps a plan never runs ("deferred to the certified run")."""
+    return tuple(s for s in STEPS if s not in PLANS[plan])
+
+
+def plan_global_cap(plan: str, projections: Mapping[str, Projection]) -> float:
+    """``full``: :data:`GLOBAL_CAP_USD`. Otherwise the sum of the plan's upper projections,
+    rounded up to $0.10."""
+    if plan == "full":
+        return GLOBAL_CAP_USD
+    up = round(sum(projections[s].usd_upper for s in PLANS[plan]), 6)
+    return round(math.ceil(up * 10 - 1e-9) / 10, 2)
 
 
 def honest_caps(projections: Mapping[str, Projection]) -> dict[str, float]:
@@ -287,13 +377,13 @@ def honest_caps(projections: Mapping[str, Projection]) -> dict[str, float]:
 # State and stop rules
 
 
-STEPS = ("preflight", "exact_e2e", "rewards", "balanced", "certify", "noise")
-TITLES = {"preflight": "a. balanced preflight (CPU)",
-          "exact_e2e": "b. exact oracle, 6 episodes, default mode, 2 x H200",
-          "rewards": "c. rewards on 3 episodes, H100",
+STEPS = ("tempseg", "preflight", "exact_e2e", "balanced", "certify", "noise")
+TITLES = {"tempseg": "0. TempSeg merger v2 build + equivalence (CPU + L40S), then pin",
+          "preflight": "a. balanced preflight (CPU)",
+          "exact_e2e": "b. exact oracle, 6 human episodes, default mode, H200",
           "balanced": "d. balanced via flora deploy/run (L40S + H100) + lab L0 / Gate A",
           "certify": "e. offline provisional certification",
-          "noise": "f. noise: oracle human job repeated, default mode, H200"}
+          "noise": "f. noise: oracle job repeated, default mode, H200"}
 
 
 @dataclass
@@ -301,7 +391,7 @@ class Attempt:
     """One run of a step (module docstring, "Spend")."""
 
     started: float
-    status: str = "running"  # running | done | failed | stopped | killed
+    status: str = "running"  # running | done | failed | stopped | killed | needs_pin
     finished: float | None = None
     heartbeat: float | None = None
     rate_usd_per_s: float = 0.0  # the step's peak burn (heartbeat estimate)
@@ -327,7 +417,7 @@ class Attempt:
 
 @dataclass
 class StepState:
-    status: str = "pending"  # pending | running | done | failed | stopped
+    status: str = "pending"  # pending | running | done | failed | stopped | needs_pin
     projected_usd: float | None = None
     projected_upper_usd: float | None = None
     billed_usd: float | None = None  # billed delta of the apps only this step used
@@ -667,6 +757,52 @@ def certify(balanced: Mapping[str, float], *, l0: Sequence[Mapping[str, Any]] = 
 
 
 # ---------------------------------------------------------------------------------------------
+# Job records for wave_h_finalize.py (pure; contract-tested against Job.report())
+
+
+def clip_containers(rows: Iterable[Mapping[str, Any]], stopped_at: float | None
+                    ) -> list[dict[str, Any]]:
+    """``flora report``'s containers (``jobs.containers``: ``kind``, ``gpu``, ``startup_s``,
+    ``busy_s``, ``seconds``) with ``seconds`` / ``usd`` cut at the app stop (``modal app stop``
+    ends every container; the report only knows the scale-down window)."""
+    from flora_deploy.jobs.containers import parse_utc
+
+    out = []
+    for c in rows:
+        c = dict(c)
+        born = parse_utc(c.get("started_utc"))
+        if stopped_at is not None and born is not None and c.get("seconds") is not None:
+            if c.get("startup_s") is not None:
+                born -= float(c["startup_s"])
+            cut = max(0.0, stopped_at - born)
+            if cut < float(c["seconds"]):
+                if c.get("usd"):
+                    c["usd"] = round(float(c["usd"]) * cut / float(c["seconds"]), 4)
+                c["seconds"] = round(cut, 1)
+        out.append(c)
+    return out
+
+
+def job_record(report: Mapping[str, Any], *, stopped_at: float | None = None
+               ) -> dict[str, Any]:
+    """The fields of a job's state entry that come from ``flora report --json``
+    (``sdk.Job.report``): ``state``, ``spend``, ``video_hours`` / ``video_s``, $/video-h and the
+    per-container rows ``wave_h_finalize.measure`` reads."""
+    vh = report.get("video_hours") or {}
+    sp = report.get("spend") or {}
+    return {"state": report.get("state"), "spend": sp.get("total_usd"),
+            "usd_per_video_hour": report.get("usd_per_video_hour"), "video_hours": vh,
+            "video_s": round(float(vh.get("done") or 0.0) * 3600.0, 2),
+            "containers": clip_containers(sp.get("containers") or [], stopped_at)}
+
+
+def record_paths(side: str, job: str = JOB) -> dict[str, str]:
+    """Where ``wave_h_finalize.py --fetch`` exports a job's records (its ``record_path``)."""
+    return {stage: str(RECORDS / side / job / f"{stage}.jsonl")
+            for stage in ("segment", "caption")}
+
+
+# ---------------------------------------------------------------------------------------------
 # Step runners (GPU steps only with --yes-spend)
 
 
@@ -678,6 +814,11 @@ class Ctx:
     log: Callable[[str], None] = print
     state_path: Path = STATE
     step: str = ""
+    global_cap: float = GLOBAL_CAP_USD  # the plan's (plan_global_cap)
+
+    @property
+    def episodes(self) -> tuple[str, ...]:
+        return episodes_in(self.manifest)
 
     def sh(self, args: list[str], *, timeout: float = 1800, check: bool = True):
         return h0.sh(args, cwd=self.work, timeout=timeout, check=check,
@@ -690,19 +831,29 @@ class Ctx:
             cur.apps.append(name)
             save_state(self.st, self.state_path)
 
+    def receipt_rows(self) -> list[dict[str, Any]]:
+        """``flora prepare --show-receipt`` (a Volume read; no container)."""
+        from flora_deploy.cli.prepare import show_receipt_rows
+
+        return show_receipt_rows()
+
 
 def resolve_receipts(names: Iterable[str], *, read: Callable[[str], bytes | None] | None = None,
                      require_pin: bool = False) -> dict[str, str]:
     """``weights.derived`` for ``names``, as ``flora prepare`` records it (H1): each receipt read
     from the ``flora-weights`` Volume, its content digest checked against ``pins.DERIVED_PINS``
     (``config.receipts.check_pinned``), its file sha256 returned. ``require_pin``: also refuse a
-    derived weight without a pinned content digest (the balanced workers fail closed on it)."""
-    from flora_deploy.config.pins import DERIVED_PINS_BY_KEY
-    from flora_deploy.config.receipts import check_pinned, pin_key
+    derived weight without a pinned content digest, with ``config.receipts.unpinned_message``
+    (``plan_app`` and the balanced workers refuse it too)."""
+    from flora_deploy.config.receipts import check_pinned, unpinned, unpinned_message
     from flora_deploy.prep.derived import DERIVED_BUILDS, receipt_sha256
 
     if read is None:
         from flora_deploy.cli.prepare import _read_weights_file as read
+    if require_pin:
+        bad = unpinned(names)
+        if bad:  # before any Volume read: nothing has started
+            raise RuntimeError(" ".join(unpinned_message(n, preset="balanced") for n in bad))
     out: dict[str, str] = {}
     for name in sorted(set(names)):
         path = DERIVED_BUILDS[name].receipt_path()
@@ -711,12 +862,164 @@ def resolve_receipts(names: Iterable[str], *, read: Callable[[str], bytes | None
             raise RuntimeError(f"{name}: no receipt at flora-weights:{path} (run `flora "
                                "prepare`)")
         check_pinned(name, json.loads(raw), where=f"flora-weights:{path}")
-        pin = DERIVED_PINS_BY_KEY.get(pin_key(name))
-        if require_pin and (pin is None or pin.content_sha256 is None):
-            raise RuntimeError(f"{name}: no content digest is pinned in pins.DERIVED_PINS; the "
-                               "balanced workers refuse it at start (pin it first)")
         out[name] = receipt_sha256(raw)
     return out
+
+
+def tempseg_row(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    return dict(next((r for r in rows if r.get("key") == "tempseg_merged"), {}))
+
+
+def require_tempseg_pin(ctx: Ctx) -> dict[str, Any]:
+    """Refuse (before any app) until step 0's TempSeg receipt matches the pin."""
+    from flora_deploy.config.receipts import unpinned_message
+
+    row = tempseg_row(ctx.receipt_rows())
+    if row.get("content_sha256_pinned") is None:
+        raise RuntimeError("step 0 has not been pinned: " + unpinned_message(
+            "tempseg_merged", kinds=("segment",), preset="balanced"))
+    if row.get("matches_pin") is not True:
+        raise RuntimeError(f"tempseg_merged on flora-weights has content digest "
+                           f"{row.get('content_sha256')}, not the pinned "
+                           f"{row.get('content_sha256_pinned')} ({row.get('error') or 'rebuilt?'}"
+                           "); re-run step 0 (`--only tempseg`)")
+    return row
+
+
+def equivalence_ok(res: Mapping[str, Any]) -> tuple[bool, dict[str, Any]]:
+    """``convert_app.tempseg_equivalence``: every window has identical inputs and greedy ids,
+    ``verify_gdn`` passes on B, and the merged files verify (docs/tempseg-merge.md)."""
+    wins = list(res.get("windows") or [])
+    gdn = res.get("b_gdn") or {}
+    summary = {
+        "windows": len(wins),
+        "inputs_identical": all(w.get("inputs_identical") for w in wins),
+        "ids_identical": all(w.get("ids_identical") for w in wins),
+        "json_equal": all(w.get("json_equal") for w in wins),
+        "gdn": {k: v for k, v in gdn.items()},
+        "verify_merged": bool(res.get("verify_merged")),
+        "max_abs_dlogit_tf": max((float(((w.get("teacher_forced_on_a") or {}).get("a_vs_b")
+                                         or {}).get("max_abs", 0.0)) for w in wins),
+                                 default=None),
+        "total_s": res.get("total_s"),
+    }
+    ok = (bool(wins) and summary["inputs_identical"] and summary["ids_identical"]
+          and all(str(v).upper() == "PASS" for v in gdn.values()) and summary["verify_merged"])
+    return ok, summary
+
+
+def _modal_run(ctx: Ctx, target: str, args: list[str], *, limit: float, out: Path
+               ) -> tuple[dict[str, Any] | None, float, str | None]:
+    """``modal run <target> <args> --out <out>`` with a client deadline; the app is stopped
+    after it either way. Returns (result JSON, wall s, error)."""
+    t0 = time.time()
+    err = None
+    try:
+        ctx.sh(["modal", "run", target, *args, "--out", str(out)], timeout=limit, check=True)
+    except subprocess.TimeoutExpired:
+        err = f"client deadline {limit:.0f} s"
+    except RuntimeError as e:
+        err = str(e)
+    finally:
+        ctx.sh(["modal", "app", "stop", "--yes", TEMPSEG_APP], check=False, timeout=120)
+    wall = time.time() - t0
+    try:
+        res = json.loads(out.read_text()) if out.exists() and err is None else None
+    except ValueError as e:
+        res, err = None, f"unreadable {out.name}: {e}"
+    return res, wall, err
+
+
+def run_tempseg(ctx: Ctx) -> dict[str, Any]:
+    """Step 0 (module docstring): build, check, report the digest, stop for the pin."""
+    rows = ctx.receipt_rows()
+    row = tempseg_row(rows)
+    pinned = row.get("content_sha256_pinned")
+    if pinned and row.get("matches_pin") is True:
+        return {"ok": True, "pinned": pinned, "receipt_sha256": row.get("receipt_sha256"),
+                "tracked_usd": 0.0, "apps": [], "built": False}
+    prev = ctx.st.step("tempseg").result
+    if (prev.get("content_sha256") and row.get("content_sha256") == prev["content_sha256"]
+            and prev.get("equivalence_ok")):  # already built and checked: never rebuild
+        return {**prev, "ok": False, "needs_pin": True, "tracked_usd": 0.0, "apps": [],
+                "built": False, "pin_mismatch": pinned}
+    target = str(ROOT / "src" / "flora_deploy" / "modal_app" / "convert_app.py") + "::tempseg"
+    spent = 0.0
+    ctx.note_app(TEMPSEG_APP)
+    out: dict[str, Any] = {"apps": [TEMPSEG_APP], "built": True}
+    rdir = ctx.work
+    limit = min(MERGE_MAX_S, gpu_deadline_s(ctx.st, "tempseg", MERGE, slack_s=LAB_SLACK_S,
+                                            global_cap=ctx.global_cap))
+    if limit < 120:
+        return {**out, "ok": False, "error": f"budget left allows {limit:.0f} s",
+                "tracked_usd": 0.0}
+    merge, wall, err = _modal_run(ctx, target, ["--step", "merge", "--force"], limit=limit,
+                                  out=rdir / "tempseg-merge.json")
+    spent += MERGE.usd_per_s() * wall
+    out["merge"] = {"wall_s": round(wall, 1), "error": err,
+                    "receipt": (merge or {}).get("receipt_sha256")}
+    if err:
+        return {**out, "ok": False, "error": f"merge: {err}", "tracked_usd": spent}
+    limit = min(EQUIV_MAX_S, gpu_deadline_s(ctx.st, "tempseg", EQUIV, spent_in_step=spent,
+                                            slack_s=LAB_SLACK_S, global_cap=ctx.global_cap))
+    if limit < 120:
+        return {**out, "ok": False, "error": f"budget left allows {limit:.0f} s for the "
+                "equivalence check", "tracked_usd": spent}
+    eq, wall, err = _modal_run(ctx, target, ["--step", "equivalence"], limit=limit,
+                               out=rdir / "tempseg-equivalence.json")
+    spent += EQUIV.usd_per_s() * wall
+    ok, summary = equivalence_ok(eq or {}) if not err else (False, {"error": err})
+    out.update(equivalence={**summary, "wall_s": round(wall, 1)}, equivalence_ok=ok)
+    row = tempseg_row(ctx.receipt_rows())
+    out.update(content_sha256=row.get("content_sha256"), receipt_sha256=row.get(
+        "receipt_sha256"), version=row.get("version"), tracked_usd=spent)
+    if not ok or not row.get("content_sha256"):
+        return {**out, "ok": False, "error": err or "equivalence check failed: do not pin"}
+    if row.get("version") != 2:
+        return {**out, "ok": False, "error": f"receipt merger version {row.get('version')}, "
+                "not 2: do not pin"}
+    return {**out, "ok": False, "needs_pin": True}
+
+
+PINS_FILE = "src/flora_deploy/config/pins.py"
+UNPINNED_LINE = "        content_sha256=None,"  # in DerivedPin(key="tempseg-merged", ...)
+
+
+def pin_edit(digest: str | None) -> tuple[str, str]:
+    """The one line of :data:`PINS_FILE` to change: (old, new)."""
+    return UNPINNED_LINE, f'        content_sha256="{digest}",'
+
+
+def pin_instructions(res: Mapping[str, Any]) -> str:
+    old, new = pin_edit(res.get("content_sha256"))
+    return (f"STOP: pin TempSeg before steps (a) and (d). The one-line edit, in {PINS_FILE}, "
+            'inside DerivedPin(key="tempseg-merged", ...) (DERIVED_PINS["tempseg-merged"]'
+            ".content_sha256):\n"
+            f"  -{old}\n"
+            f"  +{new}\n"
+            f"(receipt file sha256 {res.get('receipt_sha256')}; `flora prepare --show-receipt` "
+            "prints both), record the equivalence result in docs/tempseg-merge.md, commit, then "
+            "re-run `scripts/wave_h.py --yes-spend` from that commit. Steps that need TempSeg "
+            "refuse until the pin matches.")
+
+
+def run_preflight(ctx: Ctx) -> dict[str, Any]:
+    import modal
+
+    from flora_deploy.modal_app import balanced_lab as lab
+
+    require_tempseg_pin(ctx)
+    t0 = time.time()
+    ctx.note_app("flora-balanced-lab")
+    with modal.enable_output(), lab.app.run():
+        out = lab.preflight.remote()
+    wall = time.time() - t0
+    ok = all(out.get(k, {}).get("receipt") for k in ("tempseg", "captioner"))
+    return {"ok": ok, "wall_s": round(wall, 1), "tracked_usd": PREFLIGHT.usd_per_s() * wall,
+            "apps": ["flora-balanced-lab"],
+            "facts": {k: {kk: v.get(kk) for kk in ("receipt", "eos_token",
+                                                    "extra_state_prefixes")}
+                      for k, v in out.items() if isinstance(v, dict)}}
 
 
 def _stage_job(ctx: Ctx, job: str, ids: Sequence[str], *, embodiment: str,
@@ -748,22 +1051,29 @@ def _index(ctx: Ctx, cfg: Path, job_id: str, tag: str) -> None:
     ctx.sh([fl, "plan", "--config", str(cfg), "--index", str(ctx.work / f"summary-{tag}.json")])
 
 
+def store_uri(st: State) -> str:
+    return f"modal-volume://{STORE_VOLUME}/{st.run_id}"
+
+
 def _run_job(ctx: Ctx, step: str, cfg: Path, job_id: str, *, determinism: str,
-             usd_per_s: float, spent_in_step: float) -> dict[str, Any]:
+             usd_per_s: float, spent_in_step: float, side: str) -> dict[str, Any]:
     """``flora deploy`` + ``flora run`` with the in-step stop rule, then ``modal app stop``.
     Receipts come from the config's ``weights.derived`` (``config.receipts.resolve``), as for
-    ``flora deploy``."""
+    ``flora deploy``. Records the fields ``wave_h_finalize.py`` reads (module docstring)."""
     from flora_deploy.config.receipts import resolve
     from flora_deploy.config.schema import load_config
     from flora_deploy.modal_app.factory import plan_app
 
     fl = h0.flora_bin()
     c = load_config(cfg)
-    plan = plan_app(c, determinism=determinism, derived_receipts=resolve(c))
-    deadline = gpu_deadline_s(ctx.st, step, usd_per_s, spent_in_step=spent_in_step)
-    budget = max(0.01, step_budget(ctx.st, step, spent_in_step=spent_in_step))
+    plan = plan_app(c, determinism=determinism, derived_receipts=resolve(c))  # refuses first
+    deadline = gpu_deadline_s(ctx.st, step, usd_per_s, spent_in_step=spent_in_step,
+                              global_cap=ctx.global_cap)
+    budget = max(0.01, step_budget(ctx.st, step, spent_in_step=spent_in_step,
+                                   global_cap=ctx.global_cap))
     out: dict[str, Any] = {"app": plan.app_name, "job_id": job_id, "deadline_s": round(deadline),
-                           "budget_usd": round(budget, 4), "cfg": str(cfg)}
+                           "budget_usd": round(budget, 4), "cfg": str(cfg),
+                           "preset": c.preset, "records": record_paths(side)}
     if deadline < 60:
         out["state"] = "skipped"
         out["error"] = f"budget left allows {deadline:.0f} s"
@@ -781,38 +1091,17 @@ def _run_job(ctx: Ctx, step: str, cfg: Path, job_id: str, *, determinism: str,
             ctx.sh([fl, "cancel", job_id, "--config", str(cfg)], check=False, timeout=120)
     finally:
         ctx.sh(["modal", "app", "stop", "--yes", plan.app_name], check=False, timeout=120)
+        out["stopped_at"] = time.time()
     rep = ctx.sh([fl, "report", job_id, "--config", str(cfg), "--json"], check=False,
                  timeout=900)
     try:
-        r = json.loads(rep.stdout)
-        out.update(state=r.get("state"), spend=r.get("spend", {}).get("total_usd"),
-                   usd_per_video_hour=r.get("usd_per_video_hour"),
-                   containers=r.get("spend", {}).get("containers"),
-                   video_hours=r.get("video_hours"))
+        out.update(job_record(json.loads(rep.stdout), stopped_at=out["stopped_at"]))
     except ValueError:
         out["report_error"] = (rep.stdout + rep.stderr)[-400:]
     if out.get("spend") is None:  # unknown: charge what it was allowed (H3)
         out["report_error"] = out.get("report_error") or "no spend in flora report"
         out["spend"] = budget
     return out
-
-
-def run_preflight(ctx: Ctx) -> dict[str, Any]:
-    import modal
-
-    from flora_deploy.modal_app import balanced_lab as lab
-
-    t0 = time.time()
-    ctx.note_app("flora-balanced-lab")
-    with modal.enable_output(), lab.app.run():
-        out = lab.preflight.remote()
-    wall = time.time() - t0
-    ok = all(out.get(k, {}).get("receipt") for k in ("tempseg", "captioner"))
-    return {"ok": ok, "wall_s": round(wall, 1), "tracked_usd": PREFLIGHT.usd_per_s() * wall,
-            "apps": ["flora-balanced-lab"],
-            "facts": {k: {kk: v.get(kk) for kk in ("receipt", "eos_token",
-                                                    "extra_state_prefixes")}
-                      for k, v in out.items() if isinstance(v, dict)}}
 
 
 def _jobs_result(jobs: Mapping[str, Mapping[str, Any]], n: int) -> dict[str, Any]:
@@ -824,66 +1113,60 @@ def _jobs_result(jobs: Mapping[str, Mapping[str, Any]], n: int) -> dict[str, Any
 
 
 def run_exact(ctx: Ctx, step: str = "exact_e2e") -> dict[str, Any]:
-    """(b): the oracle, default mode, one app per embodiment (two H200 cold starts)."""
-    eps = dict(h0.EPISODES)
+    """(b): the oracle, default mode, one app."""
+    require_tempseg_pin(ctx)  # every GPU step runs from the pinned commit
     derived = resolve_receipts(["captioner_bf16"])
-    jobs: dict[str, dict[str, Any]] = {}
-    spent = 0.0
-    rate = pool_container("segcap").usd_per_s()
-    for job in sorted(eps, key=lambda j: -len(eps[j])):  # the larger job first
-        cfg, job_id = _stage_job(ctx, f"{step}-{job}", eps[job],
-                                 embodiment="human" if job == "human" else "yam",
-                                 stages=("segment", "caption"), budget=CAPS_USD[step],
-                                 derived=derived)
-        r = _run_job(ctx, step, cfg, job_id, determinism=ORACLE_DETERMINISM, usd_per_s=rate,
-                     spent_in_step=spent)
-        r["data"] = f"{step}-{job}"
-        jobs[job] = r
-        spent += float(r.get("spend") or 0.0)
-        if r.get("state") not in ("done", "completed_with_errors"):
-            break
-    return _jobs_result(jobs, len(eps))
+    cfg, job_id = _stage_job(ctx, f"{step}-{JOB}", ctx.episodes, embodiment=EMBODIMENT,
+                             stages=("segment", "caption"), budget=CAPS_USD[step],
+                             derived=derived)
+    r = _run_job(ctx, step, cfg, job_id, determinism=ORACLE_DETERMINISM,
+                 usd_per_s=pool_container("segcap").usd_per_s(), spent_in_step=0.0,
+                 side="exact")
+    r["data"] = f"{step}-{JOB}"
+    return {**_jobs_result({JOB: r}, 1), "episodes": len(ctx.episodes)}
 
 
-def run_rewards(ctx: Ctx) -> dict[str, Any]:
-    cfg, job_id = _stage_job(ctx, "rewards", REWARD_EPISODES, embodiment="yam",
-                             stages=("reward.terminal", "reward.dense"),
-                             budget=CAPS_USD["rewards"],
-                             resources={"reward.terminal": "{max_containers: 1, max_inputs: 2}",
-                                        "reward.dense": "{max_containers: 1, max_inputs: 2}"})
-    r = _run_job(ctx, "rewards", cfg, job_id, determinism="nvidia",
-                 usd_per_s=pool_container("reward.terminal").usd_per_s(), spent_in_step=0.0)
-    return {**_jobs_result({"rewards": r}, 1), "job": r}
+def balanced_episodes(manifest: Mapping[str, Any]) -> tuple[str, ...]:
+    """(d)'s episodes: :data:`EPISODES` (the golden selection), in that order, read from
+    nothing (b) wrote. All six must be staged: refused (before any app) otherwise."""
+    miss = missing_episodes(manifest)
+    if miss:
+        raise RuntimeError(f"(d) runs all {len(EPISODES)} golden {EMBODIMENT} episodes; not "
+                           f"staged: {', '.join(miss)}")
+    return EPISODES
 
 
 def run_balanced(ctx: Ctx) -> dict[str, Any]:
-    """(d): balanced through the real ``flora deploy`` / ``flora run`` on (b)'s jobs and
-    episodes, then the lab's L0 + Gate A on 6 captured requests."""
+    """(d): balanced through the real ``flora deploy`` / ``flora run`` on the 6 golden episodes
+    (:func:`balanced_episodes`; independent of (b)), then the lab's L0 + Gate A on 6 captured
+    requests, only when that job is ``done`` (L2)."""
     import modal
 
+    from flora_deploy.config.receipts import derived_content as content_of
+    from flora_deploy.config.schema import load_config
     from flora_deploy.modal_app import balanced_lab as lab
 
+    require_tempseg_pin(ctx)
+    episodes = balanced_episodes(ctx.manifest)
     derived = resolve_receipts(["captioner_bf16", "tempseg_merged"], require_pin=True)
     rate = (pool_container("segment", "balanced").usd_per_s()
             + pool_container("caption", "balanced").usd_per_s())
-    jobs: dict[str, dict[str, Any]] = {}
-    spent = 0.0
-    eps = dict(h0.EPISODES)
-    for job in sorted(eps, key=lambda j: -len(eps[j])):
-        cfg, job_id = _stage_job(ctx, f"balanced-{job}", eps[job],
-                                 embodiment="human" if job == "human" else "yam",
-                                 stages=("segment", "caption"), budget=CAPS_USD["balanced"],
-                                 preset="balanced", derived=derived)
-        r = _run_job(ctx, "balanced", cfg, job_id, determinism=ORACLE_DETERMINISM,
-                     usd_per_s=rate, spent_in_step=spent)
-        jobs[job] = r
-        spent += float(r.get("spend") or 0.0)
-        if r.get("state") not in ("done", "completed_with_errors"):
-            break
-    e2e = _jobs_result(jobs, len(eps))
-
-    ids = [i for ids in h0.EPISODES.values() for i in ids]
-    out: dict[str, Any] = {"episodes": ids, "kinds": {}}
+    cfg, job_id = _stage_job(ctx, f"balanced-{JOB}", episodes, embodiment=EMBODIMENT,
+                             stages=("segment", "caption"), budget=CAPS_USD["balanced"],
+                             preset="balanced", derived=derived)
+    r = _run_job(ctx, "balanced", cfg, job_id, determinism=ORACLE_DETERMINISM, usd_per_s=rate,
+                 spent_in_step=0.0, side="balanced")
+    jobs = {JOB: r}
+    spent = float(r.get("spend") or 0.0)
+    e2e = _jobs_result(jobs, 1)
+    out: dict[str, Any] = {"episodes": list(episodes), "kinds": {},
+                           "derived_content": content_of(load_config(cfg))}
+    if not e2e["ok"]:  # L2: the lab does not depend on the job, but a failed job stops here
+        why = (f"deployed balanced job ended {r.get('state')!r}"
+               + (f" ({r['error']})" if r.get("error") else ""))
+        out["lab"] = f"skipped: {why}; fix it and re-run the step"
+        return {"ok": False, **out, "jobs": jobs, "tracked_usd": spent,
+                "report_error": e2e["report_error"], "apps": e2e["apps"]}
     seg_rel = ""
     rdir = ROOT / "reports" / "wave-h"
     rdir.mkdir(parents=True, exist_ok=True)
@@ -892,13 +1175,14 @@ def run_balanced(ctx: Ctx) -> dict[str, Any]:
         for kind, fn in (("tempseg", lab.run_tempseg), ("captioner", lab.run_captioner)):
             c = LAB[kind]
             limit = min(LAB_MAX_S, gpu_deadline_s(ctx.st, "balanced", c, spent_in_step=spent,
-                                                  slack_s=LAB_SLACK_S))
+                                                  slack_s=LAB_SLACK_S,
+                                                  global_cap=ctx.global_cap))
             if limit < 120 or (kind == "captioner" and not seg_rel):
                 out["kinds"][kind] = {"skipped": f"budget left {limit:.0f} s"
                                       if limit < 120 else "no TempSeg segments"}
                 break
             t0 = time.time()
-            call = fn.spawn(f"wave-h-{ctx.st.run_id}", seg_rel, ids, True)
+            call = fn.spawn(f"wave-h-{ctx.st.run_id}", seg_rel, list(episodes), True)
             try:
                 res = call.get(timeout=limit)
             except (TimeoutError, modal.exception.TimeoutError):
@@ -929,7 +1213,7 @@ def _job_rows(ctx: Ctx, step: str) -> dict[str, dict[str, list[dict]]]:
     for r in ctx.st.step(step).result.get("jobs", {}).values():
         if "job_id" not in r:
             continue
-        job = sdk.open_job(r["job_id"], store=f"modal-volume://{STORE_VOLUME}/{ctx.st.run_id}")
+        job = sdk.open_job(r["job_id"], store=store_uri(ctx.st))
         for stage in ("segment", "caption"):
             for rec in job.results(stage):
                 rows.setdefault(rec.episode_id, {})[stage] = [
@@ -980,16 +1264,18 @@ def run_certify(ctx: Ctx, noise: Mapping[str, float] | None = None) -> dict[str,
 
 
 def run_noise(ctx: Ctx) -> dict[str, Any]:
-    """(f): (b)'s ``human`` job repeated: its own config file and staged data (same stage hash,
-    so the same app), a new job id, default mode."""
+    """(f): (b)'s job repeated: its own config file and staged data (same stage hash, so the
+    same app), a new job id, default mode; all of its episodes (module docstring)."""
     oracle = ctx.st.step("exact_e2e").result.get("jobs", {}).get(NOISE_JOB) or {}
     if not oracle.get("cfg"):
         raise RuntimeError(f"noise repeats (b)'s {NOISE_JOB} job, which has not run")
+    require_tempseg_pin(ctx)
     cfg = Path(oracle["cfg"])
     job_id = f"wave-h-{ctx.st.run_id}-noise-{NOISE_JOB}"
     _index(ctx, cfg, job_id, f"noise-{NOISE_JOB}")
     r = _run_job(ctx, "noise", cfg, job_id, determinism=ORACLE_DETERMINISM,
-                 usd_per_s=pool_container("segcap").usd_per_s(), spent_in_step=0.0)
+                 usd_per_s=pool_container("segcap").usd_per_s(), spent_in_step=0.0,
+                 side="noise")
     res = _jobs_result({NOISE_JOB: r}, 1)
     res["same_app_as_oracle"] = r.get("app") == oracle.get("app")
     ctx.st.step("noise").result = res  # so _job_rows can read this step's job
@@ -1005,7 +1291,7 @@ def run_noise(ctx: Ctx) -> dict[str, Any]:
 
 
 RUNNERS: dict[str, Callable[[Ctx], dict[str, Any]]] = {
-    "preflight": run_preflight, "exact_e2e": run_exact, "rewards": run_rewards,
+    "tempseg": run_tempseg, "preflight": run_preflight, "exact_e2e": run_exact,
     "balanced": run_balanced, "certify": run_certify, "noise": run_noise}
 
 
@@ -1013,12 +1299,14 @@ RUNNERS: dict[str, Callable[[Ctx], dict[str, Any]]] = {
 # Report
 
 
-def render_report(st: State, projections: Mapping[str, Projection]) -> str:
-    lines = ["# Wave H-lite report", "",
-             "Generated by `scripts/wave_h.py` (runbook: `docs/wave-h-runbook.md`). Numbers only:",
-             "episode media, captions and NVIDIA material stay on private Volumes and in the",
-             "git-ignored `reports/wave-h/`.", "",
-             f"Run `{st.run_id}`. Spent so far **${st.spent:.2f}** of the ${GLOBAL_CAP_USD:.2f} "
+def render_report(st: State, projections: Mapping[str, Projection], *,
+                  plan: str = DEFAULT_PLAN) -> str:
+    gcap = plan_global_cap(plan, projections)
+    lines = ["# Wave H-lite runbook summary", "",
+             "Generated by `scripts/wave_h.py` (runbook: `docs/wave-h-runbook.md`). Numbers only;",
+             "`docs/wave-h-report.md` is written by `scripts/wave_h_finalize.py`.", "",
+             f"Run `{st.run_id}`, plan `{plan}`. Spent so far **${st.spent:.2f}** of the "
+             f"${gcap:.2f} "
              "global cap (every attempt's tracked container-seconds x list $/h, a killed or",
              "unreported attempt at its budget, or the billed delta of every app from",
              "`scripts/spend.py` when larger; billing lags about an hour).", "",
@@ -1026,6 +1314,9 @@ def render_report(st: State, projections: Mapping[str, Projection]) -> str:
              "|---|---|---|---|---|---|---|"]
     for name in STEPS:
         s = st.steps.get(name, StepState())
+        if name not in PLANS[plan] and s.status == "pending":
+            lines.append(f"| {TITLES[name]} | {DEFERRED_NOTE} | - | - | 0 | - | - |")
+            continue
         p = projections.get(name)
         proj = f"${p.usd:.2f} (${p.usd_upper:.2f})" if p else "-"
         billed = f"${s.billed_usd:.2f}" if s.billed_usd is not None else "-"
@@ -1044,7 +1335,8 @@ def render_report(st: State, projections: Mapping[str, Projection]) -> str:
     return "\n".join(lines) + "\n"
 
 
-_PRIVATE_KEYS = {"rows", "caption", "captions", "text", "task", "facts", "episodes", "cfg"}
+_PRIVATE_KEYS = {"rows", "caption", "captions", "text", "task", "facts", "episodes", "cfg",
+                 "records"}
 
 
 def _numbers_only(d: Any) -> Any:
@@ -1059,33 +1351,61 @@ def _numbers_only(d: Any) -> Any:
 # ---------------------------------------------------------------------------------------------
 
 
-def print_plan(st: State, projections: Mapping[str, Projection], out=print) -> None:
-    out(f"Wave H-lite run {st.run_id}: spent ${st.spent:.2f} of ${GLOBAL_CAP_USD:.2f} "
-        f"(billing read {'never' if st.billed_at is None else time.ctime(st.billed_at)})")
-    for name in STEPS:
+def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
+               manifest: Mapping[str, Any] | None = None, plan: str = DEFAULT_PLAN) -> None:
+    steps = PLANS[plan]
+    gcap = plan_global_cap(plan, projections)
+    out(f"Wave H-lite run {st.run_id} ({EMBODIMENT} only), plan {plan} "
+        f"({' -> '.join(TITLES[s].split('.')[0] for s in steps)}): spent ${st.spent:.2f} of "
+        f"${gcap:.2f} (billing read "
+        f"{'never' if st.billed_at is None else time.ctime(st.billed_at)})")
+    if manifest is not None:
+        eps, miss = episodes_in(manifest), missing_episodes(manifest)
+        src = ("expected durations from the golden selection (offline, +"
+               f"{DURATION_HEADROOM:.0%})" if manifest.get("offline") else "golden manifest")
+        out(f"  episodes: {len(eps)} {EMBODIMENT} ({src}"
+            + (f"; NOT STAGED, left out: {', '.join(miss)}" if miss else "") + ")")
+    for name in steps:
         p = projections[name]
         s = st.steps.get(name, StepState())
         rule = "ok"
         try:
-            check_before(st, name, p)
+            check_before(st, name, p, global_cap=gcap)
         except StopRule as e:
             rule = f"STOP: {e}"
         out(f"  {TITLES[name]:66s} [{s.status}] cap ${CAPS_USD[name]:.2f}  nominal "
             f"${p.usd:.2f}  upper ${p.usd_upper:.2f}  rule: {rule}")
         for i in p.items:
-            out(f"      {i['what']:52s} {i['gpu']:>5s} {i['seconds']:6.0f} s / "
+            out(f"      {i['what']:60s} {i['gpu']:>5s} {i['seconds']:6.0f} s / "
                 f"{i['upper_seconds']:6.0f} s x ${i['usd_per_h']:.2f}/h = ${i['usd']:.3f} "
                 f"(upper ${i['usd_upper']:.3f})")
-    nominal = sum(p.usd for p in projections.values())
-    upper = sum(p.usd_upper for p in projections.values())
+    for name in deferred_steps(plan):
+        out(f"  {TITLES[name]:66s} [{DEFERRED_NOTE}; never runs in plan {plan}]")
+    if "balanced" in steps:
+        out(f"  assumption: no warm flora-cache compile cache for balanced/tempseg or "
+            f"balanced/captioner, so each balanced pool's startup is the rates.json placeholder "
+            f"x {COLD_COMPILE_FACTOR:.2f} (Rewarder cold/warm @enter, 318 s / 229 s, "
+            "docs/cold-start.md); the lab calls are bounded by their "
+            f"{LAB_MAX_S} s timeout either way. The deployed workers mount flora-cache read-only "
+            "(no write-back); the lab writes flora-cache:/balanced/<engine> and commits it")
+    nominal = sum(projections[s].usd for s in steps)
+    upper = sum(projections[s].usd_upper for s in steps)
+    how = ("the sum of the plan's upper projections, rounded up to $0.10" if plan != "full"
+           else "GLOBAL_CAP_USD")
     out(f"  total: nominal ${nominal:.2f}, upper ${upper:.2f} (incl. {CLIENT_SLACK_S} s client "
-        f"slack per app); global cap ${GLOBAL_CAP_USD:.2f}")
-    honest = honest_caps(projections)
-    if upper > GLOBAL_CAP_USD + 1e-9:
-        out(f"  NOT HONEST AT ${GLOBAL_CAP_USD:.2f}: the upper total needs a global cap of at "
+        f"slack per app); global cap ${gcap:.2f} ({how})")
+    honest = honest_caps({s: projections[s] for s in steps})
+    if upper > gcap + 1e-9:
+        out(f"  NOT HONEST AT ${gcap:.2f}: the upper total needs a global cap of at "
             f"least ${honest['global']:.2f} (per step: "
-            + ", ".join(f"{s} ${honest[s]:.2f}" for s in STEPS) + "); the runbook stops at the "
+            + ", ".join(f"{s} ${honest[s]:.2f}" for s in steps) + "); the runbook stops at the "
             "first step whose upper projection no longer fits the cap left")
+
+
+def load_manifest(offline: bool) -> dict[str, Any]:
+    if offline:
+        return offline_manifest(DURATION_HEADROOM)
+    return h0.golden_manifest()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1093,19 +1413,37 @@ def main(argv: list[str] | None = None) -> int:
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--dry-run", action="store_true", help="print the plan; spend nothing")
     g.add_argument("--yes-spend", action="store_true", help="run (GPU steps spend money)")
-    g.add_argument("--report", action="store_true", help="rewrite the report from the state")
+    g.add_argument("--report", action="store_true",
+                   help="rewrite reports/wave-h/runbook.md from the state (never "
+                        "docs/wave-h-report.md: wave_h_finalize.py owns it)")
+    ap.add_argument("--plan", choices=tuple(PLANS), default=DEFAULT_PLAN,
+                    help="balanced-only (default): steps 0, a, d; full: every step")
     ap.add_argument("--only", choices=STEPS, help="run just this step (if not done)")
+    ap.add_argument("--offline", action="store_true",
+                    help="dry run / report: price the golden selection's expected durations "
+                         "instead of reading the manifest from the Volume")
     ap.add_argument("--state", type=Path, default=STATE)
     ap.add_argument("--work", type=Path, default=ROOT / "reports" / "wave-h" / "work")
     args = ap.parse_args(argv)
+    if args.offline and args.yes_spend:
+        ap.error("--offline is for --dry-run / --report (a run stages the real files)")
+    if args.only and args.only not in PLANS[args.plan]:
+        ap.error(f"--only {args.only}: {DEFERRED_NOTE} (not in plan {args.plan}; use --plan "
+                 "full)")
 
     st = load_state(args.state)
     killed_apps = st.mark_killed() if args.yes_spend else []
-    manifest = h0.golden_manifest()
+    manifest = load_manifest(args.offline)
+    miss = missing_episodes(manifest)
+    if miss:
+        print(f"note: only {len(EPISODES) - len(miss)} of the {len(EPISODES)} {EMBODIMENT} "
+              f"episodes are staged; using those (missing: {', '.join(miss)})")
     projections = {s: project(s, manifest) for s in STEPS}
-    print_plan(st, projections)
+    gcap = plan_global_cap(args.plan, projections)
+    print_plan(st, projections, manifest=manifest, plan=args.plan)
     if args.report:
-        REPORT.write_text(render_report(st, projections))
+        REPORT.parent.mkdir(parents=True, exist_ok=True)
+        REPORT.write_text(render_report(st, projections, plan=args.plan))
         print(f"wrote {REPORT}")
         return 0
     if not args.yes_spend:
@@ -1125,9 +1463,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"stopped {app} (left by a killed run)")
     save_state(st, args.state)
     os.chdir(args.work)  # relative input.path is hashed against the cwd: plan where flora runs
-    ctx = Ctx(st, manifest, args.work, state_path=args.state)
+    ctx = Ctx(st, manifest, args.work, state_path=args.state, global_cap=gcap)
     rc = 0
-    for name in STEPS:
+    for name in PLANS[args.plan]:
         if args.only and name != args.only:
             continue
         s = st.step(name)
@@ -1138,13 +1476,13 @@ def main(argv: list[str] | None = None) -> int:
         p = projections[name]
         s.projected_usd, s.projected_upper_usd = p.usd, p.usd_upper
         try:
-            check_before(st, name, p)
+            check_before(st, name, p, global_cap=gcap)
         except StopRule as e:
             s.status, rc = "stopped", 3
             s.notes.append(f"stop rule before: {e}")
             break
         att = Attempt(started=time.time(), rate_usd_per_s=p.peak_usd_per_s,
-                      budget_usd=round(step_budget(st, name), 4))
+                      budget_usd=round(step_budget(st, name, global_cap=gcap), 4))
         s.attempts.append(att)
         s.status = "running"
         ctx.step = name
@@ -1155,10 +1493,15 @@ def main(argv: list[str] | None = None) -> int:
             s.result = res
             att.tracked_usd = round(float(res.get("tracked_usd") or 0.0), 4)
             att.report_error = bool(res.get("report_error"))
-            att.status = s.status = "done" if res.get("ok") else "failed"
+            att.status = s.status = ("done" if res.get("ok") else
+                                     "needs_pin" if res.get("needs_pin") else "failed")
         except Exception as e:  # noqa: BLE001 - recorded; the runbook stops
             att.status = s.status = "failed"
-            att.report_error = True  # what it spent is unknown: charged its budget
+            if att.apps:
+                att.report_error = True  # what it spent is unknown: charged its budget
+            else:  # L1: failed before it started any app: nothing to charge
+                att.tracked_usd = 0.0
+                att.notes.append("failed before any app started: charged $0")
             s.notes.append(f"error: {e!r}")
         att.finished = time.time()
         for a in s.result.get("apps", ()):
@@ -1167,16 +1510,21 @@ def main(argv: list[str] | None = None) -> int:
         refresh_billing(st)
         save_state(st, args.state)
         try:
-            check_after(st, name)
+            check_after(st, name, global_cap=gcap)
         except StopRule as e:
             s.notes.append(f"stop rule after: {e}")
             rc = 3
+            break
+        if s.status == "needs_pin":
+            print(pin_instructions(s.result))
+            rc = NEEDS_PIN
             break
         if s.status != "done":
             rc = 1
             break
     save_state(st, args.state)
-    REPORT.write_text(render_report(st, projections))
+    REPORT.parent.mkdir(parents=True, exist_ok=True)
+    REPORT.write_text(render_report(st, projections, plan=args.plan))
     print(f"wrote {REPORT}; state {args.state}")
     return rc
 

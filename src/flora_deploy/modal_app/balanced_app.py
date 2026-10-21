@@ -6,9 +6,17 @@
 - ``CaptionWorker``: ``caption`` shards, vLLM Captioner (``derived/captioner-bf16``) on the
   caption pool's GPU (``H100!``).
 
-``@modal.enter`` (:func:`build_runner`), fail closed at every step and in this order, so a bad
-deployment dies in seconds, before the GPU engine build:
+``@modal.enter`` (:func:`build_runner` over :func:`build_stage`, the part a future online
+service reuses for the identical ``cert_key``, ``docs/interactive-design.md`` §2-3), fail closed
+at every step and in this order, so a bad deployment dies in seconds, before the GPU engine
+build:
 
+0. :func:`check_pinned_kind`: a derived weight without a pinned content digest
+   (``pins.DERIVED_PINS``) is refused before anything else. ``plan_app`` already refuses it at
+   plan time (review 10 M1); if a container still gets here, ``@modal.enter`` does not raise:
+   the container serves a :class:`RefusedRunner`, which ends every shard it is given
+   ``shard_failed`` (``DEPLOYMENT_REFUSED``) at once, with no Modal retry, no orchestrator
+   respawn and no D15 count;
 1. ``workers_app.preflight`` (store reachable, media root readable, fixed instruction set);
 2. the derived weights of the kind (``PresetSpec.derived_weights``) are **resolved from
    ``weights.derived``** (``FLORA_DERIVED_RECEIPTS``: receipt name -> sha256 of the receipt file
@@ -41,6 +49,7 @@ shard preempted.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -49,7 +58,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import modal
 
@@ -61,8 +70,32 @@ ENGINE_KINDS = {"segment": "tempseg", "caption": "captioner"}
 DERIVED_FOR_KIND = {"segment": "tempseg_merged", "caption": "captioner_bf16"}
 
 
+DEPLOYMENT_REFUSED = "deployment_refused"  # shard_failed reason of a refused start (M1)
+
+
 class DerivedWeightsError(RuntimeError):
     """A derived weight directory is missing, unpinned or not the recorded build."""
+
+
+class UnpinnedDerivedWeights(DerivedWeightsError):
+    """A derived weight the kind needs has no pinned content digest: the same answer on every
+    container of this deployment (``store``: the job store, to report it per shard)."""
+
+    store: Any = None
+
+
+def check_pinned_kind(kind: str, preset: str = "balanced") -> None:
+    """Step 0: refuse when a derived weight ``kind`` needs is unpinned (``pins.DERIVED_PINS``),
+    with the message ``flora plan`` / ``deploy`` give (``config.receipts.unpinned_message``).
+    The factory refuses this at plan time; this is the in-container backstop."""
+    from flora_deploy.config.presets import get_preset
+    from flora_deploy.config.receipts import unpinned, unpinned_message
+
+    names = get_preset(preset).derived_weights.get(kind, ())  # type: ignore[call-overload]
+    bad = unpinned(names)
+    if bad:
+        raise UnpinnedDerivedWeights(" ".join(unpinned_message(n, kinds=(kind,), preset=preset)
+                                              for n in bad))
 
 
 def derived_dir(name: str, root: Path | str = WEIGHTS_MOUNT) -> Path:
@@ -116,8 +149,9 @@ def verify_derived_weights(name: str, directory: Path, recorded: str | None, *,
         raise DerivedWeightsError(f"{name}: {path}: {e}") from None
     pin = DERIVED_PINS_BY_KEY.get(pin_key(name))
     if pin is None or pin.content_sha256 is None:
-        raise DerivedWeightsError(f"{name}: no content digest is pinned in pins.DERIVED_PINS; "
-                                  "refusing an unpinned derived checkpoint")
+        from flora_deploy.config.receipts import unpinned_message
+
+        raise UnpinnedDerivedWeights(f"{name}: {unpinned_message(name)}")
     if content != pin.content_sha256:
         raise DerivedWeightsError(f"{name}: content digest {content} != pinned "
                                   f"{pin.content_sha256}")
@@ -194,11 +228,28 @@ def pool_gpu(kind: str, env: Mapping[str, str] = os.environ) -> str:
     return str(gpu)
 
 
-def build_runner(kind: str, env: Mapping[str, str] = os.environ, *,
-                 call_id: Callable[[], str | None] = lambda: "",
-                 fatal: Callable[[BaseException], None] | None = None) -> tuple[Any, dict]:
-    """The ``BalancedShardRunner`` of a real ``segment`` / ``caption`` container (module
-    docstring). Returns ``(runner, startup facts)``."""
+class BalancedStage(NamedTuple):
+    """What :func:`build_stage` returns: the pieces a ``segment`` / ``caption`` container runs,
+    shared by the batch runner (:func:`build_runner`) and a future online service
+    (``docs/interactive-design.md`` §2-3), so both carry the identical ``cert_key``.
+
+    ``engine``: the ``OfflineEngine``. ``job``: the episode job with the accel scope applied
+    (``workers_impl.balanced.AccelJob``), **not** yet stamped. ``stamp_fn(embodiment=None)``:
+    the ``certstamp.CertStamp`` to stamp records with (``None``: the container's
+    ``FLORA_EMBODIMENT``; a service passes each request's; the key does not depend on it).
+    ``info``: the jobs' ``StageInfo``. ``store`` / ``startup``: the job store and the startup
+    facts."""
+
+    engine: Any
+    job: Any
+    stamp_fn: Callable[..., Any]
+    info: Any
+    store: Any
+    startup: dict
+
+
+def build_stage(kind: str, env: Mapping[str, str] = os.environ) -> BalancedStage:
+    """The stage of a real ``segment`` / ``caption`` container (module docstring, steps 0-5)."""
     from flora_deploy.config.pins import PINS_BY_KEY
     from flora_deploy.config.presets import get_preset
     from flora_deploy.engines.offline_llm import OfflineEngine, spec_for
@@ -211,8 +262,6 @@ def build_runner(kind: str, env: Mapping[str, str] = os.environ, *,
     from flora_deploy.workers_impl.certstamp import stamp_from_env
     from flora_deploy.workers_impl.reward import PreflightError
     from flora_deploy.workers_impl.segment import (
-        BalancedShardRunner,
-        BalancedWorkerSettings,
         InputResolver,
         SegmentEpisodeJob,
         StageInfo,
@@ -230,10 +279,16 @@ def build_runner(kind: str, env: Mapping[str, str] = os.environ, *,
         store = store_from_env(env)
     except Exception as exc:  # noqa: BLE001 - a misconfigured deployment: say so, early
         raise PreflightError(f"job store: {exc}") from exc
+    preset_name = env.get("FLORA_PRESET", "balanced")
+    try:  # step 0: static, before any probe (review 10 M1)
+        check_pinned_kind(kind, preset_name)
+    except UnpinnedDerivedWeights as e:
+        e.store = store
+        raise
     facts = preflight(env, store=store)
     mark("preflight")
 
-    preset = get_preset(env.get("FLORA_PRESET", "balanced"))
+    preset = get_preset(preset_name)
     names = preset.derived_weights.get(kind, ())  # type: ignore[call-overload]
     recorded = recorded_receipts(env)
     dirs = {n: derived_dir(n) for n in names}
@@ -283,8 +338,6 @@ def build_runner(kind: str, env: Mapping[str, str] = os.environ, *,
 
         job = CaptionEpisodeJob(CaptionStage(nv, processor), info, inputs)
     active = apply_accel(nv)
-    runner = BalancedShardRunner(store, engine, wrap_job(job, active=active, stamp=stamp),
-                                 BalancedWorkerSettings(gpu=gpu), call_id=call_id, fatal=fatal)
     stats = prefetch.wait(timeout=0) if prefetch is not None else None
     startup = {"kind": kind, "preflight": facts, "marks": marks, "spec": spec.as_json(),
                "gdn_dtypes": engine.gdn_dtypes, "accel": active.provenance() if active else None,
@@ -292,7 +345,85 @@ def build_runner(kind: str, env: Mapping[str, str] = os.environ, *,
                            for n, d in derived.items()},
                "derived_files": {n: bool(f) for n, f in files.items()},
                "prefetch": stats.as_json() if stats else {"done": getattr(prefetch, "done", None)}}
-    return runner, startup
+
+    def stamp_fn(embodiment: str | None = None) -> Any:
+        if embodiment is None or embodiment == stamp.embodiment:
+            return stamp
+        return dataclasses.replace(stamp, embodiment=embodiment)
+
+    return BalancedStage(engine=engine, job=wrap_job(job, active=active), stamp_fn=stamp_fn,
+                         info=info, store=store, startup=startup)
+
+
+def build_runner(kind: str, env: Mapping[str, str] = os.environ, *,
+                 call_id: Callable[[], str | None] = lambda: "",
+                 fatal: Callable[[BaseException], None] | None = None) -> tuple[Any, dict]:
+    """The ``BalancedShardRunner`` of a real ``segment`` / ``caption`` container
+    (:func:`build_stage`, the records stamped outermost). Returns ``(runner, startup facts)``."""
+    from flora_deploy.workers_impl.balanced import wrap_job
+    from flora_deploy.workers_impl.segment import BalancedShardRunner, BalancedWorkerSettings
+
+    st = build_stage(kind, env)
+    runner = BalancedShardRunner(st.store, st.engine, wrap_job(st.job, stamp=st.stamp_fn()),
+                                 BalancedWorkerSettings(gpu=st.info.gpu), call_id=call_id,
+                                 fatal=fatal)
+    return runner, st.startup
+
+
+class RefusedRunner:
+    """The runner of a container whose start was refused for a deterministic deployment reason
+    (:class:`UnpinnedDerivedWeights`). ``@modal.enter`` does not raise (that would be a billed
+    GPU cold start per Modal retry and orchestrator respawn, review 10 M1); instead every shard
+    it is given ends at once: the attempt marker carries the error (not ``crashed``, so it is
+    never D15-counted into a poison pill), a ``shard_failed`` record (``DEPLOYMENT_REFUSED``,
+    with the fix) makes it terminal for the orchestrator, and the call returns without a
+    receipt instead of raising, so ``modal.Retries`` does not retry it."""
+
+    def __init__(self, store: Any, error: str, *, container_id: str | None = None,
+                 call_id: Callable[[], str | None] = lambda: "",
+                 clock: Callable[[], float] = time.time):
+        from flora_deploy.jobs.store import safe_key
+        from flora_deploy.workers_impl.reward import default_container_id
+
+        self.store, self.error, self.call_id, self.clock = store, error, call_id, clock
+        self.container_id = safe_key(container_id or default_container_id())
+
+    def run_shard(self, job_id: str, shard_id: str, config_hash: str, token: str = ""):
+        from flora_deploy.jobs import attempts as A
+        from flora_deploy.jobs.deps import StoreManifestSource
+        from flora_deploy.jobs.orchestrator import utc
+
+        refresh = getattr(self.store, "refresh", None)
+        if callable(refresh):
+            refresh()
+        jf = A.JobFiles(self.store, job_id, config_hash)
+        shard = StoreManifestSource(jf).shard(shard_id)
+        if A.superseded(jf, shard.kind, shard_id, token):
+            return None
+        now = utc(self.clock())
+        marker = A.write_attempt(jf, shard.kind, shard_id, self.container_id, started_utc=now,
+                                 orchestrator_attempt=A.token_attempt(token), token=token,
+                                 call_id=self.call_id() or "")
+        A.mark_exception(jf, shard.kind, shard_id, self.container_id, ended_utc=now,
+                         error=self.error, marker=marker, crashed=False)
+        A.mark_failed(jf, shard, created_utc=now, reason=DEPLOYMENT_REFUSED,
+                      detail={"error": self.error, "container_id": self.container_id})
+        print(f"refused {shard_id}: {self.error}", flush=True)
+        return None
+
+    def preempt(self) -> bool:
+        return False
+
+
+def _start(kind: str) -> tuple[Any, dict]:
+    from flora_deploy.modal_app.workers_app import _die
+
+    try:
+        return build_runner(kind, call_id=modal.current_function_call_id, fatal=_die)
+    except UnpinnedDerivedWeights as e:
+        print(f"balanced {kind} worker refused: {e}", flush=True)
+        return (RefusedRunner(e.store, str(e), call_id=modal.current_function_call_id),
+                {"kind": kind, "refused": str(e)})
 
 
 class SegmentWorker:
@@ -300,10 +431,7 @@ class SegmentWorker:
 
     @modal.enter()
     def start(self) -> None:
-        from flora_deploy.modal_app.workers_app import _die
-
-        self.runner, self.startup = build_runner(
-            "segment", call_id=modal.current_function_call_id, fatal=_die)
+        self.runner, self.startup = _start("segment")
         print(f"balanced segment worker ready: {json.dumps(self.startup, default=str)}",
               flush=True)
 
@@ -323,10 +451,7 @@ class CaptionWorker:
 
     @modal.enter()
     def start(self) -> None:
-        from flora_deploy.modal_app.workers_app import _die
-
-        self.runner, self.startup = build_runner(
-            "caption", call_id=modal.current_function_call_id, fatal=_die)
+        self.runner, self.startup = _start("caption")
         print(f"balanced caption worker ready: {json.dumps(self.startup, default=str)}",
               flush=True)
 

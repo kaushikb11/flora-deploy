@@ -297,6 +297,15 @@ def test_sdk_snippet_check_sees_every_keyword():
     assert funcs == [("submit", ["job_id", "bogus_kw"])]
 
 
+def _tempseg_unpinned() -> bool:
+    from flora_deploy.config.pins import DERIVED_PINS_BY_KEY
+
+    return DERIVED_PINS_BY_KEY["tempseg-merged"].content_sha256 is None
+
+
+@pytest.mark.xfail(_tempseg_unpinned(), strict=True,
+                   reason="balanced segment is refused until the TempSeg v2 content digest is "
+                          "pinned (wave_h step 0); flips to a hard pass once it is")
 def test_readme_modal_flow_is_deployable():
     """The "Label your own data" flow (`flora init [--template <t>]` then `flora deploy`) plans
     an app that registers a worker class for every shard kind the template's preset runs

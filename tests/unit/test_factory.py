@@ -186,13 +186,30 @@ def test_missing_worker_module_is_refused_or_skipped(monkeypatch):
     assert [o.name for o in plan.objects] == ["orchestrator_run", "reconcile"]
 
 
-def test_rubric_has_no_worker_yet(fake_workers_app):
+def test_rubric_gets_its_tp2_worker_with_the_rubric_in_its_env(fake_workers_app):
+    import json
+
+    fake_workers_app.RubricWorker = type("RubricWorker", (RewardWorker,), {})
     d = template("rewards_only.yaml")
     d["pipeline"]["stages"] = ["reward.rubric"]
+    cams = [{"role": r, "description": f"the {r} camera"}
+            for r in sorted(set(d["input"].get("cameras", {"x": "main"}).values()))]
+    d["pipeline"]["rubric"] = {"robot": "arm", "cameras": cams, "steps": [
+        {"action": "Grasp", "grading": [{"label": "no", "points": 0.0},
+                                        {"label": "yes", "points": 1.0}]}]}
     d["resources"] = {}
     d["modal"]["max_gpus"] = 4
-    with pytest.raises(f.WorkerUnavailable, match="RubricWorker"):
-        f.plan_app(parse_config(d))
+    plan = f.plan_app(parse_config(d))
+    assert plan.worker_classes == {"reward.rubric": "RubricWorker"}
+    w = plan.object("RubricWorker")
+    assert w.gpu == "H100!:2" and w.image == "img_vllm" and w.shard_kinds == ("reward.rubric",)
+    assert str(CACHE_MOUNT) not in w.volumes  # warm_reward_cache builds the terminal engine
+    assert json.loads(w.env["FLORA_KIND_MODES"])["reward.rubric"]["rubric"] == \
+        d["pipeline"]["rubric"]
+    assert json.loads(w.env["FLORA_POOL_GPUS"]) == {"reward.rubric": "H100!"}
+    assert w.env["FLORA_EMBODIMENT"] == d["pipeline"]["embodiment"]
+    assert "warm_reward_cache" not in [o.name for o in plan.objects]
+    assert f.FAKE_WORKERS["reward.rubric"].name == "FakeRubricWorker"
 
 
 # ---------------------------------------------------------------------------------------------
@@ -216,7 +233,7 @@ def test_balanced_without_opt_in_is_refused_by_the_certificate_rule():
         f.plan_app(strict, derived_receipts=BAL_RECEIPTS)
 
 
-def test_balanced_registers_segment_and_caption_workers():
+def test_balanced_registers_segment_and_caption_workers(tempseg_pinned):
     import json
 
     cfg = balanced_cfg()
@@ -253,7 +270,7 @@ def test_balanced_needs_its_derived_receipts():
         f.plan_app(balanced_cfg(), derived_receipts={"captioner_bf16": "0" * 64})
 
 
-def test_balanced_max_inputs_above_one_is_refused():
+def test_balanced_max_inputs_above_one_is_refused(tempseg_pinned):
     cfg = balanced_cfg(resources={"segment": {"max_inputs": 2}})
     with pytest.raises(f.DeployError, match="one shard per container"):
         f.plan_app(cfg, derived_receipts=BAL_RECEIPTS)
@@ -268,7 +285,7 @@ def test_balanced_fake_models_plan_uses_cpu_fake_workers():
         assert o.gpu is None and o.image == "img_cpu" and o.env["FLORA_FAKE_MODELS"] == "1"
 
 
-def test_balanced_app_materializes():
+def test_balanced_app_materializes(tempseg_pinned):
     app = f.build_app(balanced_cfg(), derived_receipts=BAL_RECEIPTS)
     _funcs, classes = f.registered(app)
     assert {"SegmentWorker", "CaptionWorker"} <= set(classes)

@@ -10,7 +10,7 @@ Background:
 - NVIDIA's own default H200 path is **not** run-to-run deterministic (`docs/determinism.md`: cuDNN
   SDPA). Deterministic mode is a different reference, not the same bits.
 - So "faithful" can only mean: `balanced` diverges from `exact` no more than `exact` diverges from
-  itself (PLAN.md §9, "Self-noise").
+  itself (archive/PLAN-v3.md §9, "Self-noise").
 
 Principle: a certificate is **derived from the records themselves** and **fails closed**.
 Anything that cannot be shown from the records refuses or downgrades the certificate.
@@ -35,9 +35,9 @@ Every record of every set (oracle, noise, candidate) must carry, in `provenance`
 | Field | Content | Today |
 |---|---|---|
 | `config_hash` | the D11 stage hash of its shard kind (64 hex) | set (segcap: stamped by the sink) |
-| `gpu` | the GPU it ran on (`nvidia-smi` name; compared via `engines.offline_llm.normalize_gpu`) | optional, often unset |
-| `embodiment` | the job's `pipeline.embodiment` | **new field, not stamped** |
-| `cert_key` | `validate.certkey.key_document(preset, kind, pool_gpu, modes=kind_modes(cfg, kind), derived_content=..., dtbias_fp32=...)` of the stack that produced it | **new field, not stamped** |
+| `gpu` | the GPU it ran on (`nvidia-smi` name; compared via `engines.offline_llm.normalize_gpu`) | stamped by every worker (`workers_impl.certstamp`; a record's own value wins) |
+| `embodiment` | the job's `pipeline.embodiment` | stamped by every worker (`FLORA_EMBODIMENT`, `workers_impl.certstamp`) |
+| `cert_key` | `validate.certkey.key_document(preset, kind, pool_gpu, modes=kind_modes(cfg, kind), derived_content=..., dtbias_fp32=...)` of the stack that produced it | stamped by every real worker: exact segcap (`reference_app`), the balanced `SegmentWorker` / `CaptionWorker` (`balanced_app.build_stage`) and the Rewarder (`workers_app`); fake workers stamp none (refused as `fake_models`) |
 | `engine` | for `segment`/`caption`: the vLLM `EngineSpec.label` (must equal `cert_key.vllm_engine.label`) | set |
 | `models` | pin key -> revision; each must agree with `cert_key.nvidia_pins` | set |
 
@@ -127,7 +127,7 @@ certificate that records them (H3).
 
 | Knob | Default | Bound |
 |---|---|---|
-| `tolerance` | 1.5 (PLAN.md §9) | [1, 2] |
+| `tolerance` | 1.5 (PLAN.md §4) | [1, 2] |
 | `min_samples` (candidate episodes per pool) | 10 | >= 10 |
 | `min_noise_samples` | 5 | >= 5 |
 | `min_coverage` | 1.0 | >= 1.0 |
@@ -152,7 +152,7 @@ floor is below what a real regression costs:
 | `rank_divergence` | 0.05 | rho >= 0.925 |
 | `length_mismatch` | 0 | the step count is fixed by the video length |
 
-**Absolute caps** from PLAN.md §2: terminal `E[s]` MAE <= 0.05 (`expected_score_abs_delta`).
+**Absolute caps** from archive/PLAN-v3.md §2: terminal `E[s]` MAE <= 0.05 (`expected_score_abs_delta`).
 PLAN's other bar, "boundary F1 at most 1 point below", is not enforced: no boundary-F1 metric
 is computed yet.
 
@@ -258,7 +258,7 @@ revokes an older `certified`, and a later `certified` (e.g. on more data) supers
 `fail`. Only a deciding `certified` unlocks.
 
 The stage hash is recorded but not matched: it also covers the input dataset, and a certificate
-must apply to the same pool on other data (PLAN.md §9).
+must apply to the same pool on other data (archive/PLAN-v3.md §9).
 
 One lookup for every caller (H7): `certkey.lookup_context(cfg, kinds, derived_content=...)`
 gives embodiment, modes and content digests to:

@@ -7,7 +7,7 @@ closed unmerged). NVIDIA's reference keeps both FP32 (``_keep_native_gdn_fp32``)
 that reads ``dt_bias`` upcasts with ``.to(tl.float32)`` / ``a.float() + dt_bias``, so an FP32
 parameter needs no kernel change.
 
-**Off by default; Gate A decides** (PLAN.md §9). The patch acts only when *both* hold:
+**Off by default; Gate A decides** (PLAN.md §8). The patch acts only when *both* hold:
 
 1. vLLM discovers the entry point. This package is not pip-installed in the Modal images, so no
    entry point exists unless ``install_entry_point(dir)`` writes a minimal ``.dist-info`` and the

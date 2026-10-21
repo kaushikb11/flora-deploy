@@ -1,4 +1,4 @@
-"""Pinned Modal images (PLAN.md §7). All x86_64.
+"""Pinned Modal images (PLAN-v3.md §7). All x86_64.
 
 Each builder returns a lazy ``modal.Image``: nothing is built or uploaded until an app using it
 runs. Access ``images.img_cpu`` / ``img_hfref`` / ``img_vllm`` or call the builders directly.

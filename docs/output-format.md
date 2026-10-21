@@ -142,10 +142,11 @@ same `<stage_hash>` directory.
 <!-- fields: rubric -->
 | Field | Type | Meaning |
 |---|---|---|
-| `scores` | list of floats | per-criterion scores |
-| `total` | float | total score |
-| `samples` | int | number of samples drawn |
-| `medoid_index` | int | index of the medoid sample the scores come from |
+| `scores` | list of floats | one score per rubric step (`pipeline.rubric.steps`, in order), from NVIDIA's medoid sample |
+| `total` | float | sum of `scores`, rounded to 4 places (as NVIDIA's `rubric_reward.py` writes it) |
+| `samples` | int | answers sampled at temperature 1 (NVIDIA's `--num-samples`, 9) |
+| `medoid_index` | int | index, among all samples, of the medoid sample the scores come from: the parsed sample with the smallest summed L1 distance to the other parsed samples (ties: the lowest index) |
+| `parsed_samples` | int or null | samples whose answer NVIDIA's parser accepted (the medoid is taken over these); an episode with none is an `nv_failure` error |
 
 ### Example records (synthetic)
 
@@ -223,6 +224,7 @@ Reward stages have one row per record:
 | `rubric_total` | double | `rubric.total` |
 | `rubric_samples` | int32 | `rubric.samples` |
 | `rubric_medoid_index` | int32 | `rubric.medoid_index` |
+| `rubric_parsed_samples` | int32 | `rubric.parsed_samples` |
 
 ## `summary.json`
 

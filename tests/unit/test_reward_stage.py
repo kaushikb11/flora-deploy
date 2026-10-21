@@ -159,7 +159,7 @@ def many(n):
 
 def test_modes_and_rubric_deferred():
     assert reward.with_rationale("terminal_rationale") and not reward.with_rationale("dense")
-    with pytest.raises(NotImplementedError, match="deferred"):
+    with pytest.raises(NotImplementedError, match="stages.rubric"):
         reward.check_mode("rubric")
     with pytest.raises(ValueError):
         reward.check_mode("nope")

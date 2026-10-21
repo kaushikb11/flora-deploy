@@ -1,6 +1,6 @@
 """The two segmenter constructions NVIDIA's ``pipeline.segment()`` uses, built from NVIDIA classes.
 
-LICENSE REVIEW FLAG (PLAN.md §11). This module restates these NVIDIA values (from
+LICENSE REVIEW FLAG (PLAN.md §7). This module restates these NVIDIA values (from
 ``batch_utils/pipeline.py`` at nvidia/Flora-TempSeg@78a0e4ac); everything else calls NVIDIA's
 functions:
 

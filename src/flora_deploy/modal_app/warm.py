@@ -2,7 +2,7 @@
 
 Two independent pieces, both Modal-agnostic and free of NVIDIA code:
 
-1. **Parallel prefetch** (:func:`read_files`, :func:`prefetch_snapshot`, :func:`start_prefetch`).
+1. **Parallel prefetch** (:func:`read_files`, :func:`start_prefetch`).
    Reads a snapshot's weight files into the page cache with a bounded thread pool, splitting large
    files into fixed-size chunks so N readers stream in parallel even when a snapshot has only a
    few shards. Chunks are handed out in file order, so the read frontier runs roughly
@@ -207,18 +207,6 @@ def read_files(
         first_chunk_s=first[0] if first else None,
         chunk_seconds=tuple(seconds),
     )
-
-
-def prefetch_snapshot(
-    snapshot_dir: Path | str,
-    *,
-    patterns: Sequence[str] = WEIGHT_PATTERNS,
-    threads: int = DEFAULT_THREADS,
-    chunk_bytes: int | None = DEFAULT_CHUNK_BYTES,
-    block_bytes: int = DEFAULT_BLOCK_BYTES,
-) -> ReadStats:
-    return read_files(snapshot_files(snapshot_dir, patterns), threads=threads,
-                      chunk_bytes=chunk_bytes, block_bytes=block_bytes)
 
 
 class BackgroundPrefetch:

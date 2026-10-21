@@ -96,7 +96,7 @@ def write_cfg(tmp_path: Path, **edits) -> Path:
 ALL_OK_SINK = "s3://my-bucket/flora/lerobot-small"
 
 
-def test_all_pass_on_the_example():
+def test_all_pass_on_the_example(tempseg_pinned):
     p = FakeProbes()
     checks = d.run_checks(EXAMPLE, p)
     fails = [c for c in checks if c.status == "fail"]
@@ -330,7 +330,7 @@ def test_a_crashing_probe_is_a_warning():
     assert c["doctor"].status == "warn" and "boom" in c["doctor"].message
 
 
-def test_cli_exit_codes_and_json(monkeypatch):
+def test_cli_exit_codes_and_json(monkeypatch, tempseg_pinned):
     cli = CliRunner()
     monkeypatch.setattr(d, "_probes_factory", FakeProbes)
     r = cli.invoke(app, ["doctor", "--config", str(EXAMPLE)])

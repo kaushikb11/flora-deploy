@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.nvtext import nv_output
+
 pytestmark = pytest.mark.nvlink
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -36,6 +38,6 @@ def test_suites_pass_in_either_order(nv_code, order):
         cwd=ROOT, capture_output=True, text=True, timeout=600,
     )
     tail = "\n".join(out.stdout.splitlines()[-15:])
-    assert out.returncode == 0, tail + out.stderr[-2000:]
+    assert out.returncode == 0, tail + nv_output(out.stderr, "pytest stderr")
     assert " passed" in tail and "error" not in tail.lower(), tail
     assert "deselected" not in tail, tail  # every test in these files ran

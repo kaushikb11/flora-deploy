@@ -75,7 +75,10 @@ def test_named_output_modules_are_hashed():
                     "jobs/indexing.py", "jobs/manifest.py", "media/sources/mp4_dir.py"):
             assert rel in mods, (kind, rel)
     assert "stages/reward.py" not in seg
-    assert "workers_impl/reward.py" not in seg
+    # workers_impl/reward.py holds the shared ShardPartSink / VideoResolver every worker writes
+    # and reads through, so it is hashed for every kind (Hygiene)
+    assert "workers_impl/reward.py" in seg and "workers_impl/reward.py" in set(
+        logic.modules_for("segment"))
     assert "cli/init.py" not in set(logic.modules_for("segcap")) | set(
         logic.modules_for("reward.dense"))
 

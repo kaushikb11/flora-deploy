@@ -1,4 +1,4 @@
-"""Stateless reconciler (PLAN.md §8): rebuild a job's status from files alone.
+"""Stateless reconciler (PLAN.md §2): rebuild a job's status from files alone.
 
 Inputs are the same files the orchestrator uses (manifest, per-shard ``call.json`` ledgers,
 receipts, attempt markers, quarantine/control records, ``errors/``). Nothing is cached between

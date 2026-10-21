@@ -34,7 +34,8 @@ input:
   revision: 41d60b449629b2181ff5b735d31c2a2cf8b3cad8   # full commit SHA, never a branch
   path: test/make_sandwich          # subdirectory inside the repo (optional)
   # Map dataset camera keys to NVIDIA's views: 1 view (main) or 3 (main, left_wrist,
-  # right_wrist). Leave out for a single-camera dataset.
+  # right_wrist; 3 views need embodiment yam, yam32, dex or tianji, not human). Leave out
+  # for a single-camera dataset.
   # cameras:
   #   observation.images.top: main
   #   observation.images.left_wrist: left_wrist

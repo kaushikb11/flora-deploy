@@ -25,9 +25,25 @@ from flora_deploy.records import Provenance, StageRecord
 from flora_deploy.validate import certify as C
 from flora_deploy.workers_impl import certstamp as CS
 from tests.unit.test_balanced_deps import balanced_yaml
+from tests.unit.test_local_rubric import RUBRIC
 
 TEMPLATE = Path(__file__).resolve().parents[2] / "src/flora_deploy/config/templates/local_demo.yaml"
-STAGES = ("segment", "caption", "reward.terminal", "reward.dense")
+STAGES = ("segment", "caption", "reward.terminal", "reward.dense", "reward.rubric")
+
+
+def with_rubric(text: str) -> str:
+    """The local demo plus ``reward.rubric`` (its ``pipeline.rubric``, TP=2 pool, budget)."""
+    out = (text.replace("stages: [segment, caption, reward.terminal, reward.dense]",
+                        "stages: [segment, caption, reward.terminal, reward.dense, "
+                        "reward.rubric]")
+           .replace("  envelope: warn\n", "  envelope: warn\n" + RUBRIC)
+           .replace("  reward.dense: {max_containers: 1}\n",
+                    "  reward.dense: {max_containers: 1}\n  reward.rubric: {max_containers: 1}\n")
+           .replace("max_gpus: 4 ", "max_gpus: 8 ")
+           .replace("budget_usd: 5 ", "budget_usd: 200 ").replace("budget_usd: 50 ",
+                                                                  "budget_usd: 200 "))
+    assert "reward.rubric: {max_containers" in out and "rubric:\n" in out
+    return out
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 ALL_KINDS = sorted({k for n in AVAILABLE_PRESETS for k in PRESETS[n].pools})
 WORKER_KINDS = [k for k in ALL_KINDS if k not in F.PENDING_WORKERS]
@@ -56,6 +72,7 @@ def _plan(preset: str):
                                         "stage_to: volume://flora-media/run/videos")
     if preset == "balanced":
         text = balanced_yaml(text)
+    text = with_rubric(text)
     cfg = parse_config(yaml.safe_load(text))
     receipts = {n: "0" * 64 for k in PRESETS[preset].derived_weights.values() for n in k}
     return cfg, F.plan_app(cfg, derived_receipts=receipts, allow_uncertified=True,
@@ -63,7 +80,7 @@ def _plan(preset: str):
 
 
 @pytest.mark.parametrize("preset", AVAILABLE_PRESETS)
-def test_production_env_resolves_every_worker_class_stamp(preset):
+def test_production_env_resolves_every_worker_class_stamp(preset, tempseg_pinned):
     cfg, plan = _plan(preset)
     assert plan.worker_classes, preset
     seen = set()
@@ -105,7 +122,7 @@ def test_fails_closed_without_env_or_content():
         CS.stamp_from_env("segcap", env, derived_content={})
 
 
-def test_pending_kinds_need_only_the_helper():
+def test_pending_kinds_need_only_the_helper(tempseg_pinned):
     """``reward.rubric`` (no worker yet): the env the factory would set already resolves."""
     for preset in AVAILABLE_PRESETS:
         cfg, _ = _plan(preset)
@@ -137,7 +154,7 @@ def runs(tmp_path_factory):
         text = TEMPLATE.read_text()
         if preset == "balanced":
             text = balanced_yaml(text)
-        (d / f"{preset}.yaml").write_text(text)
+        (d / f"{preset}.yaml").write_text(with_rubric(text))
         r = LocalRunner(d / f"{preset}.yaml", store=d / f"store-{preset}")
         try:
             res = r.run()
@@ -196,7 +213,8 @@ def test_flora_certify_refuses_local_fake_exact_and_balanced_only_as_fake(runs):
     d = runs["dir"]
     contents = [f"--derived-content={n}={v}" for k in ("segment", "caption")
                 for n, v in CS.fake_content("balanced", k).items()]
-    for stage in STAGES:
+    # reward.rubric has no certification metrics yet (distributional certificate: P2)
+    for stage in (s for s in STAGES if s != "reward.rubric"):
         res = CliRunner().invoke(app, [
             "certify", "--exact", str(d / "exact.jsonl"), "--balanced", str(d / "balanced.jsonl"),
             "--config", str(d / "balanced.yaml"), "--stage", stage, *contents])

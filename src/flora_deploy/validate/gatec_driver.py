@@ -111,9 +111,9 @@ def decoded_source(name: str, frames: np.ndarray, fps: int | Fraction,
 
 def decode_all(path: str | Path) -> tuple[np.ndarray, Fraction]:
     """Decode every frame of a small video to uint8 RGB (THWC) with PyAV."""
-    import av
+    from flora_deploy.media.avsafe import open_input
 
-    with av.open(str(path)) as container:
+    with open_input(path) as container:
         stream = container.streams.video[0]
         rate = Fraction(stream.average_rate)
         frames = [f.to_ndarray(format="rgb24") for f in container.decode(stream)]

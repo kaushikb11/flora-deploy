@@ -1,4 +1,4 @@
-"""Shard worker classes for the job system (PLAN.md §7/§8): module-scope, *undecorated* by
+"""Shard worker classes for the job system (PLAN.md §2): module-scope, *undecorated* by
 ``app.cls``. The app factory (P1a-6a, ``build_app(cfg)``) decorates them from ``RunSettings``
 pools (GPU, containers, ``@modal.concurrent``, cpu/memory, timeouts, retries, Volumes, secrets);
 this module only defines the lifecycle hooks and ``run_shard``. Importing it creates lazy Modal
@@ -21,6 +21,12 @@ objects only. Never run from tests.
 - ``run_shard(job_id, shard_id, config_hash, token="")``: the ``workers.ShardWorker`` contract.
 - ``@modal.exit``: :meth:`RewardShardRunner.preempt` (flush + ``mark_preempted``; a no-op when no
   shard is in flight, e.g. a normal scale-down).
+
+``RubricWorker`` (``reward.rubric``) is the same runner on NVIDIA's rubric engine
+(``stages.rubric.build_engine``: TP=2 on ``H100!:2``, ``max_model_len`` 98304, one video per
+camera of ``pipeline.rubric``, which arrives in ``FLORA_KIND_MODES``); its records are stamped
+with ``workers_impl.certstamp.with_stamps``. No ``flora-cache`` mount (the warm-up function
+builds the terminal engine only), so it compiles at its first start.
 
 The ``segcap`` worker is ``reference_app.ReferenceWorker`` (P1a-5s: the fast ``exact`` worker
 around :class:`flora_deploy.workers_impl.segcap.SegcapShardRunner`); it reuses
@@ -86,7 +92,8 @@ def cache_env_for(mode: str, *, mount: Path | str = CACHE_MOUNT,
 
 
 def build_reward_engine(snapshot: Path | str = ra.SNAPSHOT, *,
-                        commit: Callable[[], None] | None = None, cache_mode: str = "ro"
+                        commit: Callable[[], None] | None = None, cache_mode: str = "ro",
+                        rubric_videos: int | None = None
                         ) -> tuple[RewardEngine, Any, dict[str, Any]]:
     """``rewarder_app.Rewarder.start``'s recipe, returning ``(engine, nv, startup facts)``.
     ``cache_mode`` (:func:`cache_env_for`): ``ro`` never commits the cache Volume."""
@@ -106,7 +113,14 @@ def build_reward_engine(snapshot: Path | str = ra.SNAPSHOT, *,
     nv = load_family(Family.REWARDER, str(snapshot))
     processor = nv.engine.load_processor(str(snapshot))
     t1 = time.perf_counter()
-    llm, spec = reward.build_engine(nv, str(snapshot))
+    recipe = None
+    if rubric_videos:  # reward.rubric: NVIDIA's rubric load_llm (TP=2), stages.rubric
+        from flora_deploy.stages import rubric
+
+        llm, recipe = rubric.build_engine(nv, str(snapshot), rubric_videos)
+        spec = recipe.engine
+    else:
+        llm, spec = reward.build_engine(nv, str(snapshot))
     t2 = time.perf_counter()
     stats = prefetch.wait(timeout=0)
     if cache_mode == "rw":
@@ -115,7 +129,7 @@ def build_reward_engine(snapshot: Path | str = ra.SNAPSHOT, *,
                "engine_build_s": t2 - t1, "enter_total_s": time.perf_counter() - t0,
                "prefetch": stats.as_json() if stats else {"done": prefetch.done},
                "engine": ra._engine_facts(llm), "cache_mode": cache_mode}
-    return RewardEngine(llm, processor, spec), nv, startup
+    return RewardEngine(llm, processor, spec, recipe), nv, startup
 
 
 def store_from_env(env: Mapping[str, str] = os.environ, *, client: Any = None) -> Store:
@@ -196,7 +210,19 @@ def reward_settings_from_env(env: Mapping[str, str] = os.environ, *,
         mode = terminal_mode(mode == "terminal_rationale", env)  # a legacy override must agree
     else:
         mode = env.get(TERMINAL_MODE_ENV, "terminal")
+    rubric = None
+    if "reward.rubric" in (env.get("FLORA_SHARD_KINDS") or "").split(","):
+        import json
+
+        from flora_deploy.workers_impl.certstamp import KIND_MODES_ENV
+
+        modes = json.loads(env.get(KIND_MODES_ENV) or "{}").get("reward.rubric") or {}
+        rubric = modes.get("rubric")
+        if not rubric:
+            raise PreflightError(f"{KIND_MODES_ENV} has no reward.rubric rubric (the app "
+                                 "factory sets it from pipeline.rubric)")
     return RewardWorkerSettings(
+        rubric=rubric,
         terminal_mode=mode,
         preset=env.get("FLORA_PRESET", "exact"),
         models={"rewarder": PINS_BY_KEY["rewarder"].revision},
@@ -235,6 +261,40 @@ class RewardWorker:
         settings = with_stamps(reward_settings_from_env(env, gpu=gpu_name()), env)  # fail closed
         self.runner = RewardShardRunner(
             store, engine, nv, settings, call_id=modal.current_function_call_id, fatal=_die)
+
+    @modal.method()
+    def run_shard(self, job_id: str, shard_id: str, config_hash: str, token: str = ""):
+        return self.runner.run_shard(job_id, shard_id, config_hash, token=token)
+
+    @modal.exit()
+    def stop(self) -> None:
+        runner = getattr(self, "runner", None)
+        if runner is not None:
+            runner.preempt()
+
+
+class RubricWorker:
+    """``workers.ShardWorker`` for ``reward.rubric`` shards (module docstring)."""
+
+    @modal.enter()
+    def start(self) -> None:
+        from flora_deploy.workers_impl.certstamp import with_stamps
+
+        env = os.environ
+        try:
+            store = store_from_env(env)
+        except Exception as exc:  # noqa: BLE001 - a misconfigured deployment: say so, early
+            raise PreflightError(f"job store: {exc}") from exc
+        facts = preflight(env, store=store)
+        gpu = gpu_name()
+        # fail closed, before the engine build
+        settings = with_stamps(reward_settings_from_env(env, gpu=gpu), env)
+        engine, nv, self.startup = build_reward_engine(
+            cache_mode=os.environ.get(CACHE_MODE_ENV, "ro"),
+            rubric_videos=len((settings.rubric or {}).get("cameras") or ()))
+        self.startup["preflight"] = facts
+        self.runner = RewardShardRunner(store, engine, nv, settings,
+                                        call_id=modal.current_function_call_id, fatal=_die)
 
     @modal.method()
     def run_shard(self, job_id: str, shard_id: str, config_hash: str, token: str = ""):
@@ -558,6 +618,36 @@ class FakeRewardWorker:
                                          call_id=modal.current_function_call_id, fatal=_die)
         print(f"fake-models reward worker: terminal_mode={self.runner.settings.terminal_mode} "
               f"media={self.runner.settings.media_root} preflight={self.preflight}", flush=True)
+
+    @modal.method()
+    def run_shard(self, job_id: str, shard_id: str, config_hash: str, token: str = ""):
+        self.hook.start_shard(job_id, shard_id)
+        return self.runner.run_shard(job_id, shard_id, config_hash, token=token)
+
+    @modal.exit()
+    def stop(self) -> None:
+        runner = getattr(self, "runner", None)
+        if runner is not None:
+            runner.preempt()
+
+
+class FakeRubricWorker:
+    """``reward.rubric`` worker of a ``--fake-models`` app: :class:`FakeRewardWorker`'s body;
+    its settings carry ``pipeline.rubric`` (``FLORA_KIND_MODES``), so the runner takes the
+    ``stages.rubric`` path with the fake family's rubric interface."""
+
+    @modal.enter()
+    def start(self) -> None:
+        from flora_deploy.local.engines import vllm_shim
+
+        self.store, self.preflight = fake_preflight()
+        self._shim = vllm_shim()  # held for the container's life
+        self._shim.__enter__()
+        self.hook = FakeFaultHook(self.store)
+        self.runner = fake_reward_runner(self.store, os.environ, self.hook,
+                                         call_id=modal.current_function_call_id, fatal=_die)
+        print(f"fake-models rubric worker: media={self.runner.settings.media_root} "
+              f"preflight={self.preflight}", flush=True)
 
     @modal.method()
     def run_shard(self, job_id: str, shard_id: str, config_hash: str, token: str = ""):

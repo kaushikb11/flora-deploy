@@ -1,5 +1,5 @@
 """``VolumeStore``: job files on a mounted Modal Volume v2 (the fallback when no bucket is
-configured; PLAN.md D6, §7 Storage). No ``modal`` import: the caller passes the ``modal.Volume``.
+configured; PLAN.md D6, §2). No ``modal`` import: the caller passes the ``modal.Volume``.
 
 Discipline (research_notes ``modal_verification.md`` findings 2-4):
 

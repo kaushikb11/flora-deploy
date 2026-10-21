@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from flora_deploy.media.safepath import is_within
 from flora_deploy.media.sources.base import (
     CameraMap,
     EpisodeRef,
@@ -29,8 +30,16 @@ from flora_deploy.media.types import SourceRef
 VIDEO_SUFFIXES = (".mp4", ".mov", ".m4v")
 
 
-def _read_task(path: Path) -> str | None:
+def _inside(root: Path, path: Path) -> Path:
+    """A symlink in the dataset must not point outside it (review 11b F1)."""
+    if not is_within(root, path):
+        raise SourceError(f"{path}: resolves outside the dataset root {root}")
+    return path
+
+
+def _read_task(root: Path, path: Path) -> str | None:
     if path.is_file():
+        _inside(root, path)
         text = path.read_text(encoding="utf-8").strip()
         return text or None
     return None
@@ -52,10 +61,11 @@ class Mp4DirSource:
             if entry.is_file() and entry.suffix.lower() in VIDEO_SUFFIXES:
                 ep = EpisodeRef(
                     episode_id=entry.stem,
-                    cameras={"main": SourceRef(str(entry))},
-                    task=_read_task(entry.with_suffix(".txt")),
+                    cameras={"main": SourceRef(str(_inside(self.root, entry)))},
+                    task=_read_task(self.root, entry.with_suffix(".txt")),
                 )
             elif entry.is_dir():
+                _inside(self.root, entry)
                 files: dict[str, Path] = {}
                 for f in sorted(entry.iterdir()):
                     if (
@@ -69,14 +79,14 @@ class Mp4DirSource:
                             f"{entry}: camera {f.stem!r} has two files ({files[f.stem].name}, "
                             f"{f.name})"
                         )
-                    files[f.stem] = f
+                    files[f.stem] = _inside(self.root, f)
                 if not files:
                     continue
                 roles = resolve_camera_map(list(files), self.camera_map)
                 ep = EpisodeRef(
                     episode_id=entry.name,
                     cameras={role: SourceRef(str(files[key])) for key, role in roles.items()},
-                    task=_read_task(entry / "task.txt"),
+                    task=_read_task(self.root, entry / "task.txt"),
                 )
             else:
                 continue

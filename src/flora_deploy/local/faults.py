@@ -78,10 +78,6 @@ class Fault:
     times: int  # remaining firings; FOREVER = unlimited
     fired: int = 0
 
-    @property
-    def episode_kind(self) -> str | None:
-        return self.target.split("@", 1)[1] if "@" in self.target else None
-
     def matches_shard(self, shard_id: str) -> bool:
         return fnmatch.fnmatchcase(shard_id, self.target)
 

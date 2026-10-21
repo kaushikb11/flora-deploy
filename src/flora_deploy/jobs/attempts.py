@@ -1,4 +1,4 @@
-"""Attempts → quarantine → bisection (PLAN.md D15, §8).
+"""Attempts → quarantine → bisection (PLAN.md D15, §2).
 
 Modal retries crashes, OOMs and preemptions forever inside one FunctionCall, so the orchestrator
 counts **container starts** from files instead: every container that starts a shard writes one

@@ -32,7 +32,7 @@ jobs:
       matrix:
         python: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           python-version: ${{ matrix.python }}
@@ -117,7 +117,7 @@ jobs:
       matrix:
         python: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           python-version: ${{ matrix.python }}
@@ -140,7 +140,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           python-version: "3.12"
@@ -159,7 +159,7 @@ jobs:
           echo "key=nv-code-v1-proc-${revs}-${{ hashFiles('scripts/fetch_nv_code.py') }}" >> "$GITHUB_OUTPUT"
       - name: Restore NVIDIA code cache
         id: nvcache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ~/.cache/flora-deploy/nv
           key: ${{ steps.nvpins.outputs.key }}
@@ -194,9 +194,12 @@ jobs:
       # FLORA_FAIL_ON_SKIP: a test skipped because torch/transformers or an NVIDIA file is
       # missing fails the job instead of passing silently (tests/conftest.py, review 7 G4-1/2).
       # Not set in `test`: there, torch-less module-level skips are expected at collection.
+      # This log is public: `--tb=line --show-capture=no` plus tests/conftest.py's redaction
+      # (tests/nvtext.py) keep NVIDIA source lines, prompts and captured output out of it.
+      # FLORA_SHOW_NV_OUTPUT is never set here (it restores full reports for local debugging).
       - name: "Gate: nvlink + torch (NVIDIA's real code, CPU; includes the suite-order test)"
         env:
           FLORA_FAIL_ON_SKIP: "1"
         run: >-
           uv run pytest -q -p no:cacheprovider -m "(nvlink or torch) and not modal"
-          -n auto --dist load -rs --durations=15
+          -n auto --dist load -rs --durations=15 --tb=line --show-capture=no

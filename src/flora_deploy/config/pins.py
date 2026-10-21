@@ -162,7 +162,7 @@ PINS: tuple[RepoPin, ...] = (
 
 PINS_BY_KEY: dict[str, RepoPin] = {p.key: p for p in PINS}
 
-# Runtime versions for the Modal images (PLAN.md §7). Not used locally yet.
+# Runtime versions for the Modal images (PLAN-v3.md §7). Not used locally yet.
 RUNTIME = {
     "vllm": "0.24.0",
     "transformers": "5.8.1",

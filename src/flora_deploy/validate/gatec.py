@@ -1,4 +1,4 @@
-"""Gate C comparison and report logic (PLAN.md §9): vLLM 0.24.0 vs NVIDIA's HF processor call.
+"""Gate C comparison and report logic (PLAN.md §8): vLLM 0.24.0 vs NVIDIA's HF processor call.
 
 Compared per request: prompt token ids, per-video ``video_grid_thw`` and per-video
 ``pixel_values_videos`` (as sha256 digests in fp32 and bf16). M-RoPE position ids are not

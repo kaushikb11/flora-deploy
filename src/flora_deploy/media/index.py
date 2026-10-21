@@ -1,4 +1,4 @@
-"""Per-episode probe equivalent and NVIDIA envelope checks (PLAN.md D7, D13, §1.1).
+"""Per-episode probe equivalent and NVIDIA envelope checks (PLAN.md D7, D13; PLAN-v3.md §1.1).
 
 Contract: for an **oracle-eligible** episode range of a (possibly concatenated) MP4,
 ``index_stream(source)`` returns exactly what NVIDIA's ``batch_utils.media.probe``
@@ -55,6 +55,7 @@ from fractions import Fraction
 import av
 import numpy as np
 
+from flora_deploy.media.avsafe import open_input
 from flora_deploy.media.types import (
     CameraRole,
     EnvelopeVerdict,
@@ -318,23 +319,6 @@ class StreamScan:
             )
         )
 
-    @classmethod
-    def from_packets(cls, packets: list[Packet], **meta) -> StreamScan:
-        """Build a scan from ``Packet``s (tests / synthetic scans). Keyframes count as RAPs."""
-        flags = np.array(
-            [
-                (FLAG_KEY | FLAG_RAP if p.keyframe else 0) | (FLAG_DISCARD if p.discard else 0)
-                for p in packets
-            ],
-            dtype=np.uint8,
-        )
-        arr = {
-            k: np.array([getattr(p, k) for p in packets], dtype=np.int64)
-            for k in ("pts", "dts", "duration", "size")
-        }
-        meta.setdefault("missing_pts", False)
-        return cls(**meta, **arr, flags=flags)
-
 
 def _video_stream(container, path) -> tuple[av.video.stream.VideoStream, int]:
     disp = av.stream.Disposition
@@ -352,7 +336,7 @@ def _video_stream(container, path) -> tuple[av.video.stream.VideoStream, int]:
 def scan_stream(path: str | os.PathLike[str]) -> StreamScan:
     """Demux every packet of the video stream of ``path`` (MP4/MOV); attached cover art is
     ignored, several real video streams are an error."""
-    with av.open(str(path), options=NV_OPEN_OPTIONS) as container:
+    with open_input(path, options=NV_OPEN_OPTIONS) as container:
         stream, n_video = _video_stream(container, path)
         tb = stream.time_base
         if tb is None or tb.numerator != 1:
@@ -658,7 +642,7 @@ def decode_span(scan: StreamScan, start: int, last: int) -> Iterator[av.VideoFra
     """A fresh decoder (``err_detect=explode``, ``thread_count=1``, as ``media.py:76-78``) fed
     the source packets ``scan[start..last]`` with their flags, then drained."""
     for seek in (start > 0, False):
-        with av.open(scan.path, options=NV_OPEN_OPTIONS) as container:
+        with open_input(scan.path, options=NV_OPEN_OPTIONS) as container:
             stream = container.streams[scan.stream_index]
             stream.codec_context.thread_count = 1
             packets = demux_range(container, stream, scan, start, last, seek=seek)

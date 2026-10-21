@@ -8,6 +8,13 @@ tests (`addopts = "-m 'not modal and not nvlink and not torch'"`); run them with
 `pytest -m "(nvlink or torch) and not modal"`, as the nvlink job does. An explicit `-m` replaces
 the default.
 
+CI logs of this public repository are public. A failing `nvlink` or `torch` test therefore
+reports only frame locations and the exception type, never NVIDIA source lines, prompts or
+captured output (`tests/conftest.py`, `tests/nvtext.py`; the nvlink job also runs with
+`--tb=line --show-capture=no`). Prompts are compared by sha256, length and first differing
+offset. Set `FLORA_SHOW_NV_OUTPUT=1` locally for full reports (never in CI). Third-party actions
+are pinned by commit SHA.
+
 The gates exist because reviews kept finding the same kinds of bug. Each one below names the
 review or commit that motivated it, so a gate is never dropped without knowing what it protects.
 

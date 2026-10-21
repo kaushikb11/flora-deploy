@@ -1,4 +1,4 @@
-"""Round-based micro-batcher (PLAN.md §6.3, D14).
+"""Round-based micro-batcher (PLAN.md D14; PLAN-v3.md §6.3).
 
 NVIDIA's segmenter awaits ``predictor.apredict(request)`` and the caption stage awaits one call
 per caption plan, each on the caller's event loop. Many episodes run as coroutines on one loop;

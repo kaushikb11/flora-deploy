@@ -140,7 +140,7 @@ def build(tmp: Path, *, jobs=("human", "yam"), labs=("tempseg", "captioner"),
         t += 1000
     exact_done = st.steps["exact_e2e"].attempts[-1].finished
     for name, s in st.steps.items():
-        if name in ("exact_e2e", "rewards"):
+        if name in ("exact_e2e", "tempseg"):
             s.billed_usd = (billed or {}).get(name, s.tracked_usd)
     st.billed_total = round(sum(s.tracked_usd for s in st.steps.values()), 4)
     st.billed_at = exact_done + billed_lag_s  # the lag as seen by step (b)
@@ -208,7 +208,7 @@ def test_happy_path_updates_everything_consistently_and_is_idempotent(tmp_path, 
     assert seg.uncertainty == 0.25  # range/mean 0.18 is below the floor
     assert cap.uncertainty == round((1.4 - 1.0) / 1.2, 2)  # the range: above the floor
     assert seg.source.startswith("docs/wave-h-report.md") and seg.date == "2026-10-14"
-    assert "2 jobs (76.5 video s) on L40S" in seg.provenance and "0.500-0.600" in seg.provenance
+    assert "n=2 job(s) (76.5 video s) on L40S" in seg.provenance and "0.500-0.600" in seg.provenance
     assert t.startup_for("balanced", "segment").startup_s == 120.0
     assert t.startup_for("balanced", "caption").startup_s == 145.0
     assert t.startup_for("balanced", "caption").status == "measured"
@@ -278,27 +278,77 @@ def wh_stamp(root: Path) -> str:
     return fin.utc(fin.run_stamp(st))
 
 
-def test_too_few_samples_refuses_the_rates_and_keeps_the_placeholders(tmp_path, capsys):
+def test_too_little_video_refuses_the_rates_and_keeps_the_placeholders(tmp_path, capsys):
     root = build(tmp_path, jobs=("human",))
+    st = wh.State.from_json(json.loads((root / "reports/wave-h/state.json").read_text()))
+    st.steps["balanced"].result["jobs"]["human"]["video_hours"]["done"] = 20.0 / 3600
+    wh.save_state(st, root / "reports/wave-h/state.json")
     rates0 = (root / "src/flora_deploy/planner/rates.json").read_bytes()
     readme0 = (root / "README.md").read_bytes()
     rc, out = run(root, "--write", capsys=capsys)
     assert rc == 3
     assert "rates: REFUSED" in out
-    assert "balanced segment on L40S: 1 job sample(s); an error band needs a range" in out
-    assert "balanced caption on H100: 1 cold-start sample(s)" in out
+    assert "balanced segment on L40S: 20.0 video s behind the rate; at least 30 s" in out
     assert (root / "src/flora_deploy/planner/rates.json").read_bytes() == rates0
     assert (root / "README.md").read_bytes() == readme0  # the placeholder stays
     rep = (root / "docs/wave-h-report.md").read_text()
     assert "`planner/rates.json` **not updated**" in rep
     assert "| balanced | not measured |" in rep
     doc = (root / "docs/balanced-engines.md").read_text()
-    assert "**not measured** (balanced segment on L40S: 1 job sample(s)" in doc
+    assert "**not measured** (balanced segment on L40S: 20.0 video s" in doc
     # the human job is still certified (provisionally); yam has no balanced records
     assert sorted(c["covered_pools"][0] for c in certs(root)) == ["human", "human"]
     assert "segment (yam): refused" not in rep  # no balanced yam job: nothing to certify
     rc2, out2 = run(root, "--write", capsys=capsys)
     assert rc2 == 3 and "nothing to change" in out2
+
+
+def test_a_single_balanced_job_is_measured_with_n_1_and_a_50_percent_band(tmp_path, capsys):
+    """The balanced-only GPU session: one job, one container per kind. Measured, honestly:
+    n=1 and ±50% in rates.json (rate and cold start), the report and `flora plan`."""
+    from flora_deploy.planner.options import PlanRequest, WorkloadSummary, plan_options, rates_label
+    from flora_deploy.planner.rates import RateTable
+
+    root = build(tmp_path, jobs=("human",))
+    rc, out = run(root, "--write", capsys=capsys)
+    assert rc == 0, out
+    path = root / "src/flora_deploy/planner/rates.json"
+    data = json.loads(path.read_text())
+    for kind in ("segment", "caption"):
+        row = next(r for r in data["rates"] if r["preset"] == "balanced" and r["kind"] == kind)
+        assert (row["status"], row["n"], row["uncertainty"]) == ("measured", 1, 0.5)
+        assert "n=1 job(s)" in row["provenance"] and "±50%" in row["provenance"]
+        srow = next(r for r in data["startup"] if r["preset"] == "balanced"
+                    and r["kind"] == kind)
+        assert (srow["status"], srow["n"], srow["uncertainty"]) == ("measured", 1, 0.5)
+        assert "one container" in srow["provenance"]
+    rep = (root / "docs/wave-h-report.md").read_text()
+    assert "a single sample (n=1) has no range, so its band is ±50%" in rep
+    assert "| balanced | segment | L40S | 1 | 30.7 |" in rep and "±50%" in rep
+    t = RateTable.load(path)
+    w = WorkloadSummary.from_dict({"groups": [{"pool": "human", "cameras": 1,
+                                               "video_s": 3600.0, "episodes": 100}]})
+    opts = plan_options(PlanRequest(workload=w, stages=("segment", "caption"),
+                                    presets=("balanced",), max_gpus=4), table=t)
+    assert opts and {rates_label(o) for o in opts} == {"measured (n=1, ±50%)"}
+    assert all(k.rate_samples == "n=1, ±50%" for o in opts for k in o.kinds)
+
+
+def test_without_oracle_or_noise_records_certificates_are_deferred(tmp_path, capsys):
+    """Balanced only: no exact / noise records. Rates are still measured; certification is
+    deferred to the certified run, and nothing written earlier is removed."""
+    root = build(tmp_path)
+    assert run(root, "--write", capsys=capsys)[0] == 0
+    before = sorted(p.name for p in _cert_dir(root).glob("cert_*.json"))
+    shutil.rmtree(root / "reports/wave-h/records/exact")
+    shutil.rmtree(root / "reports/wave-h/records/noise")
+    rc, out = run(root, "--write", capsys=capsys)
+    assert rc == 0, out
+    assert "deferred to the certified run" in out and "remove" not in out
+    assert sorted(p.name for p in _cert_dir(root).glob("cert_*.json")) == before
+    rep = (root / "docs/wave-h-report.md").read_text()
+    assert "deferred to the certified run (no oracle records" in rep
+    assert "refused" not in rep.split("## Certificate")[1]
 
 
 def test_missing_l0_is_reported_and_downgrades_the_segment_certificate(tmp_path, capsys):
@@ -335,12 +385,12 @@ def test_billing_lag_and_mismatch_are_flagged(tmp_path, capsys, lag, billed, wan
     row = next(ln for ln in rep.splitlines() if ln.startswith("| b. exact oracle"))
     assert want in row
     assert "Warnings:" in rep and "WARNING exact_e2e" in out
-    rewards = next(ln for ln in rep.splitlines() if ln.startswith("| c. rewards"))
+    other = next(ln for ln in rep.splitlines() if ln.startswith("| 0. TempSeg"))
     if lag < wh.BILLING_LAG_S:
         assert "re-run the runbook's billing read after" in rep
-        assert "partial" in rewards  # read under an hour after it too
+        assert "partial" in other  # read under an hour after it too
     else:
-        assert "reconciled" in rewards  # billed == tracked: only (b) is flagged
+        assert "reconciled" in other  # billed == tracked: only (b) is flagged
 
 
 def test_blocks_fill_only_between_markers_and_refuse_without_them():
@@ -360,3 +410,160 @@ def test_l0_copy_takes_the_pool_gpu_name_and_drops_episode_rows():
     assert SECRET not in json.dumps(got)
     other = fin.l0_for_certify(_lab("tempseg", "NVIDIA H200", 0.1), "tempseg", "L40S")
     assert other["baseline"]["gpu"] == "NVIDIA H200"  # left for certify to refuse
+
+
+# ---------------------------------------------------------------------------------------------
+# Review 11a
+
+
+def _state(root: Path) -> wh.State:
+    return wh.State.from_json(json.loads((root / "reports/wave-h/state.json").read_text()))
+
+
+def _save(root: Path, st: wh.State) -> None:
+    wh.save_state(st, root / "reports/wave-h/state.json")
+
+
+def _cert_dir(root: Path) -> Path:
+    return root / "src" / "flora_deploy" / "config" / "certificates"
+
+
+def run_with(root: Path, cli, *extra: str, capsys=None) -> tuple[int, str]:
+    rc = fin.main(["--root", str(root), *DERIVED, *extra], cli=cli)
+    return rc, (capsys.readouterr().out if capsys else "")
+
+
+def test_receipts_without_the_report_contract_fields_refuse_with_a_clear_message(tmp_path,
+                                                                                 capsys):
+    """H1: finalize reads ``Job.report()``'s per-container ``kind``, ``startup_s``, ``busy_s``,
+    ``seconds``; a report without them is named as such, never measured from nothing."""
+    root = build(tmp_path)
+    st = _state(root)
+    for step in ("exact_e2e", "balanced", "noise"):
+        for r in st.steps[step].result["jobs"].values():
+            r["containers"] = [{k: c[k] for k in ("container_id", "gpu", "gpu_count", "usd",
+                                                  "stopped")} for c in r["containers"]]
+    _save(root, st)
+    rc, out = run(root, capsys=capsys)
+    assert rc == 3 and "rates: REFUSED" in out
+    assert "lacks `kind`, `startup_s`, `busy_s`, `seconds`" in out
+    assert "Job.report() per-container" in out
+    for step in ("exact_e2e", "balanced", "noise"):
+        for r in st.steps[step].result["jobs"].values():
+            r["containers"] = []
+    _save(root, st)
+    rc, out = run(root, capsys=capsys)
+    assert rc == 3
+    assert "balanced.jobs.human: `flora report` lists no per-container receipts" in out
+
+
+def test_write_with_missing_records_never_deletes_certificates(tmp_path, capsys):
+    """M1: records gone (a fresh checkout, --fetch not run): every certificate stays."""
+    root = build(tmp_path)
+    assert run(root, "--write", capsys=capsys)[0] == 0
+    before = sorted(p.name for p in _cert_dir(root).glob("cert_*.json"))
+    assert len(before) == 4
+    shutil.rmtree(root / "reports/wave-h/records")
+    rc, out = run(root, "--write", capsys=capsys)
+    assert "remove" not in out
+    assert sorted(p.name for p in _cert_dir(root).glob("cert_*.json")) == before
+    man = json.loads((root / "reports/wave-h/finalize.json").read_text())
+    assert man["certificates"] == [Path(b).stem for b in before]  # still owned
+    # L6: the refusals name inputs relative to the root, never the local path
+    rep = (root / "docs/wave-h-report.md").read_text()
+    assert ("deferred to the certified run (no oracle records: "
+            "reports/wave-h/records/exact/human/segment.jsonl" in rep)
+    assert str(root) not in rep and str(tmp_path) not in rep
+
+
+def test_a_new_certificate_replaces_only_the_one_with_its_key(tmp_path, capsys):
+    root = build(tmp_path)
+    assert run(root, "--write", capsys=capsys)[0] == 0
+    old = {(c["stage"], c["covered_pools"][0]): c["id"] for c in certs(root)}
+    # the human records go missing; yam's are re-certified at a new stamp (new ids, same keys)
+    for stage in ("segment", "caption"):
+        (root / f"reports/wave-h/records/balanced/human/{stage}.jsonl").unlink()
+    st = _state(root)
+    t = fin.run_stamp(st)
+    for s in st.steps.values():
+        for a in s.attempts:
+            if a.finished == t:
+                a.finished += 60  # a later run: a new stamp, so new certificate ids
+    _save(root, st)
+    rc, out = run(root, "--write", capsys=capsys)
+    new = {(c["stage"], c["covered_pools"][0]): c["id"] for c in certs(root)}
+    assert len(new) == 4 == len(certs(root))
+    assert new[("segment", "human")] == old[("segment", "human")]  # kept: nothing replaced it
+    assert new[("segment", "yam")] != old[("segment", "yam")]  # replaced by its new run
+    assert out.count("remove superseded") == 2
+    man = json.loads((root / "reports/wave-h/finalize.json").read_text())
+    assert sorted(man["certificates"]) == sorted(new.values())
+
+
+def test_blocks_match_whole_marker_lines_only():
+    """L4: a marker quoted in prose, or a block whose name starts with this one, is not it."""
+    txt = ("intro `<!-- wave-h:cost -->` explains the block\n...\n<!-- wave-h:cost -->\nold\n"
+           "<!-- /wave-h:cost -->\n")
+    new = fin.replace_block(txt, "cost", "NEW")
+    assert new == ("intro `<!-- wave-h:cost -->` explains the block\n...\n<!-- wave-h:cost -->\n"
+                   "NEW\n<!-- /wave-h:cost -->\n")
+    txt2 = ("<!-- wave-h:costs -->\nA\n<!-- /wave-h:costs -->\n<!-- wave-h:cost -->\nB\n"
+            "<!-- /wave-h:cost -->\n")
+    assert fin.replace_block(txt2, "cost", "NEW") == txt2.replace("\nB\n", "\nNEW\n")
+    with_note = "<!-- wave-h:results (owned by x) -->\nold\n<!-- /wave-h:results -->\n"
+    assert "\nNEW\n" in fin.replace_block(with_note, "results", "NEW")
+    for bad in ("<!-- wave-h:cost -->\n<!-- /wave-h:cost -->\n" * 2,  # two blocks
+                "<!-- /wave-h:cost -->\n<!-- wave-h:cost -->\n"):  # close before open
+        with pytest.raises(SystemExit):
+            fin.replace_block(bad, "cost", "x")
+
+
+def test_report_carries_structured_certify_fields_only(tmp_path, capsys):
+    """No raw ``flora certify`` output reaches the report: a refusal is its exit code and a
+    category; a non-zero exit with a printed list is not accepted (L5)."""
+    root = build(tmp_path)
+
+    def leaky(args):
+        return 2, f"error: {SECRET} {root}/reports/wave-h/records/x.jsonl"
+
+    run_with(root, leaky, "--write", capsys=capsys)
+    rep = (root / "docs/wave-h-report.md").read_text()
+    assert SECRET not in rep and str(root) not in rep
+    assert "refused: flora certify exited 2" in rep
+    for name, data in owned(root).items():
+        assert SECRET.encode() not in data, name
+    assert certs(root) == []
+
+    def lies(args):
+        _, text = fin.run_cli(args)
+        return 1, text  # a certificate list, but a failing exit code
+
+    run_with(root, lies, "--write", capsys=capsys)
+    assert certs(root) == []
+    rep = (root / "docs/wave-h-report.md").read_text()
+    assert "flora certify exited 1 with verdict provisional" in rep
+    assert SECRET not in rep
+
+
+def test_a_wrong_gpu_worker_refuses_its_jobs_rates(tmp_path, capsys):
+    root = build(tmp_path)
+    st = _state(root)
+    j = st.steps["balanced"].result["jobs"]["yam"]
+    cap = next(c for c in j["containers"] if c["kind"] == "caption")
+    j["containers"].insert(0, dict(cap, container_id="ta-early", startup_s=5.0))
+    cap["gpu_seen"] = "NVIDIA H200"  # jobs.containers: the receipts' nvidia-smi name
+    _save(root, st)
+    rates0 = (root / "src/flora_deploy/planner/rates.json").read_bytes()
+    rc, out = run(root, "--write", capsys=capsys)
+    assert rc == 3
+    assert ("balanced.jobs.yam: caption rates refused: container ta-balanced-caption-yam ran "
+            "on 'NVIDIA H200', not the balanced caption pool's H100") in out
+    assert (root / "src/flora_deploy/planner/rates.json").read_bytes() == rates0
+    m = fin.measure(_state(root))[("balanced", "caption")]
+    assert [s[0] for s in m.samples] == ["human"]
+    assert 5.0 not in m.startups  # nothing from the refused job, not even its good container
+    # nvidia-smi's name for the pool's own GPU is the same GPU
+    cap["gpu_seen"] = "NVIDIA H100 80GB HBM3"
+    j["containers"].pop(0)
+    _save(root, st)
+    assert run(root, capsys=capsys)[0] == 0

@@ -1,4 +1,4 @@
-"""Engine protocol and the plain-data types that cross it (PLAN.md §6.1).
+"""Engine protocol and the plain-data types that cross it (PLAN-v3.md §6.1).
 
 A ``VllmRequest`` is one captured NVIDIA model call, already in vLLM's prompt shape (the Gate C
 wrap applied by ``nv.capture.vllm_prompt``): templated text plus one ``(uint8 THWC, metadata)``

@@ -54,7 +54,7 @@ import math
 import os
 import subprocess
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -570,6 +570,15 @@ class Job:
 
         return list(iter_records(self.store, self.job_id, stage, config_hash=self.config_hash))
 
+    def export(self, out: str | os.PathLike[str], *, to: str = "lerobot",
+               **kw: Any) -> Any:
+        """Write the labels into a copy of the job's dataset (``flora export``; keywords as
+        :func:`export_job`). Returns the ``export.lerobot.ExportReport``."""
+        if to != "lerobot":
+            raise FloraError(f"unknown export target {to!r}; only lerobot is supported")
+        check_results_namespace(self.store, self.job_id, self.config_hash)
+        return export_job(self.store, self.job_id, out, config_hash=self.config_hash, **kw)
+
     def cancel(self, reason: str = "operator cancel") -> list[str]:
         """Write a ``cancel`` record (the orchestrator cancels its calls on its next tick). With
         no live orchestrator, cancels the recorded live calls directly. Returns the call ids
@@ -666,8 +675,14 @@ class Job:
                 warm=settings.min_containers), 4)}
         containers = [{"container_id": r.container_id, "gpu": r.gpu, "gpu_count": r.gpu_count,
                        "usd": round(container_cost(r, rates, now), 4),
-                       "stopped": r.stopped_utc is not None}
+                       "stopped": r.stopped_utc is not None, "source": "container_receipt"}
                       for r in read_container_receipts(self.store, self.job_id)]
+        if not containers:  # no worker writes ContainerReceipts: derive them (review 11a H1)
+            from flora_deploy.jobs.containers import job_container_rows
+
+            containers = job_container_rows(
+                self.store, self.job_id, self.config_hash, manifest, pools=settings.pools,
+                scaledown_s=float(settings.scaledown_s), now=now, rates=rates)
         done_ids = _done_shards(self, manifest)
         done_eps = {u for s in manifest.shards if s.shard_id in done_ids for u in s.episodes}
         dur = {e.uid: e.duration_s for e in manifest.episodes}
@@ -745,6 +760,25 @@ class Job:
             yield f"--- {kind} call {cid} ---"
             yield from self.backend.logs(self.app_name, environment=self.environment,
                                          follow=follow, tail=tail, function_call=cid)
+
+
+def export_job(store: Store, job_id: str, out: str | os.PathLike[str], *,
+               config_hash: str | None = None, source: str | os.PathLike[str] | None = None,
+               stages: Sequence[str] | None = None, allow_uncertified: bool = False,
+               allow_fake: bool = False, include_videos: bool = False,
+               push_to_hub: str | None = None, private: bool = True, hub_api: Any = None,
+               download: Any = None) -> Any:
+    """``flora export --to lerobot`` (docs/export.md): ``export.lerobot.export_job``, then an
+    upload to the dataset repo ``push_to_hub`` (private unless ``private=False``)."""
+    from flora_deploy.export.hub import push_to_hub as push
+    from flora_deploy.export.lerobot import export_job as do_export
+
+    report = do_export(store, job_id, out, config_hash=config_hash, source=source,
+                       stages=stages, allow_uncertified=allow_uncertified,
+                       allow_fake=allow_fake, include_videos=include_videos, download=download)
+    if push_to_hub:
+        report.pushed = push(out, push_to_hub, private=private, api=hub_api)
+    return report
 
 
 def _done_shards(job: Job, manifest: Any) -> set[str]:

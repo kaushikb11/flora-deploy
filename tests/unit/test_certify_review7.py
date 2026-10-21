@@ -179,7 +179,7 @@ def test_h3_knobs_outside_policy_are_refused(kw):
 
 
 def test_h3_absolute_cap_on_terminal_expected_score():
-    """P5: an E[s] drift of 0.42 certified against a noisy floor; PLAN §2 caps it at 0.05."""
+    """P5: an E[s] drift of 0.42 certified against a noisy floor; PLAN-v3.md §2 caps it at 0.05."""
     noisy = [rec(f"u{i}", "reward.terminal", "exact", terminal=terminal(4, 4.2 + 0.6))
              for i in range(5)]
     bal = terminal_set("balanced", 10, es=4.62)

@@ -79,6 +79,7 @@ class Clock:
 
 
 def make_runner(store, tmp_path, cid="c1", llm=None, group=1, **kw):
+    kw.setdefault("media_root", "/v")  # the fixtures' absolute uris live under it
     settings = RewardWorkerSettings(
         decoder="inline", local_dir=str(tmp_path / cid), container_id=cid, gpu="H100",
         models={"rewarder": "7d"}, limits=reward.RoundLimits(nvidia_group=group), **kw)
@@ -123,8 +124,7 @@ def test_modes_collage_order_and_index_receipt():
     assert mode_for("reward.terminal") == "terminal"
     assert mode_for("reward.terminal", "terminal_rationale") == "terminal_rationale"
     assert mode_for("reward.dense") == "dense"
-    with pytest.raises(NotImplementedError):
-        mode_for("reward.rubric")
+    assert mode_for("reward.rubric") == "rubric"
     with pytest.raises(ValueError):
         mode_for("segment")
     assert collage_order({"main", "left_wrist", "right_wrist"}) == (
@@ -148,7 +148,9 @@ def test_video_resolver_relative_and_range_cut(tmp_path):
 
     r = VideoResolver(media_root="/data", cut_dir=tmp_path, cutter=cutter)
     assert r.resolve("u", "main", SourceRef("x/a.mp4")) == "/data/x/a.mp4"
-    assert r.resolve("u", "main", SourceRef("/abs.mp4")) == "/abs.mp4"
+    assert r.resolve("u", "main", SourceRef("/data/abs.mp4")) == "/data/abs.mp4"
+    with pytest.raises(ValueError, match="not under"):  # review 11b F1
+        r.resolve("u", "main", SourceRef("/abs.mp4"))
     got = r.resolve("u", "main", SourceRef("x/v3.mp4", 2.0, 5.0))
     assert got == str(tmp_path / "u" / "main.mp4")
     assert r.resolve("u", "main", SourceRef("x/v3.mp4", 2.0, 5.0)) == got  # cached
@@ -313,13 +315,13 @@ def test_python_exception_marks_error_and_reraises(tmp_path):
     assert not store.exists(PATHS.receipt(CFG, shard.kind, shard.shard_id))
 
 
-def test_rubric_shard_is_deferred(tmp_path):
+def test_rubric_shard_needs_a_rubric_worker(tmp_path):
     store = FakeStore()
     shard = tshard(["a"], sid="reward.rubric-00000", kind="reward.rubric")
     setup(store, [ep("a")], [shard])
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(RuntimeError, match="needs pipeline.rubric"):
         make_runner(store, tmp_path).run_shard(JOB, shard.shard_id, CFG)
-    assert "NotImplementedError" in A.read_attempt(
+    assert "pipeline.rubric" in A.read_attempt(
         jf_of(store), shard.kind, shard.shard_id, "c1").error
 
 

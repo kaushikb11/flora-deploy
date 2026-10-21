@@ -9,7 +9,10 @@ per-episode ``active.episode()`` scope in each episode coroutine). Two episodes 
 3-view YAM) overlap on one event loop. The engine answers each request as a function of its
 content digest (``stages.segment.request_digest``: prompt + every frame + metadata), so equal
 inputs give equal answers; the test asserts the multiset of request digests, the rows and the
-audits are identical, and that the patches really ran (decode-once lookahead used).
+audits are identical, and that the patches really ran (decode-once lookahead used). It also
+asserts the multiset of **literal** digests of what vLLM receives
+(``tests.fakes.request_digest.prompt_dict_digest``: the wrapped prompt, every frame array with
+its dtype and shape, the metadata and ``mm_processor_kwargs``; review 10 L3).
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ from flora_deploy.stages import segment as S
 from flora_deploy.workers_impl.balanced import AccelJob, apply_accel, wrap_job
 from flora_deploy.workers_impl.caption import CaptionEpisodeJob
 from flora_deploy.workers_impl.segment import EpisodeInputs, SegmentEpisodeJob, StageInfo
+from tests.fakes.request_digest import prompt_dict_digest
 
 pytestmark = pytest.mark.nvlink
 
@@ -87,12 +91,14 @@ class DigestEngine:
         self.tok, self.kind = tokenizer, kind
         self.eos = tokenizer.eos_token_id
         self.digests: list[str] = []
+        self.literal: list[str] = []  # prompt_dict() as vLLM gets it (L3)
 
     def generate_batch(self, requests, samplings):
         out = []
         for r in requests:
             d = S.request_digest(r.prompt, r.videos)
             self.digests.append(d)
+            self.literal.append(prompt_dict_digest(r))
             text = '{"segments": []}' if self.kind == "tempseg" else f"the arm moves {d[:6]}"
             ids = tuple(self.tok.encode(text, add_special_tokens=False)) + (self.eos,)
             out.append(Completion(key=r.key, token_ids=ids, finish_reason="stop",
@@ -162,15 +168,16 @@ def _run(nv, procs, episodes, kind, accel: bool):
         stage.close()
         if active is not None:
             active.restore()
-    return outs, sorted(engine.digests), stats
+    return outs, (sorted(engine.digests), sorted(engine.literal)), stats
 
 
 @pytest.mark.parametrize("kind", ["tempseg", "captioner"])
 def test_balanced_inputs_identical_with_and_without_accel(nv, procs, episodes, kind):
     ref_out, ref_digests, _ = _run(nv, procs, episodes, kind, accel=False)
     got_out, got_digests, stats = _run(nv, procs, episodes, kind, accel=True)
-    assert ref_digests, "no model request was made"
-    assert got_digests == ref_digests  # every request: prompt, every frame, metadata
+    assert ref_digests[0], "no model request was made"
+    assert got_digests[0] == ref_digests[0]  # every request: prompt, every frame, metadata
+    assert got_digests[1] == ref_digests[1]  # literally: wrapped prompt, dtypes, mm kwargs
     assert got_out == ref_out  # records and NVIDIA's audits
     assert all(o[0] == "ok" for o in ref_out), ref_out
     assert stats.get("frames_for_calls", 0) >= 1  # the patches were on the decode path

@@ -1,4 +1,4 @@
-"""``CachedSession``: keep NVIDIA's models resident across episodes (PLAN.md §6.5).
+"""``CachedSession``: keep NVIDIA's models resident across episodes (PLAN-v3.md §6.5).
 
 NVIDIA's ``models.Session`` holds one model at a time: ``load(kind)`` first calls ``close()``, and
 ``pipeline.annotate`` closes it after every video. For a long-lived worker we wrap it:

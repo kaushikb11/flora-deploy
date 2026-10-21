@@ -45,6 +45,7 @@ from typing import Any
 import av
 import numpy as np
 
+from flora_deploy.media.avsafe import open_input
 from flora_deploy.media.index import (
     FLAG_DISCARD,
     FLAG_RAP,
@@ -119,7 +120,7 @@ class _Cursor:
     """One open decoder positioned after frame ``next - 1``."""
 
     def __init__(self, path: str, seekmap: SeekMap | None = None, start_packet: int = 0):
-        self.container = av.open(path, options=NV_OPEN_OPTIONS)
+        self.container = open_input(path, options=NV_OPEN_OPTIONS)
         try:
             self.stream = self.container.streams.video[0]
             self.stream.codec_context.thread_count = 1

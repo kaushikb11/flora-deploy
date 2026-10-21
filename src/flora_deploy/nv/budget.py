@@ -1,4 +1,4 @@
-"""NVIDIA's 32k context guard, reproduced for vLLM requests (PLAN.md §6.3).
+"""NVIDIA's 32k context guard, reproduced for vLLM requests (PLAN-v3.md §6.3).
 
 NVIDIA's ``models.generate(model, proc, inputs, budget)`` refuses a request before generating
 when ``input_ids.shape[1] + budget > 32768`` and raises ``models.InputErrorForModel``
@@ -19,7 +19,7 @@ file re-read from disk, and fail closed on any shape they do not know: a ``gener
 another function or at module level, ``models.generate(...)``, an alias, a re-import under
 another name, a non-literal budget.
 
-LICENSE REVIEW FLAG (PLAN.md §11): ``CONTEXT_LIMIT = 32768`` restates the constant of
+LICENSE REVIEW FLAG (PLAN.md §7): ``CONTEXT_LIMIT = 32768`` restates the constant of
 ``models.py:169``. It is a default only. The nvlink test ``test_nv_link_budget.py`` checks it, and
 the derived budgets, against NVIDIA's source and against NVIDIA's own ``generate`` at the
 boundary.
@@ -124,10 +124,6 @@ def executed_source(module) -> bytes:
             "refusing to parse its source from disk"
         )
     return data
-
-
-def _source_tree(module) -> ast.Module:
-    return ast.parse(executed_source(module))
 
 
 def _qualified_functions(tree: ast.Module):

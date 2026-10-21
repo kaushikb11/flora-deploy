@@ -26,16 +26,17 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
 from flora_deploy.config.hashing import MissingReceiptError
 from flora_deploy.config.pins import DERIVED_PINS_BY_KEY
 
-__all__ = ["MissingReceiptError", "ReceiptPinMismatch", "check_overrides", "check_pinned",
-           "derived_content", "load_certified", "needed", "pin_key", "record", "resolve",
-           "set_derived_text"]
+__all__ = ["MissingReceiptError", "ReceiptPinMismatch", "UnpinnedDerivedWeight",
+           "check_overrides", "check_pinned", "derived_content", "load_certified", "needed",
+           "needed_by_kind", "pin_key", "record", "require_pinned", "resolve",
+           "set_derived_text", "unpinned", "unpinned_message"]
 
 YAML_PATH = "weights.derived"
 
@@ -80,6 +81,69 @@ def check_pinned(name: str, receipt: Mapping, *, where: str | None = None) -> st
         "build would be refused at load: its files, dtype policy, casts or sources differ from "
         f"the proven build. Rebuild it (`flora prepare --force-derived`); if it still differs, "
         f"the converter changed and needs a new identity proof (docs/{pin.key}.md)")
+
+
+class UnpinnedDerivedWeight(ValueError):
+    """A derived weight the config needs has no pinned content digest yet (``pins.DERIVED_PINS``
+    ``content_sha256`` is ``None``): the workers would refuse it at start, on a billed GPU, so
+    plan / deploy / run refuse it first (review 10 M1)."""
+
+
+# Where each derived weight's build, identity check and pinning are described.
+DERIVED_DOCS = {"tempseg-merged": "docs/tempseg-merge.md",
+                "captioner-bf16": "docs/captioner-bf16.md"}
+_CHECKS = {"tempseg-merged": "its equivalence check (`modal run src/flora_deploy/modal_app/"
+                             "convert_app.py::tempseg --step equivalence`)",
+           "captioner-bf16": "its identity proof"}
+
+
+def unpinned(names: Iterable[str]) -> list[str]:
+    """Of ``names`` (receipt names), those without a pinned content digest, sorted."""
+    out = []
+    for n in sorted(set(names)):
+        pin = DERIVED_PINS_BY_KEY.get(pin_key(n))
+        if pin is None or pin.content_sha256 is None:
+            out.append(n)
+    return out
+
+
+def unpinned_message(name: str, *, kinds: Iterable[str] = (), preset: str | None = None
+                     ) -> str:
+    """Why ``name`` is refused and the exact steps that fix it (one text everywhere: plan,
+    deploy, doctor, the worker and the runbook)."""
+    key = pin_key(name)
+    pin = DERIVED_PINS_BY_KEY.get(key)
+    ver = f" (converter v{pin.converter_version})" if pin is not None else ""
+    who = " / ".join(f"`{k}`" for k in kinds)
+    head = (f"{preset or 'this preset'} {who} needs" if who else "this config needs")
+    doc = DERIVED_DOCS.get(key, "docs/")
+    check = _CHECKS.get(key, "its identity check")
+    return (f"{head} derived weight `{key}`{ver}, whose content digest is not pinned yet "
+            f"(pins.DERIVED_PINS[{key!r}].content_sha256 is None), so its workers would refuse "
+            f"it at start on a billed GPU. To fix: build it (`flora prepare`), run {check} "
+            f"({doc}), then pin the content digest that `flora prepare --show-receipt` prints "
+            f"in src/flora_deploy/config/pins.py and redeploy. Until then use `preset: exact`.")
+
+
+def require_pinned(names: Iterable[str], *, kinds_of: Mapping[str, Iterable[str]] | None = None,
+                   preset: str | None = None) -> None:
+    """Raise :class:`UnpinnedDerivedWeight` naming every unpinned one of ``names``."""
+    bad = unpinned(names)
+    if bad:
+        raise UnpinnedDerivedWeight(" ".join(
+            unpinned_message(n, kinds=(kinds_of or {}).get(n, ()), preset=preset) for n in bad))
+
+
+def needed_by_kind(cfg: Any) -> dict[str, list[str]]:
+    """Receipt name -> the config's shard kinds that need it."""
+    from flora_deploy.config.presets import get_preset, shard_kinds_for
+
+    preset = get_preset(cfg.preset)
+    out: dict[str, list[str]] = {}
+    for k in shard_kinds_for(preset, cfg.pipeline.stages):
+        for r in preset.derived_weights.get(k, ()):
+            out.setdefault(r, []).append(k)
+    return out
 
 
 def resolve(cfg: Any, overrides: Mapping[str, str] | None = None) -> dict[str, str]:

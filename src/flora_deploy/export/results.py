@@ -186,6 +186,7 @@ def records_from_table(table: pa.Table) -> list[StageRecord]:
         elif stage == "reward.rubric" and r0["rubric_scores"] is not None:
             d["rubric"] = {"scores": r0["rubric_scores"], "total": r0["rubric_total"],
                            "samples": r0["rubric_samples"],
-                           "medoid_index": r0["rubric_medoid_index"]}
+                           "medoid_index": r0["rubric_medoid_index"],
+                           "parsed_samples": r0.get("rubric_parsed_samples")}
         out.append(StageRecord.from_dict(d))
     return sort_records(out)

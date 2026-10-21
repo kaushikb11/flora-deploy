@@ -26,7 +26,7 @@ import threading
 from collections.abc import Iterator
 from typing import Any
 
-from flora_deploy.jobs.stores.local import check_rel_path
+from flora_deploy.jobs.stores.local import check_list_prefix, check_rel_path
 
 _FILE = 1  # modal.volume.FileEntryType.FILE
 LIST_DEPTH = 5  # flora/<job>/<hash>/<area>/<kind>
@@ -90,6 +90,7 @@ class ClientVolumeStore:
         self.refresh()
 
     def get_bytes(self, path: str) -> bytes:
+        check_rel_path(path)  # before the cache, not only on a miss
         with self._lock:
             hit = self._reads.get(path)
         if hit is not None:
@@ -149,6 +150,7 @@ class ClientVolumeStore:
         return path in self._listing(posixpath.dirname(path))
 
     def list(self, prefix: str) -> Iterator[str]:
+        check_list_prefix(prefix)
         base = prefix.rstrip("/")
         d = base if prefix.endswith("/") or not base else posixpath.dirname(base)
         out = [p for p in self._files_under(d)

@@ -24,10 +24,25 @@ def check_rel_path(path: str) -> str:
     return path
 
 
+def check_list_prefix(prefix: str) -> str:
+    """A listing prefix: empty, or a store path (or a leading part of one) with an optional
+    trailing ``/``. A partial last component (``jobs/a`` for ``jobs/a.json``) is allowed."""
+    if prefix == "":
+        return prefix
+    body = prefix[:-1] if prefix.endswith("/") else prefix
+    if not body:
+        raise ValueError(f"invalid list prefix {prefix!r}")
+    check_rel_path(body)
+    return prefix
+
+
 def list_tree(root: Path, prefix: str) -> Iterator[str]:
     """Relative paths of files under ``root`` whose path starts with ``prefix`` (a string prefix,
     not necessarily a directory boundary), sorted. Temp files are skipped. Only the deepest
-    directory the prefix names is walked."""
+    directory the prefix names is walked. The prefix follows :func:`check_rel_path`'s rules,
+    except that it may be empty or end in ``/`` (review 11b F7: ``list("../")`` listed outside
+    the root)."""
+    check_list_prefix(prefix)
     base = prefix.rsplit("/", 1)[0] if "/" in prefix else ""
     start = root / base if base else root
     if not start.is_dir():
@@ -73,4 +88,4 @@ class LocalStore:
         return self._abs(path).is_file()
 
     def list(self, prefix: str) -> Iterator[str]:
-        return list_tree(self.root, prefix)
+        return list_tree(self.root, check_list_prefix(prefix))

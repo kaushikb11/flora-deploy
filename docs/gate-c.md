@@ -90,7 +90,7 @@ only.
 
 The episodes used are the first ones in manifest order, `golden/v1/manifest.json`.
 
-Deviation from PLAN §9's "20 golden requests per pool": the gate uses up to 6 per pool and kind,
+Deviation from archive/PLAN-v3.md §9's "20 golden requests per pool": the gate uses up to 6 per pool and kind,
 11-12 per pool in total. The plan's 20 would mean 120 requests per kind on real media; the
 coverage above spans every pool, codec, rate class (VFR, 10/15/30/50 fps) and window length at
 about a third of the build cost. Raise `--quota` to 20 to run the plan's number.

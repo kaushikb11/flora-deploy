@@ -53,8 +53,14 @@ Concurrent inputs (``@modal.concurrent``): every in-flight shard of the containe
 the same record from two containers differ (compose would report a conflict);
 audits are found under ``JobPaths.audit`` by ``(uid, stage)``.
 
-Rubric rewards are deferred (``stages.reward.check_mode``): a ``reward.rubric`` shard raises
-``NotImplementedError`` after its attempt marker, which is then marked with the error.
+``reward.rubric`` shards (``RewardWorkerSettings.rubric`` set: the config's
+``pipeline.rubric``) run the same steps through ``stages.rubric.run`` instead: one
+``generate`` (n=9 samples) per episode on NVIDIA's TP=2 rubric engine, one part per episode.
+Their videos are one per camera in ``pipeline.rubric.cameras`` order (a different camera set is
+:class:`~flora_deploy.stages.rubric.RubricCamerasMismatch`, a configuration error), and
+failures are classified by ``nv.errors.classify``: a CUDA fault / OOM ends the shard through
+:func:`end_failed_shard` as a crash. Records are stamped like every kind's
+(``settings.cert_stamps``, ``workers_impl.certstamp.with_stamps``).
 """
 
 from __future__ import annotations
@@ -86,6 +92,7 @@ from flora_deploy.jobs.types import (
     ShardReceipt,
     safe_key,
 )
+from flora_deploy.media.safepath import UnsafePath, check_relative, contain, is_within
 from flora_deploy.media.types import SourceRef
 from flora_deploy.records import StageRecord
 from flora_deploy.stages import reward as R
@@ -104,7 +111,7 @@ def collage_order(roles: Iterable[str]) -> tuple[str, ...]:
 
 
 def mode_for(kind: ShardKind, terminal_mode: str = "terminal") -> str:
-    """``stages.reward`` mode of a shard kind (rubric raises: deferred)."""
+    """``stages.reward`` mode of a shard kind (``rubric``: ``stages.rubric``)."""
     if kind == "reward.terminal":
         if terminal_mode not in ("terminal", "terminal_rationale"):
             raise ValueError(f"terminal_mode {terminal_mode!r}")
@@ -112,7 +119,7 @@ def mode_for(kind: ShardKind, terminal_mode: str = "terminal") -> str:
     if kind == "reward.dense":
         return "dense"
     if kind == "reward.rubric":
-        return R.check_mode("rubric")  # raises NotImplementedError
+        return "rubric"
     raise ValueError(f"RewardWorker cannot run shard kind {kind!r}")
 
 
@@ -226,18 +233,30 @@ class VideoResolver:
     fetch: Fetcher = hub_fetch
 
     def local(self, uri: str) -> str:
-        if os.path.isabs(uri):
-            return uri
+        """Uris come from index receipts in the store, which come from dataset metadata: a uri
+        must name a file under the media root (``media.safepath``, review 11b F1), symlinks
+        resolved. An absolute uri is accepted only inside a local media root."""
+        if isinstance(uri, str) and os.path.isabs(uri):
+            if self.media_root is None or self.media_root.startswith(HF_SCHEME):
+                raise UnsafePath(f"absolute video uri {uri!r} outside any local media root")
+            root = Path(self.media_root)
+            if not Path(uri).is_relative_to(root):
+                raise UnsafePath(f"absolute video uri {uri!r} is not under {root}")
+            return str(contain(root, Path(uri).relative_to(root).as_posix()))
+        check_relative(uri)
         if self.media_root is None:
             raise FileNotFoundError(f"relative video uri {uri!r} and no media_root")
         if self.media_root.startswith(HF_SCHEME):
             repo, rev, sub = parse_hf_root(self.media_root)
             dest = Path(self.hub_dir) / f"{repo.replace('/', '--')}@{rev[:12]}"
             rel = f"{sub}/{uri}" if sub else uri
-            if (dest / rel).is_file():
+            if contain(dest, rel).is_file():
                 return str(dest / rel)
-            return str(self.fetch(repo, rev, rel, str(dest)))
-        return str(Path(self.media_root) / uri)
+            got = self.fetch(repo, rev, rel, str(dest))
+            if not is_within(dest, got):
+                raise UnsafePath(f"fetched {rel!r} landed outside {dest}")
+            return str(got)
+        return str(contain(self.media_root, uri))
 
     def resolve(self, uid: str, role: str, source: SourceRef) -> str:
         uri = self.local(source.uri)
@@ -469,6 +488,12 @@ def end_failed_shard(exc: BaseException, end: Callable[..., bool],
     return crash
 
 
+def _config_errors() -> tuple[type[BaseException], ...]:
+    from flora_deploy.stages.rubric import RubricCamerasMismatch
+
+    return (RubricCamerasMismatch,)
+
+
 INPUT_RETRIES = 1  # in-process retries of an episode's input loading (transient I/O)
 
 
@@ -480,6 +505,7 @@ class RewardEngine:
     llm: Any
     processor: Any
     spec: R.EngineSpec | None = None
+    recipe: Any = None  # reward.rubric: stages.rubric.Recipe (NVIDIA's rubric settings)
 
 
 def default_container_id() -> str:
@@ -505,6 +531,9 @@ class RewardWorkerSettings:
     media_root: str | None = None
     local_dir: str = "/tmp/flora-reward"
     container_id: str = field(default_factory=default_container_id)
+    # reward.rubric: ``config.schema.rubric_spec`` (NVIDIA's rubric job fields); set only on a
+    # rubric worker, which then serves reward.rubric shards only
+    rubric: Mapping[str, Any] | None = None
 
 
 @dataclass
@@ -564,7 +593,9 @@ class RewardShardRunner:
             self._end(active, preempted=True)
             raise
         except Exception as exc:  # a CUDA fault: crashed=True, then fatal (review 8a R4)
-            end_failed_shard(exc, lambda **kw: self._end(active, **kw), self.fatal)
+            end_failed_shard(exc, lambda **kw: self._end(active, **kw), self.fatal,
+                             crash=getattr(exc, "crash_kind", None),  # stages.rubric
+                             crash_message=getattr(exc, "crash_message", None))
             raise
         finally:
             with self._lock:
@@ -606,6 +637,16 @@ class RewardShardRunner:
                              error=error or "error", marker=active.marker, crashed=crashed)
         return True
 
+    @property
+    def rubric_spec(self):
+        """``stages.rubric.RubricSpec`` of ``settings.rubric`` (parsed once)."""
+        spec = getattr(self, "_rubric_spec", None)
+        if spec is None:
+            from flora_deploy.stages import rubric as RB
+
+            spec = self._rubric_spec = RB.RubricSpec.from_json(self.settings.rubric or {})
+        return spec
+
     def episode_from_index(self, ref: EpisodeRef) -> R.Episode:
         idx = parse_index_receipt(self.store.get_bytes(ref.index_ref))
         if not idx.sources:
@@ -616,7 +657,12 @@ class RewardShardRunner:
                 f"episode {ref.uid!r}: no task instruction (the index receipt has none and "
                 "FLORA_INSTRUCTION_TEXT is unset); NVIDIA's reward prompts need one: use "
                 "episode_instruction.source dataset_task with tasks, or fixed + text")
-        roles = collage_order(idx.sources)
+        if self.settings.rubric is not None:  # one video per camera, in rubric order
+            from flora_deploy.stages import rubric as RB
+
+            roles = RB.episode_for_roles(self.rubric_spec, tuple(idx.sources))
+        else:
+            roles = collage_order(idx.sources)
         videos = tuple(self.resolver.resolve(ref.uid, role, idx.sources[role]) for role in roles)
         sources = tuple((role, idx.sources[role].uri, idx.sources[role].start_s,
                          idx.sources[role].end_s) for role in roles)  # provenance (L4)
@@ -632,6 +678,11 @@ class RewardShardRunner:
         t0 = time.perf_counter()
         jf, shard, s = active.jf, active.shard, self.settings
         mode = mode_for(shard.kind, s.terminal_mode)
+        if (mode == "rubric") != (s.rubric is not None):
+            raise RuntimeError(f"{shard.kind} shard on a worker configured "
+                               f"{'with' if s.rubric is not None else 'without'} a rubric: "
+                               "reward.rubric needs pipeline.rubric, and a rubric worker runs "
+                               "reward.rubric shards only")
 
         prior = P.shard_parts(jf, shard)  # step 2
         done = set(prior.done)
@@ -650,7 +701,7 @@ class RewardShardRunner:
 
         refs = {e.uid: e for e in manifests.base().episodes}
         todo = [u for u in shard.episodes if u not in done and u not in poisoned]
-        stage = R.STAGES[mode]
+        stage = "reward.rubric" if mode == "rubric" else R.STAGES[mode]
         episodes, errors = [], []
         for uid in todo:  # step 4: inputs (per-episode isolation)
             if uid not in refs:
@@ -659,7 +710,7 @@ class RewardShardRunner:
                 try:
                     episodes.append(self.episode_for(refs[uid]))
                     break
-                except TaskInstructionMissing:
+                except (TaskInstructionMissing, *_config_errors()):
                     raise  # configuration: fail the shard, never excuse the episode
                 except ValueError as exc:  # NVIDIA semantics (parse, Collage, cut alignment)
                     errors.append(EpisodeError(
@@ -685,7 +736,14 @@ class RewardShardRunner:
         # (or a bisection child) gets the batch-mates the job gives it, whatever the shard
         # sizing; a group the shard does not hold whole is flagged, never "aligned".
         planned = [e.uid for e in manifests.base().episodes]
-        if episodes:
+        if episodes and mode == "rubric":
+            from flora_deploy.stages import rubric as RB
+
+            RB.run(self.engine.llm, self.nv, self.engine.processor, episodes, self.rubric_spec,
+                   recipe=self.engine.recipe, models=dict(s.models), gpu=s.gpu, preset=s.preset,
+                   certificate=s.certificate, config_extra=dict(s.config_extra), sink=sink,
+                   shard_id=shard.shard_id, container_id=self.container_id)
+        elif episodes:
             group = int((self.engine.spec.args if self.engine.spec else {}).get(
                 "max_num_seqs", NVIDIA_TERMINAL_GROUP))
             if shard.kind == "reward.terminal" and group != NVIDIA_TERMINAL_GROUP:

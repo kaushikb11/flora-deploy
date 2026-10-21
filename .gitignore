@@ -3,9 +3,29 @@
 research_notes/
 reports/
 
-# Never commit NVIDIA code, prompts or weights (see NOTICE.md)
+# Never commit NVIDIA code, prompts or weights (see NOTICE.md). Mirrors FORBIDDEN in
+# tests/unit/test_license_guard.py, so the files are never even staged.
 **/batch_utils/
+*TEMPSEG_PROMPTS.json
+*LICENSE.pdf
+# NVIDIA's chat templates and HF processor/tokenizer/generation configs (fetch_nv_code.py
+# --with-processor), under any directory
+*.jinja
+*chat_template*.json
+*tokenizer.json
+*tokenizer_config.json
+*processor_config.json
+*generation_config.json
+# weights, of any size
 *.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.gguf
+# an NVIDIA code / Hub cache pointed inside the checkout (FLORA_NV_CODE_CACHE, HF_HOME)
+.cache/
 
 # Python
 __pycache__/

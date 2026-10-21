@@ -41,7 +41,7 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any
 
 from flora_deploy.engines.base import Completion, Sampling, VllmRequest
@@ -499,7 +499,3 @@ def check_extra_state(weight_map: Mapping[str, Any]) -> list[str]:
         raise EngineVerifyError(f"{len(bad)} _extra_state key(s) under model.visual would "
                                 f"KeyError in vLLM's vision loader, e.g. {bad[:3]}")
     return prefixes
-
-
-def with_limits(spec: EngineSpec, **changes) -> EngineSpec:
-    return replace(spec, limits=replace(spec.limits, **changes))

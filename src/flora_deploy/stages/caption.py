@@ -16,7 +16,7 @@ For one episode the stage runs exactly what ``pipeline.annotate`` runs after seg
 - ``pipeline.annotate``'s ``segmentation_provenance`` copy and ``api.annotate``'s interval check
   follow.
 
-LICENSE REVIEW FLAG (PLAN.md §11): ``CaptionStage.caption`` restates the branch, the provenance copy
+LICENSE REVIEW FLAG (PLAN.md §7): ``CaptionStage.caption`` restates the branch, the provenance copy
 (``segment_row['metadata'].get('segmentation_provenance', 'fine')``) and the interval check of
 ``pipeline.annotate`` / ``api.DataEnginePipeline.annotate``.
 ``tests/nvlink/test_balanced_nvlink.py`` compares the result with NVIDIA's own ``caption_*`` on

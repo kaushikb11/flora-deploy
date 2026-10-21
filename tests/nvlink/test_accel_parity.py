@@ -41,6 +41,7 @@ from flora_deploy.media.synth import Spec
 from flora_deploy.nv import Family
 from flora_deploy.nv.linker import load_family, verify_code_manifest
 from flora_deploy.nv.session import CachedSession
+from tests.nvtext import SAFE_PREFIX, assert_same_text
 
 pytestmark = pytest.mark.nvlink
 
@@ -165,10 +166,16 @@ def outcome(fn, *args, **kwargs):
                          nv_errors.classify(exc))
 
 
+def _kind(o) -> str:
+    """An outcome's shape without NVIDIA's message text."""
+    return "ok" if o[0] == "ok" else f"raise {o[1][0]}/{o[1][1]}/{o[1][3]}"
+
+
 def assert_same_outcome(ref, got, where=""):
-    assert ref[0] == got[0], (where, ref, got)
+    assert ref[0] == got[0], f"{SAFE_PREFIX}{where}: {_kind(ref)} vs {_kind(got)}"
     if ref[0] == "raise":
-        assert ref[1] == got[1], where
+        assert _kind(ref) == _kind(got), f"{SAFE_PREFIX}{where}: {_kind(ref)} vs {_kind(got)}"
+        assert_same_text(got[1][2], ref[1][2], f"{where} exception message")
     else:
         assert_same_frames(ref[1], got[1], where)
 
