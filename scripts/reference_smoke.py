@@ -87,6 +87,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--deadline-min", type=float, default=16.0,
                    help="S1: no NVIDIA-unmodified episode starts after this (call minutes)")
     p.add_argument("--disable", default="", help="ExactProfile toggles to switch off")
+    p.add_argument("--determinism", default="nvidia", choices=("nvidia", "deterministic"),
+                   help="D-1 mode (docs/determinism.md)")
     p.add_argument("--no-instruction", action="store_true",
                    help="S1: blank instruction instead of the dataset task text")
     p.add_argument("--repeat", type=int, default=1, help="W3-A: run each episode K times")
@@ -165,7 +167,8 @@ def _worker(args):
     if getattr(args, "memory_gib", None):
         options["memory"] = args.memory_gib * 1024
     cls = ReferenceWorker.with_options(**options) if options else ReferenceWorker
-    return cls(disable=getattr(args, "disable", ""), concurrency=args.concurrency or 4)
+    return cls(disable=getattr(args, "disable", ""), concurrency=args.concurrency or 4,
+               determinism=getattr(args, "determinism", "nvidia"))
 
 
 def container_rate(cpu: float, memory_gib: float) -> float:

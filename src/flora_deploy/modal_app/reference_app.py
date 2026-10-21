@@ -179,6 +179,8 @@ def _load_kind(session, kind: str, callback=None) -> tuple[dict, list[dict]]:
 class ReferenceWorker:
     disable: str = modal.parameter(default="")  # ExactProfile toggles to switch off
     concurrency: int = modal.parameter(default=4)
+    # D-1 (docs/determinism.md): "nvidia" (default, NVIDIA's behavior) or "deterministic"
+    determinism: str = modal.parameter(default="nvidia")
 
     @modal.enter()
     def load(self) -> None:
@@ -189,6 +191,12 @@ class ReferenceWorker:
 
         def mark(name: str) -> None:
             marks[name] = round(time.monotonic() - t0, 2)
+
+        # Before any CUDA work: apply() sets CUBLAS_WORKSPACE_CONFIG itself while CUDA is not yet
+        # initialized, so the class env stays NVIDIA's default for the "nvidia" mode.
+        from flora_deploy.accel import determinism
+
+        self.determinism_record = determinism.apply(self.determinism)
 
         from flora_deploy.stages.reference import (
             ExactProfile,
@@ -229,8 +237,27 @@ class ReferenceWorker:
         base_thread.start()
         mark("layout")
 
+        # OPT-2's install-time check is fast (headers + small files) and would accept corrupted
+        # shard bodies: re-hash every byte of the derived BF16 Captioner against its receipt in
+        # the background (overlapped with the TempSeg load); not ready until it passes.
+        from flora_deploy.accel.captioner_load import default_derived_dir, verify_derived
+
+        derived_check: dict = {}
+
+        def check_derived():
+            try:
+                derived_check["report"] = verify_derived(default_derived_dir(WEIGHTS_MOUNT),
+                                                         full=True)
+            except BaseException as e:  # noqa: BLE001 - re-raised before ready
+                derived_check["error"] = e
+
+        derived_thread = None
+        if profile.captioner_bf16:
+            derived_thread = threading.Thread(target=check_derived, daemon=True,
+                                              name="flora-bf16-hash")
+            derived_thread.start()
+
         # 2. t=0 prefetch of the weights this load reads (base, then the Captioner)
-        from flora_deploy.accel.captioner_load import default_derived_dir
         from flora_deploy.modal_app.warm import BackgroundPrefetch, snapshot_files
 
         self.derived_dir = default_derived_dir(WEIGHTS_MOUNT)
@@ -303,6 +330,13 @@ class ReferenceWorker:
             raise base_check["error"]
         receipts["tempseg_base"] = base_check["report"]
         mark("base_verified")
+        if derived_thread is not None:
+            derived_thread.join()
+            if "error" in derived_check:
+                raise derived_check["error"]
+            receipts["captioner_bf16_full"] = {
+                k: derived_check["report"].get(k) for k in ("mode", "files", "bytes", "seconds")}
+            mark("bf16_full_hash_verified")
 
         # 5. runtime swaps: GPU lock, NVIDIA's entry point bound to our session, OPT-1 patches
         self._install_fast()
@@ -315,6 +349,7 @@ class ReferenceWorker:
         self.state = "fast"
         self.load_report = {
             "profile": profile.provenance(),
+            "determinism_mode": self.determinism_record,
             "container_import_to_enter_s": round(self.started - IMPORTED_AT, 2),
             "enter_s": round(time.monotonic() - t0, 1),
             "marks_s": marks,
@@ -328,7 +363,7 @@ class ReferenceWorker:
             "torch": torch.__version__,
             "torch_threads": self.torch_threads_after_load,
             "cpu_count": os.cpu_count(),
-            "determinism": _determinism_flags(),
+            "determinism": _determinism_flags(),  # live flags after load
             "cgroup_cpu_max": _read_text("/sys/fs/cgroup/cpu.max"),
             "cgroup_memory_max": _read_text("/sys/fs/cgroup/memory.max"),
             "gpu": _gpu_memory(),
@@ -416,11 +451,22 @@ class ReferenceWorker:
         return out
 
     def _persist(self, out: dict, run: str) -> None:
+        from flora_deploy.accel import determinism
         from flora_deploy.stages.reference import persist_result, result_digest
 
+        try:  # D-1: the mode must still be in effect before anything is saved
+            determinism.verify(self.determinism_record)
+            drift = None
+        except determinism.DeterminismError as e:
+            if self.determinism_record["mode"] != determinism.NVIDIA:
+                raise
+            drift = str(e)  # NVIDIA's default mode sets nothing; report, never drop results
         out["digests"] = {}
         for name, result in out["results"].items():
             ref = result["flora_reference"]
+            ref["determinism"] = {k: self.determinism_record[k] for k in ("schema", "mode")}
+            if drift:
+                ref["determinism"]["flags_changed_since_enter"] = drift
             ref["run_id"] = run
             ref["digest"] = out["digests"][name] = result_digest(result)
             try:
