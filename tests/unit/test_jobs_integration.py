@@ -610,3 +610,61 @@ def test_crash_after_replan_before_record_reuses_children():
     assert w.run(w.orchestrator(holder="B")).result == "done"
     assert w.spawns()["segcap-00000"] == 1
     w.assert_complete(excused={("d--e1", "segment"), ("d--e1", "caption")})
+
+
+class CapGate(FakeBudget):
+    """A hard-cap gate: while ``trip`` is set, ``overspend`` names every live call."""
+
+    def __init__(self):
+        super().__init__()
+        self.trip = False
+        self.states: list = []
+
+    def overspend(self, state):
+        self.states.append(state)
+        return [c.call_id for c in state.live()] if self.trip else []
+
+
+def test_budget_hard_cap_cancels_without_consuming_respawns():
+    gate = CapGate()
+    w = World(_spec(3, eps=4), lag=0, budget=gate,
+              behavior=Behavior(preempt={"segcap-00000": 2, "segcap-00001": 2}))
+    orch = w.orchestrator(fresh=False)
+    assert orch.acquire() and orch.tick() == "running"
+    live = {c.call_id for c in orch.budget_state().live()}
+    assert len(live) == 2
+    w.sleep(10)
+    gate.trip = True
+    assert orch.tick() == "budget_stopped"
+    assert {c.call_id for c in gate.states[-1].live()} == live
+    assert all(w.spawner.calls[c].state == "cancelled" for c in live)
+    for sid in ("segcap-00000", "segcap-00001"):
+        led = orch._ledgers[sid]  # noqa: SLF001
+        assert led.status == "retry" and led.respawns == 0
+        assert led.calls[-1]["outcome"] == "cancelled_budget"
+    assert "call_cancelled" not in w.names() and "budget_overspend_cancel" in w.names()
+    ended = [c for c in orch.budget_state().calls if c.call_id in live]
+    assert all(c.outcome == "cancelled_budget" and not c.live for c in ended)
+    orch.release()
+
+    gate.trip = False
+    w.clock.advance(5)
+    write_control(w.store, JobPaths(JOB), ControlRecord("resume", JOB, "operator",
+                                                        utc(w.clock())))
+    w.clock.advance(5)
+    assert w.run().result == "done"
+    w.assert_complete()
+
+
+def test_call_cancelled_by_a_driver_during_a_budget_stop_is_requeued():
+    """A budget cancel made outside ``enforce_budget`` (e.g. by a driver) is recognized from the
+    active budget_stop and does not consume a respawn either."""
+    w = World(_spec(1, eps=4), lag=0, behavior=Behavior(preempt={"segcap-00000": 3}))
+    orch = w.orchestrator()
+    assert orch.acquire() and orch.tick() == "running"
+    cid = orch._ledgers["segcap-00000"].call_id  # noqa: SLF001
+    orch._control("budget_stop", "driver hard cap")  # noqa: SLF001
+    w.spawner.cancel(cid)
+    assert orch.tick() == "budget_stopped"
+    led = orch._ledgers["segcap-00000"]  # noqa: SLF001
+    assert led.status == "retry" and led.respawns == 0 and "call_cancelled" not in w.names()

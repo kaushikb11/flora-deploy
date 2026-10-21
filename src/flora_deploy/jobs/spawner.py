@@ -4,9 +4,15 @@ The real implementation (P1a-3) wraps Modal: ``Cls.from_name(...).run_shard.spaw
 ``FunctionCall.from_id(call_id).get(timeout=0)``, ``.cancel()``. Tests use
 ``tests/fakes/modal.py::FakeSpawner``. The orchestrator must rely only on this protocol.
 
-Status mapping the real implementation must honor (PLAN.md §1.3):
-- ``OutputExpiredError`` → ``expired``; ``FunctionTimeoutError`` → ``failed``. Both subclass
-  ``TimeoutError``, so catch them **before** treating ``TimeoutError`` as ``pending``.
+Status mapping the real implementation must honor (PLAN.md §1.3; the code and the exception
+table live in ``modal_app/orchestrator_app.py::status_from_get``):
+- a still-running call: ``FunctionCall.get(timeout=0)`` raises the **builtin** ``TimeoutError``
+  (modal 1.6.2), *not* ``modal.exception.TimeoutError`` → ``pending``;
+- ``OutputExpiredError`` → ``expired``; ``FunctionTimeoutError`` → ``failed`` (both subclass
+  ``modal.exception.TimeoutError``); transient client errors (connection / service / internal)
+  → ``pending``, never ``failed`` (a respawn without cancel would duplicate the call);
+- a call cancelled by the orchestrator's budget hard cap is re-queued by the orchestrator itself
+  (``Orchestrator.enforce_budget``) and never consumes a respawn.
 - Modal retries crashes/OOM/preemptions indefinitely inside one call; the orchestrator never sees
   those as failures. Progress and poison pills are detected from ``AttemptMarker`` files instead.
 

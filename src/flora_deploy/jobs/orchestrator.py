@@ -507,6 +507,8 @@ class Orchestrator:
         self._ledgers: dict[str, ShardLedger] = {}
         self._own_controls: list[ControlRecord] = []  # visible before a lagging list() shows them
         self._spawn_takes_token = _accepts_kw(spawner.spawn, "token")
+        self._budget_cancelled: set[str] = set()  # call ids cancelled by the budget hard cap
+        self._stopped = False  # a budget_stop is in force this tick
 
     # events / files -------------------------------------------------------------------------
     def _emit(self, event: str, **kw: Any) -> None:
@@ -617,6 +619,13 @@ class Orchestrator:
             self._emit("cancelled", reason=controls.cancelled.reason)
             return "cancelled"
 
+        for s in shards:
+            self._ledger(s)  # the budget state needs every call history
+        self._budget_cancelled |= set(self.enforce_budget())
+        if self._budget_cancelled:
+            controls = self._controls()  # the budget_stop just written
+        self._stopped = controls.budget_stopped is not None
+
         quarantined = self.attempts.quarantined()
         failed = self._failed_records()
         for s in shards:
@@ -674,6 +683,72 @@ class Orchestrator:
     def _active_count(self) -> int:
         return sum(1 for led in self._ledgers.values() if led.status in _LIVE)
 
+    # budget hard cap ------------------------------------------------------------------------
+    def budget_state(self) -> Any:
+        """``jobs.budget.BudgetState`` of every call this orchestrator knows (its loaded
+        ``call.json`` histories): a call starts at its ``spawned``/``adopted`` entry and ends at
+        its first later entry; with none, it is live while it is the ledger's current call in a
+        live status, else it ended when the ledger was last saved."""
+        from flora_deploy.jobs.budget import BudgetState, CallRecord  # budget imports us
+
+        now = self.clock()
+        calls: list[Any] = []
+        for led in self._ledgers.values():
+            start: dict[str, float] = {}
+            end: dict[str, tuple[float, str]] = {}
+            for e in led.calls:
+                cid, ts = e.get("call_id"), e.get("utc")
+                if not cid or not ts:
+                    continue
+                t = _parse_utc(ts)
+                if e.get("outcome") in ("spawned", "adopted"):
+                    start.setdefault(cid, t)
+                elif cid in start:
+                    end.setdefault(cid, (t, str(e.get("outcome"))))
+            for cid, t0 in start.items():
+                if cid in end:
+                    calls.append(CallRecord(cid, led.shard_id, led.kind, t0, *end[cid]))
+                elif cid == led.call_id and led.status in _LIVE:
+                    calls.append(CallRecord(cid, led.shard_id, led.kind, t0))
+                else:
+                    t1 = _parse_utc(led.updated_utc) if led.updated_utc else now
+                    calls.append(CallRecord(cid, led.shard_id, led.kind, t0, t1, led.status))
+        return BudgetState(now, tuple(calls))
+
+    def enforce_budget(self) -> list[str]:
+        """Budget hard cap, every tick: ``budget.overspend(budget_state())`` names live calls to
+        stop. Writes ``budget_stop`` first (so nothing respawns), then cancels them
+        (``spawner.terminate`` when available) and re-queues their shards as ``retry`` *without*
+        consuming a respawn; ``flora resume`` runs them again. Gates without ``overspend``: no-op.
+        """
+        overspend = getattr(self.budget, "overspend", None)
+        if not callable(overspend):
+            return []
+        ids = [c for c in overspend(self.budget_state()) if c not in self._budget_cancelled]
+        if not ids:
+            return []
+        detail = {**dict(getattr(self.budget, "last_overspend", {}) or {}), "cancel": ids}
+        self._control("budget_stop", "budget hard cap: spend + in-flight work exceeds the budget",
+                      **detail)
+        stop = getattr(self.spawner, "terminate", None) or self.spawner.cancel
+        by_call = {led.call_id: led for led in self._ledgers.values() if led.call_id}
+        done: list[str] = []
+        for cid in ids:
+            try:
+                stop(cid)
+            except Exception as exc:  # retried next tick
+                self._emit("cancel_error", call_id=cid, error=repr(exc))
+                continue
+            done.append(cid)
+            led = by_call.get(cid)
+            if led is not None and led.status in _LIVE:
+                led.calls.append({"call_id": cid, "outcome": "cancelled_budget",
+                                  "utc": utc(self.clock())})
+                self._save(led, status="retry", call_id=None, reason="budget hard cap")
+        self._emit("budget_overspend_cancel", calls=done,
+                   **{k: v for k, v in detail.items() if k != "cancel"})
+        return done
+
     def _recover_spawning(self, s: Shard, led: ShardLedger) -> None:
         """Crash between the spawn intent and the call-id write: the call may or may not exist.
         Adopt it if a marker carrying the intent's token names its call id; otherwise wait out
@@ -715,6 +790,13 @@ class Orchestrator:
                 return
             # e.g. a superseded worker returned None: the shard is not done
             st = type(st)(st.call_id, "failed", error="call succeeded without a receipt")
+        if st.state == "cancelled" and (led.call_id in self._budget_cancelled or self._stopped):
+            # stopped by the budget hard cap (here or by a driver): re-queue, no respawn used
+            led.calls.append({"call_id": led.call_id, "outcome": "cancelled_budget",
+                              "utc": utc(self.clock())})
+            self._save(led, status="retry", call_id=None, reason="budget hard cap")
+            self._emit("call_cancelled_budget", shard_id=s.shard_id, call_id=st.call_id)
+            return
         # failed / expired / cancelled by someone else: bounded respawn
         self._emit("call_" + st.state, shard_id=s.shard_id, call_id=led.call_id, error=st.error)
         led.calls.append({"call_id": led.call_id, "outcome": st.state, "error": st.error,
