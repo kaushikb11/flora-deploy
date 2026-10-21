@@ -212,7 +212,8 @@ class World:
         assert not ci.missing and not ci.conflicts and ci.foreign == 0
         assert ci.excused == set(excused)
         st = self.status()
-        assert st.state == "done" and not needs_orchestrator(st), st
+        assert st.state == ("completed_with_errors" if excused else "done")
+        assert not needs_orchestrator(st), st
 
 
 def _spec(n: int, eps: int = 3) -> dict[str, list[str]]:
@@ -267,7 +268,7 @@ def test_oom_poison_pill_is_bisected_and_isolated(tmp_path, store_kw):
     spec = {"segcap-00000": ["d--e0", "d--e1", "d--e2"], "segcap-00001": ["d--x0"]}
     w = _world(tmp_path, store_kw, spec, behavior=Behavior(oom={"d--e1"}))
     out = w.run()
-    assert out.result == "done"
+    assert out.result == "completed_with_errors"
     kids = ["segcap-ep-d--e1", "segcap-ep-d--e2"]
     bis = next(e for e in w.events if e["event"] == "bisected")
     assert bis["children"] == kids and bis["done"] == ["d--e0"]
@@ -308,7 +309,7 @@ def test_lagging_children_never_resolve_a_quarantined_parent():
     d = build_deps(w.store, w.settings, clock=w.clock)
     orch = w.orchestrator(manifests=LaggingReplans(d.manifests, hide=6), attempts=d.attempts,
                           progress=d.progress)
-    assert w.run(orch).result == "done"
+    assert w.run(orch).result == "completed_with_errors"
     assert w.receipt("segcap-ep-d--e2")
     w.assert_complete(excused={("d--e1", "segment"), ("d--e1", "caption")})
 
@@ -557,7 +558,7 @@ def test_poisoned_segment_episode_does_not_flow_into_caption():
               pools=pools, kinds={"segment-00000": "segment", "caption-00000": "caption"},
               deps={"caption-00000": ["segment-00000"]},
               behavior=Behavior(oom={"b"}, oom_kinds={"segment"}))
-    assert w.run().result == "done"
+    assert w.run().result == "completed_with_errors"
     assert ("caption-00000", "b") not in w.processed
     assert {u for s, u in w.processed if s == "caption-00000"} == {"a", "c"}
     r = P.read_receipt(w.jf, "caption", "caption-00000")
@@ -607,7 +608,7 @@ def test_crash_after_replan_before_record_reuses_children():
                                                                      "segcap-ep-d--e2"]
     assert P.quarantine_records(w.jf) == {}
     w.clock.advance(400)
-    assert w.run(w.orchestrator(holder="B")).result == "done"
+    assert w.run(w.orchestrator(holder="B")).result == "completed_with_errors"
     assert w.spawns()["segcap-00000"] == 1
     w.assert_complete(excused={("d--e1", "segment"), ("d--e1", "caption")})
 

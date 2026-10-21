@@ -57,7 +57,8 @@ from flora_deploy.media.types import EnvelopeVerdict, EpisodeIndex, SourceRef, S
 
 RECEIPT_SCHEMA = "flora_index_receipt_v1"
 SUMMARY_SCHEMA = "flora_index_summary_v1"
-INDEX_VERSION = "1"  # bump when the receipt layout or the indexing procedure changes
+INDEX_VERSION = "2"  # bump when the receipt layout or the indexing procedure changes
+# 2: receipts carry ``instruction_text`` (the resolved instruction; review-4 C2)
 MAX_EPISODES_PER_UNIT = 64
 ENVELOPE_POLICIES = ("warn", "enforce", "ignore")
 # The code that decides every receipt value; its digest is part of the index code version.
@@ -509,7 +510,9 @@ def index_one(job: IndexJob, ep: Mapping[str, Any], files: DatasetFiles, scans: 
                     "repo": job.dataset.repo, "revision": job.revision,
                     "subdir": job.dataset.subdir},
         "pool": job.pool, "profile": profile, "yam32": yam32, "decode": job.decode,
-        "instruction": job.instruction, "task": ep.get("task"), "episode": dict(ep),
+        "instruction": job.instruction, "task": ep.get("task"),
+        # the instruction stages use (C2): the fixed text, the dataset task, or "" for none
+        "instruction_text": job.instruction_for(ep.get("task")), "episode": dict(ep),
         "source_files": list(source_files(ep)), "indexed_utc": utc_now(),
     }
     root = files.root

@@ -5,8 +5,10 @@ part of done and quarantined shards, drops other config hashes (``foreign``), de
 ``records.record_key`` with the latest-source-wins tie-break and reports differing duplicates
 (``conflicts``). Nothing here re-implements that.
 
-Per config hash (``Manifest.config_hash`` unless given; there are no per-stage hashes yet, so
-every stage uses the job hash) and per stage, compose writes, all as whole files:
+Per config hash (``Manifest.config_hash`` of the job's latest plan unless given; each config has
+its own manifest, ``JobPaths.config_manifest``) and per stage, compose writes, all as whole files.
+Parts are read from where their shard kind keys them (its stage hash, ``jobs.store.JobPaths``),
+so a config that reuses another config's finished ``segcap`` shards composes their records:
 
 * ``JobPaths.output(cfg, stage, "jsonl")``: canonical ``StageRecord.to_json`` lines sorted by
   uid, then the record's earliest segment start;
@@ -14,6 +16,18 @@ every stage uses the job hash) and per stage, compose writes, all as whole files
   rows are exploded for ``segment`` / ``caption``, reward stages get their own columns;
 * ``JobPaths.output(cfg, "summary", "json")``: counts, digests and problems, written **last**
   (its presence means the stage files are complete).
+
+**Status** (``summary["status"]``; never "complete" for planned work without records):
+
+* ``complete``: every planned (uid, stage) has a record or a legitimate exclusion
+  (NVIDIA-semantics failure, D15 poison pill) and, per stage, the excluded share is within
+  ``max_error_rate`` with at least one record;
+* ``completed_with_errors``: the job resolved, but a stage excluded more than that (or has no
+  record at all); outputs are written, ``summary["problems"]`` says why, ``complete`` is false;
+* ``partial``: composed with ``partial=True`` before the job resolved (or after it failed).
+
+A job with a failed shard (respawns exhausted, e.g. persistent infrastructure errors) is refused
+without ``partial``.
 
 Outputs are a pure function of the composed records, so composing twice gives byte-identical
 files (idempotent). Compose refuses (``ComposeError``) on an invalid record, a malformed part, or
@@ -48,6 +62,7 @@ import pyarrow.parquet as pq
 from flora_deploy.jobs.attempts import JobFiles
 from flora_deploy.jobs.manifest import load_manifest, stages_of
 from flora_deploy.jobs.progress import Progress, compose_input, derive, read_errors
+from flora_deploy.jobs.settings import MAX_EPISODE_ERROR_RATE
 from flora_deploy.jobs.store import Store
 from flora_deploy.jobs.types import MAX_STARTS_BEFORE_QUARANTINE, EpisodeRef
 from flora_deploy.records import SCHEMA, Stage, StageRecord
@@ -282,14 +297,16 @@ def _error_counts(jf: JobFiles, progress: Progress) -> dict[str, Any]:
 
 def compose(store: Store, job_id: str, *, config_hash: str | None = None,
             partial: bool = False, limit: int = MAX_STARTS_BEFORE_QUARANTINE,
-            write: bool = True) -> ComposeResult:
+            write: bool = True, max_error_rate: float = MAX_EPISODE_ERROR_RATE
+            ) -> ComposeResult:
     """Compose one job's outputs for one config hash (see the module docstring)."""
-    manifest = load_manifest(store, job_id)
-    cfg = config_hash or manifest.config_hash
-    if cfg != manifest.config_hash:
-        raise ComposeError(f"config hash {cfg!r} is not the manifest's "
-                           f"({manifest.config_hash!r}); outputs of another config cannot be "
-                           "composed from this manifest")
+    try:
+        manifest = load_manifest(store, job_id, config_hash)
+    except FileNotFoundError as e:
+        if config_hash is None:
+            raise
+        raise ComposeError(str(e)) from None
+    cfg = manifest.config_hash
     dstore = _DigestingStore(store)
     jf = JobFiles(dstore, job_id, cfg)  # type: ignore[arg-type]
     try:
@@ -303,6 +320,13 @@ def compose(store: Store, job_id: str, *, config_hash: str | None = None,
     if problems:
         raise ComposeError(f"{len(problems)} invalid record(s)", problems)
     missing = sorted(ci.missing)
+    failed_shards = sorted(sid for sid, s in progress.shards.items() if s.state == "failed")
+    if not partial and failed_shards:
+        raise ComposeError(
+            f"job failed: {len(failed_shards)} shard(s) exhausted their retries (persistent "
+            "infrastructure or python errors; see errors/ and the shard_failed records). Pass "
+            "partial=True / --partial to compose what exists",
+            [f"failed shard {s}" for s in failed_shards[:10]])
     if not partial and (missing or not progress.complete):
         unresolved = sorted(sid for sid, s in progress.shards.items()
                             if s.state not in ("done", "quarantined"))
@@ -353,13 +377,32 @@ def compose(store: Store, job_id: str, *, config_hash: str | None = None,
         }
 
     poisoned = sorted(f"{u}/{k}" for u, k in progress.poisoned())
+    resolved = progress.complete and not missing and not failed_shards
+    problems = []
+    for stage in stages:
+        c = stage_summary[stage]
+        if not c["expected"]:
+            continue
+        rate = c["excused"] / c["expected"]
+        if c["records"] == 0:
+            problems.append(f"{stage}: 0 records for {c['expected']} planned episodes "
+                            f"({c['excused']} excluded, {c['missing']} missing)")
+        elif rate > max_error_rate:
+            problems.append(f"{stage}: {c['excused']} of {c['expected']} episodes excluded "
+                            f"({rate:.0%} > {max_error_rate:.0%})")
+    status = ("partial" if not resolved else
+              "completed_with_errors" if problems else "complete")
     part_lines = "".join(f"{p} {h}\n" for p, h in sorted(dstore.parts.items()))
     summary = {
         "schema": SUMMARY_SCHEMA,
         "record_schema": SCHEMA,
         "job_id": job_id,
         "config_hash": cfg,
-        "complete": progress.complete and not missing,
+        "complete": status == "complete",
+        "status": status,
+        "problems": problems,
+        "max_error_rate": max_error_rate,
+        "stage_hashes": dict(manifest.stage_hashes),
         "partial": partial,
         "stages": stage_summary,
         "records": sum(len(v) for v in by_stage.values()),

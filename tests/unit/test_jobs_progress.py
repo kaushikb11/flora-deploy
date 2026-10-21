@@ -15,7 +15,7 @@ from collections import Counter
 
 import pytest
 
-from flora_deploy.jobs.attempts import JobFiles, quarantine, write_attempt
+from flora_deploy.jobs.attempts import JobFiles, is_poisoned, quarantine, write_attempt
 from flora_deploy.jobs.manifest import build_manifest, load_manifest, save_manifest, stages_of
 from flora_deploy.jobs.progress import (
     compose_input,
@@ -160,8 +160,9 @@ def test_no_lost_or_duplicated_records(seed):
     assert ci.excused == poisoned_keys
     # bisection isolated exactly the poison episode, in every kind, in single-episode shards
     assert {u for u, _ in prog.poisoned()} == ({poison} if poison else set())
+    # M3: a poison file counts even while its quarantine record is not listed yet
     holders = [s for s in prog.shards.values()
-               if any(r.detail.get("poisoned") for r in s.quarantines)]
+               if any(r.detail.get("poisoned") for r in s.quarantines) or is_poisoned(jf, s.shard)]
     assert bool(holders) == bool(poison)
     assert all(h.shard.episodes == (poison,) for h in holders)
     assert prog.resume_set() == {}

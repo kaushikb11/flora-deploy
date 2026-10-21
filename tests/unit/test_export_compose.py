@@ -195,7 +195,10 @@ def test_failed_episodes_poison_pills_and_errors_in_summary(store):
     quarantine(jf, terms[1], created_utc="2026-01-02", starts=3)
     s = compose(store, JOB).summary
     st = s["stages"]["reward.terminal"]
-    assert s["complete"]
+    # 2 of 4 excluded: resolved, but above the error-rate guard (not a clean "complete")
+    assert not s["complete"] and s["status"] == "completed_with_errors"
+    assert s["problems"] == ["reward.terminal: 2 of 4 episodes excluded (50% > 10%)"]
+    assert compose(store, JOB, max_error_rate=0.5).summary["status"] == "complete"
     assert st["records"] == 2 and st["excused"] == 2 and st["missing"] == 0
     assert st["episodes"] == {"done": 2, "failed": 1, "poison_pill": 1}
     assert s["poison_pills"] == [f"{terms[1].episodes[0]}/reward.terminal"]
@@ -261,7 +264,7 @@ def test_parquet_round_trip_all_reward_shapes_and_extras():
 
 def test_config_hash_mismatch_refused(store):
     setup_job(store)
-    with pytest.raises(ComposeError, match="not the manifest"):
+    with pytest.raises(ComposeError, match="no manifest for config"):
         compose(store, JOB, config_hash="cfgX")
 
 

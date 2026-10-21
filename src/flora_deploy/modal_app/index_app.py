@@ -14,8 +14,13 @@ With ``stage`` (``input.stage_to: volume://<volume>/<dir>``) files are staged on
 Volume and kept, so reruns and later stages read the Volume instead of the Hub.
 
 Store: ``modal-volume://<volume>[/<prefix>]`` (a ``VolumeStore`` on the mounted Volume, committed
-after every unit) or ``s3://bucket[/prefix]`` (``BucketStore``; the containers need ``boto3``, not
-in ``img_cpu`` yet, and credentials from a Secret named in ``FLORA_INDEX_SECRETS``).
+after every unit) or ``s3://bucket[/prefix]`` (``BucketStore``: ``boto3`` is in ``img_cpu``;
+credentials from a Secret named in ``FLORA_INDEX_SECRETS``).
+
+Staging is what deployed workers read (``modal_app.factory.media_for``, review-4 C1): a Hub
+dataset staged with ``stage`` lands at ``<stage dir>/<DatasetSpec.key>[/<subdir>]`` on the Volume,
+the media root the factory hands the workers; without ``stage`` workers fetch from the Hub at the
+pinned revision.
 
 Module-scope configuration (read at import, here and in the containers): ``FLORA_INDEX_VOLUME``
 (store Volume, default ``flora-canary``, mounted at ``/vol/<name>``), ``FLORA_INDEX_MAX_CONTAINERS``

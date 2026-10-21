@@ -14,7 +14,9 @@ from quarantine records. A replan file whose record is not listed yet stands in 
 * ``failed``: a ``shard_failed`` record (respawns exhausted): terminal, never bisected; the job
   cannot complete;
 * ``quarantined``: a quarantine record or replan file is visible (its children carry the work,
-  or it poisoned its single episode);
+  or it poisoned its single episode), or, for a single-episode shard, its deterministic poison
+  error file exists (``attempts.is_poisoned``: read with ``exists``, so a lagging listing of the
+  quarantine record never makes a poison-pilled job look unfinished, M3);
 * ``quarantine_due``: ``limit`` *counted* starts (``attempts.counted_starts``: preempted
   starts excluded) and no receipt: the orchestrator should call ``attempts.quarantine``
   (idempotent, see there);
@@ -25,8 +27,18 @@ from quarantine records. A replan file whose record is not listed yet stands in 
 
 **Per-episode status**, per shard kind: ``done`` (in a receipt's ``episodes_done`` or a
 quarantine record's ``done``), ``failed`` (in a receipt's ``episodes_failed``: NVIDIA's own
-failure, terminal, not retried), ``poison_pill`` (quarantine record), else ``pending``.
+failure, terminal, not retried; workers never put ``infra`` errors in a receipt, they raise and
+the shard is retried), ``poison_pill`` (quarantine record or poison file), else ``pending``.
 ``done`` takes precedence. Resume set = manifest − done − failed − poison-pilled, per kind.
+
+**Completion** (:attr:`Progress.complete`) means every effective shard resolved;
+:meth:`Progress.outcome` adds the error-rate guard: ``done`` only when the excluded episodes of
+every kind stay within ``max_error_rate`` (and a kind with planned episodes has at least one
+done), else ``completed_with_errors``; ``failed`` if a shard failed for good.
+
+**Keys.** Shard files are keyed by the stage hash of their kind (``JobFiles.key``) and records
+are accepted when their ``provenance.config_hash`` is that stage hash or the job hash
+(``JobFiles.accepts``).
 
 **Listing lag** can hide a quarantine record for a while; the parent then shows
 ``quarantine_due`` again and re-quarantining is idempotent. Because ``complete`` needs every
@@ -59,6 +71,7 @@ from flora_deploy.jobs.attempts import (
     Replan,
     children_of,
     counted_starts,
+    is_poisoned,
     read_control,
     read_replan,
 )
@@ -137,10 +150,11 @@ def shard_parts(jf: JobFiles, shard: Shard) -> ShardParts:
     restart). Lagging listings can hide recent parts: the worker then redoes those episodes and
     compose dedupes."""
     parts = tuple(p for p in jf.store.list(part_prefix(jf, shard)) if p.endswith(".jsonl"))
+    ok = jf.accepts(shard.kind)
     have: dict[str, set[str]] = defaultdict(set)
     for p in parts:
         for r in read_part(jf, p):
-            if r.provenance.config_hash == jf.config_hash:
+            if r.provenance.config_hash in ok:
                 have[r.uid].add(r.stage)
     need = set(stages_of(shard.kind))
     return ShardParts(parts, tuple(u for u in shard.episodes if need <= have.get(u, set())))
@@ -183,6 +197,42 @@ class Progress:
 
     def poisoned(self) -> set[tuple[str, ShardKind]]:
         return {k for k, st in self.episodes.items() if st == "poison_pill"}
+
+    def exclusions(self) -> dict[ShardKind, dict[str, int]]:
+        """Per kind: planned episodes, done, excluded (failed + poison-pilled), pending."""
+        out: dict[ShardKind, dict[str, int]] = {}
+        for (_uid, kind), st in self.episodes.items():
+            c = out.setdefault(kind, {"planned": 0, "done": 0, "excluded": 0, "pending": 0})
+            c["planned"] += 1
+            c["done" if st == "done" else "pending" if st == "pending" else "excluded"] += 1
+        return out
+
+    def outcome(self, max_error_rate: float) -> str:
+        """``failed`` | ``done`` | ``completed_with_errors`` | ``incomplete`` (module docs)."""
+        if any(s.state == "failed" for s in self.shards.values()):
+            return "failed"
+        if not self.complete:
+            return "incomplete"
+        return "done" if not error_rate_problems(self.exclusions(), max_error_rate) \
+            else "completed_with_errors"
+
+
+def error_rate_problems(exclusions: dict[str, dict[str, int]], max_error_rate: float
+                        ) -> list[str]:
+    """Why a resolved job is not a clean ``done``: per kind, more excluded episodes than
+    ``max_error_rate`` of the planned ones, or planned episodes but no record at all."""
+    out = []
+    for kind, c in sorted(exclusions.items()):
+        if not c["planned"]:
+            continue
+        rate = c["excluded"] / c["planned"]
+        if c["done"] == 0:
+            out.append(f"{kind}: 0 of {c['planned']} planned episodes have a record "
+                       f"({c['excluded']} excluded)")
+        elif rate > max_error_rate:
+            out.append(f"{kind}: {c['excluded']} of {c['planned']} episodes excluded "
+                       f"({rate:.0%} > {max_error_rate:.0%})")
+    return out
 
 
 def _records_of(jf: JobFiles, kind: str) -> dict[str, tuple[ControlRecord, ...]]:
@@ -286,6 +336,14 @@ def derive(jf: JobFiles, manifest: Manifest, *, limit: int) -> Progress:
         return dep is not None and all(episodes.get((u, dep.kind)) in TERMINAL
                                        for u in dep.episodes)
 
+    # M3: a poison-pilled single-episode shard whose quarantine record is not listed yet
+    poison: set[str] = set()
+    for sid, s in shards.items():
+        if receipts[sid] is None and not qs.get(sid) and sid not in fails \
+                and is_poisoned(jf, s):
+            poison.add(sid)
+            mark(s.episodes[0], s.kind, "poison_pill")
+
     statuses: dict[str, ShardStatus] = {}
     for sid, s in shards.items():
         starts = counted_starts(jf, s.kind, sid, limit=limit)
@@ -295,7 +353,7 @@ def derive(jf: JobFiles, manifest: Manifest, *, limit: int) -> Progress:
             st: ShardState = "done"
         elif sid in fails:
             st = "failed"
-        elif q:
+        elif q or sid in poison:
             st = "quarantined"
         elif starts >= limit:
             st = "quarantine_due"
@@ -330,6 +388,7 @@ def part_prefix(jf: JobFiles, shard: Shard) -> str:
 
 def compose_input(jf: JobFiles, progress: Progress) -> ComposeInput:
     sources: list[tuple[str, str, str]] = []  # (time, container, part path)
+    accepts: dict[str, frozenset[str]] = {}  # part path -> config hashes its records may carry
     for st in progress.shards.values():
         named: set[str] = set()
         if st.receipt is not None:
@@ -342,8 +401,12 @@ def compose_input(jf: JobFiles, progress: Progress) -> ComposeInput:
         if st.receipt is not None or st.quarantines:
             # H3: also every *listed* part of a finished shard, whatever the receipt names. Part
             # files are whole and immutable, so reading extra ones is safe; lowest priority.
-            sources += [("", "", p) for p in jf.store.list(part_prefix(jf, st.shard))
-                        if p.endswith(".jsonl") and p not in named]
+            listed = [p for p in jf.store.list(part_prefix(jf, st.shard))
+                      if p.endswith(".jsonl") and p not in named]
+            sources += [("", "", p) for p in listed]
+            named |= set(listed)
+        for p in named:
+            accepts[p] = accepts.get(p, frozenset()) | jf.accepts(st.shard.kind)
     sources = sorted(set(sources))
 
     expected: set[tuple[str, str]] = set()
@@ -360,8 +423,9 @@ def compose_input(jf: JobFiles, progress: Progress) -> ComposeInput:
         if path in seen_paths:
             continue
         seen_paths.add(path)
+        ok = accepts.get(path)
         for rec in read_part(jf, path):
-            if rec.provenance.config_hash != jf.config_hash:
+            if ok is None or rec.provenance.config_hash not in ok:
                 out.foreign += 1
                 continue
             key = record_key(rec)

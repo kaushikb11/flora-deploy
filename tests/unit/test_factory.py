@@ -146,7 +146,7 @@ def test_rewards_only_share_one_worker_class(fake_workers_app):
     assert w.gpu == "H100!" and w.image == "img_vllm" and w.max_inputs == 3
     assert w.max_containers == 2  # summed: each kind keeps its own pool
     assert w.memory[0] == 96 * 1024  # the larger of the two
-    assert w.volumes[str(CACHE_MOUNT)] == f.VolumeMount("flora-cache", create=True)
+    assert w.volumes[str(CACHE_MOUNT)] == f.VolumeMount("flora-cache", read_only=True)  # M7
     assert w.secrets == ("flora-bucket",)  # bucket store: credentials by Secret name
     assert w.env["FLORA_STORE_KIND"] == "bucket" and w.env["FLORA_STORE_BUCKET"] == "my-bucket"
     assert w.env["FLORA_STORE_PREFIX"] == "flora/rr"

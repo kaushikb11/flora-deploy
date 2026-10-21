@@ -144,9 +144,9 @@ def test_reconciler_reports_poison_quarantine_and_stuck_calls():
     st = _status(h, spawner=h.spawner)
     assert {s.shard_id for s in st.stuck_calls} == {"segcap-000", "segcap-001"}
     assert all(s.starts >= 3 for s in st.stuck_calls)
-    assert h.run(orch).result == "done"
+    assert h.run(orch).result == "completed_with_errors"
     st = _status(h)
-    assert st.state == "done"
+    assert st.state == "completed_with_errors"
     assert st.quarantined == ("segcap-000",)
     assert st.poisoned == ("segcap-001", "segcap-ep-b")
     assert len(st.errors) == 2 and st.stuck_calls == ()

@@ -186,7 +186,7 @@ def test_terminal_shard_records_parts_and_receipt_last(tmp_path, lag):
     assert [r.uid for r in records] == list(shard.episodes)
     assert all(r.stage == "reward.terminal" and r.provenance.config_hash == CFG
                and r.certified and r.terminal is not None for r in records)
-    assert records[0].provenance.source["camera_0"]["uri"] == "/v/ammmm"
+    assert records[0].provenance.source["main"]["uri"] == "/v/ammmm"  # role-keyed
     audits = [json.loads(line) for k in (0, 1) for line in store.get_bytes(
         PATHS.audit(CFG, shard.kind, shard.shard_id, "c1", k)).decode().splitlines()]
     assert [a["uid"] for a in audits] == list(shard.episodes)
@@ -211,7 +211,7 @@ def test_dense_shard_three_views_in_collage_order(tmp_path):
     (part,) = rec.parts
     (r,) = P.read_part(jf_of(store), part)
     assert r.stage == "reward.dense" and r.dense is not None and r.dense.per_step
-    assert [r.provenance.source[f"camera_{i}"]["uri"] for i in range(3)] == [
+    assert [r.provenance.source[r_]["uri"] for r_ in ("left_wrist", "main", "right_wrist")] == [
         "/v/llllll", "/v/mmmmmm", "/v/rrrrrr"]
 
 
@@ -375,21 +375,18 @@ def test_upstream_poisoned_episodes_are_reported_not_run(tmp_path):
 
 # --- step 4: per-episode isolation -----------------------------------------------------------
 
-def test_nv_and_input_failures_become_episode_errors(tmp_path):
+def test_nv_failures_become_episode_errors(tmp_path):
     store = FakeStore()
     eps = [ep("ok", "task ok"), ep("garbled", "task GARBLE"),
-           ep("badvid", "task bv", cams={"main": "/v/bad123"}),
-           ep("noindex", write_index=False), ep("notask", task=None)]
+           ep("badvid", "task bv", cams={"main": "/v/bad123"})]
     shard = tshard([e[0].episode_id for e in eps])
     m = setup(store, eps, [shard])
     llm = FakeLLM(answers={"GARBLE": "I refuse"})
     rec = make_runner(store, tmp_path, llm=llm, group=8).run_shard(JOB, shard.shard_id, CFG)
     assert rec.episodes_done == (uid("ok"),)
-    assert set(rec.episodes_failed) == {uid(e) for e in ("garbled", "badvid", "noindex",
-                                                         "notask")}
+    assert set(rec.episodes_failed) == {uid("garbled"), uid("badvid")}
     kinds = {e.uid: e.kind for e in all_errors(store, shard)}
-    assert kinds == {uid("garbled"): "nv_failure", uid("badvid"): "nv_failure",
-                     uid("noindex"): "infra", uid("notask"): "nv_failure"}
+    assert kinds == {uid("garbled"): "nv_failure", uid("badvid"): "nv_failure"}
     garbled = next(e for e in all_errors(store, shard) if e.uid == uid("garbled"))
     assert "unexpected terminal answer" in garbled.message
     assert garbled.container_id == "c1" and garbled.shard_id == shard.shard_id
@@ -397,6 +394,92 @@ def test_nv_and_input_failures_become_episode_errors(tmp_path):
     prog = P.derive(jf, m, limit=3)
     assert prog.episodes[(uid("garbled"), "reward.terminal")] == "failed"
     assert not P.compose_input(jf, prog).missing
+
+
+def test_infra_input_error_is_retryable_never_a_receipt(tmp_path):
+    """Review-4 H1/C1: an input that cannot be read is an infra error: the finished episodes are
+    flushed, the shard raises (no receipt), and the retry runs only the missing episode."""
+    from flora_deploy.workers_impl.reward import ShardInfraError
+
+    store = FakeStore()
+    eps = [ep("ok", "task ok"), ep("noindex", write_index=False)]
+    shard = tshard(["ok", "noindex"])
+    m = setup(store, eps, [shard])
+    with pytest.raises(ShardInfraError, match="noindex"):
+        make_runner(store, tmp_path, group=8).run_shard(JOB, shard.shard_id, CFG)
+    jf = jf_of(store)
+    assert P.read_receipt(jf, shard.kind, shard.shard_id) is None
+    kinds = {e.uid: e.kind for e in all_errors(store, shard)}
+    assert kinds == {uid("noindex"): "infra"}
+    marker = A.read_attempt(jf, shard.kind, shard.shard_id, "c1")
+    assert marker is not None and marker.error and "ShardInfraError" in marker.error
+    prog = P.derive(jf, m, limit=3)
+    assert prog.episodes[(uid("noindex"), "reward.terminal")] == "pending"  # not excused
+    assert prog.episodes[(uid("ok"), "reward.terminal")] == "pending"
+    assert not prog.complete
+    # the media appears (a transient error went away): the retry finishes the shard
+    _ref, receipt = ep("noindex")
+    store.put_bytes(_ref.index_ref, json.dumps(receipt).encode())
+    llm = FakeLLM()
+    rec = make_runner(store, tmp_path, cid="c2", llm=llm, group=8).run_shard(
+        JOB, shard.shard_id, CFG)
+    assert set(rec.episodes_done) == {uid("ok"), uid("noindex")} and not rec.episodes_failed
+    assert not any("task ok" in p for p in prompts(llm))  # not redone
+    assert P.derive(jf, m, limit=3).complete
+
+
+def test_missing_task_fails_the_shard(tmp_path):
+    """Review-4 C2: no task instruction is a configuration error, never an excused episode."""
+    from flora_deploy.workers_impl.reward import TaskInstructionMissing
+
+    store = FakeStore()
+    shard = tshard(["notask"])
+    setup(store, [ep("notask", task=None)], [shard])
+    with pytest.raises(TaskInstructionMissing):
+        make_runner(store, tmp_path).run_shard(JOB, shard.shard_id, CFG)
+    assert P.read_receipt(jf_of(store), shard.kind, shard.shard_id) is None
+
+
+def test_cuda_fault_calls_fatal_after_marking(tmp_path):
+    from flora_deploy.workers_impl.reward import ShardInfraError
+
+    store = FakeStore()
+    shard = tshard(["a"])
+    setup(store, [ep("a")], [shard])
+    seen = []
+    runner = make_runner(store, tmp_path)
+    runner.fatal = lambda exc: seen.append(
+        A.read_attempt(jf_of(store), shard.kind, shard.shard_id, "c1"))
+
+    def boom(ref):
+        raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    runner.episode_for = boom
+    with pytest.raises(ShardInfraError):
+        runner.run_shard(JOB, shard.shard_id, CFG)
+    assert len(seen) == 1 and seen[0].error  # the marker was written before the container dies
+
+
+def test_receipt_instruction_text_and_fixed_default(tmp_path):
+    """C2: the resolved instruction in the receipt (``instruction_text``) wins; a ``fixed``
+    receipt without it uses the configured fixed text (``default_task``)."""
+    _ref, rec = ep("a", task="dataset task")
+    fixed = {**rec, "schema": "flora_index_receipt_v1", "status": "indexed",
+             "dataset": {"name": DS}, "uid": uid("a"), "instruction": "fixed",
+             "instruction_text": "Fold the towel."}
+    assert parse_index_receipt(json.dumps(fixed)).task == "Fold the towel."
+    old = {k: v for k, v in fixed.items() if k != "instruction_text"}
+    assert parse_index_receipt(json.dumps(old)).task is None
+    store = FakeStore()
+    shard = tshard(["a"])
+    ref, _ = ep("a")
+    store.put_bytes(ref.index_ref, json.dumps(old).encode())
+    setup(store, [(ref, None)], [shard])
+    llm = FakeLLM()
+    out = make_runner(store, tmp_path, llm=llm, default_task="Fold the towel.").run_shard(
+        JOB, shard.shard_id, CFG)
+    assert out.episodes_done == (uid("a"),)
+    assert any("Fold the towel." in p for p in prompts(llm))
 
 
 def test_envelope_ignore_and_default_task(tmp_path):

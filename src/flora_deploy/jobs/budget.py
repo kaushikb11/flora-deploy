@@ -106,7 +106,7 @@ class Rates:
         """$/s of one container with these requests."""
         cm = 1.0 if preemptible else self.nonpreemptible_multiplier
         return self.region_multiplier * (
-            self.gpu(gpu) * (gpu_count if gpu else 0)
+            (self.gpu(gpu) * gpu_count if gpu and gpu_count else 0.0)
             + cm * (cores * self.core_per_s + memory_gib * self.gib_per_s))
 
     def pool_per_second(self, pool: PoolSettings) -> float:
@@ -282,7 +282,7 @@ class BudgetState:
 
 
 def calls_cost(calls: Iterable[CallRecord], settings: RunSettings, rates: Rates, now: float, *,
-               scaledown_s: float = 60.0) -> float:
+               scaledown_s: float = 60.0, warm: int = 0) -> float:
     """Spawn-time spend estimate, independent of container receipts.
 
     Per kind, a sweep over call intervals ``[spawned_at, ended_at or now]``: at every instant the
@@ -290,7 +290,10 @@ def calls_cost(calls: Iterable[CallRecord], settings: RunSettings, rates: Rates,
     ``scaledown_s`` of idle time every time a container goes away (Modal keeps it for its
     ``scaledown_window``). A container never starts before its call is spawned and the
     orchestrator sees a call end only after it ended, so this over- rather than under-counts the
-    containers of the calls it knows (it cannot see orphan calls; receipts and billing can)."""
+    containers of the calls it knows (it cannot see orphan calls; receipts and billing can).
+
+    ``warm``: ``min_containers`` warm containers per kind, billed from the kind's first call on
+    (kinds sharing one worker class are each charged their own: an over-count)."""
     by_kind: dict[str, list[tuple[float, int]]] = {}
     for c in calls:
         start = min(c.spawned_at, now)
@@ -308,10 +311,10 @@ def calls_cost(calls: Iterable[CallRecord], settings: RunSettings, rates: Rates,
         n = 0
         last = ev[0][0]
         for t, d in ev:
-            containers = math.ceil(n / mi)
+            containers = max(math.ceil(n / mi), warm)
             total += (t - last) * containers * per_s
             n += d
-            after = math.ceil(n / mi)
+            after = max(math.ceil(n / mi), warm)
             if after < containers:
                 total += (containers - after) * scaledown_s * per_s
             last = t
@@ -430,9 +433,12 @@ class RateTableEstimator:
     table: RateTable
     preset: str
     cameras: int | Mapping[str, int] = 1
-    durations: Mapping[str, float] | None = None
+    # uid -> seconds, or a callable returning that (read lazily: e.g. from the manifest)
+    durations: Mapping[str, float] | Callable[[], Mapping[str, float]] | None = None
     quantile: str = "mid"
     fallback: ManifestEstimator = field(default_factory=ManifestEstimator)
+    # kind -> GPU-s per video-s the manifest packed with (``Manifest.rates``), or a callable
+    packing_rates: Mapping[str, float] | Callable[[], Mapping[str, float]] | None = None
 
     @property
     def source(self) -> str:
@@ -443,11 +449,14 @@ class RateTableEstimator:
         return cls(RateTable.load(), preset, **kw)
 
     def video_seconds(self, shard: Shard) -> float:
-        if self.durations is not None and all(u in self.durations for u in shard.episodes):
-            return float(sum(self.durations[u] for u in shard.episodes))
+        d = self.durations() if callable(self.durations) else self.durations
+        if d is not None and all(u in d for u in shard.episodes):
+            return float(sum(d[u] for u in shard.episodes))
         from flora_deploy.jobs.manifest import DEFAULT_RATES
 
-        return shard.est_gpu_seconds / DEFAULT_RATES[shard.kind]
+        packed = self.packing_rates() if callable(self.packing_rates) else self.packing_rates
+        rate = (packed or {}).get(shard.kind) or DEFAULT_RATES[shard.kind]
+        return shard.est_gpu_seconds / rate
 
     def _cameras(self, shard: Shard) -> int:
         if isinstance(self.cameras, int):
@@ -585,8 +594,13 @@ class ProjectionBudgetGate:
     estimator: ShardEstimator | None = None  # default: RateTableEstimator for settings.preset
     billing: BillingProvider | None = None
     billing_refresh_s: float = 900.0
-    scaledown_s: float = 60.0
+    scaledown_s: float = 60.0  # production (``jobs.deps``): the deployed ``scaledown_window``
     tick_reserve_s: float = 30.0  # burn charged ahead in overspend(): poll interval + cancel lag
+    # kind -> stage hash (or a callable): where each kind's shard receipts live (``JobPaths``)
+    stage_hashes: Mapping[str, str] | Callable[[], Mapping[str, str]] | None = None
+    # the orchestrator's own container (non-preemptible CPU), billed from the first call on
+    orchestrator_cores: float = 0.0
+    orchestrator_memory_gib: float = 0.0
     learn_calibration: bool = True
     billing_error: str | None = field(default=None, init=False)
     last_overspend: dict[str, Any] = field(default_factory=dict, init=False)
@@ -631,9 +645,12 @@ class ProjectionBudgetGate:
                 self._receipts[p] = ContainerReceipt(**json.loads(self.store.get_bytes(p)))
             except Exception:  # half-visible or a transient read error: keep what we had
                 continue
-        prefix = f"{paths.root}/{self.settings.config_hash}/receipts/"
-        self._done |= {p.rsplit("/", 1)[-1].removesuffix(".json")
-                       for p in self.store.list(prefix) if p.endswith(".json")}
+        sh = self.stage_hashes() if callable(self.stage_hashes) else self.stage_hashes
+        keys = {self.settings.config_hash, *(sh or {}).values()}
+        for key in sorted(keys):
+            prefix = f"{paths.root}/{key}/receipts/"
+            self._done |= {p.rsplit("/", 1)[-1].removesuffix(".json")
+                           for p in self.store.list(prefix) if p.endswith(".json")}
         self._cache_at = now
 
     def _billing_now(self, now: float) -> float | None:
@@ -735,8 +752,13 @@ class ProjectionBudgetGate:
         live = 0
         if self._state is not None:
             calls = calls_cost(self._state.calls, self.settings, self.rates, now,
-                               scaledown_s=self.scaledown_s)
+                               scaledown_s=self.scaledown_s, warm=self.settings.min_containers)
             live = len(self._state.live())
+            if self._state.calls and (self.orchestrator_cores or self.orchestrator_memory_gib):
+                t0 = min(c.spawned_at for c in self._state.calls)
+                calls += max(now - t0, 0.0) * self.rates.per_second(
+                    None, 0, self.orchestrator_cores, self.orchestrator_memory_gib,
+                    preemptible=False)
         return SpendReport(receipts, calls, self._billing_now(now), len(self._known), live)
 
     def projection(self, in_flight: Mapping[str, int]) -> Projection:

@@ -15,7 +15,7 @@ Layout (see ``config/templates/*.yaml`` for commented templates)::
                determinism, terminal_rationale}
     resources: {<shard kind>: {gpu, gpu_count, max_containers, max_inputs, cpu, memory}}
     output: {sink, formats}
-    retries: {max_starts_before_quarantine}
+    retries: {max_starts_before_quarantine, max_episode_error_rate}
     observability: {log_level, heartbeat_s, progress}
 """
 
@@ -46,7 +46,14 @@ from flora_deploy.config.presets import (
     needs_certificate,
     shard_kinds_for,
 )
-from flora_deploy.jobs.settings import EnvelopePolicy, PoolSettings, Preset, RunSettings
+from flora_deploy.jobs.settings import (
+    MAX_EPISODE_ERROR_RATE,
+    WORKER_SCALEDOWN_S,
+    EnvelopePolicy,
+    PoolSettings,
+    Preset,
+    RunSettings,
+)
 from flora_deploy.jobs.types import MAX_STARTS_BEFORE_QUARANTINE, ShardKind
 from flora_deploy.media.types import CameraRole
 from flora_deploy.nv.capture import FORBIDDEN_PROMPT_TOKENS, VIDEO_TOKEN
@@ -197,6 +204,17 @@ class PipelineSection(_Model):
         order = get_args(Stage)
         return tuple(sorted(v, key=order.index))
 
+    @model_validator(mode="after")
+    def _instruction_for_rewards(self) -> PipelineSection:
+        """NVIDIA's reward prompts are built around the task instruction (C2): ``none`` would
+        give every reward episode an empty task, so it is refused up front."""
+        rewards = [s for s in self.stages if s.startswith("reward.")]
+        if rewards and self.episode_instruction.source == "none":
+            raise ValueError(f"stages {rewards} need a task instruction, but "
+                             "episode_instruction.source is 'none'; use dataset_task, or fixed "
+                             "with `text`")
+        return self
+
 
 class ResourceOverride(_Model):
     gpu: str | None = None
@@ -248,6 +266,10 @@ class OutputSection(_Model):
 
 class RetriesSection(_Model):
     max_starts_before_quarantine: int = Field(MAX_STARTS_BEFORE_QUARANTINE, ge=1, le=10)  # D15
+    # Job-level error-rate guard: a job whose excluded episodes (NVIDIA-semantics failures, poison
+    # pills) exceed this share of a stage ends ``completed_with_errors``, not ``done``.
+    max_episode_error_rate: float = Field(MAX_EPISODE_ERROR_RATE, ge=0.0, le=1.0,
+                                          allow_inf_nan=False)
 
 
 class ObservabilitySection(_Model):
@@ -499,14 +521,24 @@ def to_run_settings(
     *,
     config_hash: str | None = None,
     derived_receipts: dict[str, str] | None = None,
+    stage_hashes: dict[str, str] | None = None,
+    min_containers: int = 0,
+    scaledown_s: float = WORKER_SCALEDOWN_S,
 ) -> RunSettings:
     """Map a validated config onto ``RunSettings``.
 
-    ``config_hash`` defaults to ``hashing.config_hash(cfg, derived_receipts=...)`` (D11)."""
+    ``config_hash`` defaults to ``hashing.config_hash(cfg, derived_receipts=...)`` (D11), and then
+    ``stage_hashes`` to its per-kind hashes (shard files are keyed by them). Passing a
+    ``config_hash`` without ``stage_hashes`` keys everything by the job hash.
+    ``min_containers`` / ``scaledown_s``: the deployment's warm pool and ``scaledown_window``
+    (the budget gate charges both)."""
     if config_hash is None:
         from flora_deploy.config.hashing import config_hash as compute
 
-        config_hash = compute(cfg, derived_receipts=derived_receipts).hash
+        ch = compute(cfg, derived_receipts=derived_receipts)
+        config_hash = ch.hash
+        if stage_hashes is None:
+            stage_hashes = dict(ch.stage_hashes)
     return RunSettings(
         job_id=job_id,
         preset=cfg.preset,
@@ -519,4 +551,10 @@ def to_run_settings(
         envelope=cfg.pipeline.envelope,
         environment_budget_factor=cfg.modal.environment_budget_factor,
         tags=dict(cfg.modal.tags),
+        stage_hashes=dict(stage_hashes or {}),
+        region=cfg.modal.region,
+        scaledown_s=scaledown_s,
+        min_containers=min_containers,
+        max_episode_error_rate=cfg.retries.max_episode_error_rate,
+        **output_settings(cfg),
     )

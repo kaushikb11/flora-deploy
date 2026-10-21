@@ -85,15 +85,50 @@ UPSTREAM_CONTAINER = "upstream"  # container-id slot of "upstream poisoned" erro
 
 @dataclass(frozen=True)
 class JobFiles:
-    """A store plus the job/config it is scoped to."""
+    """A store plus the job/config it is scoped to.
+
+    ``config_hash`` is the **job** hash (what the orchestrator passes to ``run_shard``).
+    ``stage_hashes`` (shard kind -> stage hash) re-key every per-stage area of ``paths`` (parts,
+    receipts, attempts, errors, audits, replans; ``jobs.store.JobPaths``). ``None`` (default):
+    read them from this config's manifest on first use (``JobPaths.config_manifest``, then the
+    job-level manifest if it is this config's), so a worker that only knows the job hash still
+    writes where the orchestrator and compose look. ``{}``: key everything by the job hash.
+    """
 
     store: Store
     job_id: str
     config_hash: str
+    stage_hashes: Mapping[str, str] | None = None
     paths: JobPaths = field(init=False)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "paths", JobPaths(self.job_id))
+        sh = None if self.stage_hashes is None else dict(self.stage_hashes)
+        object.__setattr__(self, "_sh", sh)
+        object.__setattr__(self, "paths", JobPaths(self.job_id, config_hash=self.config_hash,
+                                                   stage_hashes=self.stage_map))
+
+    def stage_map(self) -> dict[str, str]:
+        sh = self._sh  # type: ignore[attr-defined]
+        if sh is None:
+            sh = {}
+            probe = JobPaths(self.job_id)
+            for path in (probe.config_manifest(self.config_hash), probe.manifest):
+                if self.store.exists(path):
+                    d = json.loads(self.store.get_bytes(path))
+                    if d.get("config_hash") == self.config_hash:
+                        sh = dict(d.get("stage_hashes") or {})
+                        break
+            object.__setattr__(self, "_sh", sh)
+        return sh
+
+    def key(self, kind: str) -> str:
+        """The hash ``kind``'s shard files are keyed by and its records are stamped with."""
+        return self.paths.stage_key(self.config_hash, kind)
+
+    def accepts(self, kind: str) -> frozenset[str]:
+        """``provenance.config_hash`` values a record of ``kind`` may carry and still belong to
+        this config: its stage hash, or the job hash (workers that stamp the job hash)."""
+        return frozenset({self.key(kind), self.config_hash})
 
 
 def compact_utc(created_utc: str) -> str:
@@ -237,6 +272,12 @@ def call_for_token(jf: JobFiles, kind: ShardKind, shard_id: str, token: str) -> 
         if m.token == token and m.call_id:
             return m.call_id
     return None
+
+
+def is_poisoned(jf: JobFiles, shard: Shard) -> bool:
+    """A single-episode shard whose episode was isolated by D15: its deterministic poison error
+    file exists (``exists``: read-after-write, never hidden by listing lag)."""
+    return len(shard.episodes) == 1 and jf.store.exists(poison_error_path(jf, shard))
 
 
 def has_receipt(jf: JobFiles, shard: Shard) -> bool:

@@ -17,8 +17,11 @@ preset: exact                       # exact | balanced
 
 input:
   format: mp4_dir                   # one MP4 per episode
-  path: ./videos                    # local directory
-  stage_to: null
+  path: ./videos                    # local directory (`flora index --local` reads it here)
+  # Modal workers cannot read a local directory: upload it once to a Volume
+  #   modal volume put flora-results ./videos inputs/my-mp4-labels
+  # and point stage_to at that copy (the dataset root on the Volume).
+  stage_to: volume://flora-results/inputs/my-mp4-labels
 
 pipeline:
   stages: [segment, caption]        # add reward.terminal / reward.dense for rewards

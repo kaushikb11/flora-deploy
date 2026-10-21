@@ -137,5 +137,5 @@ def test_orchestrator_on_volume_sees_worker_attempt_markers_and_quarantines(tmp_
 
     orch, sleep = _orchestrator(tmp_path / "seen", behavior=WorkerBehavior(oom={"a"}))
     out = TickDriver(orch).run_until_idle(sleep=sleep, poll_interval_s=10.0, max_ticks=30)
-    assert out.result == "done" and out.ticks < 10  # poisoned single episode, job finishes
+    assert out.result == "completed_with_errors" and out.ticks < 10  # poisoned
     assert orch.store.reloads >= out.ticks  # type: ignore[attr-defined]

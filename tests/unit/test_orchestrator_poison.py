@@ -16,7 +16,7 @@ def test_oom_episode_is_isolated_by_bisection():
     h = Harness({"segcap-000": EPS, "segcap-001": ["ds--x0", "ds--x1"]}, lag=1,
                 behavior=WorkerBehavior(oom={"ds--e2"}))
     out = h.run()
-    assert out.result == "done"  # a poisoned episode is an episode error, not a job failure
+    assert out.result == "completed_with_errors"  # not a job failure
 
     # 1. the looping call was cancelled and the parent quarantined + bisected
     first_call = next(c for c in h.spawner.calls.values() if c.shard_id == "segcap-000")
@@ -52,7 +52,7 @@ def test_poisoned_dependency_does_not_block_dependents():
                 deps={"caption-0": ["segment-0"]}, behavior=WorkerBehavior(oom={"b"}))
     # the caption worker would OOM on "b" too; make only the segment stage poisonous
     h.spawner.workers["caption"] = _skip_oom(h)
-    assert h.run().result == "done"
+    assert h.run().result == "completed_with_errors"
     assert "caption-0" in h.spawn_counts()
     spawned = {e["shard_id"]: e["t"] for e in h.events if e["event"] == "spawned"}
     poisoned = next(e["t"] for e in h.events if e["event"] == "poisoned")
@@ -94,7 +94,7 @@ def test_crash_between_replan_and_quarantine_record_is_redone_on_restart():
 
     h.clock.advance(1000)  # the dead orchestrator's lease expires
     out = h.run()
-    assert out.result == "done"
+    assert out.result == "completed_with_errors"
     assert h.done_uids() == set(EPS) - {"ds--e2"}
     assert h.attempts.poison_records == ["ds--e2"]
     assert h.spawn_counts()["segcap-000"] == 1
