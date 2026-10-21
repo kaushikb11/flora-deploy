@@ -195,14 +195,36 @@ def test_orchestrator_crash_and_restart_reattaches(demo, clean, tmp_path):
     same_as_clean(res, clean)
 
 
-def test_restart_in_a_new_process_respawns_lost_calls(demo, clean, tmp_path):
+def test_restart_in_a_new_process_respawns_lost_calls(demo, clean, tmp_path, monkeypatch):
+    """The first orchestrator dies after one tick with its calls in flight. Those calls are held
+    at their first checkpoint until the "process" dies (``close`` cancels them), so none can
+    finish first: without the hold, a fast fake call could write its receipt during the tick
+    under load, leaving nothing lost to respawn (flaky 3/30 under load, Fix-8a)."""
+    import threading
+
+    from flora_deploy.local import engines as LE
+    from flora_deploy.local import faults as LF
+
+    checkpoint, hold = LE.checkpoint, threading.Event()
+    hold.set()
+
+    def held(uid):
+        ctx = LF.current()
+        if hold.is_set() and ctx is not None:
+            ctx.cancelled.wait(60)  # in flight until the first process dies
+        checkpoint(uid)
+
+    monkeypatch.setattr(LE, "checkpoint", held)
     first = LocalRunner(demo, store=tmp_path / "store", lease_ttl_s=0.5)
     try:
         first.index()
         first.plan()
         assert first.orchestrate(crash_after_ticks=1) == "interrupted"
+        spawned = first.spawner.stats()["calls"]
     finally:
         first.close()  # the process dies: its in-flight calls are gone with it
+        hold.clear()
+    assert spawned >= 1
     second = LocalRunner(demo, store=tmp_path / "store", lease_ttl_s=0.5)
     try:
         res = second.run()
@@ -212,6 +234,7 @@ def test_restart_in_a_new_process_respawns_lost_calls(demo, clean, tmp_path):
     expired = [e for e in res.events if e["event"] == "call_expired"]
     finished_first = sum(1 for e in first.events if e["event"] == "shard_done")
     assert len(expired) + finished_first >= 1
+    assert finished_first == 0 and len(expired) == spawned  # every lost call was respawned
     same_as_clean(res, clean)
 
 

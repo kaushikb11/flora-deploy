@@ -31,9 +31,11 @@ def test_suites_pass_in_either_order(nv_code, order):
     nv_code("tempseg_code")  # skip when NVIDIA's code is not fetched
     files = UNIT + NVLINK if order == "unit-then-nvlink" else NVLINK + UNIT
     out = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-x", *files],
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-x",
+         "-m", "not modal", *files],  # override addopts: nvlink files must run
         cwd=ROOT, capture_output=True, text=True, timeout=600,
     )
     tail = "\n".join(out.stdout.splitlines()[-15:])
     assert out.returncode == 0, tail + out.stderr[-2000:]
     assert " passed" in tail and "error" not in tail.lower(), tail
+    assert "deselected" not in tail, tail  # every test in these files ran

@@ -172,7 +172,22 @@ class PlanOption:
     unavailable: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        """``asdict``, with each kind's concurrency labelled as it is deployed (review 8a R7,
+        as :func:`apply_option` writes it): an in-worker kind (segcap) gets ``max_inputs: 1``
+        and ``episode_concurrency: c``; any other kind ``max_inputs: c`` and
+        ``episode_concurrency: null``."""
+        out = asdict(self)
+        for k in out["kinds"]:
+            c = k["max_inputs"]
+            inside = k["kind"] in IN_WORKER_CONCURRENCY
+            k["max_inputs"], k["episode_concurrency"] = (1, c) if inside else (c, None)
+        return out
+
+
+def episodes_label(k: KindPlan) -> str:
+    """``x4 ep`` (episodes in flight inside one input) or ``x4`` (Modal inputs) for the plan
+    table's GPUs column."""
+    return f" x{k.max_inputs} ep" if k.kind in IN_WORKER_CONCURRENCY else f" x{k.max_inputs}"
 
 
 @dataclass(frozen=True)

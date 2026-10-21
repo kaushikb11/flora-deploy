@@ -806,15 +806,18 @@ class NvidiaError(RuntimeError):
     client process, so they cannot be unpickled there. This builtin-based class carries the
     original qualified type name and message and pickles by value."""
 
-    def __init__(self, type_name: str, message: str, origin: str | None = None):
+    def __init__(self, type_name: str, message: str, origin: str | None = None,
+                 kind: str | None = None):
         super().__init__(f"{type_name}: {message}")
         self.type_name, self.message = type_name, message
-        # who raised it (``nv.errors.origin``: nv / ours / lib / other), computed where the
-        # original traceback was still available; ``nv.errors.classify`` reads it
+        # who raised it (``nv.errors.origin``: nv / ours / lib / other) and its class
+        # (``nv.errors.classify``), computed where the original traceback was still available;
+        # ``nv.errors.classify`` returns ``kind`` as-is on the far side (review 8a R6)
         self.origin = origin
+        self.kind = kind
 
     def __reduce__(self):
-        return (type(self), (self.type_name, self.message, self.origin))
+        return (type(self), (self.type_name, self.message, self.origin, self.kind))
 
 
 class NvidiaInputError(NvidiaError):
@@ -827,20 +830,26 @@ _INPUT_ERRORS = ("InputError", "InputErrorForModel")
 def transport_error(e: BaseException) -> NvidiaError:
     """The picklable form of ``e``. In this process the original stays attached
     (``__cause__``, with its traceback) so ``nv.errors.classify`` can tell NVIDIA's frames from
-    ours; across a process boundary the ``origin`` it computed here travels instead."""
+    ours; across a process boundary the ``origin`` and the class (``nv.errors.classify``) it
+    computed here travel instead, so the far side classifies it as this side would. Our copies of
+    NVIDIA's rejections (``nv.errors.NvidiaSemanticsError``) carry NVIDIA's builtin type name."""
     if isinstance(e, NvidiaError):
         return e
     from flora_deploy.nv import errors as nv_errors
 
     cls = type(e)
-    name = f"{cls.__module__}.{cls.__qualname__}"
-    kind = NvidiaInputError if cls.__name__ in _INPUT_ERRORS or isinstance(e, ValueError) \
+    name = nv_errors.nvidia_type_name(e)
+    wrapper = NvidiaInputError if cls.__name__ in _INPUT_ERRORS or isinstance(e, ValueError) \
         else NvidiaError
     try:
-        where = nv_errors.origin(e)
+        where: str | None = nv_errors.origin(e)
     except Exception:  # noqa: BLE001 - provenance only; never mask the episode's error
         where = None
-    out = kind(name, str(e), where)
+    try:
+        kind: str | None = nv_errors.classify(e)
+    except Exception:  # noqa: BLE001 - the far side falls back to origin + type name
+        kind = None
+    out = wrapper(name, str(e), where, kind)
     out.__cause__ = e
     return out
 

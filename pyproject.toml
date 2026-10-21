@@ -67,4 +67,4 @@ markers = [
     "modal: runs on the Modal account (costs money; never in CI)",
     "torch: needs the CPU torch stack (`--group nvlink`); CI runs these in the nvlink job",
 ]
-addopts = "-m 'not modal'"
+addopts = "-m 'not modal and not nvlink and not torch'"

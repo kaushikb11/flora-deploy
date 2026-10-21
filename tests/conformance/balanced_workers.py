@@ -36,6 +36,7 @@ from flora_deploy.workers_impl.segment import (
     EpisodeOutcome,
 )
 from tests.conformance.worker_suite import WorkerSpec
+from tests.fakes import fake_nvidia as F
 
 
 class ScriptedEngine:
@@ -70,7 +71,8 @@ class ScriptedJob:
                                      Sampling(max_tokens=8))
         assert out.ok
         if ref.uid in self.nv_fail:
-            raise ValueError("NVIDIA rejected the input (InputError)")
+            # from a frame of "NVIDIA's code" (a registered NVIDIA root), as NVIDIA raises it
+            F.nvidia_raise(ValueError("NVIDIA rejected the input (InputError)"))
         prov = Provenance(models={"tempseg": "test"}, engine="vllm-0.24.0-offline",
                           preset="balanced", config_hash="stage", logic_version="test",
                           framework="flora-deploy test")
