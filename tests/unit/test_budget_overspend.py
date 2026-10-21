@@ -238,6 +238,26 @@ def test_calibration_subtracts_startup_only_for_cold_calls():
     assert cold.effective_calibration()["segcap"] == pytest.approx(1.0)
 
 
+def test_calibration_counts_calls_landing_on_a_running_container_as_warm():
+    """Review 6 B3: with ``max_inputs>1`` a call spawned while a sibling is still running
+    lands on that container's free slot: no startup. Treating it as cold subtracts startup and
+    learns an optimistic rate."""
+    g = gate(1e6, estimator=ManifestEstimator(), startup_s={"segcap": 100.0}, scaledown_s=0,
+             pool={"max_inputs": 2, "max_containers": 1})
+    g.observe(BudgetState(T0, (
+        CallRecord("fc-1", "segcap-00000", "segcap", T0 - 400, T0 - 100, "success"),
+        CallRecord("fc-2", "segcap-00001", "segcap", T0 - 300, T0 - 100, "success"),
+    )))
+    est = 30.0 * 2
+    assert g.effective_calibration()["segcap"] == pytest.approx(((300 - 100) / est
+                                                                  + 200 / est) / 2)
+    one = gate(1e6, estimator=ManifestEstimator(), startup_s={"segcap": 100.0}, scaledown_s=0)
+    one.observe(g._state)  # type: ignore[arg-type]
+    # max_inputs=1: a sibling's container has no free slot, so it stays cold
+    assert one.effective_calibration()["segcap"] == pytest.approx(
+        ((300 - 100) / 30 + (200 - 100) / 30) / 2)
+
+
 def test_overspend_cancels_largest_remaining_first_then_everything():
     g = gate(100.0, estimator=ManifestEstimator(), startup_s={}, scaledown_s=0,
              tick_reserve_s=0, learn_calibration=False, n=3)
