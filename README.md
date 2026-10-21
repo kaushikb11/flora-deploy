@@ -47,8 +47,8 @@ flora deploy && flora run  # labels the dataset, streaming progress
 flora results caption      # or segment, reward.terminal, reward.dense
 ```
 
-`flora run` stops before it would exceed your budget and resumes where it left off if interrupted.
-GPUs start when the job starts and shut down when it ends.
+`flora run` stops before it would exceed your budget, and `flora resume` picks up where a stopped
+or interrupted job left off. GPUs start when the job starts and shut down when it ends.
 
 ## Configuration
 
