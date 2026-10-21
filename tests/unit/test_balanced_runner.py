@@ -141,6 +141,7 @@ def test_cuda_fault_fails_fast_and_exits_container(tmp_path, monkeypatch):
     assert len(seen) == 1, "episodes kept running on a dead engine"
     m = w.marker("ta-1")
     assert m is not None and m.ended_utc and not m.preempted
+    assert m.crashed  # the container is replaced: the start counts toward D15
 
 
 @pytest.mark.parametrize("exc,phase,src,want", [

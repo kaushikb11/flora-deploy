@@ -539,8 +539,10 @@ class RewardShardRunner:
             raise
         except Exception as exc:
             msg = f"{type(exc).__name__}: {exc}"
-            self._end(active, error=msg)
-            if self.fatal is not None and cuda_fatal(msg):
+            fatal = self.fatal is not None and cuda_fatal(msg)
+            # a CUDA fault replaces the container: the start counts toward D15 (``crashed``)
+            self._end(active, error=msg, crashed=fatal)
+            if fatal:
                 self.fatal(exc)
             raise
         finally:
@@ -562,8 +564,8 @@ class RewardShardRunner:
 
     # -- internals -----------------------------------------------------------------------
 
-    def _end(self, active: _Active, *, preempted: bool = False, error: str | None = None
-             ) -> bool:
+    def _end(self, active: _Active, *, preempted: bool = False, error: str | None = None,
+             crashed: bool = False) -> bool:
         with self._lock:
             if active.ended:
                 return False
@@ -580,7 +582,7 @@ class RewardShardRunner:
                              marker=active.marker)
         else:
             A.mark_exception(jf, kind, sid, self.container_id, ended_utc=now,
-                             error=error or "error", marker=active.marker)
+                             error=error or "error", marker=active.marker, crashed=crashed)
         return True
 
     def episode_from_index(self, ref: EpisodeRef) -> R.Episode:
