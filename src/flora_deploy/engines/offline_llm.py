@@ -1,0 +1,383 @@
+"""vLLM 0.24.0 offline ``LLM`` for TempSeg (merged) and the Captioner (BF16), PLAN.md D2/D14.
+
+Every argument that can change outputs is explicit, because vLLM's defaults depend on the GPU
+and on the entry point (``research_notes/.../vllm_0240_verification.md``):
+
+- ``dtype="bfloat16"``: NVIDIA's reference dtype (``auto`` would give bf16 too; say it).
+- ``gdn_prefill_backend="triton"``: ``auto`` is FlashInfer on H100 and Triton on L40S, and a
+  certificate must not depend on the GPU.
+- ``enable_prefix_caching=False``: off by default for hybrid models; on is the experimental
+  ``align`` mode where cache hit or miss changes numerics. TempSeg/Captioner share no prefixes.
+- ``generation_config="vllm"``: the Captioner's ``generation_config.json`` adds EOS 248044,
+  which NVIDIA's HF ``generate`` (explicit ``eos_token_id``) never stops on.
+- ``max_num_seqs`` / ``max_num_batched_tokens`` from the per-GPU table ``GPU_LIMITS``: the
+  offline ``LLM`` would take 1024/16384 on an H100 and AsyncLLM 128/2048; #49064 (Mamba
+  blocks) bounds ``max_num_seqs``.
+- ``max_model_len=32768``: NVIDIA's context limit (``nv.budget``).
+- ``limit_mm_per_prompt={"image": 0, "video": 3}``: up to 3 videos (3-view captions), no images.
+- ``mm_processor_kwargs=NV_VIDEO_KWARGS[kind]``: NVIDIA's ``models.processor`` builds
+  ``Qwen3VLVideoProcessor(fps=4|8, max_frames=128|40)``.
+- ``mm_processor_cache_gb=0``: Gate C certifies the uncached path only
+  (``nv.capture.assert_engine_kwargs``).
+- ``seed=0``: recorded; greedy decoding does not use it.
+
+Sampling (``nvidia_sampling``) is NVIDIA's ``models.generate``: greedy, ``max_new_tokens`` =
+NVIDIA's budget for the kind (1024 TempSeg, 512 Captioner, parsed by ``nv.budget``), stop on the
+tokenizer's EOS (``<|im_end|>``) only. NVIDIA's acceptance rules (EOS reached, non-empty
+``decode(ids, skip_special_tokens=True).strip()``, the 32k guard) are applied by the stages, not
+here.
+
+``OfflineEngine.generate_batch`` runs one ``llm.generate`` per batch. If the batch raises, every
+request is retried alone so one bad request (e.g. a prompt over ``max_model_len``) cannot fail
+its neighbours; a request that still fails gets ``Completion.error`` (and ``too_long`` when
+vLLM rejected its length).
+"""
+
+from __future__ import annotations
+
+import re
+import time
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from typing import Any
+
+from flora_deploy.engines.base import Completion, Sampling, VllmRequest
+from flora_deploy.nv.capture import REQUIRED_VLLM_ENGINE_KWARGS, assert_engine_kwargs
+
+VLLM_VERSION = "0.24.0"
+KINDS = ("tempseg", "captioner")
+MAX_MODEL_LEN = 32768
+LIMIT_MM_PER_PROMPT = {"image": 0, "video": 3}
+# NVIDIA ``models.processor`` (batch_utils/models.py:48-52 at nvidia/Flora-TempSeg@78a0e4ac):
+# ``Qwen3VLVideoProcessor.from_pretrained(path, fps=4 if kind == 'tempseg' else 8,
+# max_frames=128 if kind == 'tempseg' else 40)``. Restated values (license review flag, as in
+# ``modal_app/gatec_app.NV_VIDEO_KWARGS``); ``tests/nvlink/test_balanced_nvlink.py`` checks them
+# against the processor NVIDIA's own function builds.
+NV_VIDEO_KWARGS: Mapping[str, Mapping[str, int]] = {
+    "tempseg": {"fps": 4, "max_frames": 128},
+    "captioner": {"fps": 8, "max_frames": 40},
+}
+
+
+class EngineArgsError(ValueError):
+    """Engine keyword arguments that would leave an output-relevant default implicit."""
+
+
+@dataclass(frozen=True)
+class GpuLimits:
+    max_num_seqs: int
+    max_num_batched_tokens: int
+    gpu_memory_utilization: float
+
+
+# Per (kind, GPU) scheduler limits. TempSeg is 9B (19.3 GB merged), the Captioner 27B (54.7 GB
+# BF16). ``max_num_batched_tokens`` 16384 equals the offline LLM's H100 default and holds the
+# longest golden prompt (14.7k tokens) in one prefill chunk; ``max_num_seqs`` stays well under
+# the Mamba-block bound of #49064 at these memory fractions.
+GPU_LIMITS: Mapping[tuple[str, str], GpuLimits] = {
+    ("tempseg", "L40S"): GpuLimits(32, 16384, 0.90),
+    ("tempseg", "A100-80GB"): GpuLimits(48, 16384, 0.90),
+    ("tempseg", "H100"): GpuLimits(48, 16384, 0.90),
+    ("tempseg", "H200"): GpuLimits(64, 16384, 0.90),
+    ("captioner", "H100"): GpuLimits(16, 16384, 0.90),
+    ("captioner", "H200"): GpuLimits(32, 16384, 0.90),
+}
+
+_GPU_PATTERNS = (("H200", r"H200"), ("H100", r"H100"), ("L40S", r"L40S"),
+                 ("A100-80GB", r"A100.*80"))
+
+
+def normalize_gpu(name: str) -> str:
+    """``"H100!"`` / ``"NVIDIA H100 80GB HBM3"`` -> ``"H100"``; unknown names raise."""
+    for short, pat in _GPU_PATTERNS:
+        if re.search(pat, name, re.IGNORECASE):
+            return short
+    raise EngineArgsError(f"no engine limits for GPU {name!r}")
+
+
+def gpu_limits(kind: str, gpu: str) -> GpuLimits:
+    key = (kind, normalize_gpu(gpu))
+    if key not in GPU_LIMITS:
+        raise EngineArgsError(f"no engine limits for {kind} on {key[1]} (GPU_LIMITS)")
+    return GPU_LIMITS[key]
+
+
+# What every TempSeg / Captioner engine must set, with the required value (``None``: must be
+# present, any value). ``validate_engine_kwargs`` enforces it.
+REQUIRED: Mapping[str, Any] = {
+    "dtype": "bfloat16",
+    "gdn_prefill_backend": "triton",
+    "enable_prefix_caching": False,
+    "generation_config": "vllm",
+    "max_model_len": MAX_MODEL_LEN,
+    "limit_mm_per_prompt": LIMIT_MM_PER_PROMPT,
+    "max_num_seqs": None,
+    "max_num_batched_tokens": None,
+    "seed": None,
+    **REQUIRED_VLLM_ENGINE_KWARGS,
+}
+# Arguments that would change numerics or inputs in ways no certificate covers.
+FORBIDDEN = ("quantization", "enable_lora", "kv_cache_dtype", "mamba_ssm_cache_dtype",
+             "mamba_cache_dtype", "renderer_num_workers", "tokenizer_mode")
+
+
+def validate_engine_kwargs(kind: str, kwargs: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Raise ``EngineArgsError`` unless ``kwargs`` set every ``REQUIRED`` value explicitly, the
+    video kwargs mirror NVIDIA's processor for ``kind``, and nothing in ``FORBIDDEN`` is set.
+    Also applies Gate C's ``assert_engine_kwargs``. Returns ``kwargs``."""
+    if kind not in KINDS:
+        raise EngineArgsError(f"unknown kind {kind!r}")
+    assert_engine_kwargs(kwargs)
+    for key, want in REQUIRED.items():
+        if key not in kwargs:
+            raise EngineArgsError(f"{kind}: engine kwargs must set {key} explicitly")
+        if want is not None and kwargs[key] != want:
+            raise EngineArgsError(f"{kind}: {key}={kwargs[key]!r}, required {want!r}")
+    for key in ("max_num_seqs", "max_num_batched_tokens"):
+        if type(kwargs[key]) is not int or kwargs[key] <= 0:
+            raise EngineArgsError(f"{kind}: {key} must be a positive int")
+    if dict(kwargs.get("mm_processor_kwargs") or {}) != dict(NV_VIDEO_KWARGS[kind]):
+        raise EngineArgsError(f"{kind}: mm_processor_kwargs {kwargs.get('mm_processor_kwargs')!r}"
+                              f" must equal NVIDIA's {dict(NV_VIDEO_KWARGS[kind])!r}")
+    bad = [k for k in FORBIDDEN if kwargs.get(k) not in (None, "auto", False)]
+    if bad:
+        raise EngineArgsError(f"{kind}: engine kwargs set uncertified options {bad}")
+    if kwargs.get("max_num_batched_tokens", 0) < 2048:
+        raise EngineArgsError(f"{kind}: max_num_batched_tokens below 2048")
+    return kwargs
+
+
+@dataclass(frozen=True)
+class EngineSpec:
+    """Everything that defines one TempSeg / Captioner engine (hashed into the config, D11).
+
+    ``dtbias_fp32``: run with the gated ``engines.patches.dt_bias_fp32`` plugin (Gate A). Off by
+    default. ``logprobs_mode`` / ``max_logprobs``: only what the engine *returns* for logprob
+    requests (Gate A measurements); greedy outputs do not depend on them. ``extra``: arguments
+    that change I/O only (e.g. ``safetensors_load_strategy``), recorded but never required.
+    """
+
+    kind: str
+    model: str
+    gpu: str
+    limits: GpuLimits
+    dtbias_fp32: bool = False
+    enforce_eager: bool = False
+    seed: int = 0
+    logprobs_mode: str | None = None
+    max_logprobs: int | None = None
+    extra: Mapping[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def for_gpu(cls, kind: str, model: str, gpu: str, **kw) -> EngineSpec:
+        return cls(kind=kind, model=model, gpu=normalize_gpu(gpu), limits=gpu_limits(kind, gpu),
+                   **kw)
+
+    @property
+    def label(self) -> str:
+        return f"vllm-{VLLM_VERSION}-offline" + ("+dtbias" if self.dtbias_fp32 else "")
+
+    def engine_kwargs(self) -> dict[str, Any]:
+        kwargs: dict[str, Any] = dict(
+            model=self.model,
+            tokenizer=self.model,
+            dtype="bfloat16",
+            max_model_len=MAX_MODEL_LEN,
+            limit_mm_per_prompt=dict(LIMIT_MM_PER_PROMPT),
+            mm_processor_kwargs=dict(NV_VIDEO_KWARGS[self.kind]),
+            mm_processor_cache_gb=0,
+            generation_config="vllm",
+            gdn_prefill_backend="triton",
+            enable_prefix_caching=False,
+            max_num_seqs=self.limits.max_num_seqs,
+            max_num_batched_tokens=self.limits.max_num_batched_tokens,
+            gpu_memory_utilization=self.limits.gpu_memory_utilization,
+            enforce_eager=self.enforce_eager,
+            seed=self.seed,
+        )
+        if self.logprobs_mode is not None:
+            kwargs["logprobs_mode"] = self.logprobs_mode
+        if self.max_logprobs is not None:
+            kwargs["max_logprobs"] = self.max_logprobs
+        for k, v in self.extra.items():
+            if k in kwargs:
+                raise EngineArgsError(f"extra engine arg {k!r} would override a pinned value")
+            kwargs[k] = v
+        return dict(validate_engine_kwargs(self.kind, kwargs))
+
+    def as_json(self) -> dict:
+        """Hashable description (no local model path: the model is pinned separately)."""
+        kwargs = {k: v for k, v in self.engine_kwargs().items() if k not in ("model", "tokenizer")}
+        return {"label": self.label, "kind": self.kind, "gpu": self.gpu,
+                "dtbias_fp32": self.dtbias_fp32, "engine_kwargs": kwargs}
+
+    def hashed(self) -> dict:
+        """``as_json`` minus the GPU (D11: GPU goes to provenance, not the config hash). The
+        per-GPU scheduler limits stay: they change batching, hence numerics."""
+        out = self.as_json()
+        out.pop("gpu")
+        return out
+
+
+def nvidia_sampling(budget: int, eos_token_id: int, *, logprobs: int | None = None) -> Sampling:
+    """NVIDIA's ``models.generate``: greedy, ``max_new_tokens=budget``, stop on EOS only."""
+    if type(eos_token_id) is not int:
+        raise EngineArgsError(f"EOS must be one token id, got {eos_token_id!r}")
+    return Sampling(max_tokens=int(budget), temperature=0.0, stop_token_ids=(eos_token_id,),
+                    logprobs=logprobs)
+
+
+def to_vllm_sampling(sp: Sampling, params_cls: Callable[..., Any] | None = None) -> Any:
+    if params_cls is None:
+        from vllm import SamplingParams as params_cls  # noqa: N813
+    kwargs: dict[str, Any] = dict(
+        n=sp.n, temperature=sp.temperature, top_p=sp.top_p, top_k=sp.top_k,
+        max_tokens=sp.max_tokens, seed=sp.seed, skip_special_tokens=True,
+        stop_token_ids=list(sp.stop_token_ids) if sp.stop_token_ids else None,
+    )
+    if sp.logprobs is not None:
+        kwargs["logprobs"] = sp.logprobs
+    if sp.regex is not None:
+        from vllm.sampling_params import StructuredOutputsParams
+
+        kwargs["structured_outputs"] = StructuredOutputsParams(regex=sp.regex)
+    return params_cls(**kwargs)
+
+
+_TOO_LONG = re.compile(r"(longer than the maximum model length|max_model_len|too long)", re.I)
+
+
+def _logprobs(out) -> tuple[dict[int, float], ...] | None:
+    lp = getattr(out, "logprobs", None)
+    if not lp:
+        return None
+    return tuple({int(t): float(getattr(v, "logprob", v)) for t, v in pos.items()} for pos in lp)
+
+
+def completion_from_output(key: str, ro, *, keep_prompt_ids: bool = False) -> Completion:
+    """``vllm.RequestOutput`` -> ``Completion`` (n=1)."""
+    if len(ro.outputs) != 1:
+        raise RuntimeError(f"{key}: expected one completion, got {len(ro.outputs)}")
+    out = ro.outputs[0]
+    prompt_ids = list(ro.prompt_token_ids or [])
+    return Completion(
+        key=key, token_ids=tuple(int(t) for t in out.token_ids),
+        finish_reason=out.finish_reason, stop_reason=out.stop_reason,
+        prompt_tokens=len(prompt_ids),
+        prompt_token_ids=tuple(prompt_ids) if keep_prompt_ids else None,
+        logprobs=_logprobs(out),
+    )
+
+
+class OfflineEngine:
+    """``BatchEngine`` over a ``vllm.LLM`` (built from ``spec`` unless ``llm`` is given)."""
+
+    def __init__(self, spec: EngineSpec, llm: Any = None, *,
+                 params_cls: Callable[..., Any] | None = None, keep_prompt_ids: bool = False):
+        self.spec = spec
+        self.kwargs = spec.engine_kwargs()  # validated before anything is loaded
+        self.name = spec.label
+        self.keep_prompt_ids = keep_prompt_ids
+        self._params_cls = params_cls
+        self.stats: dict[str, float] = {"batches": 0, "requests": 0, "isolated_retries": 0,
+                                        "errors": 0, "generate_s": 0.0}
+        if llm is None:
+            from flora_deploy.engines.patches import dt_bias_fp32
+
+            dt_bias_fp32.check_activation(spec.dtbias_fp32)
+            from vllm import LLM
+
+            t0 = time.perf_counter()
+            llm = LLM(**self.kwargs)
+            self.stats["build_s"] = round(time.perf_counter() - t0, 3)
+        self.llm = llm
+
+    def _params(self, sp: Sampling):
+        return to_vllm_sampling(sp, self._params_cls)
+
+    def _one(self, req: VllmRequest, sp: Sampling) -> Completion:
+        try:
+            (ro,) = self.llm.generate([req.prompt_dict()], [self._params(sp)], use_tqdm=False)
+            return completion_from_output(req.key, ro, keep_prompt_ids=self.keep_prompt_ids)
+        except Exception as exc:  # noqa: BLE001 - isolated to this request
+            self.stats["errors"] += 1
+            msg = f"{type(exc).__name__}: {exc}"
+            return Completion(key=req.key, error=msg[:2000], too_long=bool(_TOO_LONG.search(msg)))
+
+    def generate_batch(self, requests: Sequence[VllmRequest],
+                       samplings: Sequence[Sampling]) -> list[Completion]:
+        if len(requests) != len(samplings):
+            raise ValueError("one Sampling per request")
+        if not requests:
+            return []
+        t0 = time.perf_counter()
+        self.stats["batches"] += 1
+        self.stats["requests"] += len(requests)
+        try:
+            outs = self.llm.generate([r.prompt_dict() for r in requests],
+                                     [self._params(s) for s in samplings], use_tqdm=False)
+            if len(outs) != len(requests):
+                raise RuntimeError(f"generate returned {len(outs)} outputs for {len(requests)}")
+            result = [completion_from_output(r.key, o, keep_prompt_ids=self.keep_prompt_ids)
+                      for r, o in zip(requests, outs, strict=True)]
+        except Exception:  # noqa: BLE001 - isolate: retry each request alone
+            if len(requests) == 1:
+                result = [self._one(requests[0], samplings[0])]
+            else:
+                self.stats["isolated_retries"] += 1
+                result = [self._one(r, s) for r, s in zip(requests, samplings, strict=True)]
+        self.stats["generate_s"] += time.perf_counter() - t0
+        return result
+
+    def audit(self) -> dict:
+        out: dict[str, Any] = {"label": self.name, "spec": self.spec.as_json(),
+                               "stats": dict(self.stats)}
+        out["resolved"] = resolved_facts(self.llm)
+        return out
+
+
+def resolved_facts(llm) -> dict[str, Any]:
+    """What vLLM resolved (best effort: attribute paths are internal)."""
+    facts: dict[str, Any] = {}
+    try:
+        import vllm
+
+        facts["vllm"] = vllm.__version__
+        config = llm.llm_engine.vllm_config
+        facts["max_num_batched_tokens"] = config.scheduler_config.max_num_batched_tokens
+        facts["max_num_seqs"] = config.scheduler_config.max_num_seqs
+        facts["dtype"] = str(config.model_config.dtype)
+        facts["enable_prefix_caching"] = config.cache_config.enable_prefix_caching
+        facts["mamba_ssm_cache_dtype"] = str(getattr(config.cache_config,
+                                                     "mamba_ssm_cache_dtype", None))
+        facts["mm_processor_cache_gb"] = getattr(config.model_config.multimodal_config,
+                                                 "mm_processor_cache_gb", None)
+        facts["additional_config"] = dict(getattr(config, "additional_config", {}) or {})
+        facts["generation_config"] = getattr(config.model_config, "generation_config", None)
+    except Exception as exc:  # pragma: no cover - diagnostics only
+        facts["error"] = repr(exc)
+    return facts
+
+
+def gdn_param_dtypes(llm) -> dict[str, Any]:
+    """dtype counts of every GDN ``dt_bias`` / ``A_log`` parameter in the engine's workers
+    (``collective_rpc``; L1 / Gate A evidence)."""
+
+    def probe(worker) -> dict:
+        model = worker.model_runner.model
+        counts: dict[str, int] = {}
+        for name, p in model.named_parameters():
+            tail = name.rsplit(".", 1)[-1]
+            if tail in ("dt_bias", "A_log"):
+                k = f"{tail}:{str(p.dtype).replace('torch.', '')}"
+                counts[k] = counts.get(k, 0) + 1
+        return counts
+
+    try:
+        return {"workers": llm.collective_rpc(probe)}
+    except Exception as exc:  # pragma: no cover - diagnostics only
+        return {"error": repr(exc)}
+
+
+def with_limits(spec: EngineSpec, **changes) -> EngineSpec:
+    return replace(spec, limits=replace(spec.limits, **changes))

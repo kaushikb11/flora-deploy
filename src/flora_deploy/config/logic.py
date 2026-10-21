@@ -85,7 +85,19 @@ OUTPUT_MODULES: dict[str, tuple[str, ...]] = {
     ),
     # vLLM TempSeg / Captioner (balanced): NVIDIA's input builders, captured and wrapped for vLLM
     # (Gate C), on the same patch layer. No worker exists yet, so this is deliberately broad.
-    "vllm-video": _VIDEO_PATH,
+    "vllm-video": (
+        *_VIDEO_PATH,
+        "engines/__init__.py",
+        "engines/base.py",
+        "engines/offline_llm.py",  # every engine argument and NVIDIA's sampling
+        "engines/microbatch.py",  # batch composition changes numerics
+        "engines/patches/__init__.py",
+        "engines/patches/dt_bias_fp32.py",  # gated FP32 dt_bias (Gate A)
+        "stages/segment.py",
+        "stages/caption.py",
+        "workers_impl/segment.py",  # index-receipt -> NVIDIA arguments (profile, instruction)
+        "workers_impl/caption.py",  # upstream segment records -> caption inputs
+    ),
     # NVIDIA's offline vLLM Rewarder recipe, and the worker that feeds it: camera order of the
     # collage, which file/cut is read, the task fallback, ``certified``, the settings it applies
     # (``workers_app.reward_settings_from_env``), and the job's episode order, which fixes
@@ -127,6 +139,7 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     "cli/plan.py",
     "cli/prepare.py",
     "cli/results.py",
+    "cli/run_local.py",  # local runs only (fake models)
     "config/__init__.py",
     "config/pins.py",  # hashed by value (nvidia_pins, decode)
     "config/presets.py",  # hashed by value (engine identity); pools are deliberately unhashed
@@ -150,10 +163,19 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     "jobs/stores/bucket.py",
     "jobs/stores/local.py",
     "jobs/stores/volume.py",
+    # local: the in-process runner, spawner, fault injection and fake engines (G2). Never on a
+    # real run's path; fake outputs carry their own hash (fake receipts, local.runner)
+    "local/__init__.py",
+    "local/engines.py",
+    "local/faults.py",
+    "local/runner.py",
+    "local/sample.py",
+    "local/spawner.py",
     "media/synth.py",  # synthetic test media
     # modal_app: deployment and labs. Images are hashed by value (image_fingerprint); the modes
     # the factory forwards are config fields, hashed by value (config/hashing.kind_modes).
     "modal_app/__init__.py",
+    "modal_app/balanced_lab.py",  # GPU validation lab, not a production worker
     "modal_app/canary_app.py",
     "modal_app/coldstart_lab.py",
     "modal_app/convert_app.py",  # derived weights: hashed by receipt

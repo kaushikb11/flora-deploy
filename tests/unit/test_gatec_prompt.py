@@ -95,7 +95,7 @@ def test_engine_kwargs_reject_non_numbers_and_nonzero(value):
 # Files allowed to construct a vLLM engine directly; each must pass its kwargs through
 # nv.capture.assert_engine_kwargs. NVIDIA's Rewarder builds its own engine via load_llm (no
 # Flora video through our capture layer).
-ENGINE_BUILDERS = {"modal_app/gatec_app.py"}
+ENGINE_BUILDERS = {"modal_app/gatec_app.py", "engines/offline_llm.py"}
 ENGINE_CALLS = {"LLM", "AsyncLLM", "EngineArgs", "AsyncEngineArgs", "AsyncLLMEngine",
                 "LLMEngine"}
 

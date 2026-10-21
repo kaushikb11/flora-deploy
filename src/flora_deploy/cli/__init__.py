@@ -12,6 +12,7 @@ from flora_deploy.cli import (  # noqa: F401  (registers commands)
     plan,
     prepare,
     results,
+    run_local,
 )
 from flora_deploy.cli._app import app
 

@@ -255,3 +255,42 @@ The full golden build (30+12 episodes) stays deferred until the user wants produ
 1. **Now:** review 5 (running), Fix-W1 and P1b-1 code (running), G4.
 2. **After Fix-W1:** G1 and G2 in parallel; G3 after P1a-5s review.
 3. **After G1/G2 + review fixes:** ask the user for Wave H; then G5 and PLAN v4.
+
+---
+
+## Update (2026-10-21, night): critical path to the internal milestones
+
+**State:**
+- **Local `main`:** P1b-1 merged (vLLM engines and `balanced` workers, CPU-proven); unpushed until Fix-S fixes the two segcap tests.
+- **Running:** Fix-S, Fix-R5, G2 (local runner), G1 (CLI/SDK/README).
+- **Spend:** ≈$19.
+
+### Critical path
+
+```
+Fix-S ─┐
+Fix-R5 ┼─► review 6 (thematic, CPU) ─► fixes ─► G4 CI gates ─► Wave H (ask user) ─► G5 docs + PLAN v4
+G2 ────┤                                              ▲
+G1 ────┘                                   G3 cost study (CPU) ┘
+```
+
+### Remaining zero-spend items
+
+| ID | What | Why it matters |
+|---|---|---|
+| **Review 6** | One integration reviewer that runs the **G2 local runner** end to end on every preset and fault, plus a docs-vs-code reviewer for G1's README | G2 makes the seams testable without Modal; README claims must match code |
+| **G3 cost study** | (a) **Overlap shards inside a container** (R5a: ~21% fill/drain idle per 10-min shard); (b) **longest-episode-first** ordering; (c) **exact-split**: TempSeg pool on L40S plus Captioner pool on H100, using NVIDIA's separately callable `pipeline.segment()` and `caption_*()`; (d) longer-lived containers. Each option gets a CPU identity test (model inputs unchanged) and a projected $/video-h from measured component times. | Measured `exact` is ≈$36/video-h; these are the input-identical levers left |
+| **G4 CI gates** | Conformance, order independence, logic coverage, license guard, nvlink, and the G2 local e2e on every PR | Locks in what reviews keep finding |
+| **G5 docs + PLAN v4** | Architecture, user guide, contributor guide (D17, conformance, canary, classification rule); PLAN v4 rewritten to reality | Done last, so it describes what exists |
+| **Hygiene** | Remove merged worktrees and branches; prune scratch `.pyc` in the NVIDIA code cache | Keeps agents from branching off stale state |
+
+### Wave H: one GPU session, ≈$7–8 total, user approval required
+
+All on the same staged golden episodes, reusing containers where possible:
+
+1. **Balanced preflight:** CPU, cents. Can vLLM load NVIDIA's Captioner weights?
+2. **Exact e2e (internal v0.1).** Through the real deployed app, on 8 short episodes in deterministic mode, plus 4 reward episodes. This is the mini oracle, ≈$3.
+3. **Balanced validation:** L0, Gate A, throughput, ≈$2.
+4. **Balanced provisional certification** against step 2, plus a 3-episode noise run, ≈$2.
+
+**Gate to ask:** only after review 6 is clean and CI is green, so no GPU dollars are spent on bugs a CPU test could have caught.
