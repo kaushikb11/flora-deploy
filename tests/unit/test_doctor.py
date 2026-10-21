@@ -157,11 +157,72 @@ def test_hf_repo_paths(outcome, status, word):
     assert c["hf.tempseg"].status == "pass"
 
 
-def test_hf_no_token():
+def test_hf_no_token_is_a_warning_and_probes_anonymously():
+    # review 8b M1: the nvidia/Flora-* repos are not gated, so no token is not a failure.
     p = FakeProbes(hf=None)
     c = run(p)
-    assert c["hf.token"].status == "fail" and "HF_TOKEN" in c["hf.token"].fix
-    assert "hf.captioner" not in c  # not checked without a token
+    assert c["hf.token"].status == "warn" and "rate limits" in c["hf.token"].message
+    assert c["hf.captioner"].status == "pass"  # still checked, anonymously
+    c = run(FakeProbes(hf=None, repos={"nvidia/Flora-Captioner": "no_token"}))
+    assert c["hf.captioner"].status == "fail" and "HF_TOKEN" in c["hf.captioner"].fix
+
+
+class _FakeApi:
+    def __init__(self, auth_exc=None, info_exc=None):
+        self.auth_exc, self.info_exc, self.calls = auth_exc, info_exc, []
+
+    def model_info(self, repo, revision=None, token=None):
+        self.calls.append(("info", repo, revision, token))
+        if self.info_exc:
+            raise self.info_exc
+
+    dataset_info = model_info
+
+    def auth_check(self, repo, repo_type=None, token=None):
+        self.calls.append(("auth", repo, repo_type, token))
+        if self.auth_exc:
+            raise self.auth_exc
+
+
+def _gated_error():
+    import httpx
+    from huggingface_hub import errors as hfe
+
+    req = httpx.Request("GET", "https://huggingface.co/api/models/x/auth-check")
+    return hfe.GatedRepoError("gated", response=httpx.Response(403, request=req))
+
+
+@pytest.mark.parametrize("token,want", [(None, "no_token"), ("hf_x", "gated")])
+def test_real_hf_probe_detects_gated_repos(monkeypatch, token, want):
+    # review 8b M1: ``model_info`` succeeds on a gated repo without access; ``auth_check``
+    # is what tests access.
+    import huggingface_hub
+
+    api = _FakeApi(auth_exc=_gated_error())
+    monkeypatch.setattr(huggingface_hub, "HfApi", lambda: api)
+    assert d.RealProbes().hf_repo("meta-llama/x", "a" * 40, token, "model") == want
+    assert any(c[0] == "auth" for c in api.calls)
+
+
+def test_real_hf_probe_ok_when_both_pass(monkeypatch):
+    import huggingface_hub
+
+    api = _FakeApi()
+    monkeypatch.setattr(huggingface_hub, "HfApi", lambda: api)
+    assert d.RealProbes().hf_repo("nvidia/Flora-X", "a" * 40, None, "model") == "ok"
+    assert ("info", "nvidia/Flora-X", "a" * 40, False) in api.calls
+    assert ("auth", "nvidia/Flora-X", "model", False) in api.calls
+
+
+def test_real_certificate_status_for_balanced():
+    # review 8b M2: certkey.status needs (preset, pools, **lookup_context); it crashed.
+    cfg = load_config(EXAMPLE)
+    st = d.RealProbes().certificate_status(cfg)
+    assert st is not None and set(st) == set(cfg.pools())
+    assert all(isinstance(v, str) and "{" not in v for v in st.values())
+    c = by_name(d.check_certificates(d.RealProbes(), cfg))
+    assert not any(x.name == "doctor" for x in c.values())
+    assert set(c) == {f"certificates.{k}" for k in cfg.pools()}
 
 
 @pytest.mark.parametrize("probes,name,status", [
@@ -211,8 +272,8 @@ def _cfg_with_weights(derived):
 
 
 def test_weights_derived_paths():
-    c = run(FakeProbes())  # this schema has no weights.derived yet
-    assert c["weights.derived"].status == "warn" and "--receipt" in c["weights.derived"].fix
+    c = run(FakeProbes())  # the example records no weights.derived yet
+    assert c["weights.derived"].status == "warn" and "flora prepare" in c["weights.derived"].fix
     ok = by_name(d.check_weights(FakeProbes(), _cfg_with_weights(
         {"tempseg_merged": "a" * 64, "captioner_bf16": "b" * 64})))
     assert ok["weights.derived"].status == "pass"
@@ -280,6 +341,7 @@ def test_cli_exit_codes_and_json(monkeypatch):
     assert r.exit_code == 0 and doc["ok"] is True
     assert {"name", "status", "message", "fix"} <= set(doc["checks"][0])
 
-    monkeypatch.setattr(d, "_probes_factory", lambda: FakeProbes(hf=None))
+    monkeypatch.setattr(d, "_probes_factory",
+                        lambda: FakeProbes(repos={"nvidia/Flora-Captioner": "gated"}))
     r = cli.invoke(app, ["doctor", "--config", str(EXAMPLE), "--json"])
     assert r.exit_code == 2 and json.loads(r.output)["ok"] is False
