@@ -36,14 +36,14 @@ def _fail(msg: str, code: int = 2) -> typer.Exit:
 
 def certificate_status(cfg, option) -> dict[str, dict]:
     """Per shard kind of ``option``: the Gate certificate status of its (kind, GPU) pool
-    (``validate.certkey.status``: reference / certified / provisional / fail / none)."""
-    from types import SimpleNamespace
+    (``cli._certs``: reference / certified / provisional / fail / none, and why)."""
+    from dataclasses import replace
 
-    from flora_deploy.config.hashing import kind_modes
-    from flora_deploy.validate.certkey import status
+    from flora_deploy.cli._certs import certificate_report
 
-    pools = {k.kind: SimpleNamespace(gpu=k.gpu) for k in option.kinds}
-    return status(option.preset, pools, modes={k: kind_modes(cfg, k) for k in pools})
+    pools = {k.kind: k.gpu for k in option.kinds}
+    c = cfg if cfg.preset == option.preset else replace(cfg, preset=option.preset)
+    return certificate_report(c, pools)
 
 
 def _cameras_from_config(cfg) -> int:
