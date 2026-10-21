@@ -9,6 +9,14 @@ Status mapping the real implementation must honor (PLAN.md §1.3):
   ``TimeoutError``, so catch them **before** treating ``TimeoutError`` as ``pending``.
 - Modal retries crashes/OOM/preemptions indefinitely inside one call; the orchestrator never sees
   those as failures. Progress and poison pills are detected from ``AttemptMarker`` files instead.
+
+Spawn idempotency (``token``): the orchestrator writes a spawn *intent* (ledger status
+``spawning`` + a deterministic ``attempts.spawn_token``) before calling ``spawn``, and passes the
+token through to ``ShardWorker.run_shard(..., token=...)``. The worker stores it (with its call id)
+in its ``AttemptMarker`` and exits without work if the ledger names a different token
+(``attempts.superseded``). A restarted orchestrator uses that to adopt a call whose id it never
+recorded, or to make a duplicate inert. Implementations that predate ``token`` still work (the
+orchestrator detects the older signature), they just lose this protection.
 """
 
 from __future__ import annotations
@@ -30,8 +38,10 @@ class CallStatus:
 
 
 class Spawner(Protocol):
-    def spawn(self, kind: ShardKind, job_id: str, shard_id: str, config_hash: str) -> str:
-        """Start one shard call; returns a call id that survives orchestrator restarts."""
+    def spawn(self, kind: ShardKind, job_id: str, shard_id: str, config_hash: str, *,
+              token: str = "") -> str:
+        """Start one shard call; returns a call id that survives orchestrator restarts.
+        ``token`` must reach the worker's ``run_shard(..., token=token)``."""
         ...
 
     def poll(self, call_id: str) -> CallStatus: ...

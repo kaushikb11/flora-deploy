@@ -13,6 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from flora_deploy.jobs.orchestrator import (
+    RESPAWNS_EXHAUSTED,
     AttemptLedger,
     Lease,
     LeaseInfo,
@@ -74,7 +75,9 @@ def reconcile(*, job_id: str, config_hash: str, store: Store, manifests: Manifes
     manifest = manifests.load()
     shards = list(manifest.shards)
     quarantine_recs = attempts.quarantined()
-    controls = control_view(read_controls(store, paths), job_id)
+    failed_fn = getattr(attempts, "failed", None)
+    failed_recs = failed_fn() if failed_fn is not None else {}
+    controls = control_view(read_controls(store, paths), job_id, config_hash)
     notes: list[str] = []
 
     status: dict[str, str] = {}
@@ -91,16 +94,25 @@ def reconcile(*, job_id: str, config_hash: str, store: Store, manifests: Manifes
         elif led is not None and led.status in ("quarantined", "poisoned", "failed", "cancelled",
                                                 "done"):
             status[s.shard_id] = led.status
+        elif s.shard_id in failed_recs or (s.shard_id in quarantine_recs and
+                                           quarantine_recs[s.shard_id].reason ==
+                                           RESPAWNS_EXHAUSTED):
+            status[s.shard_id] = "failed"  # terminal; never bisected (H1)
         elif s.shard_id in quarantine_recs:
-            # quarantine written, ledger not yet: the orchestrator will bisect on its next tick
-            status[s.shard_id] = "failed" if quarantine_recs[s.shard_id].reason == \
-                "respawns_exhausted" else "quarantined"
+            # quarantine written, ledger not yet: the orchestrator will finish it on its next tick
+            status[s.shard_id] = "quarantined"
         elif led is not None and led.status in ("spawning", "active", "retry"):
             status[s.shard_id] = "running" if led.status != "retry" else "pending"
         else:
             status[s.shard_id] = "new"
 
-    satisfied, dead = resolve(shards, lambda sid: status.get(sid, "new"))
+    # a quarantined parent resolves only through the children its ledger lists (C2); the
+    # quarantine record's children are a fallback when the ledger write was lost
+    children = {sid: led.children for sid, led in ledgers.items() if led.status == "quarantined"}
+    for sid, rec in quarantine_recs.items():
+        if sid not in children and status.get(sid) == "quarantined":
+            children[sid] = tuple(c["shard_id"] for c in rec.detail.get("children", ()))
+    satisfied, dead = resolve(shards, lambda sid: status.get(sid, "new"), children)
     for s in shards:
         if status[s.shard_id] == "new":
             deps_ok = all(d in satisfied for d in s.depends_on)
