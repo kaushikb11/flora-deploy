@@ -12,7 +12,7 @@ Layout (see ``config/templates/*.yaml`` for commented templates)::
     allow_uncertified: false             # required for balanced until its certificates exist
     input: {format, repo, revision, path, cameras, stage_to}
     pipeline: {stages, embodiment, episode_instruction, envelope, shard_target_gpu_minutes,
-               determinism, terminal_rationale}
+               determinism, terminal_rationale, exact_scheduling}
     resources: {<shard kind>: {gpu, gpu_count, max_containers, max_inputs, cpu, memory}}
     output: {sink, formats}
     retries: {max_starts_before_quarantine, max_episode_error_rate}
@@ -180,6 +180,22 @@ class EpisodeInstruction(_Model):
         return self
 
 
+class ExactScheduling(_Model):
+    """G3 (``docs/exact-cost.md``): how the exact ``segcap`` worker schedules episodes. Default
+    off. **Not hashed** (``config.hashing`` picks fields explicitly; this section is not one of
+    them): both settings change only *when* an episode starts, never what NVIDIA's code is
+    given, so every model call's input is unchanged (CPU proof:
+    ``tests/unit/test_exact_scheduling.py``, ``tests/nvlink/test_exact_scheduling_nvlink.py``).
+
+    - ``episode_order``: ``plan`` (manifest order) or ``longest_first`` (LPT by duration);
+    - ``shard_overlap``: a container runs ``resources.segcap.max_inputs`` (>= 2) shards at
+      once, sharing its episode slots, so the next shard's episodes start while the previous
+      one drains."""
+
+    episode_order: Literal["plan", "longest_first"] = "plan"
+    shard_overlap: bool = Field(False, strict=True)
+
+
 class PipelineSection(_Model):
     stages: tuple[Stage, ...] = Field(min_length=1)
     embodiment: Embodiment
@@ -193,6 +209,9 @@ class PipelineSection(_Model):
     # NVIDIA's terminal_reward.py `--with-rationale` (default off: score only). Different
     # prompt, max_tokens and regex, so it is hashed into the reward.terminal stage hash (M4).
     terminal_rationale: bool = Field(False, strict=True)
+    # G3: exact segcap episode scheduling (start order / shard overlap). Not hashed: inputs to
+    # every model call are unchanged (see ExactScheduling).
+    exact_scheduling: ExactScheduling = Field(default_factory=ExactScheduling)
 
     @field_validator("stages")
     @classmethod
@@ -400,6 +419,7 @@ def review4_problems(cfg: FloraConfig) -> list[str]:
         p = per_device_gpu_problem(cfg.preset, kind, pool.gpu, pool.gpu_count)
         if p:
             problems.append(p)
+    problems += scheduling_problems(cfg, kinds)
     cams = cfg.input.cameras
     if cams is not None:
         if cfg.pipeline.embodiment == "human" and len(cams) == 3:
@@ -417,6 +437,35 @@ def review4_problems(cfg: FloraConfig) -> list[str]:
         problems.append(f"input.repo {cfg.input.repo!r} is not a Hugging Face repo id "
                         "('namespace/name')")
     return problems
+
+
+def scheduling_problems(cfg: FloraConfig, kinds: list[str] | tuple[str, ...]) -> list[str]:
+    """G3: ``pipeline.exact_scheduling`` applies to the exact ``segcap`` worker; overlap needs
+    ``resources.segcap.max_inputs`` >= 2 (the shards in flight) and at most the runner's cap."""
+    from flora_deploy.workers_impl.segcap import MAX_OVERLAP_SHARDS
+
+    sched = cfg.pipeline.exact_scheduling
+    if sched == ExactScheduling():
+        return []
+    if "segcap" not in kinds:
+        return ["pipeline.exact_scheduling applies to the exact preset's segcap worker only"]
+    if not sched.shard_overlap:
+        return []
+    n = cfg.pools()["segcap"].max_inputs
+    if not 2 <= n <= MAX_OVERLAP_SHARDS:
+        return [f"pipeline.exact_scheduling.shard_overlap runs resources.segcap.max_inputs "
+                f"shards per container at once: set it to 2..{MAX_OVERLAP_SHARDS} (got {n})"]
+    return []
+
+
+def exact_scheduling(cfg: FloraConfig) -> dict[str, Any]:
+    """What the segcap worker needs (``workers_impl.segcap.SCHEDULING_ENV``, read by
+    ``segcap.scheduling_from_env``): ``episode_order`` and ``max_shards`` (the pool's
+    ``max_inputs`` with overlap on, else 1). Not hashed (``ExactScheduling``)."""
+    sched = cfg.pipeline.exact_scheduling
+    pools = cfg.pools()
+    n = pools["segcap"].max_inputs if sched.shard_overlap and "segcap" in pools else 1
+    return {"episode_order": sched.episode_order, "max_shards": int(n)}
 
 
 def output_settings(cfg: FloraConfig) -> dict[str, Any]:

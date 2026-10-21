@@ -88,6 +88,8 @@ OUTPUT_MODULES: dict[str, tuple[str, ...]] = {
         "modal_app/reference_app.py",
         "modal_app/warm.py",  # build_linked_layout: which weight files NVIDIA's loader sees
         "workers_impl/segcap.py",  # segcap records, certification, provenance (P1a-5s)
+        # G3 split TempSeg/Captioner steps (proof only, unwired); conservative
+        "workers_impl/exact_split.py",
     ),
     # vLLM TempSeg / Captioner (balanced): NVIDIA's input builders, captured and wrapped for vLLM
     # (Gate C), on the same patch layer. No worker exists yet, so this is deliberately broad.

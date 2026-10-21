@@ -45,6 +45,15 @@ and the paths are re-keyed by the ``segcap`` stage hash from the config's manife
 6. ``ShardReceipt`` LAST, ``parts`` = earlier parts + this container's own, ``config_hash`` = the
    stage hash (``JobFiles.key``), ``episodes_failed`` = terminal exclusions only.
 
+G3 scheduling (``docs/exact-cost.md``; off by default, not hashed: no model input changes):
+``SegcapWorkerSettings.episode_order="longest_first"`` starts a shard's episodes longest first
+(:func:`order_episodes`); ``max_shards`` > 1 lets ``@modal.concurrent`` inputs run that many
+shards at once in one container, each with its own marker, sink, parts and receipt, over one
+``FastExactEngine(overlap=True)`` whose ``concurrency`` episode slots are shared
+(``stages.reference.EpisodeSlots``: an earlier shard's queued episodes always start first, so
+the next shard only fills the slots a draining shard frees). ``preempt`` marks every shard in
+flight before it cancels the queued episodes.
+
 Records: ``provenance.config_hash`` is the stage hash (stamped by the part sink);
 ``certified`` per the episode's envelope verdict (``EpisodeRef.envelope_ok``, D13;
 ``envelope="ignore"`` certifies regardless); ``provenance.engine`` is the engine label
@@ -88,6 +97,11 @@ from flora_deploy.workers_impl.reward import (
 
 ENGINE_LABEL = "nvidia-hf"
 AUDIT_SCHEMA = "flora_segcap_audit_v1"
+# G3 scheduling (docs/exact-cost.md). Neither changes any model input (only which episode starts
+# when), so neither is hashed: see ``config.schema.ExactScheduling``.
+EPISODE_ORDERS = ("plan", "longest_first")
+MAX_OVERLAP_SHARDS = 4
+SCHEDULING_ENV = "FLORA_SEGCAP_SCHEDULING"  # JSON {"episode_order", "max_shards"}
 # EpisodeRef.pool -> (NVIDIA profile, yam32), as ``jobs.indexing`` maps it (receipts carry both).
 POOL_PROFILES = {"human": ("human", False), "yam": ("yam", False), "yam32": ("yam", True),
                  "dex": ("dex", False), "tianji": ("tianji", False)}
@@ -334,14 +348,34 @@ class FastExactEngine:
     captioner_bf16: Any = None
     progress: Callable[[str, float, str], None] | None = None
     sampler_factory: Callable[[], Any] | None = None
+    # G3 shard overlap (docs/exact-cost.md): concurrent ``annotate`` calls (one per shard in
+    # flight, ``@modal.concurrent``) share ``concurrency`` episode slots; off: a second
+    # concurrent call is refused.
+    overlap: bool = False
     _audits: int = 0
     _drift: str | None = None
     _calls: dict = field(default_factory=dict, init=False, repr=False)
     _cancel: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
+    _state: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _batches: int = field(default=0, init=False, repr=False)
+    _seq: int = field(default=0, init=False, repr=False)
+    _slots: Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.gpu_lock is not None:
             self._calls = _install_call_timer(self.gpu_lock)
+        if self.overlap:
+            from flora_deploy.stages.reference import EpisodeSlots
+
+            if self.concurrency < 2:
+                raise ValueError("FastExactEngine(overlap=True) needs concurrency >= 2 (the GPU "
+                                 "lock and processor clones of the concurrent composite)")
+            self._slots = EpisodeSlots(self.concurrency)
+
+    @property
+    def max_batches(self) -> int:
+        """How many ``annotate`` calls may run at once (``SegcapShardRunner.max_shards``)."""
+        return MAX_OVERLAP_SHARDS if self.overlap else 1
 
     def _audit(self) -> dict | None:
         report = getattr(self.nv, "audit_report", None)
@@ -393,6 +427,7 @@ class FastExactEngine:
             "image_fingerprint": self.image_fingerprint,
             "captioner_bf16": bf16.provenance() if bf16 is not None else None,
             "concurrency": self.concurrency,
+            "overlap": self.overlap,
         }
 
     def episode_timing(self) -> dict[str, Any]:
@@ -416,15 +451,34 @@ class FastExactEngine:
 
     def annotate(self, items: list[dict], *, on_done: OnDone) -> dict:
         from flora_deploy.accel import gpu_thread as gt
-        from flora_deploy.stages.reference import annotate_batch
 
         if self.gpu_thread is not None and gt._find_mark(self.nv.pipeline.generate) \
                 is not self.gpu_thread:
             raise RuntimeError("gpu_thread is on but NVIDIA generate() does not run on it")
+        with self._state:
+            if self._batches and not self.overlap:
+                raise RuntimeError("FastExactEngine.annotate called while another batch runs; "
+                                   "concurrent shards need FastExactEngine(overlap=True)")
+            first = self._batches == 0
+            if first:  # a running batch's cancel (preemption) is never undone by a newcomer
+                self._cancel.clear()
+            self._batches += 1
+            self._seq += 1
+            seq = self._seq
+        try:
+            return self._annotate(items, on_done, first=first, seq=seq)
+        finally:
+            with self._state:
+                self._batches -= 1
+
+    def _annotate(self, items: list[dict], on_done: OnDone, *, first: bool, seq: int) -> dict:
+        from flora_deploy.stages.reference import annotate_batch
+
         self._audit()
-        self._cancel.clear()
         box: dict[str, Any] = {}
         finished = threading.Event()
+        shared = ({"slots": self._slots, "slot_key": seq, "cancelled": self._cancel.is_set,
+                   "reset_lock": first} if self.overlap else {})
 
         def run() -> None:
             try:
@@ -433,7 +487,8 @@ class FastExactEngine:
                     concurrency=min(self.concurrency, max(len(items), 1)),
                     gpu_lock=self.gpu_lock, clones=self.clones, accel=self.accel,
                     sampler=self.sampler_factory() if self.sampler_factory else None,
-                    progress=self.progress, on_start=self._on_start, on_done=on_done)
+                    progress=self.progress, on_start=self._on_start, on_done=on_done,
+                    **shared)
             except BaseException as exc:  # noqa: BLE001 - handed to the caller below
                 box["exc"] = exc
             finally:
@@ -470,6 +525,48 @@ class SegcapWorkerSettings:
     determinism: str = "nvidia"
     local_dir: str = "/tmp/flora-segcap"
     container_id: str = field(default_factory=default_container_id)
+    # G3 scheduling (docs/exact-cost.md; ``config.schema.ExactScheduling``, not hashed):
+    # ``episode_order``: "plan" (manifest order) or "longest_first" (LPT by the manifest's
+    # ``duration_s``, ties in plan order); ``max_shards``: shards this container runs at once
+    # (``@modal.concurrent`` inputs; > 1 needs an engine with ``max_batches`` >= it).
+    episode_order: str = "plan"
+    max_shards: int = 1
+
+
+def scheduling_from_env(env: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """``SegcapWorkerSettings`` scheduling fields from ``FLORA_SEGCAP_SCHEDULING`` (JSON written
+    by the app factory from ``config.schema.exact_scheduling``); defaults when unset."""
+    import os
+
+    env = os.environ if env is None else env
+    raw = env.get(SCHEDULING_ENV)
+    if not raw:
+        return {"episode_order": "plan", "max_shards": 1}
+    doc = json.loads(raw)
+    out = {"episode_order": str(doc.get("episode_order", "plan")),
+           "max_shards": int(doc.get("max_shards", 1))}
+    check_scheduling(**out)
+    return out
+
+
+def check_scheduling(episode_order: str, max_shards: int) -> None:
+    if episode_order not in EPISODE_ORDERS:
+        raise ValueError(f"episode_order {episode_order!r}: use one of {EPISODE_ORDERS}")
+    if not 1 <= max_shards <= MAX_OVERLAP_SHARDS:
+        raise ValueError(f"max_shards {max_shards}: must be 1..{MAX_OVERLAP_SHARDS}")
+
+
+def order_episodes(uids: list[str], refs: Mapping[str, EpisodeRef], order: str) -> list[str]:
+    """The order a shard's episodes start in. ``longest_first`` is LPT list scheduling: the
+    longest episode (manifest ``duration_s``) first, so the shard's makespan is not set by a
+    long episode that started last; ties keep plan order. Only start order changes: each
+    episode is still one independent NVIDIA ``annotate``."""
+    if order == "plan":
+        return list(uids)
+    if order == "longest_first":
+        pos = {u: i for i, u in enumerate(uids)}
+        return sorted(uids, key=lambda u: (-float(refs[u].duration_s or 0.0), pos[u]))
+    raise ValueError(f"episode_order {order!r}: use one of {EPISODE_ORDERS}")
 
 
 def certification(ref: EpisodeRef, envelope: str = "warn") -> tuple[bool, str | None]:
@@ -489,9 +586,10 @@ def engine_mode(engine: Any) -> str:
 
 
 class ConcurrentShardRefused(RuntimeError):
-    """A second shard arrived while one runs: the segcap worker runs one shard per container
-    (its engine and GPU-lock statistics are per batch). Use ``resources.segcap.max_inputs: 1``;
-    episode concurrency inside the shard is ``FastExactEngine.concurrency``."""
+    """More shards arrived at once than ``SegcapWorkerSettings.max_shards`` allows (default 1:
+    one shard per container). Use ``resources.segcap.max_inputs: 1``, or turn on
+    ``pipeline.exact_scheduling.shard_overlap`` (G3), whose engine shares its episode slots
+    between the shards in flight."""
 
 
 class SegcapShardRunner:
@@ -509,6 +607,12 @@ class SegcapShardRunner:
         from flora_deploy.accel import determinism as det
 
         det.check_mode(settings.determinism)
+        check_scheduling(settings.episode_order, settings.max_shards)
+        if settings.max_shards > int(getattr(engine, "max_batches", 1)):
+            raise ValueError(
+                f"max_shards={settings.max_shards} needs an engine that runs that many batches "
+                f"at once (this one: {getattr(engine, 'max_batches', 1)}; "
+                "FastExactEngine(overlap=True))")
         self.store, self.engine, self.settings = store, engine, settings
         self.inputs_for = inputs or self.inputs_from_index
         self.call_id, self.clock = call_id, clock
@@ -518,31 +622,61 @@ class SegcapShardRunner:
         self.fatal = fatal
         self._lock = threading.RLock()
         self._active: dict[int, _Active] = {}  # every in-flight input (marked by preempt)
-        self._busy = False  # one shard per container (ConcurrentShardRefused)
+        self._running = 0  # shards in flight (<= settings.max_shards: ConcurrentShardRefused)
         self._next_k: dict[tuple[str, str, str], int] = {}
         self.last_batch: dict | None = None  # the last annotate batch summary (diagnostics)
+        self.skipped_refreshes = 0
 
     # -- contract ------------------------------------------------------------------------
 
     def run_shard(self, job_id: str, shard_id: str, config_hash: str,
                   token: str = "") -> ShardReceipt | None:
-        with self._lock:  # review 5 M1: refuse, before writing anything, a concurrent input
-            if self._busy:
+        with self._lock:  # review 5 M1: refuse, before writing anything, an extra input
+            if self._running >= self.settings.max_shards:
                 raise ConcurrentShardRefused(
-                    f"shard {shard_id!r} arrived while another segcap shard runs in this "
-                    "container: set resources.segcap.max_inputs: 1")
-            self._busy = True
+                    f"shard {shard_id!r} arrived while {self._running} segcap shard(s) run in "
+                    f"this container (max_shards={self.settings.max_shards}): set "
+                    "resources.segcap.max_inputs: 1, or pipeline.exact_scheduling.shard_overlap")
+            self._running += 1
+            others = self._running > 1
         try:
-            return self._run_shard(job_id, shard_id, config_hash, token)
+            return self._run_shard(job_id, shard_id, config_hash, token, others=others)
         finally:
             with self._lock:
-                self._busy = False
+                self._running -= 1
+
+    def _media_on_store(self) -> bool:
+        """The media root lies inside the store's Volume mount (``factory.media_for`` stages
+        inputs there when ``stage_to`` names the store Volume): NVIDIA then has Volume files
+        open while an episode runs."""
+        mount, media = getattr(self.store, "mount", None), self.settings.media_root
+        if mount is None or not media or "://" in str(media):
+            return False
+        try:
+            Path(media).resolve().relative_to(Path(mount).resolve())
+        except (ValueError, OSError):
+            return False
+        return True
+
+    def _refresh(self, others: bool) -> None:
+        """Volume stores: see current ledgers / parts in a warm container. A Volume reload
+        fails (or blanks the mount) while any Volume file is open; ``VolumeStore.refresh``
+        guards its own calls, but not NVIDIA's open media files. So while another shard of this
+        container runs (G3 overlap) and the media live on the store Volume, the reload is
+        skipped: this shard sees the container's view as of the last reload, which the
+        contract tolerates (eventually consistent listings; step 0/2 races exist anyway)."""
+        refresh = getattr(self.store, "refresh", None)
+        if not callable(refresh):
+            return
+        if others and self._media_on_store():
+            with self._lock:
+                self.skipped_refreshes += 1
+            return
+        refresh()
 
     def _run_shard(self, job_id: str, shard_id: str, config_hash: str,
-                   token: str) -> ShardReceipt | None:
-        refresh = getattr(self.store, "refresh", None)
-        if callable(refresh):  # Volume stores: see current ledgers / parts in a warm container
-            refresh()
+                   token: str, *, others: bool = False) -> ShardReceipt | None:
+        self._refresh(others)
         jf = A.JobFiles(self.store, job_id, config_hash)  # paths keyed by the stage hash
         manifests = StoreManifestSource(jf)
         shard = manifests.shard(shard_id)
@@ -578,10 +712,12 @@ class SegcapShardRunner:
         Returns True if it marked at least one."""
         with self._lock:
             actives = list(self._active.values())
+        # mark first, then cancel: a cancelled batch raises in its shard thread, and that
+        # thread's error mark must never pre-empt the preempted mark (G3: several shards)
+        marked = [self._end(a, preempted=True) for a in actives]
         cancel = getattr(self.engine, "cancel", None)
         if actives and callable(cancel):
             cancel()
-        marked = [self._end(a, preempted=True) for a in actives]
         return any(marked)
 
     def on_exit(self) -> None:
@@ -702,11 +838,13 @@ class SegcapShardRunner:
 
         refs = {e.uid: e for e in manifests.base().episodes}
         todo = [u for u in shard.episodes if u not in done and u not in poisoned]
+        missing_refs = [u for u in todo if u not in refs]
+        if missing_refs:
+            raise KeyError(f"episode {missing_refs[0]!r} is not in the manifest")
+        todo = order_episodes(todo, refs, s.episode_order)  # G3: start order only
         inputs: dict[str, SegcapInputs] = {}
         errors: list[EpisodeError] = []
         for uid in todo:  # step 4: inputs (per-episode isolation)
-            if uid not in refs:
-                raise KeyError(f"episode {uid!r} is not in the manifest")
             got = self._load_inputs(shard, refs[uid])
             if isinstance(got, SegcapInputs):
                 inputs[uid] = got
@@ -749,7 +887,9 @@ class SegcapShardRunner:
                      "timing_dependent_calls": timing, "gpu_timing": gpu_timing,
                      "config_hash": jf.key(shard.kind), "job_config_hash": jf.config_hash,
                      "shard_id": shard.shard_id, "container_id": self.container_id,
-                     "runtime": {**self.engine.runtime_provenance(), "nv_audit": audit_report},
+                     "runtime": {**self.engine.runtime_provenance(), "nv_audit": audit_report,
+                                 "scheduling": {"episode_order": s.episode_order,
+                                                "max_shards": s.max_shards}},
                      "result": result}
             sink.add(records=records, audits=[audit])
             sink.flush()  # every finished episode is on the store before the next one lands

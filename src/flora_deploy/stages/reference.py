@@ -1211,6 +1211,84 @@ def episode_observe(recorder, result: dict | None, t_batch0: float,
     return out
 
 
+class EpisodeNotStarted(RuntimeError):
+    """A queued episode was never started: its batch was cancelled (preemption)."""
+
+
+class EpisodeSlots:
+    """A container-wide cap on running episodes, shared by batches that run at the same time
+    (G3 shard overlap, ``docs/exact-cost.md``): while one shard's episodes drain, the next
+    shard's queued episodes take the slots they free, so the GPU never waits for a shard
+    boundary.
+
+    A free slot goes to the waiting episode with the **smallest key** (``(batch seq, position
+    in its batch)``): an earlier shard's queued episodes always start before a later shard's,
+    so overlap only fills what a draining shard leaves free. ``acquire`` gives up, raising
+    :class:`EpisodeNotStarted`, as soon as ``cancelled()`` turns true.
+
+    Only *when* an episode starts changes. Every episode still runs NVIDIA's own ``annotate``
+    alone in its thread with its own processor clones; every model call is still NVIDIA's
+    batch-1 ``generate`` under the one GPU lock, which is exactly W3-A's proven setting (the
+    same reason more episode threads leave every model input unchanged)."""
+
+    def __init__(self, capacity: int):
+        import threading
+
+        if capacity < 1:
+            raise ValueError("EpisodeSlots capacity must be >= 1")
+        self.capacity = capacity
+        self._cv = threading.Condition()
+        self._running = 0
+        self._waiting: list[Any] = []  # heap of keys
+        self.max_running = 0
+        self.grants = 0
+
+    def acquire(self, key: Any, cancelled: Callable[[], bool] | None = None,
+                poll_s: float = 0.2) -> None:
+        import heapq
+
+        with self._cv:
+            heapq.heappush(self._waiting, key)
+            try:
+                while self._running >= self.capacity or self._waiting[0] != key:
+                    if cancelled is not None and cancelled():
+                        raise EpisodeNotStarted(f"episode {key!r} not started: cancelled")
+                    self._cv.wait(poll_s)
+                if cancelled is not None and cancelled():
+                    raise EpisodeNotStarted(f"episode {key!r} not started: cancelled")
+            except BaseException:
+                self._waiting.remove(key)
+                heapq.heapify(self._waiting)
+                self._cv.notify_all()
+                raise
+            heapq.heappop(self._waiting)
+            self._running += 1
+            self.grants += 1
+            self.max_running = max(self.max_running, self._running)
+            self._cv.notify_all()
+
+    def release(self) -> None:
+        with self._cv:
+            if self._running <= 0:
+                raise RuntimeError("EpisodeSlots.release() without a held slot")
+            self._running -= 1
+            self._cv.notify_all()
+
+    @contextmanager
+    def slot(self, key: Any, cancelled: Callable[[], bool] | None = None) -> Iterator[None]:
+        self.acquire(key, cancelled)
+        try:
+            yield
+        finally:
+            self.release()
+
+    def stats(self) -> dict:
+        with self._cv:
+            return {"capacity": self.capacity, "running": self._running,
+                    "waiting": len(self._waiting), "max_running": self.max_running,
+                    "grants": self.grants}
+
+
 def annotate_batch(
     nv,
     session,
@@ -1226,6 +1304,10 @@ def annotate_batch(
     accel=None,
     on_start: Callable[[dict], None] | None = None,
     on_done: Callable[[dict, dict | None, NvidiaError | None], None] | None = None,
+    slots: EpisodeSlots | None = None,
+    slot_key: Any = 0,
+    cancelled: Callable[[], bool] | None = None,
+    reset_lock: bool = True,
 ) -> dict:
     """Run ``annotate_nvidia`` over ``episodes`` with ``concurrency`` worker threads.
 
@@ -1244,6 +1326,14 @@ def annotate_batch(
     ``clone_processors=False``.
     Returns ``{"results": {episode: result}, "errors": {episode: str}, "batch": {...}}``; results
     keep input order. ``measure`` attaches ``flora_reference["observe"]`` per episode.
+
+    ``slots`` (G3 shard overlap): an :class:`EpisodeSlots` shared with other batches running at
+    the same time in this process; each episode holds one slot (key ``(slot_key, position)``)
+    from before ``on_start`` until after ``on_done``. A batch with ``slots`` is always run as a
+    concurrent batch (GPU lock, request-lock swap and processor clones are required even for
+    one episode, since other batches run beside it). ``cancelled``: queued episodes waiting
+    for a slot give up (:class:`EpisodeNotStarted`) once it returns true. ``reset_lock=False``
+    keeps the GPU lock's statistics (another batch is using it).
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -1254,7 +1344,7 @@ def annotate_batch(
     names = [ep["episode"] for ep in episodes]
     if len(set(names)) != len(names):
         raise ValueError(f"duplicate episode names: {names}")
-    if concurrency > 1:
+    if concurrency > 1 or slots is not None:
         if session is None:
             raise RuntimeError("concurrency > 1 needs the resident session")
         lock = getattr(nv.pipeline.generate, "__flora_gpu_lock__", None)
@@ -1265,6 +1355,10 @@ def annotate_batch(
         gpu_lock = lock
     if session is None:
         clone_processors = False
+    if slots is not None:
+        if clone_processors is False:
+            raise ValueError("a batch sharing EpisodeSlots needs processor clones")
+        clone_processors = True
     if clone_processors is None:
         clone_processors = concurrency > 1
     if clone_processors and clones is None:
@@ -1272,13 +1366,20 @@ def annotate_batch(
     if not clone_processors:
         clones = None
     clone_stats0 = clones.stats() if clones else None
-    if gpu_lock is not None:
+    if gpu_lock is not None and reset_lock:
         gpu_lock.reset()
     t0 = time.perf_counter()
     if sampler is not None:
         sampler.start()
+    position = {ep["episode"]: i for i, ep in enumerate(episodes)}
 
     def one(ep: dict) -> tuple[dict | None, str | None]:
+        if slots is None:
+            return run_one(ep)
+        with slots.slot((slot_key, position[ep["episode"]]), cancelled):
+            return run_one(ep)
+
+    def run_one(ep: dict) -> tuple[dict | None, str | None]:
         rec = Recorder(episode=ep["episode"]) if measure else None
         report = None
         if progress is not None:
@@ -1333,6 +1434,8 @@ def annotate_batch(
             "sets": clones.stats()["sets"],
         } if clones else None,
     }
+    if slots is not None:
+        batch["episode_slots"] = slots.stats()
     if gpu_lock is not None:
         batch["gpu_lock"] = gpu_lock.stats()
         batch["gpu_busy_fraction"] = round(gpu_lock.busy_fraction(t0, t0 + wall), 4)

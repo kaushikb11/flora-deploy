@@ -125,11 +125,12 @@ def segcap_fake_engine(script, *, concurrency: int = 2, raises=None, sleeps=None
                            image_fingerprint="sha256:fake")
 
 
-def _segcap_spec() -> WorkerSpec:
+def _segcap_spec(overlap: bool = False) -> WorkerSpec:
     """The real ``SegcapShardRunner`` (``workers_impl.segcap``) over the suite's store, running
     the real fast-exact composite (``segcap_fake_engine``) with two episode threads. An
     ``script.nv_fail`` episode asks NVIDIA for the 32-second profile on one camera, which
-    NVIDIA's ``_inputs`` rejects (``InputError``)."""
+    NVIDIA's ``_inputs`` rejects (``InputError``). ``overlap``: the G3 scheduling (shard
+    overlap with shared episode slots, ``max_shards=2``, longest-first order)."""
     from flora_deploy.workers_impl.segcap import (
         SegcapInputs,
         SegcapShardRunner,
@@ -144,9 +145,15 @@ def _segcap_spec() -> WorkerSpec:
                                     instruction="", videos={"main": f"/v/{ref.uid}.mp4"},
                                     sources={}, duration_s=ref.duration_s)
 
-            settings = SegcapWorkerSettings(container_id=env.container_id, gpu="H200",
-                                            models={"tempseg": "test"})
-            self.runner = SegcapShardRunner(env.store, segcap_fake_engine(env.script), settings,
+            settings = SegcapWorkerSettings(
+                container_id=env.container_id, gpu="H200", models={"tempseg": "test"},
+                episode_order="longest_first" if overlap else "plan",
+                max_shards=2 if overlap else 1)
+            engine = segcap_fake_engine(env.script)
+            if overlap:
+                engine.overlap = True
+                engine.__post_init__()
+            self.runner = SegcapShardRunner(env.store, engine, settings,
                                             call_id=lambda: env.call_id, clock=env.clock,
                                             inputs=inputs)
 
@@ -156,7 +163,7 @@ def _segcap_spec() -> WorkerSpec:
         def on_exit(self):
             self.runner.on_exit()
 
-    return WorkerSpec("segcap-worker", "segcap", Worker)
+    return WorkerSpec("segcap-worker[overlap]" if overlap else "segcap-worker", "segcap", Worker)
 def _balanced_specs() -> list[WorkerSpec]:
     """The real balanced ``BalancedShardRunner`` + ``MicroBatcher`` (``workers_impl.segment`` /
     ``workers_impl.caption``) with a scripted per-episode job and engine
@@ -172,5 +179,6 @@ WORKERS: list[WorkerSpec] = [
     _canary_spec(),
     *_reward_specs(),
     _segcap_spec(),
+    _segcap_spec(overlap=True),
     *_balanced_specs(),
 ]
