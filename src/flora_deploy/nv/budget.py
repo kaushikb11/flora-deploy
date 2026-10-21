@@ -11,7 +11,13 @@ where NVIDIA errors. ``check_context_budget`` applies NVIDIA's condition to the 
 The budgets are not guessed. ``nvidia_budgets(nv)`` reads them from NVIDIA's call sites with
 ``ast``: ``generate(..., 1024)`` in ``pipeline.Predictor.predict`` (TempSeg) and
 ``generate(..., 512)`` in ``pipeline.caption_single`` / ``pipeline.caption_three`` (Captioner).
-``nvidia_context_limit(nv)`` reads the limit from the comparison in ``models.generate``.
+``nvidia_context_limit(nv)`` reads the limit from the comparison in ``models.generate``, and
+``check_context_budget`` uses that parsed limit when a SEGCAP family is linked.
+
+Both parse the exact bytes the nv linker verified and compiled (``executed_source``), never the
+file re-read from disk, and fail closed on any shape they do not know: a ``generate`` call in
+another function or at module level, ``models.generate(...)``, an alias, a re-import under
+another name, a non-literal budget.
 
 LICENSE REVIEW FLAG (PLAN.md §11): ``CONTEXT_LIMIT = 32768`` restates the constant of
 ``models.py:169``. It is a default only. The nvlink test ``test_nv_link_budget.py`` checks it, and
@@ -23,7 +29,6 @@ from __future__ import annotations
 
 import ast
 import functools
-import inspect
 from typing import Any
 
 CONTEXT_LIMIT = 32768
@@ -76,14 +81,18 @@ def error_class(nv: Any = None) -> type:
     return _nvidia_error_class(nv.models.InputErrorForModel)
 
 
-def check_context_budget(prompt_token_ids_len: int, budget: int, *, limit: int = CONTEXT_LIMIT,
+def check_context_budget(prompt_token_ids_len: int, budget: int, *, limit: int | None = None,
                          nv: Any = None) -> None:
     """Raise like NVIDIA's ``models.generate`` would for a prompt of this many tokens.
 
     ``nv`` is the linked SEGCAP handle; by default the family linked in this process (if any)
-    supplies NVIDIA's exception class.
+    supplies NVIDIA's exception class. ``limit`` defaults to the constant parsed from the
+    linked family's verified ``models.generate`` (``nvidia_context_limit``), or
+    ``CONTEXT_LIMIT`` when no real family is linked (fakes, tests).
     """
     n, budget = int(prompt_token_ids_len), int(budget)
+    if limit is None:
+        limit = _runtime_limit(nv)
     if n + budget > limit:
         raise error_class(nv)(
             f"prompt has {n} tokens; with an output budget of {budget} it exceeds the "
@@ -92,47 +101,157 @@ def check_context_budget(prompt_token_ids_len: int, budget: int, *, limit: int =
         )
 
 
+def _runtime_limit(nv: Any) -> int:
+    from flora_deploy.nv import Family
+    from flora_deploy.nv.linker import NvFamily, loaded_family
+
+    family = nv if nv is not None else loaded_family()
+    if isinstance(family, NvFamily) and family.family is Family.SEGCAP:
+        return nvidia_context_limit(family)  # fails closed if NVIDIA's guard changed shape
+    return CONTEXT_LIMIT
+
+
+def executed_source(module) -> bytes:
+    """The exact bytes the nv linker verified and compiled for ``module``.
+
+    Never re-reads the file: a file edited on disk after import would otherwise be parsed
+    instead of the code that runs. A module not imported through the linker is refused."""
+    loader = getattr(getattr(module, "__spec__", None), "loader", None)
+    data = getattr(loader, "executed_source", None)
+    if not isinstance(data, bytes):
+        raise ValueError(
+            f"{getattr(module, '__name__', module)!r} was not imported by the nv linker; "
+            "refusing to parse its source from disk"
+        )
+    return data
+
+
 def _source_tree(module) -> ast.Module:
-    return ast.parse(inspect.getsource(module))
+    return ast.parse(executed_source(module))
 
 
 def _qualified_functions(tree: ast.Module):
+    defs = (ast.FunctionDef, ast.AsyncFunctionDef)
     for node in tree.body:
-        if isinstance(node, ast.FunctionDef):
+        if isinstance(node, defs):
             yield node.name, node
         elif isinstance(node, ast.ClassDef):
             for item in node.body:
-                if isinstance(item, ast.FunctionDef):
+                if isinstance(item, defs):
                     yield f"{node.name}.{item.name}", item
+
+
+class _GenerateSites(ast.NodeVisitor):
+    """Every ``generate(...)`` call by enclosing top-level function / method; any other use of
+    the name ``generate`` (attribute calls such as ``models.generate``, aliases, re-imports,
+    parameters, ``getattr(..., "generate")``, module-level calls) is recorded as an error."""
+
+    def __init__(self):
+        self.stack: list[tuple[str, str]] = []
+        self.calls: dict[str, list[ast.Call]] = {}
+        self.errors: list[str] = []
+
+    def _qualname(self) -> str:
+        if not self.stack:
+            return "<module>"
+        if self.stack[0][0] == "class":
+            return ".".join(name for _, name in self.stack[:2])
+        return self.stack[0][1]
+
+    def _bad(self, node, what: str) -> None:
+        self.errors.append(f"line {getattr(node, 'lineno', '?')}: {what}")
+
+    def _scope(self, kind: str, node) -> None:
+        if node.name == "generate":
+            self._bad(node, "redefines generate")
+        self.stack.append((kind, node.name))
+        self.generic_visit(node)
+        self.stack.pop()
+
+    def visit_ClassDef(self, node):
+        self._scope("class", node)
+
+    def visit_FunctionDef(self, node):
+        self._scope("def", node)
+
+    def visit_AsyncFunctionDef(self, node):
+        self._scope("def", node)
+
+    def visit_Call(self, node):
+        if isinstance(node.func, ast.Name) and node.func.id == "generate":
+            self.calls.setdefault(self._qualname(), []).append(node)
+            for child in (*node.args, *node.keywords):
+                self.visit(child)
+            return
+        self.generic_visit(node)
+
+    def visit_Name(self, node):
+        if node.id == "generate":
+            self._bad(node, "'generate' used other than as a direct call")
+
+    def visit_Attribute(self, node):
+        if node.attr == "generate":
+            self._bad(node, "attribute '.generate'")
+        self.generic_visit(node)
+
+    def visit_arg(self, node):
+        if node.arg == "generate":
+            self._bad(node, "parameter named generate")
+
+    def visit_Global(self, node):
+        if "generate" in node.names:
+            self._bad(node, "global generate")
+
+    visit_Nonlocal = visit_Global
+
+    def visit_Constant(self, node):
+        if node.value == "generate":
+            self._bad(node, "string 'generate' (getattr?)")
+
+    def visit_ImportFrom(self, node):
+        for alias in node.names:
+            if alias.name == "*":
+                self._bad(node, f"star import from {node.module}")
+            elif alias.name == "generate" and (
+                alias.asname not in (None, "generate") or node.module != "models"
+                or node.level != 1
+            ):
+                self._bad(node, "generate imported under another name or from elsewhere")
+            elif alias.asname == "generate":
+                self._bad(node, f"{alias.name} imported as generate")
+
+    def visit_Import(self, node):
+        for alias in node.names:
+            if (alias.asname or alias.name).split(".")[0] == "generate":
+                self._bad(node, "module imported as generate")
 
 
 def nvidia_budgets(nv) -> dict[str, int]:
     """``{"tempseg": ..., "captioner": ...}``: the ``budget`` argument of every ``generate(...)``
-    call in NVIDIA's ``pipeline.py``, per model kind. Fails if a site is missing, is not a
-    literal, or two sites of one kind disagree."""
-    return dict(_budgets(nv.pipeline))
+    call in NVIDIA's ``pipeline.py`` (the verified bytes that run), per model kind. Fails if a
+    site is missing, unexpected (any other function, module level, ``models.generate``, an
+    alias, ...), is not a literal, or two sites of one kind disagree."""
+    return dict(_budgets(executed_source(nv.pipeline)))
 
 
 @functools.cache
-def _budgets(pipeline) -> tuple[tuple[str, int], ...]:
+def _budgets(source: bytes) -> tuple[tuple[str, int], ...]:
+    sites = _GenerateSites()
+    sites.visit(ast.parse(source))
+    if sites.errors:
+        raise ValueError("unexpected generate() reference in pipeline: " + "; ".join(sites.errors))
     found: dict[str, set[int]] = {}
-    seen = set()
-    for qualname, fn in _qualified_functions(_source_tree(pipeline)):
-        for node in ast.walk(fn):
-            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                    and node.func.id == "generate"):
-                continue
-            if qualname not in _CALL_SITES:
-                raise ValueError(f"unexpected generate() call in pipeline.{qualname}")
+    for qualname, calls in sites.calls.items():
+        if qualname not in _CALL_SITES:
+            raise ValueError(f"unexpected generate() call in pipeline.{qualname}")
+        for node in calls:
             args = node.args
-            if len(args) != 4 or not isinstance(args[3], ast.Constant) or not isinstance(
-                args[3].value, int
-            ):
+            if (len(args) != 4 or node.keywords or not isinstance(args[3], ast.Constant)
+                    or type(args[3].value) is not int):
                 raise ValueError(f"pipeline.{qualname}: generate() budget is not a literal")
             found.setdefault(_CALL_SITES[qualname], set()).add(args[3].value)
-            seen.add(qualname)
-    if seen != set(_CALL_SITES):
-        raise ValueError(f"generate() call sites changed: found {sorted(seen)}")
+    if set(sites.calls) != set(_CALL_SITES):
+        raise ValueError(f"generate() call sites changed: found {sorted(sites.calls)}")
     out = []
     for kind, values in sorted(found.items()):
         if len(values) != 1:
@@ -142,10 +261,20 @@ def _budgets(pipeline) -> tuple[tuple[str, int], ...]:
 
 
 def nvidia_context_limit(nv) -> int:
-    """The constant in ``models.generate``'s ``n + budget > LIMIT`` guard."""
-    tree = _source_tree(nv.models)
-    fn = next(f for name, f in _qualified_functions(tree) if name == "generate")
+    """The constant in ``models.generate``'s ``n + budget > LIMIT`` guard (verified bytes)."""
+    return _context_limit(executed_source(nv.models))
+
+
+@functools.cache
+def _context_limit(source: bytes) -> int:
+    tree = ast.parse(source)
+    fns = [f for name, f in _qualified_functions(tree) if name == "generate"]
+    if len(fns) != 1:
+        raise ValueError(f"models.generate not found exactly once ({len(fns)})")
+    fn = fns[0]
     params = [a.arg for a in fn.args.args]
+    if len(params) < 4:
+        raise ValueError(f"models.generate has unexpected parameters {params}")
     budget = params[3]
     limits = []
     for node in ast.walk(fn):
@@ -153,7 +282,8 @@ def nvidia_context_limit(nv) -> int:
                 and isinstance(node.ops[0], ast.Gt) and isinstance(node.left, ast.BinOp)
                 and isinstance(node.left.op, ast.Add)
                 and isinstance(node.left.right, ast.Name) and node.left.right.id == budget
-                and isinstance(node.comparators[0], ast.Constant)):
+                and isinstance(node.comparators[0], ast.Constant)
+                and type(node.comparators[0].value) is int):
             limits.append(node.comparators[0].value)
     if len(limits) != 1:
         raise ValueError(f"models.generate context guard not found ({limits})")

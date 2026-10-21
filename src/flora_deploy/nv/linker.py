@@ -37,6 +37,14 @@ Import-time provenance (``_FamilyFinder``, installed at the front of ``sys.meta_
   the code is compiled from exactly those bytes. This covers modules NVIDIA imports lazily much
   later (``plans``, ``verify_gdn``, ``production_gdn_fix``, ``tempseg_fp32_loader``, ...): a
   directory placed ahead of the vendor dirs on ``sys.path`` cannot capture them.
+- After linking, ``NvFamily.audit()`` (cheap; call it before each stage / after each episode
+  and record ``audit_report()``) re-checks every imported family module (verified file, our
+  loader, executed bytes = verified digest), puts the family finder back at the front of
+  ``sys.meta_path`` if something was inserted ahead of it, and re-hashes the manifest-listed
+  data files (``models.json``, ``TEMPSEG_PROMPTS.json``, ...).
+- ``load_family(verify_manifest=False)`` followed by a verifying call verifies the files and the
+  bytes of every module that already ran, then arms the finder's digests; only then is
+  ``verified`` True.
 - No bytecode is read from or written to the snapshot. The family's loader always compiles from
   the verified source and never writes ``__pycache__``. This is stronger than toggling
   ``sys.dont_write_bytecode`` around the import (which is process-global and racy, does not cover
@@ -260,12 +268,19 @@ class _VerifiedSourceLoader(importlib.machinery.SourceFileLoader):
     def __init__(self, fullname: str, path: str, sha256: str | None):
         super().__init__(fullname, path)
         self._sha256 = sha256
+        # The bytes that were compiled (and their sha256): what runs, for ``nv.budget`` and
+        # ``NvFamily.audit`` (never re-read from disk).
+        self.executed_source: bytes | None = None
+        self.executed_sha256: str | None = None
 
     def get_code(self, fullname):
         data = self.get_data(self.path)
-        if self._sha256 is not None and hashlib.sha256(data).hexdigest() != self._sha256:
+        digest = hashlib.sha256(data).hexdigest()
+        if self._sha256 is not None and digest != self._sha256:
             raise CodeProvenanceError(f"{self.path} changed after it was verified", name=fullname)
-        return self.source_to_code(data, self.path)
+        code = self.source_to_code(data, self.path)
+        self.executed_source, self.executed_sha256 = data, digest
+        return code
 
     def set_data(self, *args, **kwargs):  # bytecode cache writes
         return None
@@ -408,6 +423,33 @@ class NvFamily:
     verified: bool = False
     _finder: _FamilyFinder | None = field(default=None, repr=False)
     _cache: dict[str, ModuleType] = field(default_factory=dict, repr=False)
+    _audits: int = field(default=0, repr=False)
+    _finder_reasserted: int = field(default=0, repr=False)
+
+    def _verify_later(self, pinned_digests: Mapping[str, str] | None) -> None:
+        """Verify a family linked with ``verify_manifest=False``: the files now, *and* every
+        module that already ran (its executed bytes against the verified digest); then the
+        finder checks every later import. Only then is ``verified`` True."""
+        digests = verify_family_code(self.family, self.code_dir, pinned_digests)
+        absolute = {str(self.code_dir / rel): d for rel, d in digests.items()}
+        finder = self._finder
+        if finder is None:
+            raise CodeProvenanceError(f"{self.alias}: no family finder to verify")
+        for name, mod in list(sys.modules.items()):
+            if mod is None or not finder.owns(name):
+                continue
+            origin = getattr(mod, "__file__", None)
+            if origin is None:
+                continue
+            loader = getattr(getattr(mod, "__spec__", None), "loader", None)
+            want = absolute.get(str(Path(origin).resolve()))
+            got = getattr(loader, "executed_sha256", None)
+            if want is None or got != want:
+                raise CodeProvenanceError(
+                    f"{name} ran before verification and does not match the verified files; "
+                    "restart the process with verify_manifest=True", name=name)
+        finder.digests = absolute
+        self.verified = True
 
     @property
     def package_dir(self) -> Path:
@@ -449,25 +491,75 @@ class NvFamily:
         return dict(initializer=worker_init,
                     initargs=(self.family.value, str(self.code_dir), self.pinned))
 
-    def audit(self) -> list[str]:
-        """Check that every imported module of this family comes from a verified snapshot file.
+    def audit(self, *, data: bool = True) -> list[str]:
+        """Check that every imported module of this family comes from a verified snapshot file
+        and ran through our loader with exactly the verified bytes; keep our finder first on
+        ``sys.meta_path`` (so a finder inserted ahead of it later cannot capture NVIDIA's lazy
+        imports); and, with ``data``, re-hash the non-Python files the manifests list
+        (``models.json``, ``TEMPSEG_PROMPTS.json``, ...).
 
-        Returns the checked module names; raises ``CodeProvenanceError`` on the first foreign one.
-        Call it after NVIDIA code that imports lazily (stages may call it per episode).
+        Cheap (milliseconds): call it before each stage / after each episode and record
+        ``audit_report()`` in provenance. Returns the checked module names; raises
+        ``CodeProvenanceError`` / ``CodeManifestError`` on the first problem.
         """
         finder = self._finder
+        if finder is None:
+            return []
+        with _LOCK:
+            if not sys.meta_path or sys.meta_path[0] is not finder:
+                if finder in sys.meta_path:
+                    sys.meta_path.remove(finder)
+                sys.meta_path.insert(0, finder)
+                self._finder_reasserted += 1
         names = []
         for name, mod in list(sys.modules.items()):
-            if finder is None or not finder.owns(name) or mod is None:
+            if not finder.owns(name) or mod is None:
                 continue
             origin = getattr(mod, "__file__", None)
             if origin is None and name.partition(".")[0] in finder.toplevel_names() | finder.tops:
                 # a namespace package can only come from somewhere else
                 raise CodeProvenanceError(f"{name}: no __file__ (namespace package?)", name=name)
             if origin is not None:
-                finder.check_file(name, origin)
+                _, digest = finder.check_file(name, origin)
+                loader = getattr(getattr(mod, "__spec__", None), "loader", None)
+                if not isinstance(loader, _VerifiedSourceLoader):
+                    raise CodeProvenanceError(
+                        f"{name}: loaded by {type(loader).__name__}, not the family loader",
+                        name=name)
+                if digest is not None and loader.executed_sha256 != digest:
+                    raise CodeProvenanceError(f"{name}: executed bytes differ from the "
+                                              "verified file", name=name)
             names.append(name)
+        if data:
+            self._audit_data()
+        self._audits += 1
         return sorted(names)
+
+    def _audit_data(self) -> int:
+        finder = self._finder
+        if finder is None or finder.digests is None:
+            return 0
+        n = 0
+        for path, digest in finder.digests.items():
+            if path.endswith(".py"):
+                continue  # code is checked at import, and above against what executed
+            try:
+                got = _sha256(Path(path))
+            except OSError as e:
+                raise CodeManifestError(f"{path}: {e}") from e
+            if got != digest:
+                raise CodeManifestError(f"{path} changed after it was verified")
+            n += 1
+        return n
+
+    def audit_report(self) -> dict:
+        """``audit()`` plus what it covered, for run provenance."""
+        modules = self.audit()
+        finder = self._finder
+        data = 0 if finder is None or finder.digests is None else sum(
+            not p.endswith(".py") for p in finder.digests)
+        return dict(ok=True, verified=self.verified, modules=len(modules), data_files=data,
+                    finder_reasserted=self._finder_reasserted, audits=self._audits)
 
     @property
     def production(self) -> ModuleType:
@@ -581,8 +673,7 @@ def load_family(
         if _LOADED is not None:
             if _LOADED.family is family and _LOADED.code_dir == code_dir:
                 if verify_manifest and not _LOADED.verified:
-                    verify_family_code(family, code_dir, pinned_digests)
-                    _LOADED.verified = True
+                    _LOADED._verify_later(pinned_digests)
                 return _LOADED
             raise FamilyConflictError(
                 f"cannot load {family.value} from {code_dir}: this process already linked "

@@ -32,15 +32,61 @@ active.restore()                                  # NVIDIA's attributes back, LI
 - Every patch is opt-in and individually toggleable. Applying the same patch twice is refused.
   Restoring a set while a later set still owns one of its attributes is also refused, and a
   factory error rolls back everything.
-- `AccelState` (`cache_bytes`, default 4 GiB per cache; `workers`, default `min(8, cpus)`; `seek`)
-  holds three things:
-  - the byte-bounded LRUs;
-  - the open decoders;
-  - three thread pools: codec work, per-camera sources, and GOP decoders. They are separate, so
-    no task ever waits on a pool it occupies.
+- `AccelState` (`cache_bytes`, default 4 GiB per cache; `max_total_cache_bytes`, default
+  `3 * cache_bytes`; `max_open_decoders`, default 64; `workers`, default `min(8, cpus)`; `seek`)
+  holds:
+  - per-episode **scopes** (below), each with its own byte-bounded LRUs, open decoders, source
+    keys and lookahead counters;
+  - three thread pools, shared: codec work, per-camera sources, and GOP decoders. They are
+    separate, so no task ever waits on a pool it occupies.
 
   PIL and PyAV release the GIL in their codecs. Measured: 4 concurrent PyAV decodes cost the
   wall time of 1.
+
+### Episodes and concurrency (W3-A)
+
+`active.episode()` opens a scope bound to the **current context** (a `ContextVar`). W3-A runs
+several episodes of a batch at once on threads that share one `ActivePatches`:
+
+- Enter `active.episode()` **inside** the thread (or asyncio task) that runs the episode. Each
+  overlapping episode then has its own scope, and that scope is closed when *its* episode exits
+  (decoder files closed, caches dropped, keys forgotten), whatever the other episodes do. Before
+  this, one shared depth counter kept everything open until the last episode ended (review M2:
+  40 short episodes beside a long one held 40 decoders and their file descriptors).
+- Work the patches submit to the shared pools runs in a copy of the submitting context, so it
+  sees the same scope. NVIDIA's `asyncio.to_thread` predictor call copies the context too.
+- A nested `episode()` in the same context reuses the scope. Calls outside any episode use a
+  default scope that lives until `reset()` / `restore()`.
+- Memory is bounded **across** scopes: every cache of every scope draws on one byte budget,
+  `max_total_cache_bytes` (default: what one episode could hold before). Over budget, the largest
+  cache gives up its oldest entry. Eviction only forces a recompute.
+- Open decoders are bounded across scopes: above `max_open_decoders`, the least recently used
+  *idle* decoder closes its file; it reopens from a verified random-access point if needed.
+- `active.stats()` reports `active_episodes`, `open_decoders`, `cache_bytes_total` and their peaks.
+
+`tests/unit/test_accel_decoder.py::test_overlapping_episodes_are_scoped_and_bounded` and
+`tests/nvlink/test_accel_parity.py::test_overlapping_episode_threads_identical_and_bounded` (10
+overlapping episode threads, the same source in two threads at once, 1-view and 3-view, with a
+tight budget too) check that every scope is released at its own exit, that the bounds hold, and
+that every tensor of every `generate()` call equals serial, unpatched NVIDIA's.
+
+### Proving identity across runs: `accel.identity`
+
+Whole-result digests cannot show that NVIDIA's model got identical inputs: later TempSeg windows
+and all Captioner inputs depend on earlier model *outputs*, which vary run to run on the GPU
+(`docs/exact-concurrency.md`). `accel.identity` compares two runs call by call from NVIDIA's own
+log:
+
+- `model_calls(events)` reads one episode's `FLORA_RUNTIME generation_start`
+  (`input_tensor_digest`), `generation_end` and the GPU lock's `FLORA_OBSERVE generate_output`
+  (output sha256), as raw lines or parsed dicts; `call_records` gives plain dicts to persist.
+- `compare_calls(a, b)` pairs call *k* of both runs while every earlier output agreed. A paired
+  call whose input digest differs, or a different call count with all outputs agreeing, is a
+  **violation**. After the first output divergence (or an unlogged output), calls are counted
+  as unpaired. It returns `ok` (no violation) and `conclusive` (everything was paired).
+- `compare_runs({episode: events}, {episode: events})` does that per episode.
+
+Gate the `exact` identity on `ok`, and report `conclusive`.
 
 Every cache is either **content-addressed** or keyed by a source file. Content-addressed means
 the key is a digest of the exact input bytes. A source-file key is only used after the file was
@@ -244,17 +290,22 @@ blobs.
 
 `test_pipeline_end_to_end_identical` runs NVIDIA's `pipeline.segment` and then `caption_single`
 or `caption_three`, with all patches on versus none. It uses the real Flora processors and a
-canned `generate`, which records `input_ids`, `attention_mask`, `pixel_values_videos` and
-`video_grid_thw`.
+canned `generate`. That `generate` records every tensor NVIDIA's `generate` hashes
+(`mm_token_type_ids` included) with NVIDIA's `input_tensor_digest` formula. Its TempSeg answers
+are valid, non-empty predictions: fixed events clipped to each window, so segments, multi-window
+stitching and the caption plans that follow are exercised.
 
-Cases (6):
+Cases (9):
 
 - `human` on H.264;
 - `human` on VFR with an instruction;
+- `human` on a 30 s clip (several windows, stitched);
+- `human` on HEVC open GOP (CRA + RASL);
 - 1-view `yam` on AV1;
 - 3-view `yam` on H.264;
 - 3-view `dex` on AV1 with an instruction;
-- 3-view `yam` with odd sizes and BT.709/full-range tags.
+- 3-view `yam` with odd sizes and BT.709/full-range tags;
+- 3-view `yam` on HEVC open GOP.
 
 Results:
 

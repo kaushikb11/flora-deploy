@@ -75,8 +75,10 @@ def generate(model, proc, inputs, budget):
 
 def _fake_nv(pipeline_src, models_src=FAKE_MODELS):
     def module(name, src):
+        # what the nv linker's loader records: the exact bytes it verified and compiled
         mod = types.ModuleType(name)
-        mod.__source__ = src
+        loader = types.SimpleNamespace(executed_source=src.encode())
+        mod.__spec__ = types.SimpleNamespace(loader=loader)
         return mod
 
     return types.SimpleNamespace(pipeline=module("p", pipeline_src),
@@ -84,11 +86,12 @@ def _fake_nv(pipeline_src, models_src=FAKE_MODELS):
 
 
 @pytest.fixture
-def fake_source(monkeypatch):
-    monkeypatch.setattr(budget.inspect, "getsource", lambda mod: mod.__source__)
+def fake_source():
     budget._budgets.cache_clear()
+    budget._context_limit.cache_clear()
     yield
     budget._budgets.cache_clear()
+    budget._context_limit.cache_clear()
 
 
 def test_budgets_derived_from_call_sites(fake_source):
@@ -109,6 +112,39 @@ def test_budgets_derived_from_call_sites(fake_source):
 def test_budget_derivation_fails_loudly(fake_source, src, match):
     with pytest.raises(ValueError, match=match):
         budget.nvidia_budgets(_fake_nv(src))
+
+
+IMPORTS = "from .models import Session, generate, runtime_event\nfrom . import models\n"
+
+
+@pytest.mark.parametrize("extra", [
+    "def long_caption(*a):\n    return models.generate(m, p, i, 2048)\n",  # attribute call
+    "async def acaption(*a):\n    return generate(m, p, i, 4096)\n",  # async def site
+    "g = generate\ndef other(*a):\n    return g(m, p, i, 8192)\n",  # alias
+    "WARM = generate(m, p, i, 30000)\n",  # module-level call
+    "def f(*a):\n    return getattr(models, 'generate')(m, p, i, 1)\n",  # by name
+    "from .models import generate as gen\n",  # re-import under another name
+    "def f(generate):\n    return generate(m, p, i, 1)\n",  # shadowing parameter
+    "class Other:\n    async def run(self):\n        return generate(m, p, i, 1)\n",
+])
+def test_budget_derivation_fails_closed_on_new_shapes(fake_source, extra):
+    """Review L1 (p4): shapes like these used to return {512, 1024} silently."""
+    with pytest.raises(ValueError, match="unexpected"):
+        budget.nvidia_budgets(_fake_nv(IMPORTS + FAKE_PIPELINE + "\n" + extra))
+
+
+def test_async_known_site_is_fine(fake_source):
+    src = IMPORTS + FAKE_PIPELINE.replace("def caption_three(videos):",
+                                          "async def caption_three(videos):")
+    assert budget.nvidia_budgets(_fake_nv(src)) == {"tempseg": 1024, "captioner": 512}
+
+
+def test_refuses_modules_not_imported_by_the_linker():
+    nv = types.SimpleNamespace(pipeline=types.ModuleType("p"), models=types.ModuleType("m"))
+    with pytest.raises(ValueError, match="not imported by the nv linker"):
+        budget.nvidia_budgets(nv)
+    with pytest.raises(ValueError, match="not imported by the nv linker"):
+        budget.nvidia_context_limit(nv)
 
 
 def test_limit_derivation_fails_loudly(fake_source):

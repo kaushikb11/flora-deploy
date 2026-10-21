@@ -3,15 +3,18 @@
 NVIDIA's unmodified code is the oracle (PLAN.md D17). Each test runs the original NVIDIA
 function and the patched one on the same generated inputs and asserts bit-identical results:
 
-- ``frames_for`` (``decode_once``): H.264 (B-frames, odd widths, BT.709, full range), VFR and
-  AV1 sources, 1-view and 3-view (YAM and Dex mosaics), forward / overlapping / backward /
-  edge / duplicate / empty requests, eviction under a tiny cache, serial and threaded, with and
-  without random-access restarts, plus NVIDIA's errors;
+- ``frames_for`` (``decode_once``): H.264 (B-frames, odd widths, BT.709, full range), VFR,
+  AV1 and HEVC open-GOP (CRA + RASL) sources, 1-view and 3-view (YAM and Dex mosaics),
+  forward / overlapping / backward / edge / duplicate / empty requests, eviction under a tiny
+  cache, serial and threaded, with and without random-access restarts, plus NVIDIA's errors;
 - ``human_transport`` (``transport_pool``), ``caption_single``'s PNG receipts and
   ``load_frames`` (``png_inmem``), ``normalized`` / ``source_frames`` (``geometry_pool``);
 - end to end: ``pipeline.segment`` + ``caption_single`` / ``caption_three`` through the real
-  Flora processors with a canned ``generate``: prompts, ``input_ids``, ``attention_mask``,
-  ``pixel_values_videos``, ``video_grid_thw``, segments, captions and audits.
+  Flora processors with a canned ``generate`` whose TempSeg answers are valid, non-empty
+  predictions (so segments, multi-window stitching and caption plans run): every tensor
+  NVIDIA's ``generate`` hashes (``mm_token_type_ids`` included), segments, captions, audits;
+- W3-A: ``ALL_PATCHES`` sharing one state across overlapping episode threads, against serial
+  unpatched NVIDIA, with bounded caches / open decoders and per-episode release.
 
 Nothing NVIDIA ships is copied: the code is imported from the local pin cache at test time and
 the fixtures are generated with ``flora_deploy.media.synth``.
@@ -19,6 +22,7 @@ the fixtures are generated with ``flora_deploy.media.synth``.
 
 from __future__ import annotations
 
+import contextvars
 import copy
 import dataclasses
 import hashlib
@@ -41,7 +45,6 @@ from flora_deploy.nv.session import CachedSession
 pytestmark = pytest.mark.nvlink
 
 ROLES3 = ("main", "left_wrist", "right_wrist")
-TENSOR_KEYS = ("input_ids", "attention_mask", "video_grid_thw", "pixel_values_videos")
 CONFIGS = {
     "default": dict(),
     "serial-noseek": dict(workers=1, seek=False),
@@ -96,6 +99,8 @@ def _vfr(n: int, seed: int) -> Spec:
     )
 
 
+_X265_OPEN = "open-gop=1:bframes=4:keyint=24:min-keyint=24:scenecut=0:log-level=0"
+
 SOURCES = {
     # name: (specs per role, tags)
     "h264_bframes_1v": [Spec(300, size=(112, 64), gop=24, bframes=2, seed=1)],
@@ -109,6 +114,13 @@ SOURCES = {
         Spec(120, size=(80, 48), gop=16, seed=22, color_range=2),
     ],
     "av1_3v": [Spec(150, codec="libsvtav1", size=(64, 64), gop=25, seed=30 + k) for k in range(3)],
+    # HEVC open GOP: CRA random-access points with leading RASL pictures (review p1)
+    "hevc_open_gop_1v": [Spec(240, codec="libx265", size=(128, 64), gop=24, seed=40,
+                              codec_options={"x265-params": _X265_OPEN})],
+    "hevc_3v": [Spec(200, codec="libx265", size=(128, 64), gop=24, seed=41 + k,
+                     codec_options={"x265-params": _X265_OPEN}) for k in range(3)],
+    # long enough for several TempSeg windows (stitching, overlapping frame plans)
+    "h264_long_1v": [Spec(900, size=(64, 48), gop=30, bframes=2, seed=50)],
 }
 
 
@@ -494,13 +506,34 @@ def test_geometry_pool_identical(nv, monkeypatch, workers):
 
 
 class _Runner:
-    """Drives NVIDIA's pipeline with the real processors and a canned ``generate``."""
+    """Drives NVIDIA's pipeline with the real processors and a canned ``generate``.
+
+    The canned TempSeg answers are *valid, non-empty* predictions: fixed events in global ticks
+    (``EVENTS_S``), clipped to each window's valid range with NVIDIA's ``lo`` / ``ro`` rules, so
+    segments, multi-window stitching and caption plans downstream of them are exercised. Every
+    tensor NVIDIA's ``generate`` hashes (incl. ``mm_token_type_ids``) is logged, with NVIDIA's
+    own ``input_tensor_digest`` formula (``models.py:171-172``)."""
 
     def __init__(self, nv, procs, monkeypatch):
         self.nv, self.procs, self.monkeypatch = nv, procs, monkeypatch
 
-    def _session(self, log):
-        procs = self.procs
+    def _install(self):
+        # (re)applied per call: tests call ``monkeypatch.undo()`` between runs
+        pipeline = self.nv.pipeline
+        if not getattr(pipeline.temporal_inputs, "_parity", False):
+            original = pipeline.temporal_inputs
+
+            def temporal_inputs(frames, window, *args, **kwargs):
+                _WINDOW.set(window)  # predict() calls generate right after, in this context
+                return original(frames, window, *args, **kwargs)
+
+            temporal_inputs._parity = True
+            self.monkeypatch.setattr(pipeline, "temporal_inputs", temporal_inputs)
+        if pipeline.generate is not _canned_generate:
+            self.monkeypatch.setattr(pipeline, "generate", _canned_generate)
+
+    def _session(self, procs=None):
+        procs = procs or self.procs
 
         class Fake:
             audit: dict = {}
@@ -511,34 +544,79 @@ class _Runner:
             def close(self):
                 pass
 
-        def generate(model, proc, inputs, budget):
-            log.append({k: inputs[k].clone() for k in TENSOR_KEYS if k in inputs})
-            return '{"segments":[]}' if budget == 1024 else f"caption {len(log)}"
-
-        self.monkeypatch.setattr(self.nv.pipeline, "generate", generate)
         return CachedSession(Fake)
 
-    def _tensors(self, log):
-        return [{k: (v.dtype, tuple(v.shape), v.numpy().tobytes()) for k, v in d.items()}
-                for d in log]
+    def _run(self, fn, procs=None):
+        self._install()
+        log: list = []
+        token = _LOG.set(log)
+        try:
+            out = fn(self._session(procs))
+        finally:
+            _LOG.reset(token)
+        return out, [{k: v for k, v in d.items() if k != "digest"} for d in log]
 
-    def segment(self, videos, pool, instruction=""):
-        log = []
-        out = self.nv.pipeline.segment(videos, pool, self._session(log), instruction,
-                                       lambda *a, **k: None)
-        return out, self._tensors(log)
+    def segment(self, videos, pool, instruction="", procs=None):
+        return self._run(lambda s: self.nv.pipeline.segment(
+            videos, pool, s, instruction, lambda *a, **k: None), procs)
 
-    def caption_single(self, videos, segments, profile, instruction=""):
-        log = []
-        out = self.nv.pipeline.caption_single(videos, segments, profile, self._session(log),
-                                              instruction, lambda *a, **k: None)
-        return out, self._tensors(log)
+    def caption_single(self, videos, segments, profile, instruction="", procs=None):
+        return self._run(lambda s: self.nv.pipeline.caption_single(
+            videos, segments, profile, s, instruction, lambda *a, **k: None), procs)
 
-    def caption_three(self, videos, segments, profile, instruction=""):
-        log = []
-        out = self.nv.pipeline.caption_three(videos, segments, self._session(log), instruction,
-                                             lambda *a, **k: None, profile=profile)
-        return out, self._tensors(log)
+    def caption_three(self, videos, segments, profile, instruction="", procs=None):
+        return self._run(lambda s: self.nv.pipeline.caption_three(
+            videos, segments, s, instruction, lambda *a, **k: None, profile=profile), procs)
+
+
+_LOG: contextvars.ContextVar[list] = contextvars.ContextVar("parity_log")
+_WINDOW: contextvars.ContextVar = contextvars.ContextVar("parity_window", default=None)
+TICKS_PER_S = 20  # FineWindow ticks (probed: a 10 s window spans 200 ticks)
+EVENTS_S = ((0.5, 2.5), (3.0, 5.5), (6.5, 9.0))  # repeated every 10 s
+
+
+def nvidia_input_digest(inputs) -> tuple[dict, str]:
+    """NVIDIA's ``input_tensors`` / ``input_tensor_digest`` (``models.py:166-172``)."""
+    import torch
+
+    inputs = dict(inputs)
+    inputs.pop("video_metadata", None)
+    tensors = {k: v for k, v in inputs.items() if torch.is_tensor(v)}
+    meta = {k: {"dtype": str(v.dtype), "shape": list(v.shape), "sha256": hashlib.sha256(
+        v.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()}
+        for k, v in tensors.items()}
+    digest = hashlib.sha256(
+        json.dumps(meta, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return tensors, digest
+
+
+def tempseg_answer(window) -> str:
+    """A valid prediction for ``window``: the fixed global events, clipped to it."""
+    off, lo_t, hi_t = window.global_tick_offset, window.valid_start_tick, window.valid_end_tick
+    rows = []
+    for base in range(0, 10_000, 10):
+        g0 = (base + EVENTS_S[0][0]) * TICKS_PER_S
+        if g0 - off > hi_t:
+            break
+        for a, b in EVENTS_S:
+            s, e = round((base + a) * TICKS_PER_S) - off, round((base + b) * TICKS_PER_S) - off
+            cs, ce = max(s, lo_t), min(e, hi_t)
+            if cs >= ce or not (cs < window.core_end_tick and ce > window.core_start_tick):
+                continue
+            rows.append({"s": cs, "e": ce, "lo": s < lo_t, "ro": e > hi_t})
+    rows.sort(key=lambda r: (r["s"], r["e"], r["lo"], r["ro"]))
+    return json.dumps({"segments": rows})
+
+
+def _canned_generate(model, proc, inputs, budget):
+    log = _LOG.get()
+    tensors, digest = nvidia_input_digest(inputs)
+    log.append({**{k: (v.dtype, tuple(v.shape), v.numpy().tobytes())
+                   for k, v in tensors.items()}, "digest": digest})
+    if budget == 1024:
+        window = _WINDOW.get()
+        return tempseg_answer(window) if window is not None else '{"segments":[]}'
+    return f"caption {len(log)}"
 
 
 def _segments(videos):
@@ -554,11 +632,24 @@ E2E = {
     # id: (source, segment pool, caption kind, caption profile, instruction)
     "human-h264": ("h264_bframes_1v", "human", "single", "Human", ""),
     "human-vfr-instr": ("h264_vfr_1v", "human", "single", "Human", "Fold the towel."),
+    "human-long-multiwindow": ("h264_long_1v", "human", "single", "Human", ""),
+    "human-hevc-open-gop": ("hevc_open_gop_1v", "human", "single", "Human", ""),
     "robot-1v-av1": ("av1_1v", "yam", "single", "YAM", ""),
     "yam-3v-h264": ("h264_3v", "yam", "three", "YAM", ""),
     "dex-3v-av1": ("av1_3v", "dex", "three", "Dex", "Fold the towel."),
     "yam-3v-odd-bt709": ("h264_odd_bt709_3v", "yam", "three", "YAM", ""),
+    "yam-3v-hevc": ("hevc_3v", "yam", "three", "YAM", ""),
 }
+
+
+def _e2e(run, videos, pool, kind, profile, instruction, procs=None):
+    seg = run.segment(videos, pool, instruction, procs=procs)
+    segs = _segments(videos)
+    if kind == "single":
+        cap = run.caption_single(videos, segs, profile, instruction, procs=procs)
+    else:
+        cap = run.caption_three(videos, segs, profile, instruction, procs=procs)
+    return seg, cap
 
 
 @pytest.mark.parametrize("case", sorted(E2E))
@@ -566,28 +657,22 @@ def test_pipeline_end_to_end_identical(nv, procs, sources, monkeypatch, case):
     source, pool, kind, profile, instruction = E2E[case]
     videos = sources[source]
     run = _Runner(nv, procs, monkeypatch)
-    segs = _segments(videos)
-
-    def go():
-        seg = run.segment(videos, pool, instruction)
-        if kind == "single":
-            cap = run.caption_single(videos, segs, profile, instruction)
-        else:
-            cap = run.caption_three(videos, segs, profile, instruction)
-        return seg, cap
-
-    ref = go()
+    ref = _e2e(run, videos, pool, kind, profile, instruction)
     with apply_patches(nv, ALL_PATCHES) as active:
         with active.episode():
-            got = go()
+            got = _e2e(run, videos, pool, kind, profile, instruction)
             stats = active.stats()
     (ref_seg, ref_seg_t), (ref_cap, ref_cap_t) = ref
     (got_seg, got_seg_t), (got_cap, got_cap_t) = got
     assert ref_seg == got_seg  # segments + per-window audit (frame plans, prompt hashes)
     assert ref_cap == got_cap  # captions + audit (blocks, geometry, prompt hashes)
     assert len(ref_seg_t) >= 1 and len(ref_cap_t) >= 1
-    assert ref_seg_t == got_seg_t  # processor tensors, bit for bit
+    assert ref_seg_t == got_seg_t  # every processor tensor, bit for bit
     assert ref_cap_t == got_cap_t
+    assert any("mm_token_type_ids" in t for t in ref_seg_t + ref_cap_t)
+    assert ref_seg[0], "the canned TempSeg answers must produce segments"
+    if case == "human-long-multiwindow":
+        assert len(ref_seg[1]) >= 2  # several windows, stitched
     assert stats["frames_for_calls"] >= 2
     assert stats.get("lookahead_requests", 0) >= 1  # windows / caption plans were announced
     assert stats.get("lookahead_errors", 0) == 0
@@ -599,9 +684,58 @@ def test_pipeline_end_to_end_identical_tiny_cache(nv, procs, sources, monkeypatc
     source, pool, kind, profile, instruction = E2E[case]
     videos = sources[source]
     run = _Runner(nv, procs, monkeypatch)
-    segs = _segments(videos)
-    cap = run.caption_single if kind == "single" else run.caption_three
-    ref = (run.segment(videos, pool, instruction), cap(videos, segs, profile, instruction))
+    ref = _e2e(run, videos, pool, kind, profile, instruction)
     with apply_patches(nv, ALL_PATCHES, cache_bytes=100_000, workers=2):
-        got = (run.segment(videos, pool, instruction), cap(videos, segs, profile, instruction))
+        got = _e2e(run, videos, pool, kind, profile, instruction)
     assert ref == got
+
+
+@pytest.mark.parametrize("config", [dict(), dict(workers=4, cache_bytes=150_000,
+                                                 max_total_cache_bytes=200_000,
+                                                 max_open_decoders=2)])
+def test_overlapping_episode_threads_identical_and_bounded(nv, procs, sources, monkeypatch,
+                                                           config):
+    """W3-A: ALL_PATCHES with one shared state, episodes overlapping on threads (the same source
+    in two threads at once, 1-view and 3-view). Every generate() input digest equals unpatched
+    serial NVIDIA's; every episode's scope is released at its own exit; memory and open
+    decoders stay bounded across episodes (review M2, p2 / p5)."""
+    import copy
+    from concurrent.futures import ThreadPoolExecutor
+
+    jobs = [("A", "h264_bframes_1v", "human", "single", "Human"),
+            ("B", "h264_bframes_1v", "human", "single", "Human"),
+            ("C", "h264_long_1v", "human", "single", "Human"),
+            ("D", "h264_3v", "yam", "three", "YAM"),
+            ("E", "hevc_3v", "dex", "three", "Dex")]
+    run = _Runner(nv, procs, monkeypatch)
+
+    def job(spec, procs_for_job=None):
+        _, source, pool, kind, profile = spec
+        out = _e2e(run, sources[source], pool, kind, profile, "", procs=procs_for_job)
+        (seg, seg_t), (cap, cap_t) = out
+        return seg, cap, seg_t + cap_t
+
+    ref = {spec[0]: job(spec) for spec in jobs}
+    with apply_patches(nv, ALL_PATCHES, **config) as active:
+        def episode(spec):
+            clones = {k: copy.deepcopy(p) for k, p in procs.items()}  # W3-A's per-episode clones
+            with active.episode():
+                out = job(spec, clones)
+                scope = active.state.scope()
+            return spec[0], out, scope
+
+        with ThreadPoolExecutor(len(jobs)) as pool:
+            results = list(pool.map(episode, jobs * 2))  # each job twice, all concurrent
+        stats = active.stats()
+    for key, out, scope in results:
+        assert out[0] == ref[key][0] and out[1] == ref[key][1], key
+        assert out[2] == ref[key][2], key  # every tensor of every generate() call
+        assert scope.closed and not scope.decoders and scope.nbytes() == 0
+    assert stats["episodes"] == 2 * len(jobs) and stats["active_episodes"] == 0
+    assert stats["open_decoders"] == 0 and stats["cache_bytes_total"] == 0
+    assert stats["cache_bytes_total_peak"] <= stats["cache_bytes_total_limit"]
+    assert stats["peak_active_episodes"] >= 2  # they did overlap
+    if "max_open_decoders" in config:
+        # idle decoders beyond the cap are closed; only busy ones (one per running request,
+        # three cameras per 3-view request) can exceed it
+        assert stats["peak_open_decoders"] <= config["max_open_decoders"] + 3 * 2 * len(jobs)

@@ -109,3 +109,73 @@ def test_captured_budget_and_guard_parity(nv, procs, monkeypatch, path, profile,
             ours = False
         assert ours == nvidia_raises(nv, procs[kind], out, budget), budget
     assert nvidia_raises(nv, procs[kind], out, CONTEXT_LIMIT - n + 1)
+
+
+def test_runtime_limit_is_the_parsed_one(nv):  # noqa: F811
+    check_context_budget(CONTEXT_LIMIT - 512, 512, nv=nv)  # limit parsed from verified bytes
+    with pytest.raises(nv.models.InputErrorForModel):
+        check_context_budget(CONTEXT_LIMIT - 511, 512, nv=nv)
+
+
+ISOLATED = r"""
+import importlib, importlib.abc, importlib.util, shutil, sys, tempfile
+from pathlib import Path
+from flora_deploy.config.pins import PINS_BY_KEY
+from flora_deploy.nv import Family, budget, linker
+
+src = Path(sys.argv[1])
+code = Path(tempfile.mkdtemp()) / src.name
+shutil.copytree(src / "batch_utils", code / "batch_utils",
+                ignore=shutil.ignore_patterns("__pycache__"))
+nv = linker.load_family(Family.SEGCAP, code,
+                        pinned_digests=dict(PINS_BY_KEY["tempseg_code"].code_digests))
+assert budget.nvidia_budgets(nv) == {"tempseg": 1024, "captioner": 512}
+
+# 1. budgets come from the verified bytes that run, not from the file on disk
+p = code / "batch_utils" / "pipeline.py"
+p.write_text(p.read_text().replace("generate(model, proc, inputs, 512)",
+                                   "generate(model, proc, inputs, 9999)"))
+budget._budgets.cache_clear()
+assert budget.nvidia_budgets(nv) == {"tempseg": 1024, "captioner": 512}
+print("BUDGETS_FROM_EXECUTED_BYTES")
+
+# 2. a finder inserted ahead of ours after linking: audit() puts ours back in front, so
+#    NVIDIA's lazy `from plans import ...` resolves to the verified vendor file again
+evil = Path(tempfile.mkdtemp()) / "plans.py"
+evil.write_text("def plans_for_episode(ep, clocks):\n    return ['EVIL']\n")
+
+class Foreign(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path=None, target=None):
+        if name == "plans":
+            return importlib.util.spec_from_file_location("plans", evil)
+
+sys.meta_path.insert(0, Foreign())
+sys.modules.pop("plans", None)
+nv.audit()
+mod = importlib.import_module("plans")
+assert Path(mod.__file__).resolve().is_relative_to(code.resolve()), mod.__file__
+assert "plans" in nv.audit() and nv.audit_report()["finder_reasserted"] == 1
+print("FINDER_REASSERTED")
+
+# 3. a data file changed after linking is reported by audit()
+m = code / "batch_utils" / "models.json"
+m.write_text(m.read_text() + " ")
+try:
+    nv.audit()
+except linker.CodeManifestError as e:
+    print("DATA_CHANGE_CAUGHT", "models.json" in str(e))
+"""
+
+
+def test_linker_gaps_closed_on_a_scratch_copy(nv_dirs):  # noqa: F811
+    """Review L1/L2 (p7), in a fresh interpreter on a scratch copy of NVIDIA's tree."""
+    import subprocess
+    import sys
+
+    out = subprocess.run([sys.executable, "-c", ISOLATED, str(nv_dirs["tempseg_code"])],
+                         capture_output=True, text=True, timeout=300)
+    assert out.returncode == 0, out.stderr[-3000:]
+    lines = out.stdout.split("\n")
+    assert "BUDGETS_FROM_EXECUTED_BYTES" in lines
+    assert "FINDER_REASSERTED" in lines
+    assert "DATA_CHANGE_CAUGHT True" in lines

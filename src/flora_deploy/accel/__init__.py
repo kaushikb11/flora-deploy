@@ -5,7 +5,7 @@ this process, each proven output-identical to NVIDIA's original by a parity test
 
     from flora_deploy.accel import apply_patches
     active = apply_patches(nv, ["decode_once", "transport_pool", "png_inmem"])
-    with active.episode():           # bounds caches / open decoders to one episode
+    with active.episode():           # per-thread episode scope: caches / open decoders
         segments, audit = nv.pipeline.segment(videos, pool, session, instruction, progress)
         ...
     record["accel"] = active.provenance()
@@ -13,8 +13,10 @@ this process, each proven output-identical to NVIDIA's original by a parity test
 
 NVIDIA's files are never modified; its SHA manifests keep verifying.
 
-``accel.captioner_load`` (OPT-2) is separate: ``captioner_load.install(nv)`` before loading the
-Captioner swaps in the bit-identical BF16 checkpoint (``docs/captioner-bf16.md``).
+``accel.captioner_load`` (OPT-2) is separate: ``captioner_load.install(nv, background=True)``
+before loading TempSeg swaps in the bit-identical BF16 checkpoint and hashes it in parallel with
+that load (``docs/captioner-bf16.md``). ``accel.identity`` compares two runs call by call from
+NVIDIA's ``input_tensor_digest`` log lines.
 """
 
 from __future__ import annotations
