@@ -98,6 +98,7 @@ def plan(
         WorkloadSummary,
         apply_option,
         default_presets,
+        episodes_label,
         plan_options,
         rates_label,
         recommended,
@@ -161,13 +162,15 @@ def plan(
                       f"video-hours, {workload.episodes:,} episodes; budget "
                       f"{_money(req.budget_usd or 0)}{dl}, max {req.max_gpus} GPUs")
         t = Table(show_lines=False)
-        for col in ("#", "option", "GPUs (containers x inputs)", "cost (range)", "wall-clock",
+        # "x4 ep": episodes in flight inside one input (segcap); "x4": Modal inputs
+        for col in ("#", "option", "GPUs (containers x inputs | ep)", "cost (range)",
+                    "wall-clock",
                     "peak GPUs", "fidelity", "rates", "status"):
             t.add_column(col)
         for i, o in enumerate(options, 1):
             gpus = ", ".join(
                 f"{k.kind} {k.containers}x{k.gpu}" + (f":{k.gpu_count}" if k.gpu_count > 1
-                                                       else "") + f" x{k.max_inputs}"
+                                                       else "") + episodes_label(k)
                 for k in o.kinds)
             mark = " *" if o is best else ""
             colour = {"ok": "green", "at risk": "yellow", "infeasible": "red"}[o.status]
