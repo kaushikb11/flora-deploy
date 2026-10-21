@@ -785,7 +785,8 @@ class Orchestrator:
         if st.state == "pending":
             return
         if st.state == "success":
-            if self._receipt_exists(s):
+            got = st.receipt  # C2 canary: the call's own receipt (written LAST) beats a stale view
+            if self._receipt_exists(s) or (got is not None and got.shard_id == s.shard_id):
                 self._finish(s, led, "success")
                 return
             # e.g. a superseded worker returned None: the shard is not done
