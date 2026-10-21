@@ -7,11 +7,15 @@ is faked: ``vllm`` is a stub module and ``load_llm`` returns a fake ``LLM`` (via
 ``stages.reward.engine_spec``). The fake answers depend only on request content, so the two
 runs get the same answers whatever the batching. We then check that
 
-1. the batched run makes one ``generate`` call carrying every request NVIDIA made over its
-   several calls, with identical prompts, frames, metadata, per-request kwargs and
-   ``SamplingParams``;
-2. the batched records' ``nv`` field equals the lines NVIDIA wrote, and the unrounded terminal
-   probabilities are equal.
+1. the unbounded batched run makes one ``generate`` call carrying every request NVIDIA made over
+   its several calls (9 episodes, so NVIDIA's terminal script makes two ``max_num_seqs`` calls),
+   with identical prompts, frames, metadata, per-request kwargs and ``SamplingParams``;
+2. the batched audits' ``nv`` lines equal the lines NVIDIA wrote, and the unrounded terminal
+   probabilities are equal;
+3. default rounds (``align="nvidia"``) make exactly NVIDIA's ``generate`` calls, request for
+   request, and a run in small packed rounds (2 requests per ``generate``) with decoding on a
+   spawn process pool (``nv.pool_initializer()``) gives exactly the same records, audits and
+   requests (the fake LLM is content-keyed, so only numerics could tell groupings apart).
 
 Everything runs in a fresh interpreter: the REWARDER family must not share a process with
 SEGCAP, which other nvlink tests load into the pytest process.
@@ -67,6 +71,10 @@ def jobs(tmp_path_factory) -> Path:
             videos.append(rel)
         task = f"  Put the {name} cup\n on the tray. "
         lines.append({"id": name, "task": task, "videos": videos})
+    # Six more episodes on the same videos with other tasks: 9 > NVIDIA's max_num_seqs of 8.
+    for copy in range(6):
+        base = dict(lines[copy % len(EPISODES)])
+        lines.append({**base, "id": f"{base['id']}_{copy}", "task": f"Task {copy}: stack it."})
     path = root / "jobs.jsonl"
     path.write_text("".join(json.dumps(line) + "\n" for line in lines))
     return path
@@ -94,13 +102,20 @@ def rewarder_dir(nv_code) -> Path:
 @pytest.mark.parametrize("mode", ["terminal", "terminal_rationale", "dense"])
 def test_batched_requests_and_records_match_nvidia_scripts(rewarder_dir, jobs, mode):
     result = run_worker(rewarder_dir, jobs, mode)
-    expected_requests = {"terminal": 3, "terminal_rationale": 3}.get(mode)
+    n_jobs = len(EPISODES) + 6
     assert result["batched_generate_calls"] == 1
-    if expected_requests:
-        assert result["num_requests"] == expected_requests
+    if mode != "dense":
+        assert result["num_requests"] == n_jobs
+        assert result["reference_generate_calls"] == 2  # NVIDIA: 8 + 1 episodes
     else:  # dense: every clip of every episode, while NVIDIA calls once per episode
-        assert result["num_requests"] > len(EPISODES)
-        assert result["reference_generate_calls"] == len(EPISODES)
+        assert result["num_requests"] > n_jobs
+        assert result["reference_generate_calls"] == n_jobs
+    assert result["errors"] == []
+    assert result["rounds"]["identical"] is True, result["rounds"]
+    assert result["rounds_generate_calls"] == -(-result["num_requests"] // 2)
+    assert result["rounds_requests_equal"] is True
+    assert result["aligned_calls_equal"] is True, result["call_sizes"]
+    assert result["aligned"]["identical"] is True
     assert result["request_mismatches"] == []
     assert result["params_equal"] is True
     assert result["load_llm_ok"] is True
@@ -110,7 +125,7 @@ def test_batched_requests_and_records_match_nvidia_scripts(rewarder_dir, jobs, m
         assert all(e["text_equal"] and e["score_equal"] for e in result["parity"]["episodes"])
     else:
         assert all(e["frame_scores_equal"] for e in result["parity"]["episodes"])
-        assert result["per_step_lengths"] == result["num_frames"]
+        assert result["per_step_lengths"] == result["half_seconds"]
 
 
 # ---------------------------------------------------------------------------
@@ -254,17 +269,33 @@ def _worker(code_dir: str, jobs: str, mode: str) -> dict:
 
     bat_llm = FakeLLM(processor.tokenizer, mode)
     episodes = reward.read_jobs(nv, jobs)
-    result = reward.run(bat_llm, nv, processor, episodes, mode)
+    result = reward.run(bat_llm, nv, processor, episodes, mode, spec=spec, limits=reward.UNBOUNDED,
+                        decoder="inline")
+    (bat_requests, bat_params), = bat_llm.calls
+
+    round_llm = FakeLLM(processor.tokenizer, mode)
+    rounds = reward.run(round_llm, nv, processor, episodes, mode, spec=spec,
+                        limits=reward.RoundLimits(max_requests=2, align="packed"),
+                        decoder="process", workers=2)
+    round_requests = [r for reqs, _ in round_llm.calls for r in reqs]
+    rounds_requests_equal = len(round_requests) == len(bat_requests) and not any(
+        _same_request(a, b) for a, b in zip(bat_requests, round_requests, strict=True))
+
+    # Default rounds (align="nvidia"): exactly NVIDIA's generate calls, request for request.
+    aligned_llm = FakeLLM(processor.tokenizer, mode)
+    aligned = reward.run(aligned_llm, nv, processor, episodes, mode, spec=spec)
+    aligned_calls_equal = len(aligned_llm.calls) == len(ref_llm.calls) and all(
+        len(a) == len(b) and not any(_same_request(x, y) for x, y in zip(a, b, strict=True))
+        for (a, _), (b, _) in zip(ref_llm.calls, aligned_llm.calls, strict=True))
 
     ref_requests = [r for reqs, _ in ref_llm.calls for r in reqs]
-    (bat_requests, bat_params), = bat_llm.calls
     mismatches = []
     if len(ref_requests) != len(bat_requests):
         mismatches.append(f"count {len(ref_requests)} != {len(bat_requests)}")
     for i, (a, b) in enumerate(zip(ref_requests, bat_requests, strict=False)):
         mismatches += [f"{i}:{p}" for p in _same_request(a, b)]
     params_equal = all(params == bat_params for _, params in ref_llm.calls)
-    parity = reward.compare(mode, reference, result.records,
+    parity = reward.compare(mode, reference, result.as_json(),
                             probabilities if mode != "dense" else None)
     out = {
         "batched_generate_calls": len(bat_llm.calls),
@@ -274,10 +305,20 @@ def _worker(code_dir: str, jobs: str, mode: str) -> dict:
         "params_equal": params_equal,
         "load_llm_ok": load_llm_ok,
         "parity": parity,
+        "errors": [e.message for e in result.errors],
+        "rounds": reward.same_outputs(result.as_json(), rounds.as_json()),
+        "rounds_generate_calls": len(round_llm.calls),
+        "rounds_requests_equal": rounds_requests_equal,
+        "aligned_calls_equal": aligned_calls_equal,
+        "call_sizes": [[len(a) for a, _ in ref_llm.calls], [len(b) for b, _ in aligned_llm.calls]],
+        "aligned": reward.same_outputs(result.as_json(), aligned.as_json()),
     }
     if mode == "dense":
-        out["per_step_lengths"] = [len(r["dense"]["per_step"]) for r in result.records]
-        out["num_frames"] = [r["dense"]["num_frames"] for r in result.records]
+        import math
+
+        out["per_step_lengths"] = [len(r.dense.per_step) for r in result.records]
+        out["half_seconds"] = [math.ceil(2 * a["nv"]["num_frames"] / a["nv"]["fps"] - 1e-9)
+                               for a in result.audits]
     return out
 
 

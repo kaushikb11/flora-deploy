@@ -68,7 +68,8 @@ def test_wrapped_prompt_is_hf_equivalent(nv, procs, case_id):
     merge = proc.video_processor.merge_size
     for b in built:
         wrapped = vllm_prompt(b.request)["prompt"]
-        assert wrapped != b.request.prompt
+        if wrapped == b.request.prompt:  # no `assert a != b`: pytest would print NVIDIA's prompt
+            pytest.fail("the wrap was a no-op")
         out = replay(proc, dataclasses.replace(b.request, prompt=wrapped))
         for key in D.HF_KEYS:
             assert torch.equal(out[key], b.hf[key]), key
@@ -82,3 +83,44 @@ def test_wrapped_prompt_is_hf_equivalent(nv, procs, case_id):
         with pytest.raises(RuntimeError, match="Found 0 video placeholders"):
             G.simulate_vllm_expansion(encode(b.request.prompt), grids, stamps, encode, sp,
                                       merge)
+
+
+def _verdict(proc, b, out):
+    """The Gate C verdict for ``out`` (a processor output standing in for vLLM's) vs ``b.hf``."""
+    tok = proc.tokenizer
+    sp = G.SpecialIds(*(tok.convert_tokens_to_ids(t) for t in
+                        ("<|vision_start|>", "<|vision_end|>", "<|video_pad|>")))
+    grids = b.hf["video_grid_thw"].tolist()
+    digests = G.video_pixel_digests(b.hf["pixel_values_videos"], grids)
+    vgrids = out["video_grid_thw"].tolist()
+    rows = [t * h * w for t, h, w in vgrids]
+    parts = list(torch.split(out["pixel_values_videos"], rows))
+    return G.compare(case_id="x", index=0, source="s", variant="wrapped",
+                     hf_ids=b.hf["input_ids"][0].tolist(), hf_grids=grids,
+                     vllm_ids=out["input_ids"][0].tolist(), vllm_grids=vgrids, sp=sp,
+                     merge_size=proc.video_processor.merge_size,
+                     pixels_equal=G.pixels_equal_per_video(digests, [p.bfloat16() for p in parts]))
+
+
+@pytest.mark.parametrize("case_id", ["caption-three-yam", "temporal-yam-3view"])
+def test_pixel_only_changes_fail_the_verdict(nv, procs, case_id):
+    """Wrong frame order or a different resample filter keep ids and grids but change pixels:
+    the verdict must be FAIL (M1)."""
+    (b,) = D.build_requests(nv, procs, case_id, D.synthetic_source(duration_s=40.0),
+                            max_requests=1)
+    proc = procs[D.processor_kind(case_id)]
+    same = _verdict(proc, b, replay(proc, b.request))
+    assert same.passed and same.pixels_equal == [True] * len(b.request.videos)
+    reversed_ = dataclasses.replace(b.request, videos=[(f[::-1].copy(), md)
+                                                       for f, md in b.request.videos])
+    nearest = replay(proc, b.request, resample=0)
+    for out in (replay(proc, reversed_), nearest):
+        v = _verdict(proc, b, out)
+        assert v.ids_equal and v.grids_equal and v.runs_match_grid
+        assert not all(v.pixels_equal) and not v.passed
+    if len(b.request.videos) > 1:  # videos swapped across items (same shapes in this case)
+        swapped = dataclasses.replace(b.request, videos=[b.request.videos[-1],
+                                                         *b.request.videos[1:-1],
+                                                         b.request.videos[0]])
+        v = _verdict(proc, b, replay(proc, swapped))
+        assert not v.passed

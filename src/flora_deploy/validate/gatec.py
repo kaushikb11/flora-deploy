@@ -1,8 +1,13 @@
-"""Gate C comparison and report logic (PLAN.md §9): vLLM 0.24.0 model inputs vs NVIDIA's HF call.
+"""Gate C comparison and report logic (PLAN.md §9): vLLM 0.24.0 vs NVIDIA's HF processor call.
 
-Pure functions over token-id lists and grids, so they are unit-testable without vLLM, torch or
-NVIDIA code. Results carry counts, positions and token ids of *special* tokens only, never prompt
-text (NVIDIA's prompts must not end up in the repository).
+Compared per request: prompt token ids, per-video ``video_grid_thw`` and per-video
+``pixel_values_videos`` (as sha256 digests in fp32 and bf16). M-RoPE position ids are not
+compared here: both engines derive them from exactly these ids and grids, and their
+implementations are left to Gate D (logits parity).
+
+Pure functions over token-id lists, grids and digests, so they are unit-testable without vLLM or
+NVIDIA code (only the digest helpers need torch). Results carry counts, positions and token ids
+of *special* tokens only, never prompt text (NVIDIA's prompts must not end up in the repository).
 
 Token layout of one video in both HF and vLLM (Qwen3-VL), for each temporal group ``t``::
 
@@ -11,8 +16,11 @@ Token layout of one video in both HF and vLLM (Qwen3-VL), for each temporal grou
 
 from __future__ import annotations
 
+import hashlib
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -153,6 +161,48 @@ def simulate_vllm_expansion(prompt_ids: Sequence[int], grids: Sequence[Sequence[
     return out
 
 
+PIXEL_DTYPES = ("float32", "bfloat16")
+
+
+def tensor_digest(t: Any, dtype: str) -> str:
+    """sha256 of a torch tensor's values cast to ``dtype`` (shape included), on CPU."""
+    import torch
+
+    x = t.detach().to("cpu", getattr(torch, dtype)).contiguous()
+    raw = x.view(torch.int16) if dtype == "bfloat16" else x
+    h = hashlib.sha256(repr(tuple(x.shape)).encode())
+    h.update(raw.numpy().tobytes())
+    return h.hexdigest()
+
+
+def video_pixel_digests(pixel_values: Any, grids: Sequence[Sequence[int]]) -> list[dict]:
+    """Per-video digests of HF's concatenated ``pixel_values_videos`` (``T*H*W`` rows each)."""
+    out, start = [], 0
+    for t, h, w in grids:
+        n = int(t) * int(h) * int(w)
+        part = pixel_values[start:start + n]
+        out.append({"rows": int(part.shape[0]), **{d: tensor_digest(part, d)
+                                                   for d in PIXEL_DTYPES}})
+        start += n
+    if start != pixel_values.shape[0]:
+        raise ValueError(f"grids cover {start} pixel rows, tensor has {pixel_values.shape[0]}")
+    return out
+
+
+def pixels_equal_per_video(hf_digests: Sequence[dict], vllm_parts: Sequence[Any]) -> list[bool]:
+    """Per video: does vLLM's ``pixel_values_videos`` item equal HF's? Compared in vLLM's own
+    dtype (bf16: HF cast to bf16; fp32: exact). Any other dtype or a count mismatch is unequal."""
+    if len(hf_digests) != len(vllm_parts):
+        return [False] * max(len(hf_digests), len(vllm_parts))
+    out = []
+    for ref, part in zip(hf_digests, vllm_parts, strict=True):
+        dt = str(part.dtype).removeprefix("torch.")
+        rows = part.reshape(-1, part.shape[-1])
+        out.append(dt in PIXEL_DTYPES and int(rows.shape[0]) == ref["rows"]
+                   and tensor_digest(rows, dt) == ref[dt])
+    return out
+
+
 @dataclass
 class Comparison:
     case_id: str
@@ -168,26 +218,46 @@ class Comparison:
     vllm_grids: list
     first_diff: int | None = None
     error: str | None = None
+    # one entry per video; None = not compared (counts as a failure)
+    pixels_equal: list[bool] | None = None
+    # LLM.generate saw the rendered ids; None = generate not run on this variant
+    generate_ids_equal: bool | None = None
     extras: dict = field(default_factory=dict)
 
     @property
+    def pixels_ok(self) -> bool:
+        p = self.pixels_equal
+        return bool(p) and len(p) == len(self.hf_grids) and all(p)
+
+    @property
     def passed(self) -> bool:
-        return self.error is None and self.ids_equal and self.grids_equal and self.runs_match_grid
+        return (self.error is None and self.ids_equal and self.grids_equal
+                and self.runs_match_grid and self.pixels_ok
+                and self.generate_ids_equal is not False
+                and "bare_video_pad_positions" not in self.hf
+                and "bare_video_pad_positions" not in self.vllm)
 
     def to_dict(self) -> dict:
-        return {**asdict(self), "passed": self.passed}
+        return {**asdict(self), "pixels_ok": self.pixels_ok, "passed": self.passed}
 
 
 def compare(*, case_id: str, index: int, source: str, variant: str, hf_ids: Sequence[int],
             hf_grids: Sequence[Sequence[int]], vllm_ids: Sequence[int] | None,
             vllm_grids: Sequence[Sequence[int]] | None, sp: SpecialIds, merge_size: int,
+            pixels_equal: Sequence[bool] | None = None, generate_ids_equal: bool | None = None,
             error: str | None = None, extras: dict | None = None) -> Comparison:
-    """Compare one request's vLLM model inputs with NVIDIA's HF call."""
+    """Compare one request's vLLM model inputs with NVIDIA's HF call.
+
+    PASS needs: no error, identical ids, identical grids, vLLM's frame runs as the grids imply,
+    pixels equal for every video, ``generate`` (if run) saw the same ids, and no stray bare
+    ``video_pad`` in either sequence."""
     hf_ids, hf_grids = list(hf_ids), [list(g) for g in hf_grids]
+    pix = None if pixels_equal is None else [bool(p) for p in pixels_equal]
     if vllm_ids is None:
         return Comparison(case_id, index, source, variant, False, False, False,
                           summarize_ids(hf_ids, sp), {}, hf_grids, [], None,
-                          error or "no vLLM output", dict(extras or {}))
+                          error or "no vLLM output", pix, generate_ids_equal,
+                          dict(extras or {}))
     vllm_ids = list(vllm_ids)
     vgrids = [list(g) for g in (vllm_grids or [])]
     return Comparison(
@@ -197,18 +267,36 @@ def compare(*, case_id: str, index: int, source: str, variant: str, hf_ids: Sequ
         runs_match_grid=grids_match_runs(vllm_ids, vgrids, sp, merge_size),
         hf=summarize_ids(hf_ids, sp), vllm=summarize_ids(vllm_ids, sp),
         hf_grids=hf_grids, vllm_grids=vgrids,
-        first_diff=first_diff(hf_ids, vllm_ids), error=error, extras=dict(extras or {}),
+        first_diff=first_diff(hf_ids, vllm_ids), error=error, pixels_equal=pix,
+        generate_ids_equal=generate_ids_equal, extras=dict(extras or {}),
     )
 
 
-def sanitize_error(exc: BaseException, limit: int = 200) -> str:
-    """Exception class + the start of its first line, cut before any echoed ``data=`` payload
-    (vLLM echoes the prompt there, and NVIDIA's prompt text must not reach the report)."""
+# Error messages that may reach the report verbatim: the matched text only (fixed words,
+# numbers, identifiers). Anything else is reduced to its exception class.
+_SAFE_ERRORS = (
+    re.compile(r"Failed to apply prompt replacement for mm_items\['video'\]\[\d+\]"),
+    re.compile(r"Found \d+ video placeholders but expected \d+"),
+    re.compile(r"Expected there to be \d+ prompt updates corresponding to \d+ video items, "
+               r"but instead found \d+ prompt updates!"),
+    re.compile(r"Failed to apply \w+"),
+    re.compile(r"The decoder prompt \(length \d+\) is longer than the maximum model length of "
+               r"\d+"),
+    re.compile(r"CUDA out of memory"),
+)
+
+
+def sanitize_error(exc: BaseException) -> str:
+    """Exception class plus, only if its first line starts with one of ``_SAFE_ERRORS``, the
+    matched text. An allowlist, because vLLM echoes prompts in several error formats and NVIDIA's
+    prompt text must not reach the report."""
     msg = str(exc).splitlines()[0] if str(exc) else ""
-    for marker in (" on data=", "data={", "prompt="):
-        if marker in msg:
-            msg = msg.split(marker)[0] + " [payload elided]"
-    return f"{type(exc).__name__}: {msg[:limit]}"
+    for pattern in _SAFE_ERRORS:
+        m = pattern.match(msg)
+        if m:
+            tail = "" if m.end() == len(msg) else " [rest elided]"
+            return f"{type(exc).__name__}: {m.group(0)}{tail}"
+    return f"{type(exc).__name__}: [message elided]" if msg else type(exc).__name__
 
 
 def case_verdicts(rows: Sequence[dict], variant: str) -> dict[str, bool]:
@@ -236,13 +324,17 @@ def render_report(rows: Sequence[dict], *, primary: str = "wrapped") -> str:
             cells.append("n/a" if ok is None else
                          f"{'PASS' if ok else 'FAIL'} ({sum(r['passed'] for r in n)}/{len(n)})")
         lines.append(f"| {c} | " + " | ".join(cells) + " |")
-    lines += ["", "| case | # | source | variant | ids | grid | runs | HF len | vLLM len | "
-              "first diff | grids (T,H,W) | error |", "|" + "---|" * 12]
+    lines += ["", "| case | # | source | variant | ids | grid | runs | pixels | gen | HF len | "
+              "vLLM len | first diff | grids (T,H,W) | error |", "|" + "---|" * 14]
+    yn = lambda b: "=" if b else "≠"  # noqa: E731
     for r in sorted(rows, key=lambda r: (r["case_id"], r["source"], r["index"], r["variant"])):
-        yn = lambda b: "=" if b else "≠"  # noqa: E731
+        pix = r.get("pixels_equal")
+        gen = r.get("generate_ids_equal")
         lines.append(
             f"| {r['case_id']} | {r['index']} | {r['source']} | {r['variant']} | "
             f"{yn(r['ids_equal'])} | {yn(r['grids_equal'])} | {yn(r['runs_match_grid'])} | "
+            f"{'-' if pix is None else ''.join(yn(p) for p in pix)} | "
+            f"{'-' if gen is None else yn(gen)} | "
             f"{r['hf'].get('length', '')} | {r['vllm'].get('length', '')} | "
             f"{'' if r['first_diff'] is None else r['first_diff']} | "
             f"{';'.join(','.join(map(str, g)) for g in r['hf_grids'])} | "
