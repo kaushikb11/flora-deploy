@@ -41,7 +41,7 @@ import shutil
 import tempfile
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -433,8 +433,8 @@ def nvidia_result(result: dict) -> dict:
 # - HF processor/tokenizer: NOT shared. ``PreTrainedTokenizerFast`` mutates the Rust tokenizer's
 #   padding/truncation state per call (``set_truncation_and_padding``: ``caption_three`` pads,
 #   the other builders do not) while encoding releases the GIL, which can raise "Already
-#   borrowed" or race. Each worker thread therefore gets its own ``copy.deepcopy`` of each
-#   processor (``ProcessorClones``); ``generate`` receives that same clone from NVIDIA's code.
+#   borrowed" or race. Each running episode therefore leases its own ``copy.deepcopy`` of each
+#   processor (``ProcessorClones`` pool); ``generate`` gets that same clone from NVIDIA's code.
 # - NVIDIA module globals: ``pipeline``/``media``/``preprocessing`` keep no mutable state on the
 #   episode path (``models._VERIFIED_MANIFESTS``/``_MANIFEST_LOCK`` are load-time only, already
 #   locked; ``api._REQUEST_LOCK`` is unused here). Vendor code has no caches or globals. Each
@@ -487,38 +487,66 @@ def install_gpu_lock(nv, lock, patcher) -> None:
     patcher.patch(nv.pipeline, "generate", lambda orig: locked_generate(orig, lock))
 
 
+class ProcessorSet:
+    """One episode's private processors: a lazy ``copy.deepcopy`` of each shared one."""
+
+    def __init__(self, pool: ProcessorClones):
+        self._pool = pool
+        self._procs: dict[str, tuple[Any, Any]] = {}
+
+    def get(self, kind: str, proc: Any) -> Any:
+        entry = self._procs.get(kind)
+        if entry is None or entry[0] is not proc:
+            entry = self._procs[kind] = (proc, self._pool._clone(proc))
+        return entry[1]
+
+
 class ProcessorClones:
-    """One ``copy.deepcopy`` of each processor per worker thread (see the audit above)."""
+    """Pool of ``ProcessorSet`` leases (see the audit above).
+
+    Each running episode leases a set no other episode uses at the same time; sets go back to
+    the pool afterwards, so a long-lived worker pays the deepcopy (~3 s per Captioner processor)
+    once per concurrency slot, not per batch."""
 
     def __init__(self, copier: Callable[[Any], Any] | None = None):
         import copy
         import threading
 
         self._copier = copier or copy.deepcopy
-        self._local = threading.local()
         self._lock = threading.Lock()
+        self._free: list[ProcessorSet] = []
         self.clones = 0
         self.seconds = 0.0
 
-    def get(self, kind: str, proc: Any) -> Any:
-        mine = getattr(self._local, "procs", None)
-        if mine is None:
-            mine = self._local.procs = {}
-        entry = mine.get(kind)
-        if entry is None or entry[0] is not proc:
-            t = time.perf_counter()
-            entry = mine[kind] = (proc, self._copier(proc))
+    def _clone(self, proc: Any) -> Any:
+        t = time.perf_counter()
+        clone = self._copier(proc)
+        with self._lock:
+            self.clones += 1
+            self.seconds += time.perf_counter() - t
+        return clone
+
+    @contextmanager
+    def lease(self) -> Iterator[ProcessorSet]:
+        with self._lock:
+            procs = self._free.pop() if self._free else ProcessorSet(self)
+        try:
+            yield procs
+        finally:
             with self._lock:
-                self.clones += 1
-                self.seconds += time.perf_counter() - t
-        return entry[1]
+                self._free.append(procs)
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {"clones": self.clones, "seconds": round(self.seconds, 3),
+                    "sets": len(self._free)}
 
 
 class EpisodeSession:
     """Per-episode view of a shared ``CachedSession``: same resident models, this thread's
     processor clones. Duck-types NVIDIA ``models.Session`` like ``CachedSession`` does."""
 
-    def __init__(self, base, clones: ProcessorClones | None = None):
+    def __init__(self, base, clones: ProcessorSet | None = None):
         self.base, self.clones = base, clones
 
     def load(self, kind: str):
@@ -682,6 +710,7 @@ def annotate_batch(
     gpu_lock=None,
     measure: bool = False,
     clone_processors: bool | None = None,
+    clones: ProcessorClones | None = None,
     sampler=None,
     progress: Callable[[str, float, str], None] | None = None,
 ) -> dict:
@@ -690,7 +719,9 @@ def annotate_batch(
     ``episodes`` items: ``{"episode", "videos", "profile", ["long_windows"], ["instruction"]}``.
     ``concurrency=1`` runs them in order in the calling thread (the sequential baseline). With
     ``concurrency>1`` NVIDIA's ``generate`` must already run under ``gpu_lock``
-    (``install_gpu_lock``); processors are cloned per worker unless ``clone_processors=False``.
+    (``install_gpu_lock``); each running episode leases private processor clones from ``clones``
+    (a long-lived ``ProcessorClones`` pool; a fresh one if omitted) unless
+    ``clone_processors=False``.
     Returns ``{"results": {episode: result}, "errors": {episode: str}, "batch": {...}}``; results
     keep input order. ``measure`` attaches ``flora_reference["observe"]`` per episode.
     """
@@ -710,7 +741,11 @@ def annotate_batch(
         gpu_lock = lock
     if clone_processors is None:
         clone_processors = concurrency > 1
-    clones = ProcessorClones() if clone_processors else None
+    if clone_processors and clones is None:
+        clones = ProcessorClones()
+    if not clone_processors:
+        clones = None
+    clone_stats0 = clones.stats() if clones else None
     if gpu_lock is not None:
         gpu_lock.reset()
     t0 = time.perf_counter()
@@ -724,9 +759,9 @@ def annotate_batch(
             def report(frac, desc="", _name=ep["episode"]):
                 progress(_name, frac, desc)
         try:
-            with recording(rec):
+            with recording(rec), (clones.lease() if clones else nullcontext()) as procs:
                 result = annotate_reference(
-                    nv, EpisodeSession(session, clones), ep["videos"], ep["profile"],
+                    nv, EpisodeSession(session, procs), ep["videos"], ep["profile"],
                     ep.get("long_windows", False), ep.get("instruction", ""), progress=report,
                 )
         except Exception as e:  # noqa: BLE001 - one bad episode must not sink the batch
@@ -754,8 +789,11 @@ def annotate_batch(
         "wall_s": round(wall, 3),
         "video_s": round(video_s, 3),
         "video_s_per_wall_s": round(video_s / wall, 4) if wall > 0 else None,
-        "processor_clones": {"clones": clones.clones, "seconds": round(clones.seconds, 3)}
-        if clones else None,
+        "processor_clones": {
+            "new_clones": clones.stats()["clones"] - clone_stats0["clones"],
+            "clone_s": round(clones.stats()["seconds"] - clone_stats0["seconds"], 3),
+            "sets": clones.stats()["sets"],
+        } if clones else None,
     }
     if gpu_lock is not None:
         batch["gpu_lock"] = gpu_lock.stats()

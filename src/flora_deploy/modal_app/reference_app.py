@@ -205,6 +205,9 @@ class ReferenceWorker:
         self.gpu_lock = TimedLock(GPU_LOCK_NAME)
         self.lock_patcher = Patcher()
         install_gpu_lock(nv, self.gpu_lock, self.lock_patcher)
+        from flora_deploy.stages.reference import ProcessorClones
+
+        self.clones = ProcessorClones()  # per-episode processor copies, reused across batches
         self.torch_threads_after_load = torch.get_num_threads()
         self.run_id = time.strftime("wsd-%Y%m%dT%H%M%SZ", time.gmtime())
         self.load_report = {
@@ -312,7 +315,7 @@ class ReferenceWorker:
                 patched = install_measurement(self.nv, patcher, procs)
             out = annotate_batch(
                 self.nv, self.session, episodes, concurrency=concurrency,
-                gpu_lock=self.gpu_lock, measure=measure,
+                gpu_lock=self.gpu_lock, measure=measure, clones=self.clones,
                 sampler=Sampler(interval_s=1.0) if measure else None,
                 progress=lambda ep, frac, desc="": print(f"[{ep}] {frac:.0%} {desc}", flush=True),
             )

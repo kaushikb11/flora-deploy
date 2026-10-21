@@ -182,7 +182,7 @@ def test_concurrent_outputs_identical_to_sequential():
     lock = conc["batch"]["gpu_lock"]
     assert lock["acquisitions"] == calls_seq and lock["contended"] > 0
     assert 0 < conc["batch"]["gpu_busy_fraction"] <= 1
-    assert conc["batch"]["processor_clones"]["clones"] >= 2
+    assert conc["batch"]["processor_clones"]["new_clones"] >= 2
     patcher.restore()
     assert nv.pipeline.generate is probe
 
@@ -289,18 +289,32 @@ def test_compare_runs_reports_paths_not_values():
     assert ref.diff_paths([1, 2], [1]) == ["$[len]"]
 
 
-def test_processor_clones_per_thread():
+def test_processor_clone_leases():
     clones = ref.ProcessorClones()
     proc = FakeProc("k")
-    a = clones.get("k", proc)
-    assert a is not proc and clones.get("k", proc) is a
-    seen = []
-    t = threading.Thread(target=lambda: seen.append(clones.get("k", proc)))
-    t.start()
-    t.join()
-    assert seen[0] is not a and clones.clones == 2
-    other = FakeProc("k")
-    assert clones.get("k", other) is not a  # a different base proc gets a fresh clone
+    with clones.lease() as one:
+        a = one.get("k", proc)
+        assert a is not proc and one.get("k", proc) is a
+        with clones.lease() as two:  # a concurrent episode never shares a clone
+            b = two.get("k", proc)
+            assert b is not a
+        assert one.get("k", FakeProc("k")) is not a  # a new base proc gets a fresh clone
+    assert clones.stats() == {"clones": 3, "seconds": clones.stats()["seconds"], "sets": 2}
+    with clones.lease() as again:  # sets are reused (no new set is made)
+        again.get("k", proc)
+    assert clones.stats()["clones"] == 4  # the reused set held a clone of the other proc
+
+
+def test_clone_pool_is_reused_across_batches():
+    probe, nv, session, gpu_lock, _ = setup()
+    pool = ref.ProcessorClones()
+    first = ref.annotate_batch(nv, session, EPISODES, concurrency=3, gpu_lock=gpu_lock,
+                               clones=pool)
+    second = ref.annotate_batch(nv, session, EPISODES, concurrency=3, gpu_lock=gpu_lock,
+                                clones=pool)
+    assert 0 < first["batch"]["processor_clones"]["new_clones"] <= 2 * 3
+    assert second["batch"]["processor_clones"]["new_clones"] == 0
+    assert ref.compare_runs(first["results"], second["results"])["identical"]
 
 
 def test_measurement_targets_cover_hot_path():

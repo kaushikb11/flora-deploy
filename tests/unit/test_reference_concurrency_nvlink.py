@@ -2,7 +2,7 @@
 
 CPU only, no weights: frames are synthetic (``media.decode_selected`` replaced) and the model call
 is a fake that hashes every tensor NVIDIA hands to ``generate``. Concurrent episode threads with
-per-thread processor clones must hand ``generate`` byte-identical tensors to a sequential run;
+per-episode processor clones must hand ``generate`` byte-identical tensors to a sequential run;
 torch's intra-op thread count must not change them either.
 """
 
@@ -132,9 +132,13 @@ def test_concurrent_inputs_identical_to_sequential(harness):
     assert all(reference) and lock.stats()["acquisitions"] == sum(map(len, reference))
     clones = ref.ProcessorClones()
     with ThreadPoolExecutor(len(CASES)) as pool:
-        got = list(pool.map(lambda c: run(c, clones), CASES))
+        def leased(case):
+            with clones.lease() as procs:
+                return run(case, procs)
+
+        got = list(pool.map(leased, CASES))
     assert got == reference
-    assert clones.clones >= len(CASES)
+    assert clones.stats()["clones"] >= len(CASES)
 
 
 def test_torch_threads_do_not_change_inputs(harness):
