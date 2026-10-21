@@ -382,6 +382,10 @@ class LocalRunner:
         self.index_summary = summary
         return summary
 
+    # Price spend as the ``--fake-models`` Modal app's CPU containers (``RunSettings.
+    # fake_models``) rather than the pool GPUs, which local budget tests exercise.
+    bill_as_fake_app = False
+
     def plan(self) -> Manifest:
         """Plan as ``sdk.submit`` does (``jobs.planning.plan_job``), then write the run spec."""
         from flora_deploy import sdk
@@ -403,6 +407,8 @@ class LocalRunner:
         elif old is not None:  # the budget sticks, as a submitted job's does
             settings = dataclasses.replace(settings,
                                            budget_usd=float(old["settings"]["budget_usd"]))
+        if self.bill_as_fake_app:  # the H0 app's CPU containers (``jobs.settings.billed_pool``)
+            settings = dataclasses.replace(settings, fake_models=True)
         self.settings = settings
         try:
             m = plan_job(self.store, settings, envelope=self.cfg.pipeline.envelope,

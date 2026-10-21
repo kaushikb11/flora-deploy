@@ -882,6 +882,8 @@ def submit(cfg: Any, *, job_id: str | None = None, store: str | None = None,
 
     settings = to_run_settings(cfg, job_id, config_hash=plan.config_hash,
                                stage_hashes=dict(plan.stage_hashes))
+    if getattr(plan, "fake_models", False):  # CPU containers: priced as such (jobs.budget)
+        settings = dataclasses.replace(settings, fake_models=True)
     if budget_usd is not None:
         settings = dataclasses.replace(settings, budget_usd=float(budget_usd))
     now = utc(time.time())

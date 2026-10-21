@@ -7,7 +7,7 @@ drifting apart.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
 from flora_deploy.jobs.types import MAX_STARTS_BEFORE_QUARANTINE, ShardKind
@@ -36,6 +36,22 @@ class PoolSettings:
     # Episodes in flight inside ONE input, for kinds whose worker batches in-process
     # (:data:`IN_WORKER_CONCURRENCY`); None: that kind's measured default.
     episode_concurrency: int | None = None
+
+
+# The --fake-models worker containers (``modal_app.factory.FAKE_WORKER_CPU`` /
+# ``FAKE_WORKER_MEMORY_GIB``; tests keep them equal): no GPU.
+FAKE_WORKER_CPU = 2.0
+FAKE_WORKER_MEMORY_GIB = 12.0
+
+
+def billed_pool(settings: RunSettings, kind: str) -> PoolSettings:
+    """``kind``'s pool as the containers that run it are billed: the configured pool, or for a
+    ``fake_models`` job a GPU-less CPU container (:data:`FAKE_WORKER_CPU`)."""
+    pool = settings.pools[kind]  # type: ignore[index]
+    if not getattr(settings, "fake_models", False):
+        return pool
+    return replace(pool, gpu="", gpu_count=0, cpu_cores=FAKE_WORKER_CPU,
+                   memory_gib=FAKE_WORKER_MEMORY_GIB)
 
 
 # Kinds whose worker runs one shard per container (one Modal input: ``max_inputs`` must be 1) and
@@ -82,6 +98,9 @@ class RunSettings:
     terminal_mode: str = "terminal"  # or "terminal_rationale"
     # ``output.formats``: what compose writes (not hashed: outputs are rebuilt from the parts)
     output_formats: tuple[str, ...] = ("jsonl", "parquet")
+    # A ``--fake-models`` job (H0): every kind runs on a CPU container of FAKE_WORKER_CPU cores
+    # and FAKE_WORKER_MEMORY_GIB, so spend is priced at that (``billed_pool``), not the pool GPU.
+    fake_models: bool = False
 
     def __post_init__(self) -> None:
         if self.budget_usd <= 0:
