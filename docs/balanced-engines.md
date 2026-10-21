@@ -270,12 +270,14 @@ That is ≈ $0.6 for L40S and ≈ $1.2 for H100, ≈ $1.8–2.4 in total, within
 
 ## Results
 
+<!-- wave-h:results (owned by scripts/wave_h_finalize.py) -->
 | Item | Result |
 |---|---|
 | L0 in-engine (ids, grid vs HF) | **not run** (Gate C already passed this on 127 requests through the same `vllm_prompt`; the in-engine re-check is pending) |
 | Segments / captions end to end on golden episodes | **not run** |
 | Throughput, $/video-h vs `exact` (≈ $25–40 / video-h, `docs/perf-1.md`) | **not measured**; PLAN's ≈4× cheaper is still an estimate |
 | Gate A (dt_bias FP32 vs bf16) | **not measured** |
+<!-- /wave-h:results -->
 
 **Recommendation for Gate A until it is measured:** ship with the plugin **off**, the default.
 P1b-0's merge check already showed BF16-level drift (mean |Δlogit| ≈ 0.025) with identical greedy

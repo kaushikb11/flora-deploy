@@ -87,6 +87,10 @@ def certify(
              "written only with --out-dir).")] = None,
     as_json: Annotated[bool, typer.Option("--json", help="Print the certificates as JSON.")
                        ] = False,
+    generated_at: Annotated[str | None, typer.Option(
+        help="Certificate time YYYY-MM-DDTHH:MM:SSZ (default: now). Pass the run's own time to "
+             "make re-certifying the same records reproduce the same certificate id.")
+    ] = None,
 ) -> None:
     """Certify a balanced stack against exact, within NVIDIA's own run-to-run noise."""
     from flora_deploy.config.hashing import kind_modes
@@ -136,7 +140,8 @@ def certify(
             cert = C.certify_stage(
                 st, exact=ex, balanced=bal, noise=nz, engine_spec=doc, gpu=g,
                 preset=cfg.preset, kind=kind, l0=lab_by_kind.get(C.L0_STAGES.get(st)),
-                thresholds=th, similarity=sim, similarity_name=similarity)
+                thresholds=th, similarity=sim, similarity_name=similarity,
+                generated_at=generated_at)
         except C.CertifyRefused as e:
             raise _fail(f"{st}: certified: false ({e.reason}): {e}", 1) from None
         except C.CertifyError as e:
