@@ -148,8 +148,8 @@ class _Method:
     def __init__(self, cls_name, log):
         self.cls_name, self.log = cls_name, log
 
-    def spawn(self, *args):
-        self.log.append((self.cls_name, args))
+    def spawn(self, *args, token=""):
+        self.log.append((self.cls_name, args, token))
         return _FC(f"fc-{len(self.log)}", builtins.TimeoutError())
 
 
@@ -166,11 +166,11 @@ class _ClsAPI:
 def test_modal_spawner_spawn_poll_cancel_with_fake_apis():
     sp = ModalSpawner("flora-workers", {"segcap": "ReferenceWorker"}, errors=FAKE,
                       cls_api=_ClsAPI, call_api=_CallAPI)
-    cid = sp.spawn("segcap", "job", "s1", "cfg")
+    cid = sp.spawn("segcap", "job", "s1", "cfg", token="tok-1")
     cid2 = sp.spawn("segcap", "job", "s2", "cfg")
     assert _ClsAPI.lookups == [("flora-workers", "ReferenceWorker")]  # handle cached
-    assert _ClsAPI.log[-2:] == [("ReferenceWorker", ("job", "s1", "cfg")),
-                                ("ReferenceWorker", ("job", "s2", "cfg"))]
+    assert _ClsAPI.log[-2:] == [("ReferenceWorker", ("job", "s1", "cfg"), "tok-1"),
+                                ("ReferenceWorker", ("job", "s2", "cfg"), "")]
     assert sp.poll(cid).state == "pending"
     _FC.registry[cid2].outcome = FakeOutputExpiredError()
     assert sp.poll(cid2).state == "expired"

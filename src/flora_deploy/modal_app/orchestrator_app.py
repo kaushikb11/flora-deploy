@@ -181,8 +181,11 @@ class ModalSpawner:
             self._handles[kind] = getattr(cls(), self.method)
         return self._handles[kind]
 
-    def spawn(self, kind: str, job_id: str, shard_id: str, config_hash: str) -> str:
-        fc = self._handle(kind).spawn(job_id, shard_id, config_hash)
+    def spawn(self, kind: str, job_id: str, shard_id: str, config_hash: str, *,
+              token: str = "") -> str:
+        """``token`` reaches ``run_shard(..., token=...)`` so duplicate spawns stay inert
+        (``jobs.spawner`` spawn idempotency)."""
+        fc = self._handle(kind).spawn(job_id, shard_id, config_hash, token=token)
         return fc.object_id
 
     def poll(self, call_id: str) -> CallStatus:
@@ -321,8 +324,13 @@ class TickDriver:
                 fn()
 
     def enforce_budget(self) -> list[str]:
-        """HOOK (Fix-J1): the budget hard cap. Move into ``Orchestrator.tick`` when the core
-        grows it; the gate API is ``budget.overspend(BudgetState) -> list[call_id]``."""
+        """Budget hard cap for orchestrators that don't enforce it themselves.
+
+        The real ``Orchestrator`` runs ``enforce_budget`` inside ``tick`` (budget cancels are
+        re-queued without consuming a respawn), so this driver-level fallback is a no-op for it
+        and only serves stub orchestrators. Gate API: ``budget.overspend(BudgetState)``."""
+        if callable(getattr(self.orch, "enforce_budget", None)):
+            return []
         gate = self.orch.budget
         overspend = getattr(gate, "overspend", None)
         if not callable(overspend):
