@@ -234,3 +234,22 @@ def test_sdk_submit_resolves_from_config(tmp_path):
         sdk.submit(parse_config(exact(captioner_bf16=PINNED)), backend=object(),
                    planner=planner)
     assert seen == {"captioner_bf16": PINNED}
+
+
+def test_fake_models_needs_no_real_receipts():
+    """H0 on real Modal (2026-10-22): `flora deploy --fake-models` refused a config without
+    `weights.derived`, though fake workers load no weights."""
+    cfg = parse_config(balanced())
+    with pytest.raises(rc.MissingReceiptError):
+        rc.resolve(cfg)  # real deployments still fail closed
+    got = rc.resolve(cfg, fake_models=True)
+    assert set(got) == set(rc.needed(cfg))
+    assert all(v == rc.fake_receipt(n) and len(v) == 64 for n, v in got.items())
+    assert rc.resolve(cfg, {"captioner_bf16": PINNED}, fake_models=True)["captioner_bf16"] == PINNED
+
+
+def test_deploy_fake_models_dry_run_without_receipts(tmp_path):
+    cfg = write_cfg(tmp_path, exact())
+    res = runner.invoke(cli, ["deploy", "-c", str(cfg), "--dry-run", "--fake-models"])
+    assert res.exit_code == 0, res.output
+    assert "flora prepare" not in " ".join(res.output.split())

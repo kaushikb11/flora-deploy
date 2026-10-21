@@ -849,7 +849,7 @@ def submit(cfg: Any, *, job_id: str | None = None, store: str | None = None,
            allow_uncertified: bool = False, budget_usd: float | None = None,
            bucket_secret: str = "flora-bucket", backend: Backend | None = None,
            log: Callable[[str], None] | None = None,
-           planner: Callable[..., Any] | None = None) -> Job:
+           planner: Callable[..., Any] | None = None, fake_models: bool = False) -> Job:
     """Start a job on the deployed app (``flora run --detach``); see the module docstring.
 
     ``cfg``: a ``FloraConfig`` or a path. ``receipts`` / ``determinism`` / ``allow_uncertified``
@@ -871,7 +871,7 @@ def submit(cfg: Any, *, job_id: str | None = None, store: str | None = None,
     try:
         plan = (planner or _plan_deployment)(
             cfg, store=store, bucket_secret=bucket_secret,
-            derived_receipts=resolve_receipts(cfg, receipts),
+            derived_receipts=resolve_receipts(cfg, receipts, fake_models=fake_models),
             derived_content=derived_content(cfg, receipts),
             allow_uncertified=allow_uncertified, determinism=determinism)
     except (DeployError, MissingReceiptError, ValueError) as e:

@@ -222,7 +222,7 @@ def run(
         j = sdk.submit(cfg, job_id=job, store=store, receipts=_receipts(receipt),
                        determinism=determinism, allow_uncertified=allow_uncertified,
                        budget_usd=budget, bucket_secret=bucket_secret, log=log,
-                       planner=planner)
+                       planner=planner, fake_models=fake_models)
     except sdk.NotDeployed as e:
         if fake_models:
             raise fail(f"{e} (here: `flora deploy --fake-models`); or add --local to run the "

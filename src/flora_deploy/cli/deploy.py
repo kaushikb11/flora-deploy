@@ -173,7 +173,7 @@ def deploy(
     except (ConfigError, OSError) as e:
         raise _fail(str(e)) from None
     try:
-        derived = resolve_receipts(cfg, overrides)
+        derived = resolve_receipts(cfg, overrides, fake_models=fake_models)
         plan = plan_app(cfg, store=store, bucket_secret=bucket_secret,
                         derived_receipts=derived, derived_content=content,
                         allow_uncertified=allow_uncertified,
