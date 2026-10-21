@@ -75,7 +75,10 @@ same `<stage_hash>` directory.
   run that preset);
 * `uncovered_pool`: no certificate covers the episode's embodiment pool;
 * `oracle_ineligible_source`: the source video cannot be cut so that it decodes to exactly the
-  source frames, so the record cannot be compared with the reference.
+  source frames, so the record cannot be compared with the reference;
+* `fake_models`: the record was made by fake engines in a local run (`flora run --local
+  --fake-models`). It is never a real label, and `flora certify` refuses it, as it refuses any
+  record whose `provenance.certificate` is `fake-models` (the `--fake-models` CPU rehearsal app).
 
 ### `provenance`
 
@@ -91,6 +94,9 @@ same `<stage_hash>` directory.
 | `gpu` | string or null | GPU the worker ran on (from `nvidia-smi`); not part of the config hash |
 | `certificate` | string or null | id of the Gate certificate that covers this record; null for `exact` (the reference) and for uncertified stacks |
 | `source` | object | camera role to `{uri, range_s}`: the video file and time range the episode came from |
+| `engine_hash` | string or null | the producing stage's own hash (for `balanced`, the engine spec, sampling and pins), kept when the worker stamps `config_hash` with the job's stage hash; null when the stage set none |
+| `embodiment` | string or null | the job's `pipeline.embodiment` (the embodiment pool a certificate must cover) |
+| `cert_key` | object or null | the certificate key document of the stack that produced the record (`validate.certkey.key_document`: engine and image, vLLM engine spec, NVIDIA and decode pins, derived-weight content digests, run modes, logic); `flora certify` refuses records without it (`docs/certification.md`) |
 
 ### `segments[]` (segment and caption stages)
 
@@ -138,7 +144,7 @@ same `<stage_hash>` directory.
 ### Example records (synthetic)
 
 ```json
-{"audit_ref":null,"certified":false,"dataset":"org/demo","dense":null,"episode_id":"episode_000000","provenance":{"certificate":null,"config_hash":"3f2a...","engine":"vllm-0.24.0-offline","framework":"flora-deploy 0.1.0","gpu":"NVIDIA H100 80GB HBM3","logic_version":"0.1.0","models":{"captioner":"fef0bbfe..."},"preset":"balanced","source":{"main":{"range_s":[0.0,8.0],"uri":"videos/cam_high/file-000.mp4"}}},"rubric":null,"schema":"flora_labels_v1","segments":[{"caption":"The left arm lifts the cup lid.","degradation":{},"end_s":3.5,"event_id":"event_0000","fine_event_id":null,"nv_metadata":{},"segmentation_provenance":null,"start_s":0.0,"status":"complete"}],"stage":"caption","terminal":null,"uid":"org-demo--episode_000000","uncertified_reason":"uncertified_stack"}
+{"audit_ref":null,"certified":false,"dataset":"org/demo","dense":null,"episode_id":"episode_000000","provenance":{"cert_key":{"schema":"flora-cert-key/v2","...":"..."},"certificate":null,"config_hash":"3f2a...","embodiment":"yam","engine":"vllm-0.24.0-offline","engine_hash":"9c1e...","framework":"flora-deploy 0.1.0","gpu":"NVIDIA H100 80GB HBM3","logic_version":"0.1.0","models":{"captioner":"fef0bbfe..."},"preset":"balanced","source":{"main":{"range_s":[0.0,8.0],"uri":"videos/cam_high/file-000.mp4"}}},"rubric":null,"schema":"flora_labels_v1","segments":[{"caption":"The left arm lifts the cup lid.","degradation":{},"end_s":3.5,"event_id":"event_0000","fine_event_id":null,"nv_metadata":{},"segmentation_provenance":null,"start_s":0.0,"status":"complete"}],"stage":"caption","terminal":null,"uid":"org-demo--episode_000000","uncertified_reason":"uncertified_stack"}
 ```
 
 A `reward.terminal` record has the same envelope, with `"segments":[]` and
@@ -233,6 +239,10 @@ Reward stages have one row per record:
 | `conflicts` | list of strings | `uid/stage` keys whose duplicates differed (the latest one is kept) |
 | `foreign_records_dropped` | int | records from another config hash, ignored |
 | `poison_pills` | list of strings | `uid/kind` episodes isolated because they kept crashing workers |
+| `unplanned_episodes` | object | episode to reason, for indexed episodes the planner excluded (for example, no task text); they count as excluded in every stage |
+| `generation` | string | digest of this compose's stage files: they live under `output/gen/<generation>/` |
+| `formats` | list of strings | the output formats written (`output.formats`) |
+| `files` | object | `<stage>.<format>` to the store path of that file in this generation (read files through this pointer) |
 | `errors` | object | episode error counts: `by_kind`, `by_stage`, `unreadable_files` |
 | `shards` | object | shard state to count |
 | `inputs` | object | `parts` (part files read) and `digest` (sha256 over their paths and hashes) |
@@ -251,6 +261,7 @@ Reward stages have one row per record:
 | `expected` | int | episodes planned for this stage |
 | `missing` | int | planned episodes with neither a record nor an exclusion (only in a `partial` compose) |
 | `excused` | int | excluded episodes (see below) |
+| `unplanned` | int | indexed episodes the planner excluded (`unplanned_episodes`); they count as excluded |
 | `episodes` | object | episode state to count |
 
 ## Exclusions
