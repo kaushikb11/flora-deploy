@@ -165,11 +165,15 @@ def file_origin(filename: str) -> Origin:
 
 def is_nv_class(cls: type) -> bool:
     """Whether NVIDIA's code defines ``cls`` (by its module's file, see the module docstring)."""
-    mod = sys.modules.get(getattr(cls, "__module__", "") or "")
+    name = getattr(cls, "__module__", "") or ""
+    mod = sys.modules.get(name)
     file = getattr(mod, "__file__", None)
     if file:
         return file_origin(file) == "nv"
-    return is_nv_module_name(getattr(cls, "__module__", "") or "")
+    # a live class whose module is not loaded (or has no file) was not loaded from NVIDIA's
+    # snapshot, whatever its name says; names alone only decide for transported errors
+    return mod is not None and getattr(mod, cls.__name__, None) is cls and \
+        is_nv_module_name(name)
 
 
 def is_nv_module_name(name: str) -> bool:
