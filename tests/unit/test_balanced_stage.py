@@ -108,8 +108,14 @@ def _raise(exc):
     raise exc
 
 
-def test_classify_nvidia_exception_classes():
+def test_classify_nvidia_exception_classes(monkeypatch):
     """NVIDIA's classes by where they were loaded from (``nv.errors``), not by module name."""
+    import sys
+
+    # a class merely *named* like NVIDIA's module, which is not loaded here (another test in the
+    # session may have loaded the real snapshot's module of that name)
+    monkeypatch.delitem(sys.modules, "flora_runtime.video_segmentation.fine_subtask",
+                        raising=False)
     assert classify_error(None, _raised(fake_nvidia.FineSegmentationOutputError("x"))) == \
         "nv_failure"
     assert classify_error(None, _raised(fake_nvidia.InputErrorForModel("x"))) == "nv_failure"
