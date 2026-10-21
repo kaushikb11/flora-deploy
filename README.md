@@ -8,7 +8,7 @@ Point it at a LeRobot dataset or a folder of MP4s and get JSONL + Parquet labels
 
 ```bash
 git clone https://github.com/kaushikb11/flora-deploy && cd flora-deploy
-uv sync                                     # or: pip install -e .   (Python >= 3.11)
+uv sync && source .venv/bin/activate        # or: pip install -e .   (Python >= 3.11)
 
 flora init --template local_demo            # writes flora.yaml
 flora run --local --fake-models --sample-data
@@ -27,7 +27,7 @@ You need:
   a Modal Volume (`volume://name/dir`).
 
 ```bash
-flora init --template exact_lerobot          # then set preset: balanced (see config below)
+flora init --template balanced_lerobot       # writes flora.yaml (preset: balanced)
 flora prepare                                # download + verify the weights into your Modal Volume
 
 # one-time weight conversions; each prints a receipt hash
@@ -38,7 +38,7 @@ flora index                                  # scan the dataset
 flora plan --index summary.json              # cost / time options
 flora deploy --receipt tempseg_merged=<sha> --receipt captioner_bf16=<sha>
 flora run    --receipt tempseg_merged=<sha> --receipt captioner_bf16=<sha>
-flora results --job <job> --stage caption
+flora results --job <job> --stage caption --store <store>   # store: s3://... or modal-volume://...
 ```
 
 The `balanced` preset uses vLLM: TempSeg runs on an L40S, the Captioner on an H100 and the
@@ -52,10 +52,11 @@ The keys that matter in `flora.yaml`:
 project: my-labels
 license_ack: research-only
 preset: balanced
+allow_uncertified: true   # required for balanced until its Gate certificates exist
 
 modal:
   budget_usd: 25          # hard cap: the job stops before it would exceed this
-  max_gpus: 3
+  max_gpus: 6             # covers every pool below at its max_containers
 
 input:
   format: lerobot_v3      # lerobot_v21 | lerobot_v3 | mp4_dir

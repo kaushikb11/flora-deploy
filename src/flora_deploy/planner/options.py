@@ -47,6 +47,25 @@ DEFAULT_EPISODE_S = 60.0  # assumed mean episode length when only total hours ar
 Certification = Literal["reference", "needs certificates"]
 Status = Literal["ok", "at risk", "infeasible"]
 
+# The user-facing preset: its options are listed first. `exact` stays selectable as the
+# certification reference. (Listing order only; which option is *recommended* is `recommended`.)
+PRIMARY_PRESET = "balanced"
+
+
+def default_presets() -> tuple[str, ...]:
+    """Every available preset, the primary one first, the rest in their declared order."""
+    return tuple(sorted(AVAILABLE_PRESETS, key=lambda p: p != PRIMARY_PRESET))
+
+
+DEFAULT_PRESETS: tuple[str, ...] = default_presets()
+
+
+def rates_label(option: PlanOption) -> str:
+    """How to present an option's numbers: ``measured`` only when every rate it rests on was
+    measured; otherwise ``estimate (<worst status>)``, so placeholder or projected rates are
+    never shown as measurements."""
+    return "measured" if option.rate_status == "measured" else f"estimate ({option.rate_status})"
+
 
 # ----------------------------------------------------------------------------------------------
 # Workload
@@ -154,7 +173,7 @@ class PlanOption:
 class PlanRequest:
     workload: WorkloadSummary
     stages: tuple[Stage, ...] = ("segment", "caption")
-    presets: tuple[str, ...] = AVAILABLE_PRESETS
+    presets: tuple[str, ...] = DEFAULT_PRESETS
     deadline_s: float | None = None
     budget_usd: float | None = None
     max_gpus: int = 10

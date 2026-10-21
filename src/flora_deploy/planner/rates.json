@@ -6,6 +6,7 @@
     "startup_s": "seconds from container start to ready (@modal.enter), paid once per container",
     "uncertainty": "relative half-width of the error bar (0.35 = +/-35%)"
   },
+  "balanced_slot": "The `balanced` segment and caption rows below are the measurement slot (planner.rates.MEASURED_SLOTS). To record a measurement, edit only those rows: set `container_s_per_video_s`, `uncertainty`, `status` (placeholder -> measured), `source` (the doc or run that measured it), `date`, `image` and `provenance`; no code change is needed. Their status must be placeholder or measured, and a measured row must name its source and date. Until then `flora plan` labels every option that uses them `estimate (placeholder)`.",
   "note": "`status`: measured | projected | placeholder | stale. `stale` entries were measured on another image or superseded by a measurement of the same configuration; they are kept for history only and lookups skip them. `requires` names worker features a rate depends on; `excludes` names features whose presence makes the rate invalid (the S1 row was measured with gpu_thread off). The deployed configuration's features are `planner.rates.DEPLOYED_FEATURES` (gpu_thread: `stages.reference.ExactProfile.gpu_thread`, on by default since P1a-5s); a rate that needs a feature outside it (e.g. `long_lived_container`) only appears in projection options, which are never recommended. At equal concurrency a measured entry beats a projected one whatever its `requires` (review 5 M-C). `image`: the image the entry was measured or projected on. `cameras` \"*\": measured on a 1-/3-view mix. Determinism mode (`pipeline.determinism: deterministic`, cuDNN SDPA off) has no rate of its own: docs/determinism.md measured <= 3% end to end before gpu_thread; it is not re-measured on the current profile and does not pay the cold cuDNN graph tax, so its rate will differ; do not reuse these rows for it without a measurement.",
   "rates": [
     {
@@ -183,6 +184,7 @@
       "requires": [],
       "excludes": [],
       "provenance": "not measured (vLLM TempSeg lands in P1b-1); jobs.manifest.DEFAULT_RATES",
+      "source": null,
       "date": "2026-10-21"
     },
     {
@@ -197,6 +199,7 @@
       "requires": [],
       "excludes": [],
       "provenance": "not measured (vLLM Captioner lands in P1b-1); jobs.manifest.DEFAULT_RATES",
+      "source": null,
       "date": "2026-10-21"
     }
   ],

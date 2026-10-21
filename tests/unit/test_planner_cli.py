@@ -38,7 +38,8 @@ def test_plan_table(cfg):
     assert r.exit_code == 0, r.output
     assert "exact x4" in r.output and "balanced x1" in r.output
     assert "reference" in r.output and "needs certificates" in r.output
-    assert "Recommended: 1 (exact x4)" in r.output
+    assert r.output.index("balanced x1") < r.output.index("exact x4")  # balanced first
+    assert "Recommended: 2 (exact x4)" in r.output
     assert "exact x8 +long_lived_container" in r.output and "projection only" in r.output
     assert "warning: includes projected" in r.output
     assert "pinned 2026-10-21" in r.output
@@ -48,7 +49,8 @@ def test_plan_json(cfg):
     r = runner.invoke(app, ["plan", "-c", str(cfg), *ARGS, "--json"])
     assert r.exit_code == 0, r.output
     d = json.loads(r.output)
-    assert d["workload"]["video_hours"] == 100 and d["recommended"] == 1
+    assert d["workload"]["video_hours"] == 100 and d["recommended"] == 2
+    assert d["options"][0]["preset"] == "balanced"
     assert 2 <= len(d["options"]) <= 4
     assert d["options"][0]["peak_gpus"] <= 10
 
@@ -101,3 +103,13 @@ def test_estimate_placeholder_and_rates(cfg):
                       env={"COLUMNS": "200"})
     assert r.exit_code == 0, r.output
     assert "segcap" in r.output and "measured" in r.output
+
+
+def test_plan_labels_unmeasured_rates_estimate(cfg):
+    r = runner.invoke(app, ["plan", "-c", str(cfg), *ARGS], env={"COLUMNS": "250"})
+    assert r.exit_code == 0, r.output
+    row = next(ln for ln in r.output.splitlines() if "balanced x1" in ln)
+    assert "estimate" in row and "measured" not in row
+    d = json.loads(runner.invoke(app, ["plan", "-c", str(cfg), *ARGS, "--json"]).output)
+    labels = {o["preset"]: o["rates"] for o in d["options"] if not o["requires"]}
+    assert labels == {"balanced": "estimate (placeholder)", "exact": "measured"}

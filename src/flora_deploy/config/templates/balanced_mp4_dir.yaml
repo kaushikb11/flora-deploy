@@ -1,0 +1,54 @@
+# flora.yaml: label a directory of MP4 episodes with the `balanced` preset (vLLM engines).
+# Every key is documented in balanced_lerobot.yaml. Unknown keys are an error.
+
+project: my-mp4-labels
+
+# NVIDIA's Flora models are licensed for non-commercial research only. Required.
+license_ack: research-only
+
+modal:
+  environment: main
+  max_gpus: 4                       # workspace GPU cap; all pools together stay under it
+  budget_usd: 10                    # hard spend cap
+  region: null
+  tags: {}
+
+# balanced: TempSeg on an L40S, the Captioner on an H100!, the Rewarder on an H100!. No Gate
+# certificates yet, so it needs `allow_uncertified: true` (records are marked certified: false).
+preset: balanced
+allow_uncertified: true
+
+# Derived weights by receipt name; `flora prepare` will fill these in (until then, pass
+# `--receipt NAME=<sha256>` to `flora deploy` / `flora run`).
+# weights:
+#   derived:
+#     tempseg_merged: <sha256>
+#     captioner_bf16: <sha256>
+
+input:
+  format: mp4_dir                   # one MP4 per episode
+  path: ./videos                    # local directory (`flora index --local` reads it here)
+  # Modal workers cannot read a local directory: upload it once to a Volume
+  #   modal volume put flora-results ./videos inputs/my-mp4-labels
+  # and point stage_to at that copy (the dataset root on the Volume).
+  stage_to: volume://flora-results/inputs/my-mp4-labels
+
+pipeline:
+  stages: [segment, caption]        # add reward.terminal / reward.dense for rewards
+  embodiment: human                 # human | yam | yam32 | dex | tianji
+  episode_instruction:
+    source: fixed                   # dataset_task | fixed | none
+    text: Fold the towel.
+  envelope: warn                    # warn | enforce | ignore
+  # terminal_rationale: false       # with reward.terminal: also return NVIDIA's rationale
+
+# One pool per stage (see balanced_lerobot.yaml). With rewards, add e.g.
+#   reward.terminal: {gpu: H100!, max_containers: 1}
+# and raise modal.max_gpus to cover it.
+resources:
+  segment: {gpu: L40S, max_containers: 2}    # 2 x L40S
+  caption: {gpu: H100!, max_containers: 2}   # 2 x H100!
+
+output:
+  sink: volume://flora-results/my-mp4-labels
+  formats: [jsonl]
