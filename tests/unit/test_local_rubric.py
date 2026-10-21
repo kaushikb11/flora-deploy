@@ -18,20 +18,20 @@ from flora_deploy.local import sample_dataset as make_sample
 
 TEMPLATE = Path(__file__).resolve().parents[2] / "src/flora_deploy/config/templates/local_demo.yaml"
 RUBRIC = """  rubric:
-    robot: single-arm robot
+    robot: two-finger gripper on a tabletop arm
     cameras:
-      - {role: main, description: a fixed scene camera}
+      - {role: main, description: overhead view of the workbench}
     steps:
-      - action: Grasp the cup
+      - action: Pull the drawer open
         grading:
-          - {label: Not attempted, points: 0.0}
-          - {label: Grasped after re-tries, points: 0.1}
-          - {label: Clean grasp, points: 0.2}
-      - action: Set the cup on the tray
+          - {label: Drawer untouched, points: 0.0}
+          - {label: Opened partway, points: 0.15}
+          - {label: Opened fully, points: 0.3}
+      - action: Drop the wooden block into the drawer
         grading:
-          - {label: Not attempted, points: 0.0}
-          - {label: Placed but tipped over, points: 0.4}
-          - {label: Placed upright, points: 0.8}
+          - {label: Block not moved, points: 0.0}
+          - {label: Block lands outside, points: 0.35}
+          - {label: Block inside the drawer, points: 0.7}
 """
 
 
@@ -72,8 +72,8 @@ def test_rubric_job_is_done_with_records_and_audits(runs):
         rb = r.rubric
         assert rb.samples == 9 and 1 <= rb.parsed_samples <= 9
         assert 0 <= rb.medoid_index < rb.samples
-        assert len(rb.scores) == 2 and rb.scores[0] in (0.0, 0.1, 0.2)
-        assert rb.scores[1] in (0.0, 0.4, 0.8)
+        assert len(rb.scores) == 2 and rb.scores[0] in (0.0, 0.15, 0.3)
+        assert rb.scores[1] in (0.0, 0.35, 0.7)
         assert rb.total == round(sum(rb.scores), 4)
         assert r.provenance.certificate == "local-fake-models"
         assert r.provenance.embodiment == "human"  # stamped (certstamp) by the rubric runner
@@ -86,7 +86,7 @@ def test_rubric_job_is_done_with_records_and_audits(runs):
         nv = au["nv"]
         assert set(nv) == {"id", "task", "steps", "scores", "total", "medoid_sample",
                            "parsed_samples", "samples", "prompt_tokens"}
-        assert nv["steps"] == ["Grasp the cup", "Set the cup on the tray"]
+        assert nv["steps"] == ["Pull the drawer open", "Drop the wooden block into the drawer"]
         assert nv["samples"][nv["medoid_sample"]]["parsed"]
 
 

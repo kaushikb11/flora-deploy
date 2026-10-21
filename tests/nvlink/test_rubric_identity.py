@@ -34,11 +34,11 @@ import pytest
 
 pytestmark = pytest.mark.nvlink
 
-RUBRIC = [{"action": "Grasp the cup",
+RUBRIC = [{"action": "Pull the drawer open",
            "grading": [{"label": "Not attempted", "points": 0.0},
                        {"label": "Grasped after re-tries", "points": 0.1},
                        {"label": "Clean grasp", "points": 0.2}]},
-          {"action": "  Set the cup\n on the tray ", "max_score": 0.8,
+          {"action": "  Drop the wooden\n block into the drawer ", "max_score": 0.8,
            "grading": [{"label": "Not attempted", "points": 0.0},
                        {"label": "Placed but tipped over", "points": 0.4},
                        {"label": "Placed upright", "points": 0.8}]}]
@@ -46,7 +46,7 @@ ROBOT_FORM = {"robot": "bimanual robot",
               "cameras": ["a top (scene) camera", "a left-wrist camera", "a right-wrist camera"]}
 HEADER_FORM = {"header": "You are an expert evaluator. Video 1 is the scene, Video 2 the left "
                          "wrist, and Video 3 the right wrist.\n\n",
-               "task_name": "cup to tray"}
+               "task_name": "block to drawer"}
 CASES = ("spread", "tie", "none", "messy")
 
 
@@ -54,7 +54,8 @@ def write_jobs(root: Path, form: dict, name: str) -> Path:
     lines = []
     for n, case in enumerate(CASES):
         videos = [str(root / f"{name}-{case}-cam{v}.mp4") for v in range(3)]
-        lines.append({"id": f"{name}_{case}", "task": f"  Put the cup on the tray (case={case}). ",
+        task = f"  Put the block in the drawer (case={case}). "
+        lines.append({"id": f"{name}_{case}", "task": task,
                       "videos": videos, "rubric": RUBRIC, **form})
         assert n >= 0
     path = root / f"{name}.jsonl"

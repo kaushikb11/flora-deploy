@@ -28,10 +28,10 @@ RUBRIC = {"robot": "bimanual robot",
           "cameras": [{"role": "main", "description": "a top (scene) camera"},
                       {"role": "left_wrist", "description": "a left-wrist camera"},
                       {"role": "right_wrist", "description": "a right-wrist camera"}],
-          "steps": [{"action": "Grasp the cup",
+          "steps": [{"action": "Pull the drawer open",
                      "grading": [{"label": "Not attempted", "points": 0.0},
                                  {"label": "Clean grasp", "points": 0.2}]},
-                    {"action": "Set the cup on the tray", "max_score": 0.8,
+                    {"action": "Drop the wooden block into the drawer", "max_score": 0.8,
                      "grading": [{"label": "Not attempted", "points": 0.0},
                                  {"label": "Placed upright", "points": 0.8}]}]}
 
@@ -91,7 +91,7 @@ def test_header_form_needs_no_descriptions():
     r.pop("robot")
     spec = RB.RubricSpec.from_json(rubric_spec(parse_config(cfg_dict(r))))
     assert spec.header == "You see a robot.\n\n" and spec.cameras is None
-    job = spec.job(R.Episode("e", "Put the cup.", ("/a", "/b", "/c")))
+    job = spec.job(R.Episode("e", "Put the block.", ("/a", "/b", "/c")))
     assert job["header"] == spec.header and "robot" not in job and "cameras" not in job
 
 
@@ -128,7 +128,7 @@ def nv_with(video_inputs=None):
 
 
 def episodes(n=3):
-    return [R.Episode(f"e{i}", f"Put cup {i} on the tray.",
+    return [R.Episode(f"e{i}", f"Put block {i} in the drawer.",
                       tuple(f"/v/e{i}-{r}.mp4" for r in ("m", "l", "r")), dataset="org/ds",
                       envelope_ok=True,
                       sources=tuple((r, f"videos/{r}/e{i}.mp4", 1.0 * i, None)
@@ -163,7 +163,7 @@ def test_run_records_audits_and_one_generate_per_episode():
         assert list(rb.scores) == line["scores"] and rb.total == line["total"]
         assert rb.parsed_samples == line["parsed_samples"] == sum(
             s["parsed"] for s in line["samples"])
-        assert line["steps"] == ["Grasp the cup", "Set the cup on the tray"]
+        assert line["steps"] == ["Pull the drawer open", "Drop the wooden block into the drawer"]
         assert rec.provenance.source["main"]["range_s"][1] == pytest.approx(
             rec.provenance.source["main"]["range_s"][0] + 3.5)
     # NVIDIA's prompt pieces: thinking + vision ids on, the rubric's camera order
