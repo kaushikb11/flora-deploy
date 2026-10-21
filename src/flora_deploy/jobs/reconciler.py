@@ -157,12 +157,16 @@ def reconcile(*, job_id: str, config_hash: str, store: Store, manifests: Manifes
                    for p in store.list(paths.area_prefix(config_hash, "errors", kind)))
 
     state: JobState
-    if controls.cancelled is not None:
+    resolved = bool(shards) and active == 0 and \
+        all(s.shard_id in satisfied or s.shard_id in dead for s in shards)
+    # a cancel that arrives after every shard was satisfied changes nothing (review 6 M1): the
+    # job's outcome stands; a cancel that stopped work (cancelled = dead shards) wins
+    if controls.cancelled is not None and not (resolved and not dead):
         state = "cancelled"
-    elif shards and all(s.shard_id in satisfied or s.shard_id in dead for s in shards) \
-            and active == 0:
+    elif resolved:
         problems = [] if dead else _error_rate_problems(store, paths, config_hash, shards,
-                                                         status, max_error_rate)
+                                                         status, max_error_rate,
+                                                         getattr(manifest, "excluded", None))
         notes += problems
         if dead:
             state = "failed"
@@ -191,9 +195,9 @@ def reconcile(*, job_id: str, config_hash: str, store: Store, manifests: Manifes
 
 
 def _error_rate_problems(store: Store, paths: JobPaths, config_hash: str, shards, status,
-                         max_error_rate: float) -> list[str]:
+                         max_error_rate: float, unplanned=None) -> list[str]:
     from flora_deploy.jobs.manifest import from_json
-    from flora_deploy.jobs.progress import error_rate_problems
+    from flora_deploy.jobs.progress import error_rate_problems, with_unplanned
     from flora_deploy.jobs.types import ShardReceipt
 
     planned: dict[str, set[str]] = {}
@@ -213,7 +217,7 @@ def _error_rate_problems(store: Store, paths: JobPaths, config_hash: str, shards
     for kind, eps in planned.items():
         x = len(excluded.get(kind, set()) & eps)
         tallies[kind] = {"planned": len(eps), "done": len(eps) - x, "excluded": x, "pending": 0}
-    return error_rate_problems(tallies, max_error_rate)
+    return error_rate_problems(with_unplanned(tallies, unplanned), max_error_rate)
 
 
 def needs_orchestrator(status: JobStatus) -> bool:

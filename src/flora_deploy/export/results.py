@@ -1,7 +1,10 @@
 """Reader API over composed outputs (``flora results``): records, Parquet tables, the summary.
 
-Outputs are read only after their ``summary.json`` exists (compose writes it last), so a reader
-never sees a half-composed set. ``config_hash`` defaults to the job manifest's.
+Outputs are read only through their ``summary.json`` (compose writes it last; its ``files``
+name the stage files of one complete generation, ``export.compose``), so a reader never sees a
+half-composed or mixed set, even while a re-compose runs. ``config_hash`` defaults to the job
+manifest's. A stage composed without JSONL (``output.formats: [parquet]``) is read from its
+Parquet table, and the other way round.
 
 ``store_from_uri`` maps a ``--store`` URI to a ``Store``:
 
@@ -68,15 +71,42 @@ def resolve_config_hash(store: Store, job_id: str, config_hash: str | None = Non
     return config_hash or load_manifest(store, job_id).config_hash
 
 
-def _read(store: Store, job_id: str, stage: str, fmt: str, config_hash: str | None) -> bytes:
+def _path(store: Store, job_id: str, stage: str, fmt: str, config_hash: str | None
+          ) -> str | None:
+    """The stage file the current summary points at (``None``: not composed in ``fmt``)."""
     cfg = resolve_config_hash(store, job_id, config_hash)
     paths = JobPaths(job_id)
-    if not store.exists(paths.output(cfg, "summary", "json")):
+    sp = paths.output(cfg, "summary", "json")
+    if not store.exists(sp):
         raise ResultsNotFound(f"job {job_id!r} (config {cfg}) has not been composed yet; run "
                               "`flora compose`")
-    path = paths.output(cfg, stage, fmt)
-    if not store.exists(path):
+    summary = json.loads(store.get_bytes(sp))
+    files = summary.get("files")
+    if files is None:  # composed before generations: the fixed paths
+        legacy = paths.output(cfg, stage, fmt)
+        return legacy if store.exists(legacy) else None
+    path = files.get(f"{stage}.{fmt}")
+    if path is None and stage not in summary.get("stages", {}):
         raise ResultsNotFound(f"no {stage!r} output for job {job_id!r} (config {cfg})")
+    return path
+
+
+def _read(store: Store, job_id: str, stage: str, fmt: str, config_hash: str | None) -> bytes:
+    path = _path(store, job_id, stage, fmt, config_hash)
+    if path is None:
+        other = "parquet" if fmt == "jsonl" else "jsonl"
+        if _path(store, job_id, stage, other, config_hash) is None:
+            raise ResultsNotFound(f"no {stage!r} output for job {job_id!r}")
+        recs = (records_from_table(pq.read_table(io.BytesIO(
+            _read(store, job_id, stage, "parquet", config_hash))))
+            if other == "parquet" else
+            [StageRecord.from_json(x) for x in _read(store, job_id, stage, "jsonl", config_hash)
+             .decode().splitlines() if x.strip()])
+        from flora_deploy.export.compose import to_jsonl, to_parquet, to_table
+
+        return to_jsonl(recs) if fmt == "jsonl" else to_parquet(to_table(stage, recs))
+    if not store.exists(path):
+        raise ResultsNotFound(f"no {stage!r} output for job {job_id!r} ({path} is missing)")
     return store.get_bytes(path)
 
 

@@ -75,8 +75,8 @@ jobs:
           set +e
           uv run flora run --local --fake-models --config "$demo/flora.yaml" \
             --store "$demo/faults" \
-            --inject preempt:segcap-00000,oom:ep003@segcap,fail:reward.terminal-00000 \
-            --inject infra:reward.dense-00000,spawnerr:segcap-00002,nverr:ep005@reward.dense
+            --inject "preempt:segcap-*,oom:ep003@segcap,fail:reward.terminal-*" \
+            --inject "infra:reward.dense-*,spawnerr:segcap-*,nverr:ep005@reward.dense"
           code=$?
           set -e
           test "$code" -eq 3

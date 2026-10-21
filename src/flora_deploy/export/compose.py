@@ -10,18 +10,30 @@ its own manifest, ``JobPaths.config_manifest``) and per stage, compose writes, a
 Parts are read from where their shard kind keys them (its stage hash, ``jobs.store.JobPaths``),
 so a config that reuses another config's finished ``segcap`` shards composes their records:
 
-* ``JobPaths.output(cfg, stage, "jsonl")``: canonical ``StageRecord.to_json`` lines sorted by
-  uid, then the record's earliest segment start;
-* ``JobPaths.output(cfg, stage, "parquet")``: the flattened table (``stage_schema``); segment
-  rows are exploded for ``segment`` / ``caption``, reward stages get their own columns;
-* ``JobPaths.output(cfg, "summary", "json")``: counts, digests and problems, written **last**
-  (its presence means the stage files are complete).
+* ``<stage>.jsonl``: canonical ``StageRecord.to_json`` lines sorted by uid, then the record's
+  earliest segment start;
+* ``<stage>.parquet``: the flattened table (``stage_schema``); segment rows are exploded for
+  ``segment`` / ``caption``, reward stages get their own columns;
+* ``JobPaths.output(cfg, "summary", "json")``: counts, digests and problems, written **last**.
+
+Only the formats in ``formats`` are written (the config's ``output.formats``; ``lerobot`` is
+not implemented yet and falls back to Parquet, with a problem line).
+
+**Generations** (review 6 M2). Stage files go to a generation directory named by the digest of
+their contents, ``<cfg>/output/gen/<generation>/<stage>.<fmt>``, and ``summary.json`` (the
+pointer: ``summary["files"]`` maps ``"<stage>.<fmt>"`` to those paths) is written after all of
+them. A re-compose writes a complete new generation and then swaps the pointer, so a reader that
+goes through the summary (``export.results``) always sees one complete set, even when a
+re-compose dies half way. Old generations stay in the store (whole-file stores have no
+delete); composing the same parts again reuses the same generation (byte-identical files).
 
 **Status** (``summary["status"]``; never "complete" for planned work without records):
 
 * ``complete``: every planned (uid, stage) has a record or a legitimate exclusion
   (NVIDIA-semantics failure, D15 poison pill) and, per stage, the excluded share is within
-  ``max_error_rate`` with at least one record;
+  ``max_error_rate`` with at least one record. Episodes the plan left out
+  (``Manifest.excluded``: index failures, source errors, enforced envelope exclusions, no task
+  text) count as excluded in every stage (``unplanned``);
 * ``completed_with_errors``: the job resolved, but a stage excluded more than that (or has no
   record at all); outputs are written, ``summary["problems"]`` says why, ``complete`` is false;
 * ``partial``: composed with ``partial=True`` before the job resolved (or after it failed).
@@ -120,6 +132,7 @@ REWARD_COLS: dict[str, list[pa.Field]] = {
 _OWN = {"segment": "segments", "caption": "segments", "reward.terminal": "terminal",
         "reward.dense": "dense", "reward.rubric": "rubric"}
 _PAYLOADS = ("segments", "terminal", "dense", "rubric")
+FORMATS = ("jsonl", "parquet")
 
 
 class ComposeError(ValueError):
@@ -295,11 +308,32 @@ def _error_counts(jf: JobFiles, progress: Progress) -> dict[str, Any]:
             "unreadable_files": unreadable}
 
 
+def job_state(state: str, summary: dict[str, Any] | None) -> str:
+    """A job's final state from the orchestrator's (or reconciler's) verdict and the composed
+    summary, the same way everywhere (``sdk.Job.status``, ``flora run --local``; review 6 H2):
+    compose may only downgrade a resolved ``done`` to ``completed_with_errors`` (its own rate
+    guard found too many exclusions); every other state is the orchestrator's."""
+    if state in ("done", "completed_with_errors") and summary is not None:
+        if summary.get("status") == "completed_with_errors":
+            return "completed_with_errors"
+    return state
+
+
+def output_path(paths: Any, cfg: str, generation: str, stage: str, fmt: str) -> str:
+    """Where one generation's stage file lives (module docstring)."""
+    base = paths.output(cfg, stage, fmt).rsplit("/", 1)
+    return f"{base[0]}/gen/{generation}/{base[1]}"
+
+
 def compose(store: Store, job_id: str, *, config_hash: str | None = None,
             partial: bool = False, limit: int = MAX_STARTS_BEFORE_QUARANTINE,
-            write: bool = True, max_error_rate: float = MAX_EPISODE_ERROR_RATE
-            ) -> ComposeResult:
+            write: bool = True, max_error_rate: float = MAX_EPISODE_ERROR_RATE,
+            formats: Iterable[str] = FORMATS) -> ComposeResult:
     """Compose one job's outputs for one config hash (see the module docstring)."""
+    wanted = [f for f in FORMATS if f in set(formats)]
+    format_problems = ([] if wanted else [
+        f"output.formats {sorted(set(formats))}: not implemented; wrote parquet instead"])
+    wanted = wanted or ["parquet"]
     try:
         manifest = load_manifest(store, job_id, config_hash)
     except FileNotFoundError as e:
@@ -340,7 +374,7 @@ def compose(store: Store, job_id: str, *, config_hash: str | None = None,
         by_stage[rec.stage].append(rec)
     stages = sorted({st for _u, st in ci.expected} | set(by_stage), key=STAGES.index)
 
-    files: dict[str, bytes] = {}
+    data_by_key: dict[str, bytes] = {}
     paths: dict[str, str] = {}
     stage_summary: dict[str, Any] = {}
     episode_states: dict[str, Counter[str]] = defaultdict(Counter)
@@ -351,10 +385,10 @@ def compose(store: Store, job_id: str, *, config_hash: str | None = None,
         recs = sort_records(by_stage.get(stage, []))
         by_stage[stage] = recs
         table = to_table(stage, recs, pools)
-        for fmt, data in (("jsonl", to_jsonl(recs)), ("parquet", to_parquet(table))):
-            p = jf.paths.output(cfg, stage, fmt)
-            files[p] = data
-            paths[f"{stage}.{fmt}"] = p
+        if "jsonl" in wanted:
+            data_by_key[f"{stage}.jsonl"] = to_jsonl(recs)
+        if "parquet" in wanted:
+            data_by_key[f"{stage}.parquet"] = to_parquet(table)
         cert = sum(r.certified for r in recs)
         per_pool: dict[str, Counter[str]] = defaultdict(Counter)
         for r in recs:
@@ -376,20 +410,33 @@ def compose(store: Store, job_id: str, *, config_hash: str | None = None,
             "episodes": dict(sorted(episode_states[stage].items())),
         }
 
+    generation = sha256("".join(f"{k} {sha256(v)}\n" for k, v in sorted(data_by_key.items())
+                                ).encode())[:16]
+    files: dict[str, bytes] = {}
+    for key, data in data_by_key.items():
+        stage, fmt = key.rsplit(".", 1)
+        p = output_path(jf.paths, cfg, generation, stage, fmt)
+        files[p] = data
+        paths[key] = p
+
     poisoned = sorted(f"{u}/{k}" for u, k in progress.poisoned())
     resolved = progress.complete and not missing and not failed_shards
-    problems = []
+    unplanned = dict(getattr(manifest, "excluded", None) or {})
+    problems = list(format_problems)
     for stage in stages:
         c = stage_summary[stage]
+        c["unplanned"] = len(unplanned)
         if not c["expected"]:
             continue
-        rate = c["excused"] / c["expected"]
+        excluded = c["excused"] + len(unplanned)
+        rate = excluded / (c["expected"] + len(unplanned))
         if c["records"] == 0:
             problems.append(f"{stage}: 0 records for {c['expected']} planned episodes "
                             f"({c['excused']} excluded, {c['missing']} missing)")
         elif rate > max_error_rate:
-            problems.append(f"{stage}: {c['excused']} of {c['expected']} episodes excluded "
-                            f"({rate:.0%} > {max_error_rate:.0%})")
+            problems.append(f"{stage}: {excluded} of {c['expected'] + len(unplanned)} episodes "
+                            f"excluded ({rate:.0%} > {max_error_rate:.0%})"
+                            + (f"; {len(unplanned)} left out of the plan" if unplanned else ""))
     status = ("partial" if not resolved else
               "completed_with_errors" if problems else "complete")
     part_lines = "".join(f"{p} {h}\n" for p, h in sorted(dstore.parts.items()))
@@ -410,6 +457,10 @@ def compose(store: Store, job_id: str, *, config_hash: str | None = None,
         "conflicts": [f"{u}/{st}" for u, st in sorted(ci.conflicts)],
         "foreign_records_dropped": ci.foreign,
         "poison_pills": poisoned,
+        "unplanned_episodes": unplanned,
+        "generation": generation,
+        "formats": wanted,
+        "files": dict(sorted(paths.items())),
         "errors": _error_counts(jf, progress),
         "shards": dict(sorted(Counter(s.state for s in progress.shards.values()).items())),
         "inputs": {"parts": len(dstore.parts), "digest": sha256(part_lines.encode())},
@@ -417,7 +468,7 @@ def compose(store: Store, job_id: str, *, config_hash: str | None = None,
     }
     summary_path = jf.paths.output(cfg, "summary", "json")
     paths["summary"] = summary_path
-    if write:
+    if write:  # the generation's files first, the pointer last (module docstring)
         for p, data in files.items():
             store.put_bytes(p, data)
         store.put_bytes(summary_path, (json.dumps(summary, sort_keys=True, indent=2,

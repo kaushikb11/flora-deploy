@@ -21,6 +21,7 @@ UncertifiedReason = Literal[
     "uncertified_stack",
     "uncovered_pool",
     "oracle_ineligible_source",
+    "fake_models",  # local runs (`flora run --local --fake-models`): never real labels
 ]
 
 

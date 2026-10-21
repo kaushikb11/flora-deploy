@@ -9,6 +9,7 @@ import pytest
 from flora_deploy.export.compose import (
     ComposeError,
     compose,
+    output_path,
     stage_schema,
     to_jsonl,
     to_parquet,
@@ -103,9 +104,11 @@ def test_compose_writes_outputs_and_summary(store):
     m, _jf = setup_job(store)
     res = compose(store, JOB)
     paths = JobPaths(JOB)
+    gen = res.summary["generation"]
     for stage in ("segment", "caption", "reward.terminal"):
         for fmt in ("jsonl", "parquet"):
-            assert store.exists(paths.output(CFG, stage, fmt))
+            p = output_path(paths, CFG, gen, stage, fmt)
+            assert store.exists(p) and res.summary["files"][f"{stage}.{fmt}"] == p
     s = load_summary(store, JOB)
     assert s == res.summary and s["complete"] and s["config_hash"] == CFG
     seg = s["stages"]["segment"]
@@ -117,7 +120,7 @@ def test_compose_writes_outputs_and_summary(store):
     assert s["stages"]["reward.terminal"]["rows"] == 4
     assert s["records"] == 12 and s["duplicates_resolved"] == 0 and s["conflicts"] == []
     assert s["inputs"]["parts"] == len(m.shards)
-    assert set(s["outputs"]) == {paths.output(CFG, st, f) for st in res.records
+    assert set(s["outputs"]) == {output_path(paths, CFG, gen, st, f) for st in res.records
                                  for f in ("jsonl", "parquet")}
 
     recs = list(iter_records(store, JOB, "caption"))

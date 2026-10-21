@@ -265,7 +265,7 @@ def test_flora_results_refuses_zero_records_for_planned_work(tmp_path):
     assert r.exit_code == 3 and "completed_with_errors" in r.output
     r = CliRunner().invoke(app, ["results", "--job", JOB, "--stage", KIND, "--store", uri,
                                  "--format", "jsonl"])
-    assert r.exit_code == 1 and "0 records for 1 planned" in r.output
+    assert r.exit_code == 2 and "0 records for 1 planned" in r.output
 
 
 # ---------------------------------------------------------------------------------------------

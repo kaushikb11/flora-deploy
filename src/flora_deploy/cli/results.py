@@ -13,14 +13,14 @@ from flora_deploy.cli._app import app, console
 
 StoreOpt = Annotated[str, typer.Option(
     "--store", envvar="FLORA_STORE",
-    help="State-of-record store: file:///dir (or a path), s3://bucket[/prefix], "
+    help="State-of-record store: file:///dir (or a path), s3://bucket\\[/prefix], "
          "modal-volume://name.")]
 JobOpt = Annotated[str, typer.Option("--job", help="Job id.")]
 CfgOpt = Annotated[str | None, typer.Option(
     "--config-hash", help="Config hash (default: the job manifest's).")]
 
 
-def _fail(msg: str, code: int = 1) -> typer.Exit:
+def _fail(msg: str, code: int = 2) -> typer.Exit:
     from rich.markup import escape
 
     console.print(f"[red]{escape(msg)}[/red]")

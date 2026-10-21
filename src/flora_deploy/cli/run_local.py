@@ -7,8 +7,14 @@ index → plan → orchestrate → compose with the real orchestrator, stores, w
 compose, deterministic fake models, no Modal and no GPU. Results go to a ``LocalStore`` directory
 (``--store``, default ``<config dir>/flora-local-store``) and are read with ``flora results``.
 
-Exit codes: 0 ``done``; 1 ``failed``; 3 ``completed_with_errors`` (records for some episodes are
-excused: see the errors in the summary); 4 ``budget_stopped``; 5 any other stop; 2 usage errors.
+Exit codes: 0 ``done``; 1 ``failed``; 3 ``completed_with_errors`` (more episodes excluded than
+``retries.max_episode_error_rate`` allows: see the errors in the summary); 4 ``budget_stopped``;
+5 any other stop (``cancelled``, ``interrupted``, ``lease_held``: another orchestrator holds the
+job's lease); 2 usage errors, refusals and internal errors (``flora_deploy.cli.main``).
+
+The job's run spec is written to the store, so ``flora status|report|cancel|resume <job> --store
+<store dir>`` and ``sdk.open_job`` work on local jobs. ``--store`` takes a directory or a
+``file:///dir`` URI.
 """
 
 from __future__ import annotations

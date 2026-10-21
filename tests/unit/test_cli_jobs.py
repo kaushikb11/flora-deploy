@@ -67,7 +67,7 @@ def test_detach_status_cancel(deployed):
     assert "detached" in out.output and "planned" in out.output
     st = job_cmd(deployed, "status")
     assert st.exit_code == 0 and "no orchestrator holds the lease" in st.output
-    assert job_cmd(deployed, "cancel").exit_code == 1  # no confirmation (no input)
+    assert job_cmd(deployed, "cancel").exit_code == 2  # declined (no input): a refusal
     c = job_cmd(deployed, "cancel", "--yes")
     assert c.exit_code == 0, c.output
     assert job_cmd(deployed, "status").exit_code == 5

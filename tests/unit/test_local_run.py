@@ -219,7 +219,9 @@ def test_budget_stop_then_resume(demo, clean, tmp_path):
     stopped = run_local(demo, store=tmp_path / "store", budget_usd=0.05)
     assert stopped.state == "budget_stopped", stopped.as_dict()
     assert stopped.counts("budget_stop") == 1
-    assert 1 <= stopped.summary["shards"].get("done", 0) < 5
+    # the production gate (review 6 M4): the whole job's projection, startup and scale-down
+    # included, is over $0.05 before the first spawn, so nothing runs
+    assert stopped.summary["shards"].get("done", 0) == 0 and stopped.spawner["calls"] == 0
     # without --resume the stop stays in force
     again = run_local(demo, store=tmp_path / "store", budget_usd=5.0)
     assert again.state == "budget_stopped" and again.spawner["calls"] == 0
@@ -279,26 +281,35 @@ def test_unsupported_kinds_and_states(tmp_path):
         LocalRunner(tmp_path / "flora.yaml")
     with pytest.raises(LocalRunError, match="fake-models"):
         LocalRunner(TEMPLATE, fake_models=False)
-    ok = {"complete": True, "poison_pills": [], "stages": {"caption": {"excused": 0}}}
-    assert completion_state("done", ok) == "done"
-    assert completion_state("done", {**ok, "poison_pills": ["u/segcap"]}) == \
-        "completed_with_errors"
-    assert completion_state("done", {**ok, "stages": {"caption": {"excused": 2}}}) == \
-        "completed_with_errors"
-    assert completion_state("done", {**ok, "complete": False}) == "failed"
+    # the orchestrator's verdict, downgraded only by compose's own rate guard (review 6 H2)
+    ok = {"status": "complete", "poison_pills": [], "stages": {"caption": {"excused": 1}}}
+    assert completion_state("done", ok) == "done"  # an exclusion within the rate is done
+    cwe = {**ok, "status": "completed_with_errors"}
+    assert completion_state("done", cwe) == "completed_with_errors"
+    assert completion_state("completed_with_errors", ok) == "completed_with_errors"
+    assert completion_state("done", {**ok, "status": "partial"}) == "failed"
+    assert completion_state("done", None) == "failed"
     assert completion_state("failed", ok) == "failed"
     assert completion_state("budget_stopped", None) == "budget_stopped"
+    assert completion_state("max_ticks", None) == "failed"
 
 
-def test_changed_config_for_the_same_job_is_refused(demo, tmp_path):
+def test_changed_config_for_the_same_job_replans_under_its_own_hash(demo, tmp_path):
+    """Review 6 H3: as on Modal, a changed config is planned under its own hash (its own
+    manifest), not refused; ``envelope`` is hashed into every kind, so everything re-runs."""
     store = tmp_path / "store"
-    assert run_local(demo, store=store).state == "done"
+    first = run_local(demo, store=store)
+    assert first.state == "done"
     text = demo.read_text().replace("envelope: warn", "envelope: ignore")
     other = tmp_path / "other.yaml"
     other.write_text(text)
     shutil.copytree(demo.parent / "videos", tmp_path / "videos")
-    with pytest.raises(LocalRunError, match="planned for config"):
-        run_local(other, store=store)
+    second = run_local(other, store=store)
+    assert second.state == "done" and second.config_hash != first.config_hash
+    assert second.spawner["calls"] == 5
+    st = LocalStore(store)
+    assert load_manifest(st, JOB, first.config_hash).config_hash == first.config_hash
+    assert load_manifest(st, JOB).config_hash == second.config_hash  # the latest plan
 
 
 def test_zero_modal_a_whole_job_runs_with_modal_unimportable(demo, tmp_path):

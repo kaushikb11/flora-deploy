@@ -62,7 +62,7 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Literal
 
@@ -215,6 +215,19 @@ class Progress:
             return "incomplete"
         return "done" if not error_rate_problems(self.exclusions(), max_error_rate) \
             else "completed_with_errors"
+
+
+def with_unplanned(exclusions: dict[str, dict[str, int]], unplanned: Mapping[str, str] | None
+                   ) -> dict[str, dict[str, int]]:
+    """Add the episodes the plan left out (``Manifest.excluded``: index failures, source errors,
+    enforced envelope exclusions, missing task text) to every kind's planned and excluded counts,
+    so the error-rate guard sees them (review 6 M6). Shared by the orchestrator, the reconciler
+    and compose."""
+    n = len(unplanned or {})
+    if not n:
+        return exclusions
+    return {kind: {**c, "planned": c["planned"] + n, "excluded": c["excluded"] + n}
+            for kind, c in exclusions.items()}
 
 
 def error_rate_problems(exclusions: dict[str, dict[str, int]], max_error_rate: float
