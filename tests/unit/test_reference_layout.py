@@ -11,15 +11,30 @@ from flora_deploy.layout import RECEIPT_NAME, snapshot_path
 from flora_deploy.stages import reference as ref
 
 
+def write_receipt(d: Path, pin, *, ok=True, **override) -> dict:
+    """A receipt shaped like ``prep.verify.build_receipt`` for the files in ``d``."""
+    from flora_deploy.prep import verify
+
+    digests = []
+    for rel in sorted(verify.local_files(d)):
+        size, mtime_ns, ino, dev = verify.fingerprint(d / rel)
+        sha = verify.hash_file(d / rel, git_blob=False)[0]
+        digests.append({"path": rel, "size": size, "sha256": sha, "mtime_ns": mtime_ns,
+                        "ino": ino, "dev": dev})
+    receipt = {"schema": verify.RECEIPT_SCHEMA, "ok": ok, "pin": verify.pin_record(pin),
+               "pin_digest": verify.pin_digest(pin), "plan_digest": pin.plan_digest,
+               "checks": [{"name": "x", "ok": ok, "detail": ""}], "digests": digests,
+               **override}
+    (d / RECEIPT_NAME).write_text(json.dumps(receipt))
+    return receipt
+
+
 def _fake_snapshot(weights: Path, key: str, *, ok=True, tree=True) -> Path:
     pin = PINS_BY_KEY[key]
     d = Path(snapshot_path(pin, weights))
     d.mkdir(parents=True)
     (d / "config.json").write_text("{}")
     (d / "model-00001-of-00002.safetensors").write_bytes(b"x" * 1000)
-    (d / RECEIPT_NAME).write_text(
-        json.dumps({"ok": ok, "pin": {"key": key, "revision": pin.revision}})
-    )
     meta = d / ".cache" / "huggingface" / "download"
     meta.mkdir(parents=True)
     (meta / "config.json.metadata").write_text(f"{pin.revision}\netag\n1.0\n")
@@ -29,7 +44,24 @@ def _fake_snapshot(weights: Path, key: str, *, ok=True, tree=True) -> Path:
         t = ref.tree_listing(d, pin.revision)
         t.parent.mkdir(parents=True)
         t.write_text("[]")
+    write_receipt(d, pin, ok=ok)
     return d
+
+
+REAL_EXPECTED = {"test_receipt_check_derives_expected_digests"}
+
+
+@pytest.fixture(autouse=True)
+def fake_expected(request, monkeypatch):
+    """The fake snapshots have no adapter / NVIDIA manifest: derive pins.py's expected digests
+    as matching, except in the tests that check the real derivation."""
+    if request.node.name in REAL_EXPECTED:
+        return
+    from flora_deploy.prep import verify
+
+    monkeypatch.setattr(verify, "_EXPECTED", {
+        k: (lambda key: lambda pin, root, sha: (dict(pin.expected)[key], "x"))(k)
+        for k in verify._EXPECTED})
 
 
 @pytest.fixture
@@ -145,3 +177,59 @@ def test_nvidia_models_json_matches_pins(nv_code):
     """The real models.json of the code pin names exactly our weight pins."""
     models = json.loads((nv_code("tempseg_code") / "batch_utils" / "models.json").read_text())
     ref.check_nv_models(models, environ={})
+
+
+def test_full_receipt_check(tmp_path, weights):
+    pin = PINS_BY_KEY["tempseg_base"]
+    d = Path(snapshot_path(pin, weights))
+    rep = ref.check_prep_receipt(pin, d)
+    assert rep["files"] == 2 and rep["fingerprints"] == ["size", "mtime_ns", "ino"]
+    assert rep["hashed_files"] == 2  # both are small
+    # the old shallow check accepted any receipt with ok + revision; these must all fail
+    good = json.loads((d / RECEIPT_NAME).read_text())
+    for bad, why in [({"schema": 3}, "schema"), ({"pin_digest": "0" * 64}, "pin_digest"),
+                     ({"plan_digest": "0" * 64}, "plan_digest"),
+                     ({"checks": [{"name": "x", "ok": False}]}, "passing"),
+                     ({"pin": {**good["pin"], "allow_patterns": ["*"]}}, "pin record")]:
+        (d / RECEIPT_NAME).write_text(json.dumps({**good, **bad}))
+        with pytest.raises(ref.OfflineLayoutError, match=why):
+            ref.check_prep_receipt(pin, d)
+    (d / RECEIPT_NAME).write_text(json.dumps(good))
+    # a rewritten file (same size, new mtime) and an extra file are caught
+    f = d / "model-00001-of-00002.safetensors"
+    os.utime(f, ns=(5, 5))
+    with pytest.raises(ref.OfflineLayoutError, match="fingerprint changed"):
+        ref.check_prep_receipt(pin, d)
+    assert ref.check_prep_receipt(pin, d, fields=("size",))["files"] == 2
+    (d / "extra.json").write_text("{}")
+    with pytest.raises(ref.OfflineLayoutError, match="file set"):
+        ref.check_prep_receipt(pin, d, fields=("size",))
+
+
+def test_legacy_schema1_receipt(tmp_path, weights):
+    """WS-A's schema-1 receipts (on the Volume today) carry sha256 + size only."""
+    pin = PINS_BY_KEY["tempseg_base"]
+    d = Path(snapshot_path(pin, weights))
+    good = json.loads((d / RECEIPT_NAME).read_text())
+    legacy = {**good, "schema": 1, "pin": {k: v for k, v in good["pin"].items()
+                                           if k != "plan_digest"}}
+    legacy.pop("pin_digest")
+    legacy["digests"] = [{k: x[k] for k in ("path", "size", "sha256")} for x in good["digests"]]
+    (d / RECEIPT_NAME).write_text(json.dumps(legacy))
+    rep = ref.check_prep_receipt(pin, d, hash_files="all")
+    assert rep["schema"] == 1 and rep["fingerprints"] == ["size"] and rep["hashed_files"] == 2
+    # same size, different bytes: only a hash catches it on a legacy receipt
+    f = d / "model-00001-of-00002.safetensors"
+    f.write_bytes(b"y" * 1000)
+    assert ref.check_prep_receipt(pin, d, hash_files="none")["files"] == 2
+    with pytest.raises(ref.OfflineLayoutError, match="sha256"):
+        ref.check_prep_receipt(pin, d, hash_files="all")
+    (d / RECEIPT_NAME).write_text(json.dumps({**legacy, "schema": 0}))
+    with pytest.raises(ref.OfflineLayoutError, match="schema"):
+        ref.check_prep_receipt(pin, d)
+
+
+def test_receipt_check_derives_expected_digests(tmp_path, weights):
+    pin = PINS_BY_KEY["tempseg"]  # expects adapter_sha256 + manifest_sha256
+    with pytest.raises(ref.OfflineLayoutError, match="expected"):
+        ref.check_prep_receipt(pin, Path(snapshot_path(pin, weights)))

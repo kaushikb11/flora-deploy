@@ -1,13 +1,18 @@
 """The ``exact`` reference stage: NVIDIA's own TempSeg -> Captioner pipeline (PLAN.md §4, §6.5).
 
-Modal-agnostic pieces used by ``modal_app/reference_app.py``:
+Modal-agnostic pieces used by ``modal_app/reference_app.py`` (``docs/exact-worker.md``):
 
-- ``build_offline_layout``: make NVIDIA's ``models.Session.load`` find the weights on the
-  ``flora-weights`` Volume with no network access and with NVIDIA's code unmodified (see below).
-- ``annotate_reference``: the minimal re-expression of NVIDIA's ``api.annotate`` /
-  ``pipeline.annotate`` orchestration around a ``CachedSession``.
-- ``capture_runtime_events`` / ``generation_stats``: read NVIDIA's own ``FLORA_RUNTIME`` stdout
-  events (token counts, generation time) without touching NVIDIA's modules.
+- ``annotate_nvidia``: runs NVIDIA's own entry point ``api.DataEnginePipeline().annotate``
+  with our resident ``CachedSession`` injected through a runtime swap of ``pipeline.Session``
+  (``install_nvidia_entry``). No NVIDIA orchestration is re-expressed here.
+- ``annotate_batch``: N episode threads sharing the resident models under one GPU lock (W3-A),
+  optionally with the OPT-1 ``accel`` patches active.
+- ``model_calls`` / ``compare_model_inputs`` / ``identity_summary``: model-input identity from
+  the ``input_tensor_digest`` NVIDIA's ``generate()`` logs.
+- ``ExactProfile``: which proven speedups are on (each toggleable, recorded in provenance).
+- ``build_offline_layout`` / ``check_prep_receipt``: WS-D copy layout and full prep-receipt
+  validation (the no-copy layout is ``modal_app/warm.build_linked_layout``).
+- ``capture_runtime_events`` / ``generation_stats``: NVIDIA's own ``FLORA_RUNTIME`` events.
 - ``persist_result``: write a result JSON locally, then copy it whole onto a Volume.
 
 How offline loading works (NVIDIA ``batch_utils/models.py`` at nvidia/Flora-TempSeg@78a0e4ac):
@@ -18,13 +23,12 @@ How offline loading works (NVIDIA ``batch_utils/models.py`` at nvidia/Flora-Temp
   ``<snapshot>/.cache/huggingface/trees/`` and, per file, the download metadata in
   ``.cache/huggingface/download/`` and returns the existing file without a request
   (``HF_HUB_OFFLINE=1`` makes any request raise instead). Reading that metadata takes a
-  ``filelock`` *inside* ``local_dir`` (``_local_folder.read_download_metadata``), so ``local_dir``
-  must be writable: a symlink to the read-only Volume fails with EROFS (measured on Modal).
-  We therefore **copy** each prepared Volume snapshot (mtimes preserved, so the metadata stays
-  current) to ``FLORA_MODEL_CACHE/<kind>`` on local disk. NVIDIA's ``validate_manifest``
-  (``models.py:59-98``) then hashes the local copy against NVIDIA's ``SOURCE_MANIFEST.sha256``
-  with its own path guard (``allowed_root`` = the copy itself) unchanged, so the bytes the model
-  loads are still verified by NVIDIA's check.
+  ``filelock`` *inside* ``local_dir``, so ``local_dir`` must be writable. WS-D copied each
+  snapshot to local disk (``build_offline_layout``); W3-B's link farm (``warm``) avoids the copy.
+  Preserving mtimes in the copy is **not required** (review2-wsd L2, measured): with a changed
+  mtime hub logs "Ignored metadata (outdated)" and still resolves offline; ``copy2`` keeps them
+  only to avoid that warning. Integrity rests on NVIDIA's ``validate_manifest`` (TempSeg,
+  Captioner) and on our prep receipts (``check_prep_receipt``; the only anchor for the base).
 - The TempSeg base (``models.py:128-130``) uses ``snapshot_download`` into the HF cache. We set
   ``HF_HUB_CACHE`` to a tmp dir with ``models--Qwen--Qwen3.5-9B/snapshots/<sha>`` -> the base
   snapshot on the Volume and ``.../trees`` -> its cached tree listing. In cache mode a commit-sha
@@ -34,6 +38,7 @@ How offline loading works (NVIDIA ``batch_utils/models.py`` at nvidia/Flora-Temp
 
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import re
@@ -111,8 +116,9 @@ def _same_file(src: os.stat_result, dest: Path) -> bool:
 
 
 def copy_snapshot(src: Path, dest: Path, *, workers: int = 8) -> dict:
-    """Copy a prepared snapshot dir (including ``.cache/huggingface``) with ``copy2`` so mtimes
-    survive. Skips files already copied (same size and mtime) and hub ``*.lock`` files."""
+    """Copy a prepared snapshot dir (including ``.cache/huggingface``) with ``copy2`` (mtimes are
+    kept only to avoid hub's "outdated metadata" warning; see the module docstring). Skips files
+    already copied (same size and mtime) and hub ``*.lock`` files."""
     from concurrent.futures import ThreadPoolExecutor
 
     t0 = time.monotonic()
@@ -162,6 +168,118 @@ def _check_snapshot(pin: RepoPin, target: Path, *, require_receipt: bool) -> Non
             raise OfflineLayoutError(f"{pin.key}: receipt {path} is not a passing receipt")
 
 
+LEGACY_RECEIPT_SCHEMA = 1  # WS-A's first receipts: sha256 + size per file, no fingerprints
+SMALL_FILE_BYTES = 64 * 2**20
+
+
+def check_prep_receipt(pin: RepoPin, snapshot_dir: Path,
+                       fields: tuple[str, ...] | None = None, *,
+                       hash_files: str = "small") -> dict:
+    """Full offline validation of a snapshot's ``prep_receipt.json`` (review2-wsd M5).
+
+    Same rules as ``prep.verify.check_receipt`` minus the Hub plan (offline there is no Hub tree;
+    the pinned ``plan_digest`` stands in for it): ``ok`` and every recorded check passing; the
+    receipt's pin equal to this pin (so a receipt of an older pin or ``allow_patterns`` is
+    refused); ``plan_digest`` equal to the pinned one; exactly the receipt's files on disk with
+    the recorded sizes.
+
+    - Current schema: also ``pin_digest`` (pin + verifier version) and each file's fingerprint
+      (``fields``, default size, mtime_ns and inode) equal to what was hashed, so a rewrite,
+      partial re-prep or ``modal volume put`` is caught without hashing.
+    - Legacy schema 1 (no fingerprints, no ``pin_digest`` were recorded): sizes only, so
+      ``hash_files`` decides what is re-hashed against the receipt's sha256.
+
+    ``hash_files``: ``"small"`` (files under 64 MiB: configs, tokenizer, chat template - a few
+    MB), ``"all"`` (every byte) or ``"none"``. Returns a small report; raises
+    ``OfflineLayoutError``."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from flora_deploy.prep import verify
+
+    fields = tuple(verify.REUSE_FINGERPRINT if fields is None else fields)
+    root = Path(snapshot_dir)
+    path = root / RECEIPT_NAME
+    t0 = time.monotonic()
+    try:
+        receipt = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        raise OfflineLayoutError(f"{pin.key}: unreadable receipt {path}: {e}") from e
+
+    def bad(why: str) -> OfflineLayoutError:
+        return OfflineLayoutError(f"{pin.key}: receipt {path} rejected: {why}")
+
+    schema = receipt.get("schema") if isinstance(receipt, dict) else None
+    if schema not in (verify.RECEIPT_SCHEMA, LEGACY_RECEIPT_SCHEMA):
+        raise bad(f"schema {schema} is neither {verify.RECEIPT_SCHEMA} nor "
+                  f"{LEGACY_RECEIPT_SCHEMA}")
+    current = schema == verify.RECEIPT_SCHEMA
+    if receipt.get("ok") is not True or not all(c.get("ok") for c in receipt.get("checks", [])):
+        raise bad("not a passing receipt")
+    want_pin = verify.pin_record(pin)
+    got_pin = receipt.get("pin")
+    if not current:
+        # Schema 1 did not record plan_digest inside the pin, and pins.py gained expected
+        # digests (manifest_sha256) after those receipts were written: what it recorded must
+        # agree; the rest is derived from the receipt's own sha256 table below.
+        drop = ("plan_digest", "expected")
+        got_expected = dict((got_pin or {}).get("expected") or {})
+        if any(dict(pin.expected).get(k) != v for k, v in got_expected.items()):
+            raise bad("expected digests differ from pins.py")
+        want_pin = {k: v for k, v in want_pin.items() if k not in drop}
+        got_pin = {k: v for k, v in (got_pin or {}).items() if k not in drop}
+    if got_pin != want_pin:
+        raise bad("pin record differs from pins.py")
+    if current and receipt.get("pin_digest") != verify.pin_digest(pin):
+        raise bad("pin_digest differs (pin, verifier or schema changed)")
+    if not pin.plan_digest or receipt.get("plan_digest") != pin.plan_digest.lower():
+        raise bad("plan_digest differs from the pinned plan_digest")
+    digests = {d.get("path"): d for d in receipt.get("digests", []) if isinstance(d, dict)}
+    try:
+        on_disk = verify.local_files(root)
+    except OSError as e:
+        raise bad(f"snapshot unreadable: {e}") from e
+    if on_disk != set(digests):
+        raise bad(f"file set differs: {sorted(on_disk ^ set(digests))[:5]}")
+    for rel, rec in digests.items():
+        size, mtime_ns, ino, _dev = verify.fingerprint(root / rel)
+        now = {"size": size, "mtime_ns": mtime_ns, "ino": ino}
+        changed = [k for k in (fields if current else ("size",)) if rec.get(k) != now[k]]
+        if changed:
+            raise bad(f"{rel}: fingerprint changed ({', '.join(changed)})")
+    if hash_files not in ("small", "all", "none"):
+        raise ValueError(f"hash_files must be small, all or none, not {hash_files!r}")
+    todo = [rel for rel, rec in digests.items()
+            if hash_files == "all" or (hash_files == "small"
+                                       and int(rec.get("size", 0)) < SMALL_FILE_BYTES)]
+
+    def sha(rel: str) -> tuple[str, bool]:
+        got, _, _ = verify.hash_file(root / rel, git_blob=False)
+        return rel, got == digests[rel].get("sha256")
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        mismatched = [rel for rel, ok in pool.map(sha, sorted(todo)) if not ok]
+    if mismatched:
+        raise bad(f"sha256 differs from the receipt: {mismatched[:5]}")
+    # pins.py's expected digests (e.g. NVIDIA's manifest sha256), from the receipt's table.
+    table = {rel: rec.get("sha256") for rel, rec in digests.items()}
+    for key, value in dict(pin.expected).items():
+        derive = verify._EXPECTED.get(key)
+        if derive is None:
+            raise bad(f"unknown expected digest {key!r}")
+        try:
+            got, _src = derive(pin, root, table)
+        except (OSError, ValueError) as e:
+            raise bad(f"expected {key}: {e}") from e
+        if got != value:
+            raise bad(f"expected {key} differs from pins.py")
+    return {"pin": pin.key, "schema": schema, "files": len(digests),
+            "bytes": sum(int(d.get("size", 0)) for d in digests.values()),
+            "fingerprints": list(fields) if current else ["size"],
+            "hashed_files": len(todo),
+            "hashed_bytes": sum(int(digests[r].get("size", 0)) for r in todo),
+            "seconds": round(time.monotonic() - t0, 3)}
+
+
 def _symlink(link: Path, target: Path) -> None:
     link.parent.mkdir(parents=True, exist_ok=True)
     if link.is_symlink():
@@ -180,11 +298,15 @@ def build_offline_layout(
     kinds: tuple[str, ...] = MODEL_KINDS,
     require_receipts: bool = True,
     workers: int = 8,
+    model_cache: Path | None = None,
 ) -> OfflineLayout:
-    """Create the layout described in the module docstring (idempotent; re-runs skip copies)."""
+    """Create the WS-D copy layout described in the module docstring (idempotent; re-runs skip
+    copies). Receipts get the full ``check_prep_receipt``. ``model_cache`` overrides
+    ``<root>/models`` (it must equal the container's ``FLORA_MODEL_CACHE``)."""
     root = Path(root)
     weights_root = PurePosixPath(weights_root)
-    model_cache, hub_cache = root / "models", root / "hf" / "hub"
+    model_cache = Path(model_cache) if model_cache is not None else root / "models"
+    hub_cache = root / "hf" / "hub"
     sources: dict[str, Path] = {}
     paths: dict[str, Path] = {}
     copies: dict[str, dict] = {}
@@ -194,6 +316,8 @@ def build_offline_layout(
         pin = PINS_BY_KEY[kind]
         src = Path(snapshot_path(pin, weights_root))
         _check_snapshot(pin, src, require_receipt=require_receipts)
+        if require_receipts:
+            check_prep_receipt(pin, src)
         dest = model_cache / kind
         if dest.is_symlink():
             raise OfflineLayoutError(f"{dest} is a symlink; NVIDIA's loader needs a writable copy")
@@ -203,6 +327,8 @@ def build_offline_layout(
     base = PINS_BY_KEY[BASE_KEY]
     src = Path(snapshot_path(base, weights_root))
     _check_snapshot(base, src, require_receipt=require_receipts)
+    if require_receipts:
+        check_prep_receipt(base, src)
     storage = hub_cache / hub_repo_folder(base.repo)
     _symlink(storage / "snapshots" / base.revision, src)
     _symlink(storage / "trees", tree_listing(src, base.revision).parent)
@@ -277,12 +403,81 @@ def generation_stats(events: list[dict]) -> dict:
     }
 
 
-# --- orchestration --------------------------------------------------------------------------
+# --- running NVIDIA's own entry point ------------------------------------------------------
+#
+# Review2-wsd M1: we no longer re-express ``pipeline.annotate``. Every episode runs NVIDIA's own
+# ``api.DataEnginePipeline().annotate(..., include_audit=True)``, which runs NVIDIA's ``_inputs``
+# (argument checks, 256 MiB cap, probe, ``check_synchronized``), ``pipeline.annotate`` (profile
+# checks, ``segment``, ``caption_*``, result dict) and its own interval check. Two module
+# attributes are swapped at runtime in our process (NVIDIA's files are untouched):
+#
+# - ``pipeline.Session``: ``pipeline.annotate`` does ``session = Session()`` (the name it imported
+#   from ``.models``) and ``session.close()`` in ``finally``. We bind it to a factory returning the
+#   episode's ``EpisodeSession`` view of the resident ``CachedSession`` (whose ``close`` is a
+#   no-op). The episode's session travels in a ``ContextVar`` set by the episode's own thread, so
+#   concurrent episodes each get their own processor clones.
+# - ``api._REQUEST_LOCK`` (only for concurrency > 1): NVIDIA's RLock serializes whole requests
+#   ("one video at a time"). With our GPU lock serializing every model call
+#   (``install_gpu_lock``) it is replaced by a no-op lock so CPU work of other episodes overlaps.
+#
+# Unbinding (``Patcher.restore``) gives back NVIDIA's original attributes: that is the
+# "unmodified NVIDIA" arm of the identity proof.
 
 ROLE_SETS = ({"main"}, {"main", "left_wrist", "right_wrist"})
+_EPISODE_SESSION: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "flora_episode_session", default=None
+)
+_SESSION_MARK = "__flora_session_factory__"
 
 
-def annotate_reference(
+class _NoLock:
+    """Stand-in for NVIDIA's ``api._REQUEST_LOCK`` when our GPU lock serializes model calls."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def acquire(self, *a, **k):
+        return True
+
+    def release(self):
+        return None
+
+
+def _bound_session_factory(original: Callable) -> Callable:
+    def Session():  # noqa: N802 - NVIDIA's name
+        session = _EPISODE_SESSION.get()
+        if session is None:
+            raise RuntimeError("pipeline.Session() called with no episode session bound "
+                               "(use stages.reference.bind_session)")
+        return session
+
+    setattr(Session, _SESSION_MARK, original)
+    return Session
+
+
+def install_nvidia_entry(nv, patcher, *, request_lock: bool = True) -> None:
+    """Make NVIDIA's ``annotate`` use the bound episode session (see the section comment).
+    ``request_lock=False`` also swaps NVIDIA's whole-request lock for a no-op (concurrency)."""
+    if getattr(nv.pipeline.Session, _SESSION_MARK, None) is not None:
+        raise RuntimeError("NVIDIA's pipeline.Session is already bound")
+    patcher.patch(nv.pipeline, "Session", _bound_session_factory)
+    if not request_lock:
+        patcher.patch(nv.api, "_REQUEST_LOCK", lambda orig: _NoLock())
+
+
+@contextmanager
+def bind_session(session) -> Iterator[None]:
+    token = _EPISODE_SESSION.set(session)
+    try:
+        yield
+    finally:
+        _EPISODE_SESSION.reset(token)
+
+
+def annotate_nvidia(
     nv,
     session,
     videos: dict[str, str],
@@ -290,136 +485,344 @@ def annotate_reference(
     long_windows: bool = False,
     instruction: str = "",
     progress: Callable[..., None] | None = None,
-    clock: Callable[[], float] = time.monotonic,
 ) -> dict:
-    """Run NVIDIA's pipeline on camera files with an already-loaded ``CachedSession``.
+    """Run NVIDIA's ``DataEnginePipeline().annotate(include_audit=True)`` on camera files.
 
-    LICENSE REVIEW FLAG (PLAN.md §11): re-expresses the orchestration of NVIDIA's
-    ``api.DataEnginePipeline.annotate`` (``batch_utils/api.py:44-58``) and ``pipeline.annotate``
-    (``batch_utils/pipeline.py:141-169``) at nvidia/Flora-TempSeg@78a0e4ac. Every step calls
-    NVIDIA's own function; the only differences are (a) the session is our ``CachedSession``
-    instead of a fresh ``Session()`` closed after the video, (b) per-stage wall-clock timers and
-    runtime-event capture, (c) the audit is always kept (``include_audit=True``).
-
-    ``videos`` maps camera roles (``main`` or ``main/left_wrist/right_wrist``) to local paths;
-    ``profile`` is an NVIDIA API profile (``human``, ``yam``, ``dex``, ``tianji``). Returns NVIDIA's
-    result dict plus a ``flora_reference`` key with our measurements.
+    ``session``: the session NVIDIA's ``pipeline.annotate`` should use (``install_nvidia_entry``
+    must be active), or ``None`` for NVIDIA's own fresh ``Session()`` (unmodified path).
+    ``videos`` maps roles (``main`` or ``main/left_wrist/right_wrist``) to local paths. Returns
+    NVIDIA's result dict plus a ``flora_reference`` key with our measurements, including
+    ``model_calls``: one entry per NVIDIA ``generate()`` with NVIDIA's logged input-tensor digest.
+    NVIDIA's exceptions propagate unchanged (``transport_error`` converts them at the Modal edge).
     """
     if set(videos) not in ROLE_SETS:
         raise ValueError(f"camera roles must be main or main/left_wrist/right_wrist: {videos}")
-    progress = progress or (lambda *a, **k: None)
-    pipeline, media, models = nv.pipeline, nv.media, nv.models
-    t0 = clock()
-    # api.py:50 -> api.py:11-38: argument checks, size cap, probe per role, check_synchronized.
-    nv_videos, canonical = nv.api.DataEnginePipeline._inputs(
-        videos["main"],
-        profile,
-        videos.get("left_wrist"),
-        videos.get("right_wrist"),
-        long_windows,
-        instruction,
-    )
-    t_probe = clock()
-    # pipeline.py:142-152
-    media.check_synchronized(nv_videos)
-    nv.preprocessing.instruction_suffix(instruction)
-    if canonical not in nv.config.PROFILE_POOLS:
-        raise media.InputError("Choose a supported action profile.")
-    if len(nv_videos) == 3 and canonical in ("Human", "Human actions"):
-        raise media.InputError("Choose YAM, Dex or Tianji when uploading wrist cameras.")
-    if long_windows and len(nv_videos) != 3:
-        raise media.InputError("The 32-second profile requires three synchronized camera views.")
-    if long_windows and canonical not in ("YAM", "Robot actions"):
-        raise media.InputError("The 32-second profile is available for YAM videos.")
-    pool = "yam32" if long_windows else nv.config.PROFILE_POOLS[canonical]
-    start = clock()
-    # pipeline.py:157-158
-    with capture_runtime_events() as seg_events:
-        segments, temporal_audit = pipeline.segment(nv_videos, pool, session, instruction, progress)
-        models.runtime_event(
-            "segmentation_complete", windows=len(temporal_audit), segments=len(segments)
+    bound = getattr(nv.pipeline.Session, _SESSION_MARK, None) is not None
+    if session is not None and not bound:
+        raise RuntimeError("a session was given but install_nvidia_entry is not active")
+    if session is None and bound:
+        raise RuntimeError("install_nvidia_entry is active: restore it for NVIDIA's own Session")
+    user_progress = progress or (lambda *a, **k: None)
+    marks: list[tuple[float, str]] = []
+
+    def progress_cb(frac, desc="", *a, **k):
+        if not marks:
+            marks.append((time.time(), desc))  # first call: right after ``Session()``
+        return user_progress(frac, desc)
+
+    t0 = time.time()
+    with (bind_session(session) if session is not None else nullcontext()), \
+            capture_runtime_events() as events:
+        result = nv.api.DataEnginePipeline().annotate(
+            videos["main"], profile=profile, left_wrist=videos.get("left_wrist"),
+            right_wrist=videos.get("right_wrist"), yam32=long_windows, instruction=instruction,
+            progress=progress_cb, include_audit=True,
         )
-    t_seg = clock()
-    # pipeline.py:160-163
-    with capture_runtime_events() as cap_events:
-        if len(nv_videos) == 3:
-            captions, caption_audit = pipeline.caption_three(
-                nv_videos, segments, session, instruction, progress, profile=canonical
-            )
-        else:
-            captions, caption_audit = pipeline.caption_single(
-                nv_videos, segments, canonical, session, instruction, progress
-            )
-    t_cap = clock()
-    # pipeline.py:164-167
-    for row, segment_row in zip(captions, segments, strict=True):
-        row["segmentation_provenance"] = segment_row["metadata"].get(
-            "segmentation_provenance", "fine"
-        )
-    models.runtime_event(
-        "annotation_complete",
-        segments=len(captions),
-        complete_captions=sum(r["status"] == "complete" for r in captions),
-        elapsed_s=round(clock() - start, 3),
-    )
-    main = nv_videos["main"]
-    result = dict(
-        schema_version="flora_demo_annotation_v1",
-        duration_s=main.duration_s,
-        segments=captions,
-        elapsed_s=round(clock() - start, 2),
-        source_clock="seconds relative to the first native source presentation timestamp",
-        camera_roles=list(nv_videos),
-        profile=canonical,
-        model_revisions=nv.config.MODELS,
-        input_sha256={role: video.sha256 for role, video in nv_videos.items()},
-        pipeline=dict(temporal_windows=temporal_audit, caption_inputs=caption_audit),
-    )
-    # api.py:52-55
-    for seg in result["segments"]:
-        ok = 0 <= seg["start_s"] < seg["end_s"] <= result["duration_s"] + 0.001
-        if not ok:
-            raise RuntimeError("The pipeline returned an invalid caption interval.")
+    t_end = time.time()
+    split = next((i for i, e in enumerate(events) if e.get("event") == "segmentation_complete"),
+                 len(events))
+    seg_events, cap_events = events[:split], events[split:]
+
+    def utc(name: str) -> float | None:
+        e = next((x for x in events if x.get("event") == name), None)
+        return _utc_seconds(e.get("utc")) if e else None
+
+    t_probe = marks[0][0] if marks else None
+    t_seg, t_cap = utc("segmentation_complete"), utc("annotation_complete")
+    audit = result.get("pipeline", {})
+
+    def span(a, b):
+        return round(b - a, 3) if a is not None and b is not None else None
+
     result["flora_reference"] = {
-        "pool": pool,
-        "inputs": {
-            role: {
-                "path": str(v.path),
-                "rate": str(v.rate),
-                "frames": len(v.pts_us),
-                "size": list(v.size),
-                "cfr": v.cfr,
-                "duration_us": v.duration_us,
-            }
-            for role, v in nv_videos.items()
-        },
+        "entry": "api.DataEnginePipeline.annotate",
+        "session": "nvidia_fresh" if session is None else type(session).__name__,
+        "inputs": {role: str(path) for role, path in videos.items()},
         "timings_s": {
-            "probe": round(t_probe - t0, 3),
-            "segment": round(t_seg - start, 3),
-            "caption": round(t_cap - t_seg, 3),
-            "total": round(t_cap - t0, 3),
+            "probe": span(t0, t_probe),  # NVIDIA's _inputs: probe + checks (+ Session())
+            "segment": span(t_probe, t_seg),  # includes the TempSeg load on a fresh Session
+            "caption": span(t_seg, t_cap),  # includes the Captioner load on a fresh Session
+            "total": round(t_end - t0, 3),
         },
         "counts": {
-            "temporal_windows": len(temporal_audit),
-            "segments": len(segments),
-            "caption_inputs": len(caption_audit),
-            "captions_complete": sum(r["status"] == "complete" for r in captions),
+            "temporal_windows": len(audit.get("temporal_windows", [])),
+            "segments": len(result.get("segments", [])),
+            "caption_inputs": len(audit.get("caption_inputs", [])),
+            "captions_complete": sum(s.get("status") == "complete"
+                                     for s in result.get("segments", [])),
         },
-        "generation": {
-            "segment": generation_stats(seg_events),
-            "caption": generation_stats(cap_events),
-        },
-        "tokens": {
-            "segment": token_stats(seg_events),
-            "caption": token_stats(cap_events),
-        },
+        "generation": {"segment": generation_stats(seg_events),
+                       "caption": generation_stats(cap_events)},
+        "tokens": {"segment": token_stats(seg_events), "caption": token_stats(cap_events)},
+        "model_calls": model_calls(events, result),
     }
     return result
+
+
+def _utc_seconds(value: str | None) -> float | None:
+    from datetime import datetime
+
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        return None
 
 
 def nvidia_result(result: dict) -> dict:
     """NVIDIA's dict without our measurements (for parity comparisons)."""
     return {k: v for k, v in result.items() if k != "flora_reference"}
+
+
+# --- model-input identity (docs/exact-worker.md) ---------------------------------------------
+#
+# NVIDIA's ``models.generate`` logs ``generation_start`` with ``input_tensor_digest`` (sha256 over
+# every input tensor's dtype, shape and bytes) before each model call, and ``generation_end``
+# (token counts, ``complete``) after it. W3-A showed NVIDIA's own sequential pipeline is not run-to-
+# run deterministic on the H200 (identical inputs, different text), so identity of a wrap is
+# proven on these input digests. Outputs are paired from NVIDIA's result: the k-th complete TempSeg
+# call (budget 1024) is ``pipeline.temporal_windows[k].output`` (NVIDIA appends after each
+# successful ``generate``), the k-th complete Captioner call (budget 512) is the k-th ``complete``
+# caption (calls follow plan order, which is segment order).
+
+TEMPSEG_BUDGET, CAPTION_BUDGET = 1024, 512
+
+
+def _sha(text: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def model_calls(events: list[dict], result: dict | None = None) -> list[dict]:
+    """One record per NVIDIA ``generate()`` call of an episode, in call order."""
+    calls: list[dict] = []
+    open_call: dict | None = None
+    for e in events:
+        kind = e.get("event")
+        if kind == "generation_start":
+            open_call = {
+                "model": "tempseg" if e.get("output_limit") == TEMPSEG_BUDGET else "captioner",
+                "input_digest": e.get("input_tensor_digest"),
+                "input_tokens": e.get("input_tokens"),
+                "output_limit": e.get("output_limit"),
+            }
+            calls.append(open_call)
+        elif kind == "generation_end" and open_call is not None:
+            open_call.update(generated_tokens=e.get("generated_tokens"),
+                             complete=bool(e.get("complete")))
+            open_call = None
+    if result is not None:
+        windows = [w.get("output") for w in result.get("pipeline", {}).get("temporal_windows", [])]
+        captions = [s.get("caption") for s in result.get("segments", [])
+                    if s.get("status") == "complete"]
+        outs = {"tempseg": iter(windows), "captioner": iter(captions)}
+        for c in calls:
+            if c.get("complete"):
+                text = next(outs[c["model"]], None)
+                c["output_sha256"] = _sha(text) if isinstance(text, str) else None
+            else:
+                c["output_sha256"] = None
+    return calls
+
+
+def _same_output(a: dict, b: dict) -> bool:
+    return (a.get("complete"), a.get("output_sha256"), a.get("generated_tokens")) == (
+        b.get("complete"), b.get("output_sha256"), b.get("generated_tokens"))
+
+
+def compare_model_inputs(a: list[dict], b: list[dict]) -> dict:
+    """Model-input identity of two runs of one episode (``model_calls`` lists, call order).
+
+    ``strict``: every call's input digest equal, same number of calls.
+    ``gate_ok`` (the acceptance gate): no call has a different input while every earlier call
+    (inputs and outputs) agreed; calls after the first *output* difference are downstream of
+    NVIDIA's own GPU non-determinism and only reported.
+    """
+    from collections import Counter
+
+    da, db = [c.get("input_digest") for c in a], [c.get("input_digest") for c in b]
+    first_out_diff = None
+    violation = None
+    gated = 0
+    for k in range(min(len(a), len(b))):
+        if da[k] != db[k]:
+            violation = k
+            break
+        gated += 1
+        if not _same_output(a[k], b[k]):
+            first_out_diff = k
+            break
+    if violation is None and first_out_diff is None and len(a) != len(b):
+        violation = min(len(a), len(b))  # same everything, but one run made more calls
+    pairs = [(x, y) for x, y in zip(a, b, strict=False)
+             if x.get("input_digest") == y.get("input_digest")]
+    return {
+        "calls_a": len(a),
+        "calls_b": len(b),
+        "strict": da == db,
+        "multiset": Counter(da) == Counter(db),
+        "gate_ok": violation is None,
+        "gate_violation_call": violation,
+        "gated_calls": gated,
+        "first_output_difference_call": first_out_diff,
+        "same_input_pairs": len(pairs),
+        "same_input_different_output": sum(not _same_output(x, y) for x, y in pairs),
+    }
+
+
+def identity_summary(a: dict[str, dict], b: dict[str, dict]) -> dict:
+    """Per-episode ``compare_model_inputs`` + output agreement for two ``{episode: result}``."""
+    episodes = {}
+    for ep in sorted(set(a) | set(b)):
+        if ep not in a or ep not in b:
+            episodes[ep] = {"missing_in": "a" if ep not in a else "b"}
+            continue
+        ca = a[ep].get("flora_reference", {}).get("model_calls", [])
+        cb = b[ep].get("flora_reference", {}).get("model_calls", [])
+        row = compare_model_inputs(ca, cb)
+        row["output_identical"] = comparable_result(a[ep]) == comparable_result(b[ep])
+        row["digest_a"], row["digest_b"] = result_digest(a[ep])[:12], result_digest(b[ep])[:12]
+        if not row["output_identical"]:
+            row["diff_paths"] = diff_paths(comparable_result(a[ep]), comparable_result(b[ep]),
+                                           limit=5)
+        episodes[ep] = row
+    both = [r for r in episodes.values() if "missing_in" not in r]
+    return {
+        "episodes": episodes,
+        "compared": len(both),
+        "gate_ok": bool(both) and all(r["gate_ok"] for r in both),
+        "strict_episodes": sum(r["strict"] for r in both),
+        "output_identical_episodes": sum(r["output_identical"] for r in both),
+        "gated_calls": sum(r["gated_calls"] for r in both),
+        "calls_a": sum(r["calls_a"] for r in both),
+        "same_input_pairs": sum(r["same_input_pairs"] for r in both),
+        "same_input_different_output": sum(r["same_input_different_output"] for r in both),
+    }
+
+
+# --- transport across the Modal boundary (review2-wsd M4) ------------------------------------
+
+
+class NvidiaError(RuntimeError):
+    """An exception raised inside NVIDIA's (or our) code in the worker, carried to the client.
+
+    NVIDIA's exception classes live in the aliased ``flora_nv_*`` modules that do not exist in the
+    client process, so they cannot be unpickled there. This builtin-based class carries the
+    original qualified type name and message and pickles by value."""
+
+    def __init__(self, type_name: str, message: str):
+        super().__init__(f"{type_name}: {message}")
+        self.type_name, self.message = type_name, message
+
+    def __reduce__(self):
+        return (type(self), (self.type_name, self.message))
+
+
+class NvidiaInputError(NvidiaError):
+    """NVIDIA rejected the input (``InputError``, ``InputErrorForModel``) or ours did."""
+
+
+_INPUT_ERRORS = ("InputError", "InputErrorForModel")
+
+
+def transport_error(e: BaseException) -> NvidiaError:
+    if isinstance(e, NvidiaError):
+        return e
+    cls = type(e)
+    name = f"{cls.__module__}.{cls.__qualname__}"
+    kind = NvidiaInputError if cls.__name__ in _INPUT_ERRORS or isinstance(e, ValueError) \
+        else NvidiaError
+    return kind(name, str(e))
+
+
+def new_run_id(prefix: str = "exact") -> str:
+    """Unique, path-safe run id: ``<prefix>-<UTC second>-<8 hex>`` (review2-wsd L1)."""
+    import uuid
+
+    return safe_name(f"{prefix}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-"
+                     f"{uuid.uuid4().hex[:8]}")
+
+
+# --- the `exact` profile: which proven speedups are on ---------------------------------------
+
+
+@dataclass(frozen=True)
+class ExactProfile:
+    """Every proven speedup of the ``exact`` worker, individually toggleable (and recorded).
+
+    - ``accel``: OPT-1 runtime patches (``docs/accel.md``), any subset of ``accel.ALL_PATCHES``;
+    - ``captioner_bf16``: OPT-2 bit-identical BF16 Captioner (``docs/captioner-bf16.md``);
+    - ``linked_layout``: W3-B no-copy model cache (``warm.build_linked_layout``); off = WS-D copy;
+    - ``prefetch``: W3-B t=0 parallel read of the weights into the page cache;
+    - ``overlap_hash``: W3-B NVIDIA's FP32 Captioner manifest hash while TempSeg loads (only
+      meaningful with ``captioner_bf16`` off; NVIDIA's ``_VERIFIED_MANIFESTS`` then reuses it);
+    - ``concurrency``: W3-A episode threads under one GPU lock (1 = NVIDIA's sequential order).
+    """
+
+    accel: tuple[str, ...] = ("decode_once", "transport_pool", "png_inmem", "geometry_pool")
+    captioner_bf16: bool = True
+    linked_layout: bool = True
+    prefetch: bool = True
+    overlap_hash: bool = True
+    concurrency: int = 4
+
+    FEATURES = ("captioner_bf16", "linked_layout", "prefetch", "overlap_hash")
+
+    @classmethod
+    def from_spec(cls, disable: str = "", concurrency: int | None = None) -> ExactProfile:
+        """``disable``: comma-separated feature or accel patch names to turn off."""
+        off = {s.strip() for s in disable.split(",") if s.strip()}
+        base = cls()
+        unknown = off - set(cls.FEATURES) - set(base.accel)
+        if unknown:
+            raise ValueError(f"unknown exact-profile toggles {sorted(unknown)}")
+        return cls(
+            accel=tuple(p for p in base.accel if p not in off),
+            **{f: f not in off for f in cls.FEATURES},
+            concurrency=base.concurrency if concurrency is None else int(concurrency),
+        )
+
+    def provenance(self) -> dict:
+        return {
+            "schema": "flora_exact_profile_v1",
+            "accel": list(self.accel),
+            "captioner_bf16": self.captioner_bf16,
+            "linked_layout": self.linked_layout,
+            "prefetch": self.prefetch,
+            "overlap_hash": self.overlap_hash and not self.captioner_bf16,
+            "concurrency": self.concurrency,
+            "gpu_lock": True,
+        }
+
+
+# --- records (flora_labels_v1) ---------------------------------------------------------------
+
+
+def stage_records(result: dict, *, uid: str, dataset: str, episode_id: str, provenance,
+                  audit_ref: str | None = None) -> list:
+    """NVIDIA's result as ``segment`` and ``caption`` ``StageRecord``s (``records.py``).
+
+    ``exact`` is the reference by construction, so records are certified."""
+    from flora_deploy.records import Segment, StageRecord
+
+    rows = result.get("segments", [])
+
+    def segs(with_caption: bool):
+        return tuple(
+            Segment(event_id=f"event_{i:04d}", start_s=float(s["start_s"]),
+                    end_s=float(s["end_s"]),
+                    status="complete" if s.get("status") == "complete"
+                    else "unsupported_target_frames",
+                    caption=s.get("caption") if with_caption else None,
+                    segmentation_provenance=s.get("segmentation_provenance"))
+            for i, s in enumerate(rows))
+
+    return [StageRecord(uid=uid, dataset=dataset, episode_id=episode_id, stage=stage,
+                        provenance=provenance, certified=True, segments=segs(cap),
+                        audit_ref=audit_ref)
+            for stage, cap in (("segment", False), ("caption", True))]
 
 
 # --- output-identical concurrency (docs/exact-concurrency.md) -------------------------------
@@ -713,8 +1116,13 @@ def annotate_batch(
     clones: ProcessorClones | None = None,
     sampler=None,
     progress: Callable[[str, float, str], None] | None = None,
+    accel=None,
 ) -> dict:
-    """Run ``annotate_reference`` over ``episodes`` with ``concurrency`` worker threads.
+    """Run ``annotate_nvidia`` over ``episodes`` with ``concurrency`` worker threads.
+
+    ``session``: the resident ``CachedSession`` (``install_nvidia_entry`` active), or ``None`` to
+    run NVIDIA's own fresh ``Session()`` per episode (sequential only). ``accel``: an active
+    ``accel.ActivePatches``; each episode runs inside its ``episode()`` scope.
 
     ``episodes`` items: ``{"episode", "videos", "profile", ["long_windows"], ["instruction"]}``.
     ``concurrency=1`` runs them in order in the calling thread (the sequential baseline). With
@@ -735,10 +1143,16 @@ def annotate_batch(
     if len(set(names)) != len(names):
         raise ValueError(f"duplicate episode names: {names}")
     if concurrency > 1:
+        if session is None:
+            raise RuntimeError("concurrency > 1 needs the resident session")
         lock = getattr(nv.pipeline.generate, "__flora_gpu_lock__", None)
         if lock is None or (gpu_lock is not None and lock is not gpu_lock):
             raise RuntimeError("concurrency > 1 needs NVIDIA generate() under the GPU lock")
+        if not isinstance(getattr(nv.api, "_REQUEST_LOCK", None), _NoLock):
+            raise RuntimeError("concurrency > 1 needs install_nvidia_entry(request_lock=False)")
         gpu_lock = lock
+    if session is None:
+        clone_processors = False
     if clone_processors is None:
         clone_processors = concurrency > 1
     if clone_processors and clones is None:
@@ -759,15 +1173,20 @@ def annotate_batch(
             def report(frac, desc="", _name=ep["episode"]):
                 progress(_name, frac, desc)
         try:
-            with recording(rec), (clones.lease() if clones else nullcontext()) as procs:
-                result = annotate_reference(
-                    nv, EpisodeSession(session, procs), ep["videos"], ep["profile"],
-                    ep.get("long_windows", False), ep.get("instruction", ""), progress=report,
+            with recording(rec), (clones.lease() if clones else nullcontext()) as procs, \
+                    (accel.episode() if accel is not None else nullcontext()):
+                result = annotate_nvidia(
+                    nv, None if session is None else EpisodeSession(session, procs),
+                    ep["videos"], ep["profile"], ep.get("long_windows", False),
+                    ep.get("instruction", ""), progress=report,
                 )
         except Exception as e:  # noqa: BLE001 - one bad episode must not sink the batch
-            return None, f"{type(e).__name__}: {e}"
+            err = transport_error(e)
+            return None, f"{err.type_name}: {err.message}"
         ref = result["flora_reference"]
         ref["batch"] = {"concurrency": concurrency, "end_s": round(time.perf_counter() - t0, 3)}
+        if accel is not None:
+            ref["accel"] = accel.provenance()
         if rec is not None:
             ref["observe"] = episode_observe(rec, result, t0,
                                              gpu_lock.name if gpu_lock else GPU_LOCK_NAME)
@@ -835,11 +1254,15 @@ def persist_result(
     episode: str,
     commit: Callable[[], None] = lambda: None,
     tmp_dir: str | None = None,
+    overwrite: bool = False,
 ) -> Path:
     """Write ``result`` to a local temp file, copy it whole to
-    ``<golden_root>/reference_runs/<run_id>/<episode>.json`` (via a ``.partial`` + rename), then
-    ``commit()`` the Volume. Never keeps a file open on the Volume."""
+    ``<golden_root>/reference_runs/<run_id>/<episode>.json`` (via a ``.partial`` + rename, so a
+    reader never sees a partial file), then ``commit()`` the Volume. Never keeps a file open on
+    the Volume. Refuses to replace an existing result unless ``overwrite`` (like NVIDIA's CLI)."""
     dest = Path(golden_root) / result_relpath(run_id, episode)
+    if dest.exists() and not overwrite:
+        raise FileExistsError(f"{dest} exists (pass overwrite=True to replace it)")
     payload = dumps_result(result)
     with tempfile.TemporaryDirectory(dir=tmp_dir) as tmp:
         local = Path(tmp) / dest.name
@@ -1050,3 +1473,45 @@ def stage_all(
     write_json_whole(manifest, manifest_path)
     commit()
     return manifest
+
+
+# --- golden episodes (docs/golden-manifest-v1.md) --------------------------------------------
+
+# S1 identity proof: short episodes spanning the human / single-view yam / 3-view yam / dex pools.
+IDENTITY_EPISODES = (
+    "human/egodex_add_remove_lid/episode_000014",
+    "human/egodex_make_sandwich/episode_000002",
+    "single_view_robot/wgo/robointer_droid_000010",
+    "yam/aloha_static_cups_open/episode_000000",
+    "yam/aloha_static_towel/episode_000000",
+    "dex/g1_dex3_toasted_bread/episode_000034",
+)
+
+
+def golden_name(episode_id: str) -> str:
+    """Path-safe result name of a golden manifest id (``pool/dataset/slug``)."""
+    return safe_name(episode_id.replace("/", "__"))
+
+
+def golden_episode_inputs(manifest: dict, ids, root: Path | PurePosixPath, *,
+                          instruction: bool = True) -> list[dict]:
+    """``annotate_batch`` episodes for golden manifest ids (camera files under ``root``).
+
+    ``instruction``: pass the episode's dataset task text as NVIDIA's ``instruction`` (blank when
+    the dataset has none), so both of NVIDIA's caption prompt paths are exercised."""
+    by_id = {e["id"]: e for e in manifest.get("episodes", [])}
+    out = []
+    for i in ids:
+        e = by_id.get(i)
+        if e is None:
+            raise KeyError(f"{i!r} not in the golden manifest")
+        if not e.get("oracle_eligible") or e.get("pool") == "reward":
+            raise ValueError(f"{i!r} is not an oracle-eligible TempSeg/Captioner episode")
+        videos = {role: str(PurePosixPath(root) / e["path"] / f["file"])
+                  for role, f in e["files"].items() if f.get("file")}
+        task = (e.get("task") or "").strip() if instruction else ""
+        out.append({"episode": golden_name(i), "id": i, "pool": e["pool"],
+                    "profile": e["profile"], "long_windows": bool(e.get("yam32")),
+                    "instruction": task if len(task) <= 2000 else "",
+                    "duration_s": float(e.get("duration_s") or 0.0), "videos": videos})
+    return out
