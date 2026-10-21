@@ -1,13 +1,20 @@
 # Gate C: vLLM 0.24.0 model inputs vs NVIDIA's HF processor
 
-**Verdict: not yet decided under the current criteria. The recorded 2026-10-21 run passed
-(PASS, pre-criteria run; re-run pending)** with a capture-layer fix, under a required engine
-setting (`mm_processor_cache_gb=0`). That run predates the run-verdict rules below: it did not
-check placeholder ranges, its `results.json` has no `verdict` or `provenance` keys, the HF side
-ran in `img_vllm` rather than the `exact` reference image `img_hfref` (review 3 C2), and its
-`tianji` pool built 5 of the 6 TempSeg requests of the quota, which is now a FAIL (review 4 L3).
-Re-run `scripts/gatec.py` on a committed SHA, with the quota and the `img_hfref` cross-check
-passed to `validate.gatec.gate_verdict`, to decide it.
+**Verdict: FAIL under the current criteria** (the recorded 2026-10-21 run, re-scored by
+`scripts/gatec.py --rescore` exactly as the script now scores a run, review 5 M-A). Every one of
+its 127 compared requests passes (`wrapped` rows: tempseg 67/67, captioner 60/60; 20/20 cases),
+with a capture-layer fix and under a required engine setting (`mm_processor_cache_gb=0`). It
+fails on two run-level criteria, not on any compared request:
+- **quota:** `tempseg golden:tianji` built 5 of the 6 requests (tianji has 2 golden episodes,
+  and episode 75 has only 2 TempSeg windows). A shortfall is a FAIL (review 4 L3), and the gate
+  stays FAIL for this pool until the golden selection gains a tianji episode;
+- **C2:** the HF reference ran in `img_vllm`, not the `exact` reference image `img_hfref`, and
+  no `img_hfref` cross-check exists yet (review 3 C2). An `img_hfref` stage-1 build that emits
+  `{case_id, index, hf_ids_digest, hf_pixels_digest}` for `validate.gatec.reference_cross_check`
+  is still to be written.
+
+The run also predates the placeholder-range check, and its `results.json` has no `verdict` or
+`provenance` keys. A new run on a committed SHA records both.
 
 NVIDIA's prompts, as captured, are **rejected** by vLLM 0.24.0
 (0/56 builder-case requests render). With the fix (`nv.capture.vllm_prompt`, which wraps each bare
@@ -119,12 +126,19 @@ container:
 only over the rows that exist:
 - every (kind, part) is built, with no build-stage error and at least one request. A pool whose
   builds all failed is a FAIL, never a silent `n/a`;
-- every golden pool reaches its request quota (`quota=`, or the build's own `quota`): a
-  shortfall is a FAIL, not a smaller sample (review 4 L3). Without a quota the verdict carries
-  a warning;
+- every golden pool reaches its request quota: a shortfall is a FAIL, not a smaller sample
+  (review 4 L3). The required quota is the larger of the caller's `quota=` and a build's own
+  `quota` (a build can never lower the floor, review 5 M-A). `scripts/gatec.py` passes
+  `--quota` (default 6) and the golden selection's capacity
+  (`validate.gatec_driver.golden_capacity`: staged, oracle-eligible episodes × 3 per episode).
+  Before anything runs it warns about every pool whose capacity is below the quota; a shortfall
+  names its reason (too few episodes, or episodes with fewer calls than the maximum). Called
+  without a quota, `gate_verdict` only warns;
 - the HF reference ran in `img_hfref`, or a passing `validate.gatec.reference_cross_check`
   shows that the stage-1 HF ids and pixel digests built in `img_vllm` equal those built in
-  `img_hfref` (review 3 C2). Without this information the verdict carries a warning;
+  `img_hfref` (review 3 C2). `scripts/gatec.py` records where `build_part` ran it
+  (`img_vllm`). With no reference recorded the verdict is a FAIL (review 5 M-A), unless the
+  caller passes `allow_unverified_reference=True` (then a warning);
 - every built request has a `wrapped` row;
 - every builder case and golden pool has rows;
 - every `wrapped` row passes.
@@ -135,12 +149,23 @@ provenance: `run_id`, `git rev-parse HEAD` with a dirty flag, and `image_fingerp
 
 **Status of the recorded run.** The 2026-10-21 run below predates these rules (review 3, C1/C3/
 C4). It had no build errors (`errors: []` in every build), covered every pool, and ran
-`generate` on every `wrapped` row. But it did not check placeholder ranges, its
-`results.json` has no git SHA or image fingerprint, its HF side ran in `img_vllm`, and `tianji`
-built 5 of 6 TempSeg requests (episode 75 has only 2 TempSeg windows), which the quota rule now
-fails. Re-run `scripts/gatec.py` once on the committed SHA to decide it under the full
-criteria; `modal_app/gatec_app.py` still has to pass `quota=` and the `img_hfref`
-cross-check to `gate_verdict`.
+`generate` on every `wrapped` row. Re-scored with `scripts/gatec.py --rescore
+~/.cache/flora-deploy/gatec/results.json` (quota 6, capacity from `golden/v1/manifest.json`,
+reference `img_vllm`), it is a **FAIL** with exactly two problems:
+
+```
+problem: tempseg golden:tianji: 5 of 6 requests (quota shortfall: the golden selection's
+         2 episode(s) yielded fewer calls than their 6 maximum; add episodes)
+problem: HF reference ran in 'img_vllm', not 'img_hfref', and no passing cross-check
+         against 'img_hfref' (review 3 C2)
+coverage: captioner 60 built / 60 compared / 60 passed; tempseg 67 / 67 / 67
+```
+
+It also did not check placeholder ranges, and its `results.json` has no git SHA or image
+fingerprint. To turn the gate into a PASS: add a tianji golden episode (or lower the quota
+explicitly, and say so here), write the `img_hfref` stage-1 build and pass its
+`reference_cross_check` result as `reference["cross_check"]`, and re-run `scripts/gatec.py` on
+a committed SHA.
 
 Unit tests (`tests/unit/test_gatec_compare.py`) and nvlink tests with the real processor
 (`tests/nvlink/test_nv_link_capture_vllm_prompt.py::test_pixel_only_changes_fail_the_verdict`)

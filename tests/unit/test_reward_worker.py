@@ -557,3 +557,33 @@ def test_volume_store_is_refreshed_before_every_input(tmp_path):
     runner.run_shard(JOB, shard.shard_id, CFG)
     runner.run_shard(JOB, shard.shard_id, CFG)
     assert store.refreshes == 2
+
+
+def test_groups_follow_the_job_order_across_shards(tmp_path):
+    """Review 5 M-B: a job whose terminal shards are 13 + 7 episodes (a manifest packed before
+    group-aligned terminal shards). The worker groups by *job* position: NVIDIA's script on
+    the job runs [0..7] [8..15] [16..19], so group 1, cut by the shard edge, runs as [8..12]
+    and [13..15] and is flagged in both shards; nothing claims a group it does not hold."""
+    store = FakeStore()
+    eids = [f"e{i:02d}" for i in range(20)]
+    a, b = (tshard(eids[:13], sid="reward.terminal-a"), tshard(eids[13:], sid="reward.terminal-b"))
+    setup(store, [ep(e) for e in eids], [a, b])
+    llm = FakeLLM()
+    runner = make_runner(store, tmp_path, llm=llm, group=8)
+    for shard in (a, b):
+        runner.run_shard(JOB, shard.shard_id, CFG)
+    sizes = [len(reqs) for reqs, _p, _t in llm.calls]
+    assert sizes == [8, 5, 3, 4]
+    grouping = {}
+    for shard in (a, b):
+        prefix = PATHS.audit(CFG, shard.kind, shard.shard_id, "x", 0)[:-len("x-0.jsonl")]
+        for path in store.list(prefix):
+            for line in store.get_bytes(path).decode().splitlines():
+                row = json.loads(line)
+                grouping[row["uid"]] = row["grouping"]
+    job = [uid(e) for e in eids]
+    for i, e in enumerate(eids):
+        g = grouping[uid(e)]
+        assert g["position"] == i and g["anchor"] == "planned"
+        assert g["aligned"] is (i < 8 or i >= 16), (e, g)
+        assert g["members"] == job[(i // 8) * 8:(i // 8) * 8 + 8]

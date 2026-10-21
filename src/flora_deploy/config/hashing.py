@@ -5,9 +5,8 @@
 - ``stage_hashes``: one hash **per shard kind**, over the shared inputs plus that kind's own
   inputs (and the hashes of the kinds it consumes). They are meant to key finished shards, so
   that adding ``reward.dense`` to ``stages`` or bumping the vLLM lock (rewards only) does not
-  invalidate finished ``segcap`` shards (review A5). Review 4 M1: the job store still keys parts
-  by the job hash, so until it switches, the job hash (a superset of every stage hash) decides
-  reuse;
+  invalidate finished ``segcap`` shards (review A5). The job store keys each kind's shard files
+  by its stage hash (``jobs.store.JobPaths``, Fix-W1); the job hash keys the manifest;
 - the document and its exact bytes, so provenance records what was hashed and a changed hash can
   be diffed.
 
@@ -18,8 +17,10 @@ Shared (every stage hash):
 - preset, embodiment pool, episode-instruction source/text, envelope policy;
 - decode pins (av, Pillow, numpy, arch);
 - input identity: format, dataset (repo or normalized path), revision, subdirectory, camera map,
-  and the input ``content`` digest when the caller has one (e.g. an index summary digest; for a
-  local ``mp4_dir`` the path string alone does not bind the file contents, review 3 A8). The
+  and the input ``content`` digest: the caller's ``input_digest`` when it has one, else for a
+  **local** input (no ``repo``) :func:`local_input_digest` of the directory (relative path,
+  size and sha256 of every file; review 3 A8: the path string alone does not bind the
+  contents). A Hugging Face input is bound by its 40-hex ``revision``. The
   camera map is hashed as written: ``cameras: None`` and an explicit map that resolves to the
   same views hash differently, because which map ``None`` resolves to depends on the dataset's
   camera keys. That costs a re-run, never a mix.
@@ -41,7 +42,11 @@ Per shard kind:
 Excluded (they don't change outputs; they go to provenance instead): GPU type and count,
 container counts, max inputs, cpu/memory, budget, max_gpus, region, tags, Modal environment,
 shard sizing, retries, output sink/formats, observability, ``stage_to``, project name,
-``allow_uncertified``.
+``allow_uncertified``. Shard sizing really is output-neutral for rewards too (review 5 M-B):
+NVIDIA's terminal batches are taken from the job's planned episode order
+(``stages.reward.run(planned=...)``) and ``jobs.manifest`` cuts terminal shards on those group
+boundaries, so ``shard_target_gpu_minutes`` decides which groups share a shard, never which
+episodes share a batch.
 
 GPU type (review 4 M7). It is excluded on purpose: the model inputs are identical on every GPU
 (the input-identity gates run on CPU-built tensors), so a GPU override is a cost/speed choice.
@@ -55,6 +60,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -106,6 +112,44 @@ def _pin_identity(key: str) -> dict[str, Any]:
     }
 
 
+_CHUNK = 1 << 20
+
+
+def local_input_digest(path: str | os.PathLike[str] | None) -> str | None:
+    """sha256 over ``(relative path, size, sha256)`` of every regular file under a local input
+    directory (review 3 A8), sorted by path; hidden files and directories (``.DS_Store``,
+    ``.cache``) are skipped. ``None`` when ``path`` is unset or not a local directory here (a
+    path that only exists in a container): then only the path string is hashed, as before.
+    Symlinked files are read through; symlinked directories are followed."""
+    if not path:
+        return None
+    root = Path(path)
+    if not root.is_dir():
+        return None
+    entries = []
+    seen: set[str] = set()  # real directories walked (a symlink loop is walked once)
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+        real = os.path.realpath(dirpath)
+        if real in seen:
+            dirnames[:] = []
+            continue
+        seen.add(real)
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+        for name in sorted(filenames):
+            if name.startswith("."):
+                continue
+            f = Path(dirpath) / name
+            if not f.is_file():
+                continue
+            h = hashlib.sha256()
+            with f.open("rb") as fh:
+                for chunk in iter(lambda fh=fh: fh.read(_CHUNK), b""):
+                    h.update(chunk)
+            entries.append([f.relative_to(root).as_posix(), f.stat().st_size, h.hexdigest()])
+    entries.sort()
+    return _sha({"schema": "flora-local-input/v1", "files": entries})
+
+
 def kind_modes(cfg, kind: str) -> dict[str, Any]:
     """The output-affecting run modes of ``kind`` (hashed in its entry, read by its worker)."""
     modes: dict[str, Any] = {}
@@ -140,7 +184,8 @@ def hash_document(
     ``engines``: per-shard-kind engine identity overriding the preset's (for engines whose args
     are only known at deploy time). ``image_fingerprint`` and ``logic_root`` (the package
     directory whose source is digested): injectable for tests. ``input_digest``: a digest of
-    the input's contents (e.g. the index summary), when the caller has one."""
+    the input's contents (e.g. the index summary), when the caller has one; otherwise a local
+    input directory is digested here (:func:`local_input_digest`)."""
     preset = get_preset(cfg.preset)
     fingerprint = image_fingerprint or _default_fingerprint
     receipts = dict(derived_receipts or {})
@@ -172,6 +217,8 @@ def hash_document(
         }
 
     inp = cfg.input
+    if input_digest is None and inp.repo is None:
+        input_digest = local_input_digest(inp.path)
     instr = cfg.pipeline.episode_instruction
     shared = {
         "logic_version": LOGIC_VERSION,

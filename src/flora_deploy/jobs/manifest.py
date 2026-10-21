@@ -10,7 +10,18 @@
   shards.
 * Packing is next-fit in a deterministic order (group key, then episode id): a shard is closed
   when adding the next group would push its estimate past ``shard_target_gpu_minutes``. A shard
-  exceeds the target only when it holds a single episode that does.
+  exceeds the target only when it holds a single episode that does (``reward.terminal``: a
+  single NVIDIA group, below).
+* ``reward.terminal`` shards hold **whole NVIDIA groups** (review 5 M-B). NVIDIA's
+  ``terminal_reward.py`` calls ``generate`` once per ``max_num_seqs`` (8,
+  :data:`NVIDIA_TERMINAL_GROUP`) episodes of its jobs file, and a terminal score depends on its
+  batch-mates. The job's jobs file is the manifest's episode list (``Manifest.episodes``, the
+  order above), so terminal shards are packed from consecutive runs of 8 episodes of that list
+  (a run is never split, even when it exceeds the target) and every shard boundary is a group
+  boundary. The reward worker groups by *job* position (``stages.reward.run(planned=<the
+  manifest's episode list>)``), so the batches are a function of the planned episode list
+  only: ``shard_target_gpu_minutes`` and the packing rates (unhashed) decide which groups share
+  a shard, never which episodes share a batch.
 * Estimates: ``rates[kind]`` GPU-seconds per video-second × episode duration. The defaults are
   placeholders until measured rates exist (S2 → ``rates.json``).
 * Kinds: exactly the shard kinds in ``settings.pools`` (the config's stages; H2: a rewards-only
@@ -53,6 +64,10 @@ from flora_deploy.records import Stage
 
 REWARD_KINDS: tuple[ShardKind, ...] = ("reward.terminal", "reward.dense", "reward.rubric")
 ALL_KINDS: tuple[ShardKind, ...] = get_args(ShardKind)
+
+# NVIDIA's terminal batch: ``engine.base_parser``'s ``--max-num-seqs`` default, which the reward
+# engine uses (``stages.reward.engine_spec``; the worker checks the two agree).
+NVIDIA_TERMINAL_GROUP = 8
 
 # GPU-seconds per second of video. PLACEHOLDERS (order-of-magnitude guesses) until S2 measures
 # them; pass ``rates=`` from rates.json once it exists.
@@ -130,6 +145,33 @@ def _pack(groups: list[list[EpisodeRef]], rate: float, target_s: float
     return shards
 
 
+def nvidia_groups(refs: list[EpisodeRef], size: int = NVIDIA_TERMINAL_GROUP
+                  ) -> list[list[EpisodeRef]]:
+    """The job's NVIDIA terminal groups: consecutive runs of ``size`` episodes of the planned
+    episode list (``terminal_reward.py`` on the whole jobs file)."""
+    if size < 1:
+        raise ValueError(f"NVIDIA group size {size} < 1")
+    return [refs[i:i + size] for i in range(0, len(refs), size)]
+
+
+def _pack_whole(units: list[list[EpisodeRef]], rate: float, target_s: float
+                ) -> list[tuple[list[str], float]]:
+    """Next-fit over units that are never split (a unit above the target is a shard alone)."""
+    shards: list[tuple[list[str], float]] = []
+    cur: list[str] = []
+    cur_s = 0.0
+    for unit in units:
+        u_s = sum(e.duration_s * rate for e in unit)
+        if cur and cur_s + u_s > target_s:
+            shards.append((cur, cur_s))
+            cur, cur_s = [], 0.0
+        cur.extend(e.uid for e in unit)
+        cur_s += u_s
+    if cur:
+        shards.append((cur, cur_s))
+    return shards
+
+
 def build_manifest(
     indexes: Iterable[EpisodeIndex],
     settings: RunSettings,
@@ -177,9 +219,11 @@ def build_manifest(
     by_kind: dict[ShardKind, list[Shard]] = {}
     for kind in kinds_for(settings):
         rate = rates[kind]
+        packed = (_pack_whole(nvidia_groups([r for _, r in refs]), rate, target_s)
+                  if kind == "reward.terminal" else _pack(groups, rate, target_s))
         out = [Shard(shard_id=shard_id_for(kind, uids), kind=kind, episodes=tuple(uids),
                      est_gpu_seconds=round(est, 6))
-               for uids, est in _pack(groups, rate, target_s)]
+               for uids, est in packed]
         if kind == "caption":
             owner = {u: s.shard_id for s in by_kind["segment"] for u in s.episodes}
             out = [replace(s, depends_on=tuple(dict.fromkeys(owner[u] for u in s.episodes)))

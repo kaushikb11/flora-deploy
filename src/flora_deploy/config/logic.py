@@ -75,6 +75,12 @@ OUTPUT_MODULES: dict[str, tuple[str, ...]] = {
         "nv/linker.py",
         "config/hashing.py",
         "config/logic.py",
+        # Review 5 L-a: the code that turns hashed config fields into worker behaviour. A hashed
+        # mode is only as good as the code that applies it: the W2-merge bug (determinism and
+        # terminal_rationale hashed but not applied) lived here, while these were non-output.
+        "config/schema.py",  # output_settings / with_pipeline / to_run_settings
+        "jobs/settings.py",  # RunSettings carries the modes to the workers
+        "modal_app/factory.py",  # worker env (FLORA_DETERMINISM, FLORA_TERMINAL_MODE, ...)
     ),
     # NVIDIA's HF pipeline (exact segcap) and its output-identical runtime patches (D17).
     "nvidia-hf": (
@@ -133,17 +139,22 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     # cli: argument parsing; every output-affecting choice goes through the (hashed) config
     "cli/__init__.py",
     "cli/_app.py",
+    "cli/cancel.py",
     "cli/deploy.py",
     "cli/index.py",
     "cli/init.py",
+    "cli/logs.py",
     "cli/plan.py",
     "cli/prepare.py",
+    "cli/report.py",
     "cli/results.py",
+    "cli/resume.py",
+    "cli/run.py",
     "cli/run_local.py",  # local runs only (fake models)
+    "cli/status.py",
     "config/__init__.py",
     "config/pins.py",  # hashed by value (nvidia_pins, decode)
     "config/presets.py",  # hashed by value (engine identity); pools are deliberately unhashed
-    "config/schema.py",  # hashed by value (the validated fields)
     # export: rebuilt from the parts on every export, never mixed into stored results
     "export/__init__.py",
     "export/compose.py",
@@ -156,7 +167,6 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     "jobs/orchestrator.py",
     "jobs/progress.py",
     "jobs/reconciler.py",
-    "jobs/settings.py",
     "jobs/spawner.py",
     "jobs/store.py",
     "jobs/stores/__init__.py",
@@ -172,8 +182,8 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     "local/sample.py",
     "local/spawner.py",
     "media/synth.py",  # synthetic test media
-    # modal_app: deployment and labs. Images are hashed by value (image_fingerprint); the modes
-    # the factory forwards are config fields, hashed by value (config/hashing.kind_modes).
+    # modal_app: deployment and labs. Images are hashed by value (image_fingerprint). The
+    # factory, which applies the hashed modes, is output-affecting (``common``, review 5 L-a).
     "modal_app/__init__.py",
     "modal_app/balanced_lab.py",  # GPU validation lab, not a production worker
     "modal_app/canary_app.py",
@@ -181,7 +191,6 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     "modal_app/convert_app.py",  # derived weights: hashed by receipt
     "modal_app/determinism_lab.py",
     "modal_app/emit.py",
-    "modal_app/factory.py",
     "modal_app/gatec_app.py",
     "modal_app/golden_app.py",
     "modal_app/images.py",
@@ -195,6 +204,9 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     "planner/__init__.py",
     "planner/options.py",
     "planner/rates.py",
+    # sdk: client-side submit/status/report (and the deployed orchestrator's deps factory: it
+    # reads back the RunSettings the client planned); which shards run, never what they compute
+    "sdk.py",
     "prep/__init__.py",
     "prep/download.py",  # downloads are verified against the pins
     "prep/merge_tempseg.py",  # derived weights: hashed by receipt
