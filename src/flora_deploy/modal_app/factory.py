@@ -569,6 +569,9 @@ def plan_app(
 
     name = app_name_for(cfg.project, ch.stage_hashes, fake_models=fake_models)
     watch_dict = f"flora-watch-{_digest(ch.stage_hashes)}"
+    if fake_models:  # per app (so per project): concurrent H0 runs share stage hashes, and each
+        # deletes its own watch Dict on cleanup (review 9a M2)
+        watch_dict = f"flora-watch-fake-{_digest({'app': name})}"
     skipped: dict[str, str] = {}
     by_class: dict[str, list[str]] = {}
     refs: dict[str, WorkerRef] = {}
