@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from flora_deploy.nv.capture import CaptureProcessor
+from flora_deploy.nv.errors import NvidiaRuntimeError  # NVIDIA's rejection (api.py:55)
 from flora_deploy.stages.segment import (
     UNCERTIFIED,
     CallStats,
@@ -111,7 +112,7 @@ class CaptionStage:
         for row in rows:
             s, e = row["start_s"], row["end_s"]
             if not (math.isfinite(s) and math.isfinite(e) and 0 <= s < e <= duration + 0.001):
-                raise RuntimeError("The pipeline returned an invalid caption interval.")
+                raise NvidiaRuntimeError("The pipeline returned an invalid caption interval.")
         return CaptionResult(rows, list(audit), stats)
 
 

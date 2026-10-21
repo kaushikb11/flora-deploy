@@ -43,6 +43,7 @@ from typing import Any
 import numpy as np
 
 from flora_deploy.local.faults import FakeNvidiaInputError, checkpoint, note_episodes, nv_rejects
+from flora_deploy.nv.errors import NvidiaValueError
 
 FAKE_ENGINE = "flora-local-fake"
 FAKE_CERTIFICATE = "local-fake-models"
@@ -283,7 +284,7 @@ def fake_rewarder_family(registry: EpisodeRegistry | None = None) -> SimpleNames
     def parse_terminal(text: str, rationale: bool):
         head, _, reason = text.partition("\nReason: ")
         if not head.startswith("Score: ") or not head[-1:].isdigit():
-            raise ValueError(f"unexpected terminal answer: {text!r}")
+            raise NvidiaValueError(f"unexpected terminal answer: {text!r}")
         return int(head[-1]), (reason or None) if rationale else None
 
     def score_probabilities(positions, score: int):

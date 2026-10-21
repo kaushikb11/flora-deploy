@@ -9,6 +9,7 @@ import pytest
 
 from flora_deploy.engines import offline_llm as O
 from flora_deploy.engines.base import Sampling, VllmRequest
+from flora_deploy.engines.worker_ext import WORKER_EXTENSION
 from flora_deploy.nv.capture import CaptureError
 
 
@@ -221,19 +222,51 @@ def test_dead_engine_classifies_as_cuda_fatal():
 
 
 
-class RpcLLM(FakeLLM):
-    """A fake engine whose workers report GDN parameter dtypes (``collective_rpc``)."""
+class _GpuWorker:
+    """vLLM's GPU worker as far as the extension sees it."""
 
-    def __init__(self, dt_bias="bfloat16", a_log="float32", n=48):
+    def __init__(self, params):
+        self.model_runner = SimpleNamespace(
+            model=SimpleNamespace(named_parameters=lambda: iter(params)))
+
+
+class RpcLLM(FakeLLM):
+    """A fake engine whose workers report GDN parameter dtypes (``collective_rpc``).
+
+    Enforces vLLM 0.24's V1 multiprocess rules (review 8a R5): ``collective_rpc`` crosses to the
+    engine process through msgpack, which refuses a callable without
+    ``VLLM_ALLOW_INSECURE_SERIALIZATION=1`` (``vllm/v1/serial_utils.py:221``); a method name
+    resolves on the worker class only through ``worker_extension_cls``, which vLLM mixes into
+    the worker's bases; and the result must be msgpack-native."""
+
+    def __init__(self, dt_bias="bfloat16", a_log="float32", n=48,
+                 worker_extension_cls=WORKER_EXTENSION):
         super().__init__()
         self.params = [(f"model.layers.{i}.linear_attn.dt_bias", dt_bias) for i in range(n)] + \
             [(f"model.layers.{i}.linear_attn.A_log", a_log) for i in range(n)]
+        self.worker_extension_cls = worker_extension_cls
 
-    def collective_rpc(self, fn):
+    def collective_rpc(self, method, timeout=None, args=(), kwargs=None):
+        import importlib
+        import json
+
+        # msgpack-native only (JSON types stand in): what MsgpackEncoder.enc_hook allows
+        try:
+            json.dumps([method, timeout, list(args), kwargs or {}])
+        except TypeError:
+            raise TypeError(f"Object of type {type(method)} is not serializable"
+                            "Set VLLM_ALLOW_INSECURE_SERIALIZATION=1 to allow fallback to "
+                            "pickle-based serialization.") from None
+        assert isinstance(method, str)
+        bases: tuple[type, ...] = (_GpuWorker,)
+        if self.worker_extension_cls:
+            mod, _, name = self.worker_extension_cls.rpartition(".")
+            bases += (getattr(importlib.import_module(mod), name),)
+        worker_cls = type("Worker", bases, {})
         params = [(name, SimpleNamespace(dtype=f"torch.{dt}")) for name, dt in self.params]
-        worker = SimpleNamespace(model_runner=SimpleNamespace(
-            model=SimpleNamespace(named_parameters=lambda: iter(params))))
-        return [fn(worker)]
+        out = [getattr(worker_cls(params), method)(*args, **(kwargs or {}))]
+        json.dumps(out)  # the utility result goes back the same way
+        return out
 
 
 @pytest.mark.parametrize(("dtbias", "dt", "a_log", "n", "ok"), [
@@ -262,6 +295,39 @@ def test_engine_build_verifies_gdn_dtypes(monkeypatch, dtbias, dt, a_log, n, ok)
 def test_rpc_failure_fails_verification():
     with pytest.raises(O.EngineVerifyError):
         O.verify_gdn_dtypes(spec(), {"error": "RuntimeError('no rpc')"})
+
+
+def test_rpc_fake_enforces_vllm_v1_rules():
+    """Review 8a R5: the fake refuses what vLLM 0.24 refuses, so a callable probe (or an engine
+    built without the worker extension) cannot pass the unit tests again."""
+    llm = RpcLLM()
+    with pytest.raises(TypeError, match="VLLM_ALLOW_INSECURE_SERIALIZATION"):
+        llm.collective_rpc(lambda worker: {})
+    assert "error" in O.gdn_param_dtypes(RpcLLM(worker_extension_cls=""))
+    assert O.gdn_param_dtypes(RpcLLM())["workers"] == [{"dt_bias:bfloat16": 48,
+                                                       "A_log:float32": 48}]
+
+
+def test_engine_build_installs_the_worker_extension(monkeypatch):
+    """The built ``vllm.LLM`` gets ``worker_extension_cls`` (not part of the hashed spec)."""
+    import sys
+    import types
+
+    from flora_deploy.engines.patches import dt_bias_fp32
+
+    monkeypatch.setattr(dt_bias_fp32, "check_activation", lambda want: None)
+    built = {}
+
+    def LLM(**kwargs):  # noqa: N802 - vllm.LLM
+        built.update(kwargs)
+        return RpcLLM(worker_extension_cls=kwargs.get("worker_extension_cls", ""))
+
+    monkeypatch.setitem(sys.modules, "vllm", types.SimpleNamespace(LLM=LLM))
+    s = spec()
+    eng = O.OfflineEngine(s, params_cls=Params)
+    assert built["worker_extension_cls"] == WORKER_EXTENSION
+    assert eng.gdn_dtypes["workers"][0]["dt_bias:bfloat16"] == 48
+    assert "worker_extension_cls" not in s.as_json()["engine_kwargs"]
 
 
 def test_extra_state_under_vision_tower_fails_preflight():

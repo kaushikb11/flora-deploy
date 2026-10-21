@@ -41,6 +41,9 @@ from typing import Any
 
 from PIL import Image
 
+# NVIDIA's rejections (unified_input.py:63-71), raised as NVIDIA's verdict
+from flora_deploy.nv.errors import NvidiaValueError
+
 _PREFETCH: contextvars.ContextVar[Any] = contextvars.ContextVar("flora_accel_png", default=None)
 
 
@@ -166,14 +169,14 @@ def make_load_frames(nv, original: Callable, state) -> Callable:
             for path, receipt in zip(b["paths"], b["frames"], strict=True):
                 p = Path(root) / path
                 if not p.resolve().is_relative_to(Path(root).resolve()):
-                    raise ValueError("Unowned frame path")
+                    raise NvidiaValueError("Unowned frame path")
                 raw = p.read_bytes()
                 digest = hashlib.sha256(raw).hexdigest()
                 if digest != receipt["png_sha256"]:
-                    raise ValueError("PNG changed")
+                    raise NvidiaValueError("PNG changed")
                 frame = decoded(digest, raw)
                 if list(frame.size) != receipt["size"]:
-                    raise ValueError("Frame dimensions changed")
+                    raise NvidiaValueError("Frame dimensions changed")
                 original_size = list(frame.size)
                 size = regularized_size(frame, max_pixels)
                 if size is not None:

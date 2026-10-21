@@ -107,6 +107,7 @@ OUTPUT_MODULES: dict[str, tuple[str, ...]] = {
         "engines/microbatch.py",  # batch composition changes numerics
         "engines/patches/__init__.py",
         "engines/patches/dt_bias_fp32.py",  # gated FP32 dt_bias (Gate A)
+        "engines/worker_ext.py",  # mixed into vLLM's workers; the GDN dtype check (conservative)
         "stages/segment.py",
         "stages/caption.py",
         "workers_impl/segment.py",  # index-receipt -> NVIDIA arguments (profile, instruction)

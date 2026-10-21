@@ -40,7 +40,8 @@ ends in the state the same job would on Modal (review 6 H2):
 they die with it (a restarted orchestrator in a new process sees them ``expired`` and respawns,
 where Modal calls outlive the orchestrator); ``terminate`` is a graceful cancel (the worker
 flushes and marks the start preempted, while Modal may kill the container before
-``@modal.exit``); the CUDA-fatal container exit is not modelled; spend comes from wall time of
+``@modal.exit``); the CUDA-fatal container exit (``workers_app._die``) is modelled by
+``_container_exit`` raising ``ContainerCrash``; spend comes from wall time of
 fake calls (seconds), so budget tests exercise the projection (startup, scale-down, rate
 table), not realistic spend. The ``timeout`` fault models ``FunctionTimeoutError``.
 
@@ -480,7 +481,7 @@ class LocalRunner:
             envelope=cfg.pipeline.envelope, default_task=instr.text, media_root=media,
             local_dir=local_dir, container_id=container_id)
         runner = RewardShardRunner(store, RewardEngine(FakeLLM(), "fake-processor"), self.nv, s,
-                                   call_id=call_id)
+                                   call_id=call_id, fatal=_container_exit)  # as workers_app
         from_index = runner.episode_from_index
 
         def episode(ref):  # the runner's own reader, plus fault targeting by video paths

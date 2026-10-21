@@ -438,6 +438,33 @@ def cuda_fatal(message: str) -> bool:
     return any(m in message for m in CUDA_FATAL_MARKERS)
 
 
+def end_failed_shard(exc: BaseException, end: Callable[..., bool],
+                     fatal: Callable[[BaseException], None] | None, *,
+                     crash: str | None = None, crash_message: str | None = None,
+                     is_crash: Callable[[str], bool] = cuda_fatal) -> str | None:
+    """The one path a shard runner takes when ``run_shard`` fails with ``exc`` (review 8a R4,
+    review 6 M1). Call it in the ``except Exception`` around the shard, then re-raise.
+
+    ``crash``: a crash kind the runner already saw (an episode hit ``cuda_fatal`` / ``oom``),
+    with ``crash_message``; otherwise ``exc`` is a crash when ``is_crash`` matches its message or
+    (for a :class:`ShardInfraError`) any episode's message. A crash is marked ``crashed=True``
+    via ``end(error=..., crashed=True)`` (the runner's ``_end``), so the start counts toward D15
+    and a deterministic fault ends quarantined, bisected and poison-pilled instead of
+    crash-looping; then ``fatal(exc)`` (``os._exit`` in the Modal worker) replaces the
+    container. Any other error is marked as a python exception (not D15-counted) and the
+    container lives on. Returns the crash kind (or ``None``)."""
+    msg = f"{type(exc).__name__}: {exc}"
+    infra = exc.infra.values() if isinstance(exc, ShardInfraError) else ()
+    if crash is None and (is_crash(msg) or any(map(is_crash, infra))):
+        crash = "cuda_fatal"
+    if crash:
+        msg = f"{crash}: {crash_message or msg}"
+    end(error=msg, crashed=bool(crash))
+    if crash and fatal is not None:
+        fatal(exc)  # the engine is unusable: replace the container
+    return crash
+
+
 INPUT_RETRIES = 1  # in-process retries of an episode's input loading (transient I/O)
 
 
@@ -530,11 +557,8 @@ class RewardShardRunner:
         except KeyboardInterrupt:  # SIGINT (preemption): flush, mark, let Modal retry
             self._end(active, preempted=True)
             raise
-        except Exception as exc:
-            msg = f"{type(exc).__name__}: {exc}"
-            self._end(active, error=msg)
-            if self.fatal is not None and cuda_fatal(msg):
-                self.fatal(exc)
+        except Exception as exc:  # a CUDA fault: crashed=True, then fatal (review 8a R4)
+            end_failed_shard(exc, lambda **kw: self._end(active, **kw), self.fatal)
             raise
         finally:
             with self._lock:
@@ -555,8 +579,8 @@ class RewardShardRunner:
 
     # -- internals -----------------------------------------------------------------------
 
-    def _end(self, active: _Active, *, preempted: bool = False, error: str | None = None
-             ) -> bool:
+    def _end(self, active: _Active, *, preempted: bool = False, error: str | None = None,
+             crashed: bool = False) -> bool:
         with self._lock:
             if active.ended:
                 return False
@@ -573,7 +597,7 @@ class RewardShardRunner:
                              marker=active.marker)
         else:
             A.mark_exception(jf, kind, sid, self.container_id, ended_utc=now,
-                             error=error or "error", marker=active.marker)
+                             error=error or "error", marker=active.marker, crashed=crashed)
         return True
 
     def episode_from_index(self, ref: EpisodeRef) -> R.Episode:

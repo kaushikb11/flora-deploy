@@ -25,6 +25,9 @@ from typing import Any
 
 from PIL import Image
 
+# our copies of NVIDIA's rejections are NVIDIA's verdict (nv.errors.NvidiaSemanticsError)
+from flora_deploy.nv.errors import NvidiaAssertionError, NvidiaRuntimeError, as_nvidia
+
 
 def _asset(rcg, indices: list, originals: list, factor) -> dict:
     # robot_caption_geometry.py:23-35, per pair
@@ -61,7 +64,10 @@ def make_normalized(nv, original: Callable, state) -> Callable:
             for b, block in enumerate(plan["blocks"]):
                 for start in range(0, len(block["indices"]), 2):
                     indices = block["indices"][start : start + 2]
-                    originals = [frames[i] for i in indices]
+                    try:
+                        originals = [frames[i] for i in indices]
+                    except LookupError as e:  # NVIDIA's own lookup (:26): its verdict
+                        raise as_nvidia(e) from None
                     jobs.append((b, indices, originals))
             futures = [state.submit(_asset, rcg, ix, ims, factor) for _, ix, ims in jobs]
             assets: list[dict] = []
@@ -83,16 +89,21 @@ def make_normalized(nv, original: Callable, state) -> Callable:
                     blocks[b]["images"].append(asset)
                 break
         if blocks is None:
-            raise RuntimeError("No common caption input geometry fits")
+            raise NvidiaRuntimeError("No common caption input geometry fits")
         if expected:
+            # NVIDIA's asserts (:43-45), raised as NVIDIA's verdict (and, like an assert, only
+            # under __debug__)
             for old, new in zip(expected["frame_blocks"], blocks, strict=False):
-                assert old["role"] == new["role"] and len(old["images"]) == len(new["images"])
+                if __debug__ and not (old["role"] == new["role"]
+                                      and len(old["images"]) == len(new["images"])):
+                    raise NvidiaAssertionError
                 for a, b in zip(old["images"], new["images"], strict=False):
-                    assert (
+                    if __debug__ and not (
                         a["indices"] == b["indices"]
                         and a["rgb_sha256"] == b["rgb_sha256"]
                         and (a["size"] == b["size"])
-                    )
+                    ):
+                        raise NvidiaAssertionError
         return dict(
             plan,
             frame_blocks=blocks,
@@ -130,7 +141,8 @@ def make_source_frames(nv, original: Callable, state) -> Callable:
         out = {}
         for fut in futures:
             for i, frame, ok in fut.result():
-                assert ok
+                if __debug__ and not ok:  # NVIDIA's assert (:58), NVIDIA's verdict
+                    raise NvidiaAssertionError
                 out[i] = frame
         return out
 

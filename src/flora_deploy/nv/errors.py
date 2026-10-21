@@ -30,8 +30,10 @@ In order:
    NVIDIA's environment checks (integrity, "Production code changed", "CUDA is required", ...)
    → ``infra``;
 3. a class NVIDIA's code defines (anywhere in the MRO: ``FineSegmentationOutputError``,
-   ``U2WorkerError``, ``InputError``, ...) and our re-implementation of NVIDIA's context guard
-   (``nv.budget.ContextBudgetError``) → ``nv_failure``;
+   ``U2WorkerError``, ``InputError``, ...), our re-implementation of NVIDIA's context guard
+   (``nv.budget.ContextBudgetError``) and every :class:`NvidiaSemanticsError` (an NVIDIA
+   rejection reproduced by our certified re-implementations: ``NvidiaRuntimeError``, ...)
+   → ``nv_failure``;
 4. a builtin-family exception (``AssertionError``, ``TypeError``, ``LookupError``,
    ``StopIteration``, ``ValueError``, ``RuntimeError``, ``ArithmeticError``) whose innermost
    non-library frame is NVIDIA's → ``nv_failure`` (library frames, i.e. the standard library and
@@ -40,8 +42,10 @@ In order:
 5. otherwise ``python`` if that frame is ours (or the test's), else ``infra``.
 
 Errors carried across a process boundary (``stages.reference.NvidiaError``) are classified from
-the original exception when it is still attached (``__cause__``), else from the ``origin`` the
-sender computed (:func:`origin`) and the original type name.
+the original exception when it is still attached (``__cause__``), else as the ``kind`` the sender
+computed with this same function while the traceback was still available (so a pickled error
+classifies exactly like the in-process one), else (an error built from strings only) from the
+``origin`` the sender computed (:func:`origin`) and the original type name.
 """
 
 from __future__ import annotations
@@ -101,6 +105,62 @@ NVIDIA_EPISODE_REJECTIONS = (
 )
 
 _PKG_DIR = Path(__file__).resolve().parents[1]  # src/flora_deploy
+
+
+# --- our copies of NVIDIA's rejections ----------------------------------------------------------
+
+
+class NvidiaSemanticsError(Exception):
+    """Marker: one of NVIDIA's own episode rejections, raised by our certified re-implementation
+    of the NVIDIA function that raises it (an ``accel`` patch, a balanced stage). Classified
+    ``nv_failure`` (NVIDIA's verdict) although our frame raised it.
+
+    Never raised directly: raise the concrete class for the builtin NVIDIA raises
+    (``NvidiaRuntimeError``, ``NvidiaValueError``, ``NvidiaAssertionError``) with NVIDIA's exact
+    message. Each subclasses that builtin (``except RuntimeError`` still catches it) and keeps
+    the builtin's ``__name__``, so ``f"{type(e).__name__}: {e}"`` records exactly what NVIDIA's
+    own error records; its ``__qualname__`` (``NvidiaRuntimeError``, ...) is the module
+    attribute pickle resolves. :func:`nvidia_type_name` is the qualified name NVIDIA's error
+    has (``builtins.RuntimeError``)."""
+
+
+_MARKERS: dict[type[BaseException], type[Exception]] = {}
+
+
+def _semantics(base: type[Exception]) -> type[Exception]:
+    cls = type(base.__name__, (NvidiaSemanticsError, base), {
+        "__module__": __name__, "__qualname__": f"Nvidia{base.__name__}",
+        "__doc__": f"NVIDIA's ``{base.__name__}`` rejection, raised by our re-implementation "
+                   "(:class:`NvidiaSemanticsError`)."})
+    _MARKERS[base] = cls
+    return cls
+
+
+NvidiaRuntimeError = _semantics(RuntimeError)
+NvidiaValueError = _semantics(ValueError)
+NvidiaAssertionError = _semantics(AssertionError)
+NvidiaKeyError = _semantics(KeyError)
+NvidiaIndexError = _semantics(IndexError)
+
+
+def as_nvidia(exc: BaseException) -> BaseException:
+    """``exc`` (a builtin our re-implementation hit exactly where NVIDIA's code raises the same
+    builtin, e.g. a missing frame lookup) as NVIDIA's verdict: the marker class for its type, same
+    args (so the same message) and traceback. Any other exception is returned unchanged."""
+    cls = _MARKERS.get(type(exc))
+    if cls is None:
+        return exc
+    return cls(*exc.args).with_traceback(exc.__traceback__)
+
+
+def nvidia_type_name(exc: BaseException) -> str:
+    """The qualified type name of the error NVIDIA's own code raises: the builtin for an
+    :class:`NvidiaSemanticsError` (``builtins.RuntimeError``), else ``exc``'s class."""
+    cls = type(exc)
+    if isinstance(exc, NvidiaSemanticsError):
+        base = next(c for c in cls.__mro__ if c.__module__ == "builtins")
+        return f"builtins.{base.__qualname__}"
+    return f"{cls.__module__}.{cls.__qualname__}"
 _extra_roots: list[Path] = []
 _roots_lock = threading.Lock()
 
@@ -229,8 +289,7 @@ def _unwrap(exc: BaseException) -> tuple[BaseException, str, str, Origin | None,
     type_name = getattr(exc, "type_name", None)
     if isinstance(type_name, str) and type_name:  # stages.reference.NvidiaError
         cause = exc.__cause__
-        if cause is not None and type(cause).__module__ + "." + type(cause).__qualname__ \
-                == type_name:
+        if cause is not None and nvidia_type_name(cause) == type_name:
             return cause, type_name, str(cause), None, False
         message = str(getattr(exc, "message", None) or exc)
         return exc, type_name, message, getattr(exc, "origin", None), True
@@ -245,6 +304,9 @@ def _env_failure(message: str) -> bool:
 def classify(exc: BaseException) -> Kind:
     """``nv_failure`` | ``infra`` | ``python`` | ``cuda_fatal`` | ``oom`` (module docstring)."""
     err, type_name, message, carried, transported = _unwrap(exc)
+    sent = getattr(exc, "kind", None) if transported else None
+    if sent in KINDS:  # classified by the sender, with the original traceback
+        return sent  # type: ignore[return-value]
     module, _, name = type_name.rpartition(".")
     if transported:
         names, roots, mro = {name}, {module.partition(".")[0]}, ()
@@ -278,7 +340,7 @@ def classify(exc: BaseException) -> Kind:
         return "python" if carried in ("ours", "other") else "infra"
     from flora_deploy.nv.budget import ContextBudgetError
 
-    if isinstance(err, ContextBudgetError) or any(
+    if isinstance(err, ContextBudgetError | NvidiaSemanticsError) or any(
             is_nv_class(c) for c in mro if c.__module__ != "builtins"):
         return "nv_failure"
     # 4. builtins raised by NVIDIA's own frames
