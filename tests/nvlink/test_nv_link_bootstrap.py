@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -19,10 +20,13 @@ pytestmark = pytest.mark.nvlink
 
 
 def run_isolated(code: str, *args: str) -> subprocess.CompletedProcess:
-    """Run ``code`` in a fresh interpreter so families never leak between tests."""
+    """Run ``code`` in a fresh interpreter so families never leak between tests. The CI
+    workflow sets ``PYTHONDONTWRITEBYTECODE=1``; drop it so the bytecode assertions test what
+    *our* code does to ``sys.dont_write_bytecode``, not the runner's environment."""
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONDONTWRITEBYTECODE"}
     return subprocess.run(
         [sys.executable, "-c", textwrap.dedent(code), *map(str, args)],
-        capture_output=True, text=True, timeout=300,
+        capture_output=True, text=True, timeout=300, env=env,
     )
 
 
