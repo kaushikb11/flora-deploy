@@ -3,17 +3,21 @@
 Inputs: the manifest, receipts (``exists``/``get``: read-after-write), attempt markers, parts,
 quarantine ``ControlRecord``s and error files (``list``: possibly lagging).
 
-**Effective shards** = manifest shards + the children recorded in quarantine records (bisection),
-transitively.
+**Effective shards** = manifest shards + bisection children, transitively. Children come from
+the durable replan files (``attempts.read_replan``: ``exists``/``get``, never hidden by lag) and
+from quarantine records. A replan file whose record is not listed yet stands in for the record.
 
 **Per-shard state** (first match wins):
 
 * ``done``: its receipt exists (even if it was also quarantined; a late receipt from a container
   that was still running is real output);
-* ``quarantined``: a quarantine record is visible (its children carry the work, or it poisoned
-  its single episode);
-* ``quarantine_due``: ``limit`` attempt markers are visible and no receipt: the orchestrator
-  should call ``attempts.quarantine`` (idempotent, see there);
+* ``failed``: a ``shard_failed`` record (respawns exhausted): terminal, never bisected; the job
+  cannot complete;
+* ``quarantined``: a quarantine record or replan file is visible (its children carry the work,
+  or it poisoned its single episode);
+* ``quarantine_due``: ``limit`` *counted* starts (``attempts.counted_starts``: preempted
+  starts excluded) and no receipt: the orchestrator should call ``attempts.quarantine``
+  (idempotent, see there);
 * ``blocked``: some ``depends_on`` shard is not resolved, where resolved means every one of its
   episodes is terminal for that shard's kind (done, failed or poison-pilled), which also covers a
   dependency that was quarantined and bisected;
@@ -30,13 +34,16 @@ effective shard resolved and each quarantine record lists the parts that hold it
 a ``complete`` view always has every expected record reachable (``compose_input().missing`` is
 empty), which the property tests check.
 
-**Compose input** = the parts named by receipts plus the ``done_parts`` of quarantine records,
-deduplicated by ``records.record_key``. Records whose ``provenance.config_hash`` differs from the
-job's are dropped (counted as ``foreign``). Among duplicates (same key, same config hash) the
-*latest* source wins: sources are ordered by (receipt ``finished_utc`` or quarantine
-``created_utc``, container id, part path), and a later one replaces an earlier one. Within one
-config hash outputs should be identical (``exact`` is deterministic), so a duplicate whose JSON
-differs is reported in ``conflicts`` instead of being hidden.
+**Compose input** = the parts named by receipts, the ``done_parts`` of quarantine records, and
+every part file *listed* under the part prefix of a done or quarantined shard (so a receipt that
+names only its own container's parts loses nothing: ``ShardReceipt.parts`` should name all of
+them, and whole part files are immutable, so reading extra ones is safe), deduplicated by
+``records.record_key``. Records whose ``provenance.config_hash`` differs from the job's are
+dropped (counted as ``foreign``). Among duplicates (same key, same config hash) the *latest*
+source wins: sources are ordered by (receipt ``finished_utc`` or quarantine ``created_utc``,
+container id, part path), and a later one replaces an earlier one. Within one config hash outputs
+should be identical (``exact`` is deterministic), so a duplicate whose JSON differs is reported
+in ``conflicts`` instead of being hidden.
 """
 
 from __future__ import annotations
@@ -47,7 +54,14 @@ from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from typing import Literal
 
-from flora_deploy.jobs.attempts import JobFiles, children_of, count_starts, read_control
+from flora_deploy.jobs.attempts import (
+    JobFiles,
+    Replan,
+    children_of,
+    counted_starts,
+    read_control,
+    read_replan,
+)
 from flora_deploy.jobs.manifest import from_json, stages_of, to_json
 from flora_deploy.jobs.types import (
     ControlRecord,
@@ -59,7 +73,8 @@ from flora_deploy.jobs.types import (
 )
 from flora_deploy.records import StageRecord, record_key
 
-ShardState = Literal["done", "quarantined", "quarantine_due", "blocked", "ready", "started"]
+ShardState = Literal["done", "failed", "quarantined", "quarantine_due", "blocked", "ready",
+                     "started"]
 EpisodeState = Literal["done", "failed", "poison_pill", "pending"]
 TERMINAL: frozenset[str] = frozenset({"done", "failed", "poison_pill"})
 
@@ -121,9 +136,7 @@ def shard_parts(jf: JobFiles, shard: Shard) -> ShardParts:
     """What earlier containers of ``shard`` already wrote (a worker skips these episodes on
     restart). Lagging listings can hide recent parts: the worker then redoes those episodes and
     compose dedupes."""
-    prefix = _dir_prefix(jf.paths.part(jf.config_hash, shard.kind, shard.shard_id, "x", 0),
-                         "x-0.jsonl")
-    parts = tuple(p for p in jf.store.list(prefix) if p.endswith(".jsonl"))
+    parts = tuple(p for p in jf.store.list(part_prefix(jf, shard)) if p.endswith(".jsonl"))
     have: dict[str, set[str]] = defaultdict(set)
     for p in parts:
         for r in read_part(jf, p):
@@ -139,7 +152,7 @@ def shard_parts(jf: JobFiles, shard: Shard) -> ShardParts:
 class ShardStatus:
     shard: Shard
     state: ShardState
-    starts: int  # visible attempt markers (lower bound)
+    starts: int  # counted (non-preempted) visible attempt markers (lower bound)
     receipt: ShardReceipt | None = None
     quarantines: tuple[ControlRecord, ...] = ()
 
@@ -172,27 +185,62 @@ class Progress:
         return {k for k, st in self.episodes.items() if st == "poison_pill"}
 
 
-def quarantine_records(jf: JobFiles) -> dict[str, tuple[ControlRecord, ...]]:
-    prefix = f"{jf.paths.root}/control/quarantine/"
+def _records_of(jf: JobFiles, kind: str) -> dict[str, tuple[ControlRecord, ...]]:
+    prefix = f"{jf.paths.root}/control/{kind}/"
     out: dict[str, list[ControlRecord]] = defaultdict(list)
     for p in jf.store.list(prefix):
-        rec = read_control(jf.store, p)
-        if rec.kind == "quarantine" and rec.detail.get("config_hash") == jf.config_hash:
+        try:
+            rec = read_control(jf.store, p)
+        except (KeyError, TypeError, ValueError):
+            continue  # half-visible / malformed file; never fatal
+        if rec.kind == kind and rec.detail.get("config_hash") == jf.config_hash:
             out[rec.target].append(rec)
     return {k: tuple(sorted(v, key=lambda r: r.created_utc)) for k, v in out.items()}
 
 
-def effective_shards(manifest: Manifest, quarantines: dict[str, tuple[ControlRecord, ...]]
-                     ) -> dict[str, Shard]:
+def quarantine_records(jf: JobFiles) -> dict[str, tuple[ControlRecord, ...]]:
+    """Listed quarantine records of this config (may lag)."""
+    return _records_of(jf, "quarantine")
+
+
+def failed_records(jf: JobFiles) -> dict[str, tuple[ControlRecord, ...]]:
+    """Listed ``shard_failed`` records of this config (may lag)."""
+    return _records_of(jf, "shard_failed")
+
+
+def replan_record(rp: Replan, kind: ShardKind) -> ControlRecord:
+    """A quarantine record synthesized from a replan file (stand-in while the record lags)."""
+    return ControlRecord(
+        kind="quarantine", target=rp.parent, reason="replan", created_utc=rp.created_utc,
+        detail={"config_hash": rp.config_hash, "shard_kind": kind, "done": list(rp.done),
+                "done_parts": list(rp.done_parts),
+                "children": [asdict(c) for c in rp.children], "poisoned": [],
+                "error_path": None})
+
+
+def effective_shards(manifest: Manifest, quarantines: dict[str, tuple[ControlRecord, ...]],
+                     jf: JobFiles | None = None,
+                     replans: dict[str, Replan] | None = None) -> dict[str, Shard]:
+    """Manifest shards + bisection children, transitively. With ``jf``, replan files are read
+    (``exists``/``get``) for every multi-episode shard and, if ``replans`` is given, collected
+    into it."""
     shards = {s.shard_id: s for s in manifest.shards}
     todo = list(shards)
     while todo:
         sid = todo.pop()
+        kids: list[Shard] = []
+        if jf is not None and len(shards[sid].episodes) > 1:
+            rp = read_replan(jf, shards[sid])
+            if rp is not None:
+                kids += rp.children
+                if replans is not None:
+                    replans[sid] = rp
         for rec in quarantines.get(sid, ()):
-            for child in children_of(rec):
-                if child.shard_id not in shards:
-                    shards[child.shard_id] = child
-                    todo.append(child.shard_id)
+            kids += children_of(rec)
+        for child in kids:
+            if child.shard_id not in shards:
+                shards[child.shard_id] = child
+                todo.append(child.shard_id)
     return shards
 
 
@@ -200,8 +248,13 @@ def derive(jf: JobFiles, manifest: Manifest, *, limit: int) -> Progress:
     """Rebuild the full job status from files. Stateless: safe to call from any process."""
     if manifest.config_hash != jf.config_hash:
         raise ValueError("manifest and JobFiles disagree on config_hash")
-    qs = quarantine_records(jf)
-    shards = effective_shards(manifest, qs)
+    qs = dict(quarantine_records(jf))
+    fails = failed_records(jf)
+    replans: dict[str, Replan] = {}
+    shards = effective_shards(manifest, qs, jf, replans)
+    for sid, rp in replans.items():
+        if sid not in qs:
+            qs[sid] = (replan_record(rp, shards[sid].kind),)
 
     episodes: dict[tuple[str, ShardKind], EpisodeState] = {}
     for s in shards.values():
@@ -235,11 +288,13 @@ def derive(jf: JobFiles, manifest: Manifest, *, limit: int) -> Progress:
 
     statuses: dict[str, ShardStatus] = {}
     for sid, s in shards.items():
-        starts = count_starts(jf, s.kind, sid)
+        starts = counted_starts(jf, s.kind, sid, limit=limit)
         r = receipts[sid]
         q = qs.get(sid, ())
         if r is not None:
             st: ShardState = "done"
+        elif sid in fails:
+            st = "failed"
         elif q:
             st = "quarantined"
         elif starts >= limit:
@@ -268,14 +323,27 @@ class ComposeInput:
         return self.expected - self.records.keys() - self.excused
 
 
+def part_prefix(jf: JobFiles, shard: Shard) -> str:
+    return _dir_prefix(jf.paths.part(jf.config_hash, shard.kind, shard.shard_id, "x", 0),
+                       "x-0.jsonl")
+
+
 def compose_input(jf: JobFiles, progress: Progress) -> ComposeInput:
     sources: list[tuple[str, str, str]] = []  # (time, container, part path)
     for st in progress.shards.values():
+        named: set[str] = set()
         if st.receipt is not None:
             sources += [(st.receipt.finished_utc, st.receipt.container_id, p)
                         for p in st.receipt.parts]
+            named |= set(st.receipt.parts)
         for rec in st.quarantines:
             sources += [(rec.created_utc, "", p) for p in rec.detail.get("done_parts", ())]
+            named |= set(rec.detail.get("done_parts", ()))
+        if st.receipt is not None or st.quarantines:
+            # H3: also every *listed* part of a finished shard, whatever the receipt names. Part
+            # files are whole and immutable, so reading extra ones is safe; lowest priority.
+            sources += [("", "", p) for p in jf.store.list(part_prefix(jf, st.shard))
+                        if p.endswith(".jsonl") and p not in named]
     sources = sorted(set(sources))
 
     expected: set[tuple[str, str]] = set()

@@ -91,6 +91,7 @@ class FakeAttempts:
     def __init__(self, store: FakeStore, cfg: str = CFG, job: str = JOB):
         self.store, self.cfg, self.paths = store, cfg, JobPaths(job)
         self._q: dict[str, ControlRecord] = {}
+        self._f: dict[str, ControlRecord] = {}
         self.poison_records: list[str] = []
 
     def _prefix(self, s: Shard) -> str:
@@ -108,6 +109,17 @@ class FakeAttempts:
         self._q.setdefault(shard.shard_id, rec)
         self.store.put_bytes(f"{self.paths.root}/control/quarantine/{shard.shard_id}.json",
                              json.dumps(asdict(rec)).encode())
+
+    def fail(self, shard: Shard, reason: str, detail: Mapping[str, Any]) -> None:
+        rec = ControlRecord("shard_failed", shard.shard_id, reason, f"f-{len(self._f)}",
+                            dict(detail))
+        self._f.setdefault(shard.shard_id, rec)
+
+    def failed(self) -> Mapping[str, ControlRecord]:
+        return dict(self._f)
+
+    def call_for_token(self, shard: Shard, token: str) -> str | None:
+        return None  # make_worker's markers carry no token
 
     def bisect(self, shard: Shard, done: set[str]) -> tuple[Shard, ...]:
         todo = [u for u in shard.episodes if u not in done]
@@ -232,6 +244,45 @@ class RecordingSpawner(FakeSpawner):
         for k, n in inf.items():
             self.peak_by_kind[k] = max(self.peak_by_kind.get(k, 0), n)
         return call_id
+
+
+class TokenSpawner(RecordingSpawner):
+    """Spawner that carries the spawn ``token`` to the worker, like ``run_shard(..., token=)``.
+
+    Workers registered here take ``(job_id, shard_id, cfg, container, store, *, call_id, token)``
+    (``call_id`` plays ``modal.current_function_call_id()``). ``crash_after_spawn`` makes the
+    next ``spawn`` start the call and then raise ``SystemExit`` before returning its id: the
+    orchestrator dies between the spawn and the ledger write (M1)."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.tokens: dict[str, str] = {}
+        self.current: Any = None
+        self.crash_after_spawn = False
+        self._token_workers = dict(self.workers)
+        self.workers = {k: self._bind(k) for k in self._token_workers}
+
+    def _bind(self, kind: str) -> Callable:
+        def run(job_id, shard_id, cfg, container, store):
+            call_id = self.current.call_id
+            return self._token_workers[kind](job_id, shard_id, cfg, container, store,
+                                             call_id=call_id, token=self.tokens.get(call_id, ""))
+        return run
+
+    def spawn(self, kind, job_id, shard_id, config_hash, *, token: str = ""):
+        call_id = super().spawn(kind, job_id, shard_id, config_hash)
+        self.tokens[call_id] = token
+        if self.crash_after_spawn:
+            self.crash_after_spawn = False
+            raise SystemExit("orchestrator killed right after spawn")
+        return call_id
+
+    def _run(self, c, once: bool = False) -> None:
+        self.current = c
+        super()._run(c, once)
+
+    def live(self) -> list[str]:
+        return [c.call_id for c in self.calls.values() if not c.done]
 
 
 def make_manifest(spec: Mapping[str, Sequence[str]], kind: str = "segcap",

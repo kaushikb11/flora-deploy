@@ -91,7 +91,10 @@ def test_python_failures_respawn_with_bound_then_fail_the_shard():
     assert h.receipt("segcap-000") and not h.receipt("segcap-001")
     failed = [e for e in h.events if e["event"] == "shard_failed"]
     assert [e["shard_id"] for e in failed] == ["segcap-001"]
-    assert h.attempts.quarantined()["segcap-001"].reason == "respawns_exhausted"
+    # H1: a terminal shard_failed record, not a quarantine (never bisected)
+    assert h.attempts.failed()["segcap-001"].reason == "respawns_exhausted"
+    assert "segcap-001" not in h.attempts.quarantined()
+    assert "bisected" not in [e["event"] for e in h.events]
 
 
 def test_failed_shard_blocks_its_dependents_and_job_ends_failed():

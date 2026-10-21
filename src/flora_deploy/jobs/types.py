@@ -79,12 +79,28 @@ class Manifest:
 @dataclass(frozen=True)
 class AttemptMarker:
     """One file per container start of a shard, named by container id, so concurrent or
-    Modal-retried starts never overwrite each other. Starts = number of distinct markers."""
+    Modal-retried starts never overwrite each other.
+
+    D15 counting (``jobs.attempts.counted_starts``): a start counts toward quarantine unless the
+    worker rewrote its marker with ``preempted=True`` (``attempts.mark_preempted``, called from
+    ``@modal.exit`` / the SIGINT handler) or with ``error`` (``attempts.mark_exception``: the
+    shard raised; Modal counts that against ``modal.Retries`` and the orchestrator respawns, so
+    it is not a crash loop). OOM and SIGKILL leave no mark, so they count.
+
+    ``token`` is the orchestrator's spawn idempotency token (``attempts.spawn_token``) and
+    ``call_id`` the Modal FunctionCall id the container runs (``modal.current_function_call_id()``);
+    together they let a restarted orchestrator adopt a call whose id it never recorded.
+    """
 
     shard_id: str
     container_id: str  # unique per container (MODAL_TASK_ID); part of the file name
     started_utc: str
     orchestrator_attempt: int  # the spawn number the orchestrator assigned (single writer)
+    token: str = ""
+    call_id: str = ""
+    preempted: bool = False
+    ended_utc: str | None = None  # set together with ``preempted`` / ``error``
+    error: str | None = None  # the exception that ended this start (python failure)
 
 
 @dataclass(frozen=True)
@@ -97,7 +113,10 @@ class ShardReceipt:
     container_id: str
     episodes_done: tuple[str, ...]  # uids
     episodes_failed: tuple[str, ...]  # uids with EpisodeError files; not retried in this shard
-    parts: tuple[str, ...]  # store paths of the part-files holding this shard's records
+    # ALL part files holding records for this shard, across containers: the parts of earlier
+    # attempts the worker found (and skipped episodes for) plus its own. Compose also lists the
+    # shard's part prefix, so a receipt that names only its own parts loses nothing either.
+    parts: tuple[str, ...]
     gpu: str | None
     wall_seconds: float
     finished_utc: str
@@ -137,8 +156,12 @@ class EpisodeError:
 class ControlRecord:
     """Operator/orchestrator decisions that status is derived from (no in-memory state)."""
 
-    kind: Literal["quarantine", "cancel", "budget_stop", "resume"]
-    target: str  # shard_id for quarantine; job_id otherwise
+    # quarantine: shard bisected / poison-pilled (D15). shard_failed: python failures or expiry
+    # exhausted the orchestrator's respawns; terminal, never bisected (the job ends ``failed``).
+    kind: Literal["quarantine", "shard_failed", "cancel", "budget_stop", "resume"]
+    target: str  # shard_id for quarantine / shard_failed; job_id otherwise
     reason: str
     created_utc: str
+    # ``detail["config_hash"]`` scopes a record to one config (always set by the orchestrator and
+    # by quarantine). cancel / resume written without it apply to every config of the job.
     detail: dict = field(default_factory=dict)

@@ -65,27 +65,32 @@ def _skip_oom(h):
     return make_worker(h.manifests, WorkerBehavior(), "caption", h.processed)
 
 
-def test_crash_between_quarantine_and_bisect_is_redone_on_restart():
+def test_crash_between_replan_and_quarantine_record_is_redone_on_restart():
+    """C2 order: the bisection is persisted (replan) *before* the quarantine record, so a crash in
+    between leaves durable children and no record; the successor redoes the quarantine with the
+    same children."""
     h = Harness({"segcap-000": EPS}, lag=1, behavior=WorkerBehavior(oom={"ds--e2"}))
     orch = h.orchestrator()
     assert orch.acquire()
 
-    real_bisect = h.attempts.bisect
+    real_quarantine = h.attempts.quarantine
     calls = {"n": 0}
 
-    def crashing_bisect(shard, done):
+    def crashing_quarantine(shard, reason, detail):
         calls["n"] += 1
         if calls["n"] == 1:
             raise SystemExit("orchestrator killed mid-quarantine")
-        return real_bisect(shard, done)
+        return real_quarantine(shard, reason, detail)
 
-    h.attempts.bisect = crashing_bisect  # type: ignore[method-assign]
+    h.attempts.quarantine = crashing_quarantine  # type: ignore[method-assign]
     try:
         while orch.tick() == "running":
             h.sleep(10)
     except SystemExit:
         pass
-    assert "segcap-000" in h.attempts.quarantined()
+    assert "segcap-000" not in h.attempts.quarantined()
+    children = set(h.manifests.added)
+    assert children == {"segcap-ep-ds--e2", "segcap-ep-ds--e3", "segcap-ep-ds--e4"}
 
     h.clock.advance(1000)  # the dead orchestrator's lease expires
     out = h.run()

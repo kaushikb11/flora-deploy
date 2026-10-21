@@ -17,13 +17,39 @@ One instance per job is enforced by a :class:`Lease` (Modal: :class:`DictLease` 
 ``"continue"`` so the Modal wrapper can spawn its successor.
 
 The planning pieces (manifest, attempts/quarantine/bisection, progress) belong to P1a-2 and the
-budget gate to P1a-4; they are consumed here only through the small ``Protocol``s below.
+budget gate to P1a-4; they are consumed here only through the small ``Protocol``s below
+(``jobs.deps`` adapts the P1a-2 modules to them).
+
+**Terminal shard states** (ledger ``status``; :func:`resolve` and the reconciler agree on them):
+
+- ``done``: a receipt exists. Satisfied.
+- ``poisoned``: a single-episode shard reached the D15 start limit; its episode is isolated to
+  ``errors/`` (excused in compose). Satisfied.
+- ``quarantined``: a multi-episode shard reached the D15 limit and was bisected. The children are
+  persisted (replan) *before* the quarantine record; the parent is satisfied only when every child
+  listed in its ledger is known and satisfied (a child the manifest does not show yet = wait), and
+  dead if any child is dead.
+- ``failed``: python failures / expiry exhausted ``max_respawns``. Written as a ``shard_failed``
+  record, **never bisected**. Dead: the job ends ``failed`` once nothing else is live.
+- ``cancelled``: the job was cancelled. Dead.
+
+**D15 counting.** ``AttemptLedger.starts`` counts container starts *that were not preempted*
+(workers flag preempted starts via ``attempts.mark_preempted``), so spot preemption alone never
+quarantines a shard or poison-pills a healthy episode.
+
+**Spawn intent.** Before ``spawn`` the ledger is saved as ``spawning`` with ``spawn_n`` and a
+deterministic ``token`` (``attempts.spawn_token``), which the worker records in its marker and
+checks against the ledger (``attempts.superseded``). A successor that finds ``spawning`` adopts
+the call if a marker with that token names it, waits ``spawn_grace_s`` for one to appear, and
+otherwise respawns with a new token, which turns any late duplicate into a no-op.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
 import math
+import re
 import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -31,6 +57,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
 
+from flora_deploy.jobs.attempts import spawn_token
 from flora_deploy.jobs.settings import RunSettings
 from flora_deploy.jobs.spawner import Spawner
 from flora_deploy.jobs.store import JobPaths, Store
@@ -40,6 +67,8 @@ DEADLINE_S = 23 * 3600  # Modal caps one function attempt at 24 h; leave an hour
 LEASE_TTL_S = 300.0
 POLL_INTERVAL_S = 15.0
 MAX_RESPAWNS = 3  # respawns after failed / expired / externally cancelled calls, per shard
+SPAWN_GRACE_S = 120.0  # how long a successor waits for a marker of an unconfirmed spawn
+RESPAWNS_EXHAUSTED = "respawns_exhausted"
 
 Event = dict[str, Any]
 EventSink = Callable[[Event], None]
@@ -63,25 +92,43 @@ _LIVE = ("spawning", "active")
 
 class ManifestSource(Protocol):
     def load(self) -> Manifest:
-        """The effective manifest: planned shards plus every shard added by :meth:`replan`."""
+        """The effective manifest: planned shards plus every shard added by :meth:`replan`.
+
+        Must reflect a completed :meth:`replan` **immediately** (read-after-write, never via a
+        lagging ``list``): the orchestrator resolves a quarantined parent from its children."""
         ...
 
     def replan(self, parent: Shard, children: Sequence[Shard]) -> None:
-        """Persist ``children`` (``bisected_from == parent.shard_id``). Idempotent by shard id."""
+        """Durably persist ``children`` (``bisected_from == parent.shard_id``) before the
+        quarantine record is written. Idempotent; the first persisted child set wins."""
         ...
 
 
 class AttemptLedger(Protocol):
     def starts(self, shard: Shard) -> int:
-        """Number of distinct ``AttemptMarker`` files for ``shard`` (container starts)."""
+        """D15 count: distinct ``AttemptMarker`` files for ``shard`` *not* flagged
+        ``preempted`` (``attempts.counted_starts``)."""
         ...
 
     def quarantined(self) -> Mapping[str, ControlRecord]:
-        """shard_id -> its ``quarantine`` ControlRecord."""
+        """shard_id -> its ``quarantine`` ControlRecord, **for this config hash only**."""
         ...
 
     def quarantine(self, shard: Shard, reason: str, detail: Mapping[str, Any]) -> None:
-        """Write a ``ControlRecord(kind="quarantine", target=shard_id)``. Idempotent."""
+        """Write a ``ControlRecord(kind="quarantine", target=shard_id)``. Idempotent. Called
+        after :meth:`ManifestSource.replan` for multi-episode shards."""
+        ...
+
+    def fail(self, shard: Shard, reason: str, detail: Mapping[str, Any]) -> None:
+        """Write a ``ControlRecord(kind="shard_failed")``: terminal, never bisected."""
+        ...
+
+    def failed(self) -> Mapping[str, ControlRecord]:
+        """shard_id -> its ``shard_failed`` ControlRecord, for this config hash only."""
+        ...
+
+    def call_for_token(self, shard: Shard, token: str) -> str | None:
+        """Call id recorded in a marker written with spawn ``token`` (adoption), else None."""
         ...
 
     def bisect(self, shard: Shard, done: set[str]) -> tuple[Shard, ...]:
@@ -136,6 +183,9 @@ class LeaseInfo:
 class Lease(Protocol):
     def acquire(self, holder: str, ttl_s: float) -> bool: ...
     def renew(self, holder: str, ttl_s: float) -> bool: ...
+    def verify(self, holder: str) -> bool:
+        """Cheap check, before every spawn, that ``holder`` still holds the lease."""
+        ...
     def release(self, holder: str) -> None: ...
     def current(self) -> LeaseInfo | None:
         """The live (unexpired) lease, or ``None`` if nobody holds it."""
@@ -158,6 +208,12 @@ class DictLease:
     expired generation ``g`` means creating ``g+1`` with ``put(skip_if_exists=True)``, which exactly
     one contender wins. The holder renews by rewriting its own generation key, after checking that
     ``g+1`` doesn't exist; a holder that finds ``g+1`` has lost the lease and must stop.
+
+    Renew is *renew-then-verify*: ``contains(g+1)`` and the write are not atomic, so a contender
+    can create ``g+1`` in between. Renew therefore re-checks ``g+1`` after its write and reports
+    the loss; the orchestrator also calls :meth:`verify` right before every spawn, which bounds a
+    stalled holder's overlap with its successor to one in-flight spawn decision (whose spawn
+    token then makes the duplicate inert, see ``attempts.superseded``).
     """
 
     def __init__(self, kv: KV, name: str, clock: Callable[[], float] = time.time):
@@ -203,6 +259,13 @@ class DictLease:
             self._gen = None
             return False
         self.kv.put(self._key(g), {"holder": holder, "expires_at": self.clock() + ttl_s})
+        return self.verify(holder)
+
+    def verify(self, holder: str) -> bool:
+        g = self._gen
+        if g is None or self.kv.contains(self._key(g + 1)):
+            self._gen = None
+            return False
         return True
 
     def release(self, holder: str) -> None:
@@ -227,11 +290,8 @@ class DictLease:
 
 
 def call_path(paths: JobPaths, config_hash: str, kind: str, shard_id: str) -> str:
-    """Per-shard orchestrator ledger. Lives under ``<cfg_hash>/`` like attempts and receipts.
-
-    (Candidate for promotion to ``JobPaths.call`` when the contracts are next revised.)
-    """
-    return f"{paths._cfg(config_hash, 'calls', kind, shard_id)}/call.json"  # noqa: SLF001
+    """Per-shard orchestrator ledger (``JobPaths.call``), under ``<cfg_hash>/``."""
+    return paths.call(config_hash, kind, shard_id)
 
 
 @dataclass
@@ -246,6 +306,7 @@ class ShardLedger:
     children: tuple[str, ...] = ()
     calls: list[dict[str, Any]] = field(default_factory=list)
     updated_utc: str = ""
+    token: str = ""  # spawn token of spawn_n (attempts.spawn_token); read by workers
 
     def to_bytes(self) -> bytes:
         return json.dumps(asdict(self), sort_keys=True, separators=(",", ":")).encode()
@@ -261,14 +322,27 @@ def utc(t: float) -> str:
     return datetime.fromtimestamp(t, UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
+def _parse_utc(ts: str) -> float:
+    return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC).timestamp()
+
+
 def _compact(ts: str) -> str:
     return "".join(c for c in ts if c.isalnum() or c == ".")
+
+
+_UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")
 
 
 def write_control(store: Store, paths: JobPaths, record: ControlRecord) -> str:
     """Write one ControlRecord as its own whole file; returns its path (used by CLI too).
 
-    ``created_utc`` must use :func:`utc`'s format: cancel/budget_stop/resume are ordered by it."""
+    ``created_utc`` must use :func:`utc`'s format (validated): cancel/budget_stop/resume are
+    ordered by it as strings. Scope: a record with ``detail["config_hash"]`` applies to that
+    config only; without it, to every config of the job (an operator's ``cancel``/``resume``).
+    The orchestrator always scopes its own ``budget_stop``."""
+    if not _UTC_RE.match(record.created_utc):
+        raise ValueError(f"created_utc {record.created_utc!r} must look like "
+                         "2026-10-21T12:00:00.000000Z (orchestrator.utc)")
     path = paths.control(record.kind, record.target, _compact(record.created_utc))
     data = json.dumps(asdict(record), sort_keys=True, separators=(",", ":")).encode()
     store.put_bytes(path, data)
@@ -294,8 +368,13 @@ class ControlView:
     budget_stopped: ControlRecord | None  # latest budget_stop not superseded by a later resume
 
 
-def control_view(records: Iterable[ControlRecord], job_id: str) -> ControlView:
-    mine = sorted((r for r in records if r.target == job_id), key=lambda r: r.created_utc)
+def control_view(records: Iterable[ControlRecord], job_id: str,
+                 config_hash: str | None = None) -> ControlView:
+    """Latest decision for ``job_id``. With ``config_hash``, records scoped to another config
+    (``detail["config_hash"]``) are ignored, so config A's ``budget_stop`` never stops config B."""
+    mine = sorted((r for r in records if r.target == job_id and (
+        config_hash is None or r.detail.get("config_hash") in (None, config_hash))),
+        key=lambda r: r.created_utc)
     cancel = next((r for r in mine if r.kind == "cancel"), None)
     stop: ControlRecord | None = None
     for r in mine:
@@ -311,18 +390,27 @@ def control_view(records: Iterable[ControlRecord], job_id: str) -> ControlView:
 # ----------------------------------------------------------------------------------------------
 
 
-def resolve(shards: Sequence[Shard], status: Callable[[str], str]) -> tuple[set[str], set[str]]:
+def resolve(shards: Sequence[Shard], status: Callable[[str], str],
+            children_of: Mapping[str, Iterable[str]] | None = None,
+            ) -> tuple[set[str], set[str]]:
     """Return (satisfied, dead) shard ids.
 
     satisfied: receipt (``done``), or the shard is an isolated poison episode (``poisoned``), or it
     was quarantined and bisected and all of its children are satisfied.
     dead: ``failed``/``cancelled``, a dependency is dead, or a bisection child is dead.
+
+    ``children_of`` (parent -> child ids, e.g. from the ``call.json`` ledgers) is the authority
+    for a quarantined parent's children: a listed child that ``shards`` does not contain yet
+    (lagging manifest) is *unknown* and keeps the parent unsatisfied, never vacuously satisfied.
     """
     by_id = {s.shard_id: s for s in shards}
     children: dict[str, list[str]] = {}
     for s in shards:
         if s.bisected_from:
             children.setdefault(s.bisected_from, []).append(s.shard_id)
+    for parent, kids in (children_of or {}).items():
+        lst = children.setdefault(parent, [])
+        lst.extend(k for k in kids if k not in lst)
     sat: dict[str, bool] = {}
     dead: dict[str, bool] = {}
 
@@ -332,7 +420,9 @@ def resolve(shards: Sequence[Shard], status: Callable[[str], str]) -> tuple[set[
         if depth > len(by_id) + 1:
             raise ValueError(f"cycle in shard graph at {sid!r}")
         st = status(sid)
-        if st in ("done", "poisoned"):
+        if sid not in by_id:
+            r = False  # unknown (e.g. a child the manifest does not show yet): wait
+        elif st in ("done", "poisoned"):
             r = True
         elif st == "quarantined":
             r = all(is_sat(c, depth + 1) for c in children.get(sid, ()))
@@ -397,7 +487,7 @@ class Orchestrator:
                  budget: BudgetGate | None = None, events: EventSink | None = None,
                  clock: Callable[[], float] = time.time, deadline_s: float = DEADLINE_S,
                  lease_ttl_s: float = LEASE_TTL_S, max_respawns: int = MAX_RESPAWNS,
-                 holder: str | None = None):
+                 spawn_grace_s: float = SPAWN_GRACE_S, holder: str | None = None):
         self.settings = settings
         self.job_id = settings.job_id
         self.cfg = settings.config_hash
@@ -408,6 +498,7 @@ class Orchestrator:
         self.events = events or (lambda e: None)
         self.clock = clock
         self.deadline_s, self.lease_ttl_s, self.max_respawns = deadline_s, lease_ttl_s, max_respawns
+        self.spawn_grace_s = spawn_grace_s
         self.holder = holder or f"orch-{uuid.uuid4().hex[:12]}"
         self.k = settings.max_starts_before_quarantine
         self.started_at = clock()
@@ -415,6 +506,9 @@ class Orchestrator:
         self._held = False
         self._ledgers: dict[str, ShardLedger] = {}
         self._own_controls: list[ControlRecord] = []  # visible before a lagging list() shows them
+        self._spawn_takes_token = _accepts_kw(spawner.spawn, "token")
+        self._budget_cancelled: set[str] = set()  # call ids cancelled by the budget hard cap
+        self._stopped = False  # a budget_stop is in force this tick
 
     # events / files -------------------------------------------------------------------------
     def _emit(self, event: str, **kw: Any) -> None:
@@ -447,7 +541,8 @@ class Orchestrator:
 
     def _control(self, kind: str, reason: str, **detail: Any) -> ControlRecord:
         rec = ControlRecord(kind=kind, target=self.job_id, reason=reason,  # type: ignore[arg-type]
-                            created_utc=utc(self.clock()), detail=dict(detail))
+                            created_utc=utc(self.clock()),
+                            detail={**detail, "config_hash": self.cfg})
         write_control(self.store, self.paths, rec)
         self._own_controls.append(rec)
         return rec
@@ -456,7 +551,11 @@ class Orchestrator:
         seen = {(r.kind, r.created_utc) for r in self._own_controls}
         listed = [r for r in read_controls(self.store, self.paths)
                   if (r.kind, r.created_utc) not in seen]
-        return control_view([*listed, *self._own_controls], self.job_id)
+        return control_view([*listed, *self._own_controls], self.job_id, self.cfg)
+
+    def _failed_records(self) -> Mapping[str, ControlRecord]:
+        failed = getattr(self.attempts, "failed", None)
+        return failed() if failed is not None else {}
 
     # lifecycle ------------------------------------------------------------------------------
     def acquire(self) -> bool:
@@ -473,6 +572,10 @@ class Orchestrator:
             self.lease.release(self.holder)
             self._held = False
             self._emit("lease_released")
+
+    def _still_leader(self) -> bool:
+        verify = getattr(self.lease, "verify", None)
+        return True if verify is None else bool(verify(self.holder))
 
     def run_until_idle(self, *, sleep: Callable[[float], None] = time.sleep,
                        poll_interval_s: float = POLL_INTERVAL_S,
@@ -516,20 +619,29 @@ class Orchestrator:
             self._emit("cancelled", reason=controls.cancelled.reason)
             return "cancelled"
 
+        for s in shards:
+            self._ledger(s)  # the budget state needs every call history
+        self._budget_cancelled |= set(self.enforce_budget())
+        if self._budget_cancelled:
+            controls = self._controls()  # the budget_stop just written
+        self._stopped = controls.budget_stopped is not None
+
         quarantined = self.attempts.quarantined()
+        failed = self._failed_records()
         for s in shards:
             led = self._ledger(s)
             if led.status == "spawning":
-                # crash between "intent" and "call id" writes: the call may or may not exist.
-                self._emit("orphan_spawn_possible", shard_id=s.shard_id)
-                self._save(led, status="retry")
+                self._recover_spawning(s, led)
+            elif led.status in ("new", "retry", "active") and (
+                    s.shard_id in failed or (s.shard_id in quarantined and
+                                             quarantined[s.shard_id].reason ==
+                                             RESPAWNS_EXHAUSTED)):
+                # shard_failed written but ledger not updated before a crash: finish it
+                rec = failed.get(s.shard_id) or quarantined[s.shard_id]
+                self._save(led, status="failed", call_id=None, reason=rec.reason)
             elif led.status in ("new", "retry", "active") and s.shard_id in quarantined:
                 # quarantine record written but ledger not updated before a crash: finish it
-                rec = quarantined[s.shard_id]
-                if rec.reason == "respawns_exhausted":
-                    self._save(led, status="failed", call_id=None, reason=rec.reason)
-                else:
-                    self._quarantine(s, led, reason=rec.reason, redo=True)
+                self._quarantine(s, led, reason=quarantined[s.shard_id].reason, redo=True)
             elif led.status == "active":
                 self._watch(s, led)
 
@@ -543,7 +655,9 @@ class Orchestrator:
             s = by_id.get(sid)
             return self._ledger(s).status if s else "new"
 
-        satisfied, dead = resolve(shards, status)
+        children = {sid: led.children for sid, led in self._ledgers.items()
+                    if led.status == "quarantined"}
+        satisfied, dead = resolve(shards, status, children)
 
         if self.clock() - self.started_at >= self.deadline_s:
             self._emit("continue", active=self._active_count())
@@ -553,6 +667,8 @@ class Orchestrator:
         stopped = controls.budget_stopped is not None
         if not stopped:
             stopped = not self._spawn_eligible(shards, satisfied, dead, status)
+            if not self._held:
+                return "lost_lease"
 
         active = self._active_count()
         if all(sid in satisfied or sid in dead for sid in by_id) and active == 0:
@@ -566,6 +682,94 @@ class Orchestrator:
 
     def _active_count(self) -> int:
         return sum(1 for led in self._ledgers.values() if led.status in _LIVE)
+
+    # budget hard cap ------------------------------------------------------------------------
+    def budget_state(self) -> Any:
+        """``jobs.budget.BudgetState`` of every call this orchestrator knows (its loaded
+        ``call.json`` histories): a call starts at its ``spawned``/``adopted`` entry and ends at
+        its first later entry; with none, it is live while it is the ledger's current call in a
+        live status, else it ended when the ledger was last saved."""
+        from flora_deploy.jobs.budget import BudgetState, CallRecord  # budget imports us
+
+        now = self.clock()
+        calls: list[Any] = []
+        for led in self._ledgers.values():
+            start: dict[str, float] = {}
+            end: dict[str, tuple[float, str]] = {}
+            for e in led.calls:
+                cid, ts = e.get("call_id"), e.get("utc")
+                if not cid or not ts:
+                    continue
+                t = _parse_utc(ts)
+                if e.get("outcome") in ("spawned", "adopted"):
+                    start.setdefault(cid, t)
+                elif cid in start:
+                    end.setdefault(cid, (t, str(e.get("outcome"))))
+            for cid, t0 in start.items():
+                if cid in end:
+                    calls.append(CallRecord(cid, led.shard_id, led.kind, t0, *end[cid]))
+                elif cid == led.call_id and led.status in _LIVE:
+                    calls.append(CallRecord(cid, led.shard_id, led.kind, t0))
+                else:
+                    t1 = _parse_utc(led.updated_utc) if led.updated_utc else now
+                    calls.append(CallRecord(cid, led.shard_id, led.kind, t0, t1, led.status))
+        return BudgetState(now, tuple(calls))
+
+    def enforce_budget(self) -> list[str]:
+        """Budget hard cap, every tick: ``budget.overspend(budget_state())`` names live calls to
+        stop. Writes ``budget_stop`` first (so nothing respawns), then cancels them
+        (``spawner.terminate`` when available) and re-queues their shards as ``retry`` *without*
+        consuming a respawn; ``flora resume`` runs them again. Gates without ``overspend``: no-op.
+        """
+        overspend = getattr(self.budget, "overspend", None)
+        if not callable(overspend):
+            return []
+        ids = [c for c in overspend(self.budget_state()) if c not in self._budget_cancelled]
+        if not ids:
+            return []
+        detail = {**dict(getattr(self.budget, "last_overspend", {}) or {}), "cancel": ids}
+        self._control("budget_stop", "budget hard cap: spend + in-flight work exceeds the budget",
+                      **detail)
+        stop = getattr(self.spawner, "terminate", None) or self.spawner.cancel
+        by_call = {led.call_id: led for led in self._ledgers.values() if led.call_id}
+        done: list[str] = []
+        for cid in ids:
+            try:
+                stop(cid)
+            except Exception as exc:  # retried next tick
+                self._emit("cancel_error", call_id=cid, error=repr(exc))
+                continue
+            done.append(cid)
+            led = by_call.get(cid)
+            if led is not None and led.status in _LIVE:
+                led.calls.append({"call_id": cid, "outcome": "cancelled_budget",
+                                  "utc": utc(self.clock())})
+                self._save(led, status="retry", call_id=None, reason="budget hard cap")
+        self._emit("budget_overspend_cancel", calls=done,
+                   **{k: v for k, v in detail.items() if k != "cancel"})
+        return done
+
+    def _recover_spawning(self, s: Shard, led: ShardLedger) -> None:
+        """Crash between the spawn intent and the call-id write: the call may or may not exist.
+        Adopt it if a marker carrying the intent's token names its call id; otherwise wait out
+        ``spawn_grace_s`` (queued calls start late) and respawn with a new token, which makes a
+        late duplicate exit without work (``attempts.superseded``)."""
+        if self._receipt_exists(s):
+            self._finish(s, led, "receipt")
+            return
+        finder = getattr(self.attempts, "call_for_token", None)
+        call_id = finder(s, led.token) if (finder is not None and led.token) else None
+        if call_id:
+            led.calls.append({"call_id": call_id, "outcome": "adopted", "spawn_n": led.spawn_n,
+                              "utc": utc(self.clock())})
+            self._save(led, status="active", call_id=call_id)
+            self._emit("spawn_adopted", shard_id=s.shard_id, call_id=call_id, token=led.token)
+            return
+        age = (self.clock() - _parse_utc(led.updated_utc)) if led.updated_utc else math.inf
+        if led.token and age < self.spawn_grace_s:
+            return  # still live: blocks completion and counts against caps until resolved
+        self._emit("orphan_spawn_possible", shard_id=s.shard_id, token=led.token)
+        self._save(led, status="retry")
 
     def _watch(self, s: Shard, led: ShardLedger) -> None:
         assert led.call_id
@@ -581,16 +785,30 @@ class Orchestrator:
         if st.state == "pending":
             return
         if st.state == "success":
-            self._finish(s, led, "success")
+            if self._receipt_exists(s):
+                self._finish(s, led, "success")
+                return
+            # e.g. a superseded worker returned None: the shard is not done
+            st = type(st)(st.call_id, "failed", error="call succeeded without a receipt")
+        if st.state == "cancelled" and (led.call_id in self._budget_cancelled or self._stopped):
+            # stopped by the budget hard cap (here or by a driver): re-queue, no respawn used
+            led.calls.append({"call_id": led.call_id, "outcome": "cancelled_budget",
+                              "utc": utc(self.clock())})
+            self._save(led, status="retry", call_id=None, reason="budget hard cap")
+            self._emit("call_cancelled_budget", shard_id=s.shard_id, call_id=st.call_id)
             return
         # failed / expired / cancelled by someone else: bounded respawn
         self._emit("call_" + st.state, shard_id=s.shard_id, call_id=led.call_id, error=st.error)
         led.calls.append({"call_id": led.call_id, "outcome": st.state, "error": st.error,
                           "utc": utc(self.clock())})
         if led.respawns >= self.max_respawns:
-            self.attempts.quarantine(s, "respawns_exhausted",
-                                     {"last_state": st.state, "error": st.error,
-                                      "respawns": led.respawns})
+            # H1: terminal failure, never bisected (bisection is only for D15 crash loops)
+            detail = {"last_state": st.state, "error": st.error, "respawns": led.respawns}
+            fail = getattr(self.attempts, "fail", None)
+            if fail is not None:
+                fail(s, RESPAWNS_EXHAUSTED, detail)
+            else:  # legacy ledgers: a quarantine record with this reason means "failed"
+                self.attempts.quarantine(s, RESPAWNS_EXHAUSTED, detail)
             self._save(led, status="failed", call_id=None,
                        reason=f"{st.state} after {led.respawns} respawns: {st.error}")
             self._emit("shard_failed", shard_id=s.shard_id, reason=led.reason)
@@ -604,23 +822,31 @@ class Orchestrator:
 
     def _quarantine(self, s: Shard, led: ShardLedger, *, reason: str, starts: int | None = None,
                     redo: bool = False) -> None:
-        """D15: cancel the looping call, quarantine, then bisect (or isolate a single episode)."""
+        """D15: cancel the looping call, persist the bisection (replan), *then* write the
+        quarantine record (or isolate a single episode)."""
         if led.call_id:
             self.spawner.cancel(led.call_id)
             led.calls.append({"call_id": led.call_id, "outcome": "cancelled_poison",
                               "utc": utc(self.clock())})
         detail = {"starts": starts, "call_id": led.call_id}
-        if not redo:
-            self.attempts.quarantine(s, reason, detail)
-        self._emit("quarantined", shard_id=s.shard_id, reason=reason, starts=starts)
         if len(s.episodes) <= 1:
+            if not redo:
+                self.attempts.quarantine(s, reason, detail)
+            self._emit("quarantined", shard_id=s.shard_id, reason=reason, starts=starts)
             self.attempts.record_poison(s, {**detail, "reason": reason})
             self._save(led, status="poisoned", call_id=None, reason=reason)
             self._emit("poisoned", shard_id=s.shard_id, episodes=list(s.episodes))
             return
         done = self.progress.episodes_done(s)
         children = self.attempts.bisect(s, done)
-        self.manifests.replan(s, children)
+        self.manifests.replan(s, children)  # C2: durable before the quarantine record
+        persisted = tuple(c for c in self.manifests.load().shards
+                          if c.bisected_from == s.shard_id)
+        if persisted:  # the first persisted child set wins (crash-and-redo safe)
+            children = persisted
+        if not redo:
+            self.attempts.quarantine(s, reason, detail)
+        self._emit("quarantined", shard_id=s.shard_id, reason=reason, starts=starts)
         self._save(led, status="quarantined", call_id=None, reason=reason,
                    children=tuple(c.shard_id for c in children))
         self._emit("bisected", shard_id=s.shard_id, children=[c.shard_id for c in children],
@@ -641,6 +867,11 @@ class Orchestrator:
             pool = self.settings.pools[kind]  # type: ignore[index]
             total += math.ceil(n / max(pool.max_inputs, 1)) * pool.gpu_count
         return total
+
+    def _spawn(self, s: Shard, token: str) -> str:
+        if self._spawn_takes_token:
+            return self.spawner.spawn(s.kind, self.job_id, s.shard_id, self.cfg, token=token)
+        return self.spawner.spawn(s.kind, self.job_id, s.shard_id, self.cfg)
 
     def _spawn_eligible(self, shards: Sequence[Shard], satisfied: set[str], dead: set[str],
                         status: Callable[[str], str]) -> bool:
@@ -667,18 +898,33 @@ class Orchestrator:
                               **dict(decision.detail))
                 self._emit("budget_stop", reason=decision.reason, active=self._active_count())
                 return False
-            self._save(led, status="spawning", spawn_n=led.spawn_n + 1)
+            if not self._still_leader():  # M2: renew-then-verify, right before acting
+                self._held = False
+                self._emit("lease_lost", at="spawn", shard_id=s.shard_id)
+                return True
+            n = led.spawn_n + 1
+            token = spawn_token(self.job_id, self.cfg, s.shard_id, n)
+            self._save(led, status="spawning", spawn_n=n, token=token)  # intent first (M1)
             try:
-                call_id = self.spawner.spawn(s.kind, self.job_id, s.shard_id, self.cfg)
+                call_id = self._spawn(s, token)
             except Exception as exc:  # Modal API hiccup: try again next tick
                 self._save(led, status="retry")
                 self._emit("spawn_error", shard_id=s.shard_id, error=repr(exc))
                 return True
             led.calls.append({"call_id": call_id, "outcome": "spawned", "spawn_n": led.spawn_n,
-                              "utc": utc(self.clock())})
+                              "token": token, "utc": utc(self.clock())})
             self._save(led, status="active", call_id=call_id)
             self.spawned += 1
             in_flight = trial
             self._emit("spawned", shard_id=s.shard_id, kind=s.kind, call_id=call_id,
                        spawn_n=led.spawn_n, gpus=self._gpus(in_flight))
         return True
+
+
+def _accepts_kw(fn: Callable[..., Any], name: str) -> bool:
+    """Whether ``fn`` takes keyword ``name`` (Spawner implementations that predate ``token``)."""
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == name or p.kind is inspect.Parameter.VAR_KEYWORD for p in params)

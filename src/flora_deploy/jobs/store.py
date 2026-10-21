@@ -71,6 +71,16 @@ class JobPaths:
     def receipt(self, cfg_hash: str, kind: str, shard_id: str) -> str:
         return f"{self._cfg(cfg_hash, 'receipts', kind, shard_id)}.json"
 
+    def replan(self, cfg_hash: str, kind: str, shard_id: str) -> str:
+        """Durable quarantine decision of one shard (children, done, poisoned). Written once,
+        *before* the quarantine ControlRecord, and read with ``exists``/``get``, never ``list``."""
+        return f"{self._cfg(cfg_hash, 'replans', kind, shard_id)}.json"
+
+    def call(self, cfg_hash: str, kind: str, shard_id: str) -> str:
+        """The orchestrator's per-shard ledger (``orchestrator.ShardLedger``); workers read it to
+        detect a superseded spawn (``attempts.superseded``)."""
+        return f"{self._cfg(cfg_hash, 'calls', kind, shard_id)}/call.json"
+
     def attempt(self, cfg_hash: str, kind: str, shard_id: str, container_id: str) -> str:
         return f"{self._cfg(cfg_hash, 'attempts', kind, shard_id)}/{safe_key(container_id)}.json"
 

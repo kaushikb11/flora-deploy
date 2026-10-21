@@ -82,3 +82,76 @@ def test_quarantine_bisects_then_poison_pills_idempotently():
     # a single-episode shard whose episode is already done is not poisoned
     q3 = quarantine(jf, child, created_utc="t3", done=["d--e2"])
     assert q3.poisoned == () and q3.error_path is None
+
+
+def test_preempted_and_exception_starts_do_not_count():
+    from flora_deploy.jobs.attempts import counted_starts, mark_exception, mark_preempted
+
+    jf = _jf()
+    for i in range(4):
+        m = write_attempt(jf, "segcap", SHARD.shard_id, f"ta-{i}", started_utc="t",
+                          orchestrator_attempt=1)
+        if i < 2:
+            mark_preempted(jf, "segcap", SHARD.shard_id, f"ta-{i}", ended_utc="t2", marker=m)
+    mark_exception(jf, "segcap", SHARD.shard_id, "ta-2", ended_utc="t3", error="boom")
+    assert count_starts(jf, "segcap", SHARD.shard_id) == 4
+    assert counted_starts(jf, "segcap", SHARD.shard_id) == 1
+    assert counted_starts(jf, "segcap", SHARD.shard_id, limit=5) == 4  # below limit: no reads
+    assert not should_quarantine(jf, SHARD, limit=2)
+    p = jf.paths.attempt("cfg", "segcap", SHARD.shard_id, "ta-0")
+    got = from_json(AttemptMarker, jf.store.get_bytes(p))
+    assert got.preempted and got.ended_utc == "t2"
+
+
+def test_spawn_tokens_and_superseded_workers():
+    import json
+
+    from flora_deploy.jobs.attempts import (
+        call_for_token,
+        spawn_token,
+        superseded,
+        token_attempt,
+    )
+
+    jf = _jf()
+    t1, t2 = (spawn_token("job", "cfg", SHARD.shard_id, n) for n in (1, 2))
+    assert t1 == spawn_token("job", "cfg", SHARD.shard_id, 1) != t2 and token_attempt(t2) == 2
+    assert not superseded(jf, "segcap", SHARD.shard_id, t1)  # no ledger: a manual run
+    led = jf.paths.call("cfg", "segcap", SHARD.shard_id)
+    jf.store.put_bytes(led, json.dumps({"token": t2, "status": "spawning"}).encode())
+    assert superseded(jf, "segcap", SHARD.shard_id, t1)
+    assert not superseded(jf, "segcap", SHARD.shard_id, t2)
+    jf.store.put_bytes(led, json.dumps({"token": t2, "status": "quarantined"}).encode())
+    assert superseded(jf, "segcap", SHARD.shard_id, t2)
+    write_attempt(jf, "segcap", SHARD.shard_id, "ta-1", started_utc="t", orchestrator_attempt=2,
+                  token=t2, call_id="fc-9")
+    assert call_for_token(jf, "segcap", SHARD.shard_id, t2) == "fc-9"
+    assert call_for_token(jf, "segcap", SHARD.shard_id, t1) is None
+
+
+def test_replan_is_durable_and_first_writer_wins():
+    from flora_deploy.jobs.attempts import read_replan, write_replan
+
+    jf = _jf(lag=5)  # listing lag must not matter: replans are read with exists/get
+    first = bisect(SHARD, done=["d--e1"])
+    write_replan(jf, SHARD, first, created_utc="t1", done=SHARD.episodes, done_parts=["p1"])
+    rp = read_replan(jf, SHARD)
+    assert rp is not None and rp.children == first and rp.done == ("d--e1",)
+    write_replan(jf, SHARD, bisect(SHARD), created_utc="t2")  # a redo with another done set
+    assert read_replan(jf, SHARD).children == first
+    q = quarantine(jf, SHARD, created_utc="2026-10-21T00:00:00Z", done=[], starts=3)
+    assert q.children == first and q.record.detail["done"] == ["d--e1"]
+
+
+def test_upstream_poisoned_episodes_are_found_by_exists():
+    from flora_deploy.jobs.attempts import upstream_poisoned
+
+    jf = _jf(lag=5)
+    seg = Shard("segment-00000", "segment", ("a", "b", "c"), 3.0)
+    single = Shard("segment-00001", "segment", ("d",), 1.0)
+    cap = Shard("caption-00000", "caption", ("a", "b", "c", "d"), 4.0,
+                depends_on=("segment-00000", "segment-00001"))
+    child_b = next(c for c in bisect(seg) if c.episodes == ("b",))
+    quarantine(jf, child_b, created_utc="t", starts=3)
+    quarantine(jf, single, created_utc="t", starts=3)
+    assert upstream_poisoned(jf, cap, [seg, single]) == {"b", "d"}
