@@ -10,7 +10,8 @@ Upstream records (``UpstreamSegments``): every part under the shard's ``depends_
 shards and under their single-episode bisection children (``attempts.child_shard_id``), filtered
 to this config (``JobFiles.accepts("segment")``: the segment stage hash or the job hash); read
 once per shard. An episode without one is an ``infra`` ``EpisodeError`` (the orchestrator
-chains caption shards on segment receipts, so this means a lost or foreign part). Upstream-poisoned episodes never get here (runner step 3).
+chains caption shards on segment receipts, so this means a lost or foreign part).
+Upstream-poisoned episodes never get here (runner step 3).
 """
 
 from __future__ import annotations
@@ -86,7 +87,6 @@ class CaptionEpisodeJob:
         self.budget = budget
 
     async def run(self, ref: EpisodeRef, batcher, ctx: ShardContext) -> EpisodeOutcome:
-        from flora_deploy.stages import caption as C
         from flora_deploy.stages import segment as S
 
         with phase("inputs"):

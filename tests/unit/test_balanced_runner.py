@@ -18,7 +18,7 @@ from flora_deploy.workers_impl.segment import (
     SegmentEpisodeJob,
     StageInfo,
 )
-from tests.conformance.worker_suite import World, WorkerSpec
+from tests.conformance.worker_suite import WorkerSpec, World
 
 
 class NullEngine:
