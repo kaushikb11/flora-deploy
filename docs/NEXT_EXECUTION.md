@@ -332,3 +332,14 @@ Local mode can't see these, and the canary only covers part of them. So, before 
 6. 2-episode default-mode noise run (≈$0.30).
 
 Each step has a projected-spend stop rule. The runbook runs only after review 6 is clean, CI is green and H0 passes.
+
+## Balanced-first (2026-10-22)
+
+`balanced` is the user-facing product. `exact` is kept as the certification reference only.
+
+Waves:
+- **W1 (CPU, parallel):** Certify (certificate generator + consumption), Prepare (`flora prepare --derived` records receipts in `flora.yaml`), Templates (`balanced_lerobot` default, README-as-test, planner measured-rate slot).
+- **W2:** Wire-balanced: factory registers SegmentWorker/CaptionWorker, per-episode segment→caption dependency, accel, H0 covers balanced. Runs after H0 merges.
+- **W3:** two reviewers (balanced e2e through fakes; certificate soundness).
+
+Wave H-lite is reordered: H0 (both presets) → exact oracle (6 episodes, deterministic) → balanced via real `flora deploy`/`run` (same 6 episodes) + L0/Gate A → rewards (3 episodes) → noise (2 episodes) → offline certificate + measured rates.
