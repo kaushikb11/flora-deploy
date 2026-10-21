@@ -19,7 +19,7 @@ from flora_deploy.cli.run import ConfigOpt, EnvOpt, JobArg, StoreOpt, fail, open
 
 @app.command()
 def logs(
-    job: JobArg,
+    job: JobArg = None,
     kind: Annotated[str | None, typer.Option(
         "--kind", help="orchestrator, or a shard kind (segcap, reward.terminal, ...).")] = None,
     follow: Annotated[bool, typer.Option("--follow", "-f", help="Stream new lines.")] = False,

@@ -82,16 +82,27 @@ jobs:
           test "$code" -eq 3
           uv run flora results --job local-demo.fake --stage caption --store "$demo/faults"
           uv run flora results --job local-demo.fake --stage reward.terminal --store "$demo/faults"
-      # README-as-test: run the README's "Try it locally" block exactly as written (minus the
-      # clone + install lines, which this checkout already did) in an empty directory.
-      - name: README "Try it locally" block
+      # README-as-test: the quickstart ("Try it in two minutes") block exactly as written, through
+      # `flora results caption`, in an empty directory, with flora-deploy installed from the
+      # built wheel into a fresh venv (no dev group, no checkout on the path), as `uv tool
+      # install` / `pip install` give a user. Only the install line is replaced (by the wheel);
+      # its dependencies are pinned to uv.lock (`uv export --no-dev`).
+      - name: README quickstart block (from the built wheel)
         timeout-minutes: 2
         run: |
+          uv build --wheel --out-dir "$RUNNER_TEMP/dist"
+          uv export --frozen --no-dev --no-emit-project --no-hashes --format requirements-txt \
+            -o "$RUNNER_TEMP/constraints.txt"
+          uv venv "$RUNNER_TEMP/wheel-venv" --python "${{ matrix.python }}"
+          uv pip install --python "$RUNNER_TEMP/wheel-venv/bin/python" \
+            -c "$RUNNER_TEMP/constraints.txt" "$RUNNER_TEMP"/dist/flora_deploy-*.whl
           uv run python scripts/readme_blocks.py try-it README.md > "$RUNNER_TEMP/try-it.sh"
           cat "$RUNNER_TEMP/try-it.sh"
           mkdir -p "$RUNNER_TEMP/try-it"
           cd "$RUNNER_TEMP/try-it"
-          source "$GITHUB_WORKSPACE/.venv/bin/activate"
+          test -z "$(ls -A)"
+          export PATH="$RUNNER_TEMP/wheel-venv/bin:$PATH"
+          python -I -c 'import flora_deploy as f; assert "site-packages" in f.__file__, f.__file__'
           bash "$RUNNER_TEMP/try-it.sh"
 
   # Test-order independence: the full CPU suite reversed, serially, so the order is the same on

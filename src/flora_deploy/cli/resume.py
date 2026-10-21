@@ -23,7 +23,7 @@ from flora_deploy.cli.run import ConfigOpt, EnvOpt, JobArg, StoreOpt, fail, open
 
 @app.command()
 def resume(
-    job: JobArg,
+    job: JobArg = None,
     budget_usd: Annotated[float | None, typer.Option(
         "--budget-usd", help="New job budget in USD (not below the spend so far).")] = None,
     store: StoreOpt = None, config: ConfigOpt = Path("flora.yaml"), env: EnvOpt = None,
@@ -32,6 +32,8 @@ def resume(
     from flora_deploy import sdk
 
     j = open_job_cli(job, store, config, env)
+
+    job = j.job_id  # resolved (default: the config's project)
     try:
         call_id = j.resume(budget_usd=budget_usd)
     except sdk.FloraError as e:

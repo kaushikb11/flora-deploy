@@ -2,7 +2,7 @@
 #
 #   flora init --template local_demo
 #   flora run --local --fake-models --sample-data      # makes ./videos, then runs the job
-#   flora results --job local-demo.fake --stage caption --store flora-local-store
+#   flora results caption                              # reads ./flora-local-store
 #
 # No Modal account, no GPU, no NVIDIA weights. The models are deterministic fakes, so the
 # outputs only demonstrate the pipeline (index -> plan -> run -> compose -> results); they are

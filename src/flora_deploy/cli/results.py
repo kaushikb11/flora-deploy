@@ -10,12 +10,17 @@ from typing import Annotated
 import typer
 
 from flora_deploy.cli._app import app, console
+from flora_deploy.cli.run import ConfigOpt, EnvOpt
 
 StoreOpt = Annotated[str, typer.Option(
     "--store", envvar="FLORA_STORE",
     help="State-of-record store: file:///dir (or a path), s3://bucket\\[/prefix], "
          "modal-volume://name.")]
 JobOpt = Annotated[str, typer.Option("--job", help="Job id.")]
+JobStoreOpt = Annotated[str | None, typer.Option(
+    "--store", envvar="FLORA_STORE",
+    help="Job store: file:///dir (or a path), s3://bucket\\[/prefix], modal-volume://name "
+         "(default: the config's output.sink, then <config dir>/flora-local-store).")]
 CfgOpt = Annotated[str | None, typer.Option(
     "--config-hash", help="Config hash (default: the job manifest's).")]
 
@@ -94,16 +99,23 @@ def _print_status(s: dict) -> None:
 
 @app.command()
 def results(
-    job: JobOpt,
-    stage: Annotated[str, typer.Option("--stage", help="segment | caption | reward.terminal | "
-                                                       "reward.dense | reward.rubric")],
-    store: StoreOpt,
+    stage: Annotated[str | None, typer.Argument(
+        help="segment | caption | reward.terminal | reward.dense | reward.rubric",
+        show_default=False)] = None,
+    job: Annotated[str | None, typer.Option(
+        "--job", help="Job id (default: the config's project; its fake-models run "
+                      "<project>.fake when there is no real one).", show_default=False)] = None,
+    store: JobStoreOpt = None,
     fmt: Annotated[str, typer.Option("--format", help="jsonl | parquet | table")] = "table",
     out: Annotated[Path | None, typer.Option("--out", help="Write to this file.")] = None,
     config_hash: CfgOpt = None,
     limit: Annotated[int, typer.Option(help="Rows shown by --format table.")] = 50,
+    config: ConfigOpt = Path("flora.yaml"),
+    env: EnvOpt = None,
+    stage_opt: Annotated[str | None, typer.Option(
+        "--stage", hidden=True, help="Same as the STAGE argument (older spelling).")] = None,
 ) -> None:
-    """Read a composed stage's records."""
+    """Read a composed stage's records (job and store default from flora.yaml)."""
     from flora_deploy.export.compose import STAGES
     from flora_deploy.export.results import (
         ResultsNotFound,
@@ -112,13 +124,26 @@ def results(
         read_parquet_bytes,
     )
 
+    if stage is not None and stage_opt is not None and stage != stage_opt:
+        raise _fail(f"two stages given ({stage} and --stage {stage_opt}); give one", 2)
+    stage = stage or stage_opt
+    if stage is None:
+        raise _fail(f"which stage? `flora results <stage>`, one of {', '.join(STAGES)}", 2)
     if stage not in STAGES:
         raise _fail(f"unknown stage {stage!r}; choose one of {', '.join(STAGES)}", 2)
     if fmt not in ("jsonl", "parquet", "table"):
         raise _fail(f"unknown format {fmt!r}; use jsonl, parquet or table", 2)
     if fmt == "parquet" and out is None:
         raise _fail("--format parquet needs --out <file>", 2)
-    st = _store(store)
+    from flora_deploy.cli._jobref import ResolveError, print_notes, resolve
+    from flora_deploy.config.schema import ConfigError
+
+    try:
+        ref = resolve(job, store, config, env)
+    except (ResolveError, ConfigError) as e:
+        raise _fail(str(e)) from None
+    print_notes(ref)
+    st, job = ref.store, ref.job_id
     _check_namespace(st, job, config_hash)
     from flora_deploy.export.results import load_summary
 

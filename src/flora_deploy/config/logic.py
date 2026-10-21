@@ -153,6 +153,7 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     "cli/__init__.py",
     "cli/_app.py",
     "cli/_certs.py",  # certificate status report (validate.certkey.status); display only
+    "cli/_jobref.py",  # which job id / store a job command reads; never outputs
     "cli/cancel.py",
     "cli/certify.py",
     "cli/deploy.py",

@@ -31,8 +31,9 @@ from flora_deploy.cli.run import (
 
 
 @app.command()
-def status(job: JobArg, store: StoreOpt = None, config: ConfigOpt = Path("flora.yaml"),
-           env: EnvOpt = None, as_json: JsonOpt = False) -> None:
+def status(job: JobArg = None, store: StoreOpt = None,
+           config: ConfigOpt = Path("flora.yaml"), env: EnvOpt = None,
+           as_json: JsonOpt = False) -> None:
     """Show a job's state, progress, errors, spend vs budget and ETA."""
     from flora_deploy import sdk
 

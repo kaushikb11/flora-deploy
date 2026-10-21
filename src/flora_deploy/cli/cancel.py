@@ -19,7 +19,7 @@ from flora_deploy.cli.run import ConfigOpt, EnvOpt, JobArg, StoreOpt, fail, open
 
 @app.command()
 def cancel(
-    job: JobArg,
+    job: JobArg = None,
     reason: Annotated[str, typer.Option(help="Recorded with the cancel.")] = "operator cancel",
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Do not ask for confirmation.")
                    ] = False,
@@ -29,6 +29,8 @@ def cancel(
     from flora_deploy import sdk
 
     j = open_job_cli(job, store, config, env)
+
+    job = j.job_id  # resolved (default: the config's project)
     try:
         state = j.status().state
     except sdk.FloraError as e:

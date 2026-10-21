@@ -111,7 +111,11 @@ def run(
         typer.echo(json.dumps(res.as_dict(), indent=2, sort_keys=True, default=str))
     else:
         colour = {"done": "green", "completed_with_errors": "yellow"}.get(res.state, "red")
-        lines = summary_lines(res)
+        hint = None
+        if store is None and job is None:  # the defaults `flora results` resolves (cli._jobref)
+            hint = "flora results caption" + (
+                "" if config == Path("flora.yaml") else f" --config {config}")
+        lines = summary_lines(res, results_cmd=hint)
         console.print(f"[{colour}]{escape(lines[0])}[/{colour}]", soft_wrap=True)
         for line in lines[1:]:
             console.print(line, highlight=False, markup=False, soft_wrap=True)

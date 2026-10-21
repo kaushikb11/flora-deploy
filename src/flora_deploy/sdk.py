@@ -790,11 +790,18 @@ def open_job(job_id: str, *, store: str | None = None, config: Any = None,
             raise FloraError("give --store (or FLORA_STORE) or --config to find the job store")
         store = store_uri_for(cfg)
     env = environment or (cfg.modal.environment if cfg is not None else None)
-    st = be.store(store, environment=env)
+    return open_job_in(be.store(store, environment=env), job_id, store_uri=store,
+                       config_hash=config_hash, backend=be)
+
+
+def open_job_in(st: Store, job_id: str, *, store_uri: str, config_hash: str | None = None,
+                backend: Backend | None = None) -> Job:
+    """:func:`open_job` on an already opened job store (the CLI resolves which store)."""
+    be = backend or get_backend()
     check_results_namespace(st, job_id, config_hash)
     spec = read_run_spec(st, job_id, config_hash)
     check_job_namespace(job_id, spec)
-    return Job(job_id, spec["config_hash"], spec.get("store", store), st, spec, be)
+    return Job(job_id, spec["config_hash"], spec.get("store", store_uri), st, spec, be)
 
 
 def _plan_deployment(cfg: Any, **kw: Any) -> Any:

@@ -34,14 +34,17 @@ def _p(s: str) -> None:
 
 
 @app.command()
-def report(job: JobArg, store: StoreOpt = None, config: ConfigOpt = Path("flora.yaml"),
-           env: EnvOpt = None, as_json: JsonOpt = False) -> None:
+def report(job: JobArg = None, store: StoreOpt = None,
+           config: ConfigOpt = Path("flora.yaml"), env: EnvOpt = None,
+           as_json: JsonOpt = False) -> None:
     """Spend by kind/container, $/video-hour, errors, certification and output locations."""
     from rich.markup import escape
 
     from flora_deploy import sdk
 
     j = open_job_cli(job, store, config, env)
+
+    job = j.job_id  # resolved (default: the config's project)
     try:
         r = j.report()
     except (sdk.FloraError, FileNotFoundError, ValueError) as e:
