@@ -252,13 +252,13 @@ DERIVED_PINS: tuple[DerivedPin, ...] = (
     # Built 2026-10-21 by ``convert_app.py --step convert`` (flora-weights:/derived/
     # captioner-bf16@fef0bbfe.../derived_receipt.json, receipt file sha256 0e91e467... in
     # docs/captioner-bf16.md); identity proven on an H200 with torch 2.11.0+cu130,
-    # transformers 5.8.1 and safetensors 0.7.0. Content digest not pinned yet: the docs do not
-    # record the per-file sha256s it covers. Read it with ``flora prepare --show-receipt``.
+    # transformers 5.8.1 and safetensors 0.7.0. Content digest read from that same receipt with
+    # ``flora prepare --show-receipt`` on 2026-10-22.
     DerivedPin(
         key="captioner-bf16",
         source_key="captioner",
         converter_version=1,
-        content_sha256=None,
+        content_sha256="d4c1bea5dbd3e49746a81279df2f27b904fdd2f4a71322df266201c72de0327e",
         proven_with=(("torch", "2.11.0"), ("transformers", "5.8.1"), ("safetensors", "0.7.0")),
     ),
     # Merger v2 (fixed-order FP64 merge, docs/tempseg-merge.md): not built yet. Pin its content
