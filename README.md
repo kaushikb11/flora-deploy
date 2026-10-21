@@ -105,9 +105,11 @@ An episode that keeps crashing workers is isolated and excluded rather than fail
 ## Output
 
 Each stage gets a JSONL file (one nested record per episode) and a Parquet file (flattened; one
-row per segment for `segment` / `caption`), plus a `summary.json`, under
-`<sink>/flora/<job>/<config_hash>/output/`. Every record carries `uid`, `certified` and
-`provenance`. Join stages on `uid`. Excluded episodes have no record; `summary.json` counts them.
+row per segment for `segment` / `caption`) under
+`<sink>/flora/<job>/<config_hash>/output/gen/<generation>/`, and
+`<sink>/flora/<job>/<config_hash>/output/summary.json` points at them (its `files` map; `flora
+results` reads through it). Every record carries `uid`, `certified` and `provenance` (engine,
+models, GPU, embodiment, certificate key). Join stages on `uid`. Excluded episodes have no record; `summary.json` counts them.
 Example records (synthetic, shortened):
 
 ```json

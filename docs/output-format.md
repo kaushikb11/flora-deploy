@@ -21,22 +21,28 @@ flora/<job_id>/
   manifest.json                 # the job's latest planned manifest (a pointer)
   run.json                      # the latest run spec (`flora status` reads it)
   runs/<config_hash>.json       # one run spec per config
+  index/                        # `flora index`: one receipt per episode, plus summary.json
   <config_hash>/
     manifest.json               # this config's manifest (episodes, shards, stage hashes)
     output/
-      segment.jsonl             segment.parquet
-      caption.jsonl             caption.parquet
-      reward.terminal.jsonl     reward.terminal.parquet
-      reward.dense.jsonl        reward.dense.parquet
-      reward.rubric.jsonl       reward.rubric.parquet
-      summary.json              # written last: when it exists, the stage files are complete
-    calls/...                   # the orchestrator's per-shard ledgers
+      summary.json              # the pointer: written last, names the current generation
+      gen/<generation>/         # one complete compose; a re-compose writes a new one
+        segment.jsonl           segment.parquet
+        caption.jsonl           caption.parquet
+        reward.terminal.jsonl   reward.terminal.parquet
+        reward.dense.jsonl      reward.dense.parquet
+        reward.rubric.jsonl     reward.rubric.parquet
   <stage_hash>/                 # what shards produce, keyed by the hash of their shard kind
-    parts/  receipts/  attempts/  errors/  audit/  replans/
+    parts/  receipts/  attempts/  calls/  errors/  audit/  replans/
 flora/deployments/<app>.json    # what `flora deploy` deployed
 ```
 
-Only the stages the config lists get files. Compose always writes both JSONL and Parquet.
+Only the stages the config lists get files, in the formats `output.formats` lists (default
+both JSONL and Parquet). Read the stage files through `summary.json`: its `files` maps
+`<stage>.<format>` to the path under `output/gen/<generation>/` (`flora results` and the SDK do
+this). `<generation>` is a digest of the composed contents, so composing the same parts again
+reuses the same directory, and a reader never sees a half-written set. Inside `<stage_hash>/`,
+files are fanned out by shard id (`parts/<kind>/<xx>/<yy>/<shard_id>/...`).
 `<config_hash>` is the job's config hash. `flora results --job <job>` uses the manifest's hash
 by default; pass `--config-hash` to pick another one. A config that adds a stage reuses the
 finished shards of the stages it shares with an earlier config, so their parts stay under the
@@ -88,11 +94,11 @@ same `<stage_hash>` directory.
 | `models` | object | pin key to model revision (full commit) used for this record |
 | `engine` | string | inference engine label, such as `vllm-0.24.0-offline` |
 | `preset` | string | `exact` or `balanced` |
-| `config_hash` | string | config hash recorded by the worker; also the Parquet `config_hash` column |
+| `config_hash` | string | the stage hash of the record's shard kind (the `<stage_hash>` directory its parts are in), stamped by the worker; also the Parquet `config_hash` column |
 | `logic_version` | string | framework logic version |
 | `framework` | string | `flora-deploy <version>` |
 | `gpu` | string or null | GPU the worker ran on (from `nvidia-smi`); not part of the config hash |
-| `certificate` | string or null | id of the Gate certificate that covers this record; null for `exact` (the reference) and for uncertified stacks |
+| `certificate` | string or null | id of the Gate certificate that covers this record; null for `exact` (the reference) and for uncertified stacks; `fake-models` / `local-fake-models` for fake engines |
 | `source` | object | camera role to `{uri, range_s}`: the video file and time range the episode came from |
 | `engine_hash` | string or null | the producing stage's own hash (for `balanced`, the engine spec, sampling and pins), kept when the worker stamps `config_hash` with the job's stage hash; null when the stage set none |
 | `embodiment` | string or null | the job's `pipeline.embodiment` (the embodiment pool a certificate must cover) |
@@ -259,7 +265,7 @@ Reward stages have one row per record:
 | `uncertified_reasons` | object | `uncertified_reason` to count |
 | `by_pool` | object | pool to `{records, certified}` |
 | `expected` | int | episodes planned for this stage |
-| `missing` | int | planned episodes with neither a record nor an exclusion (only in a `partial` compose) |
+| `missing` | int | planned episodes with neither a record nor an exclusion (0 unless the compose is `partial`) |
 | `excused` | int | excluded episodes (see below) |
 | `unplanned` | int | indexed episodes the planner excluded (`unplanned_episodes`); they count as excluded |
 | `episodes` | object | episode state to count |
