@@ -5,7 +5,7 @@ One module per command group, each registering on the shared ``app`` from ``_app
 results, report, cancel) go in their own modules and are imported here.
 """
 
-from flora_deploy.cli import init, plan, prepare  # noqa: F401  (registers commands)
+from flora_deploy.cli import init, plan, prepare, results  # noqa: F401  (registers commands)
 from flora_deploy.cli._app import app
 
 __all__ = ["app"]
