@@ -126,12 +126,13 @@ def load_certified(path: str | os.PathLike[str], *, allow_uncertified: bool = Fa
 
     p = Path(path)
     data = loads_yaml(p.read_text(encoding="utf-8"), source=str(p))
-    first = parse_config(data, source=str(p), allow_uncertified=True)
+    base = p.resolve().parent  # a relative input.path resolves against it
+    first = parse_config(data, source=str(p), allow_uncertified=True, base_dir=base)
     content = derived_content(first, overrides)
     if allow_uncertified:
         return first, content
     return parse_config(data, source=str(p), allow_uncertified=False,
-                        derived_content=content), content
+                        derived_content=content, base_dir=base), content
 
 
 # --- recording in flora.yaml ------------------------------------------------------------------

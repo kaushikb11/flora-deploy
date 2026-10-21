@@ -500,7 +500,8 @@ def check_input(p: Probes, cfg: Any, token: str | None) -> Check:
                          f"History tab on huggingface.co/datasets/{inp.repo})")
         return c
     pattern = "*.mp4" if inp.format == "mp4_dir" else "*"
-    n = p.local_files(str(inp.path), pattern)
+    root = cfg.local_input_root() if hasattr(cfg, "local_input_root") else inp.path
+    n = p.local_files(str(root), pattern)
     if n is None:
         return Check("input", "fail", f"{inp.path} is not a directory", "fix input.path")
     if n == 0:
