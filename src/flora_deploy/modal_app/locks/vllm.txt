@@ -2541,6 +2541,7 @@ numpy==2.3.5 \
     --hash=sha256:ffe22d2b05504f786c867c8395de703937f934272eb67586817b46188b4ded6d \
     --hash=sha256:fffe29a1ef00883599d1dc2c51aa2e5d80afe49523c261a74933df395c15c520
     # via
+    #   -r src/flora_deploy/modal_app/locks/vllm.in
     #   cuda-core
     #   decord
     #   flashinfer-python
