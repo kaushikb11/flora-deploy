@@ -16,6 +16,7 @@ Layout (see ``config/templates/*.yaml`` for commented templates)::
     resources: {<shard kind>: {gpu, gpu_count, max_containers, max_inputs, episode_concurrency,
                                cpu, memory}}
     output: {sink, formats}
+    weights: {derived: {<name>: <receipt sha256>}}   # recorded by `flora prepare`
     retries: {max_starts_before_quarantine, max_episode_error_rate}
     observability: {log_level, heartbeat_s, progress}
 """
@@ -40,6 +41,7 @@ from pydantic import (
 
 from flora_deploy.config.presets import (
     GPU_MEMORY_GIB,
+    PRESETS,
     PresetUnavailableError,
     find_certificates,
     get_preset,
@@ -286,6 +288,33 @@ class OutputSection(_Model):
         return v
 
 
+# Every derived-weight receipt name a preset can need (``PresetSpec.derived_weights``).
+DERIVED_WEIGHT_NAMES: tuple[str, ...] = tuple(sorted(
+    {n for p in PRESETS.values() for names in p.derived_weights.values() for n in names}))
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+class WeightsSection(_Model):
+    """Weights built in the user's Modal Volume. ``derived``: receipt name -> sha256 of its
+    ``derived_receipt.json``, recorded by ``flora prepare`` (``config/receipts.py``). Not hashed
+    as written: the receipts a job needs enter the config hash as ``derived_weights``."""
+
+    derived: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("derived")
+    @classmethod
+    def _derived(cls, v: dict[str, str]) -> dict[str, str]:
+        unknown = sorted(set(v) - set(DERIVED_WEIGHT_NAMES))
+        if unknown:
+            raise ValueError(f"unknown derived weight(s) {unknown}; known: "
+                             f"{', '.join(DERIVED_WEIGHT_NAMES)}")
+        bad = sorted(k for k, h in v.items() if not _SHA256.match(h))
+        if bad:
+            raise ValueError(f"{bad}: each receipt is the 64-hex sha256 that `flora prepare` "
+                             "records")
+        return v
+
+
 class RetriesSection(_Model):
     max_starts_before_quarantine: int = Field(MAX_STARTS_BEFORE_QUARANTINE, ge=1, le=10)  # D15
     # Job-level error-rate guard: a job whose excluded episodes (NVIDIA-semantics failures, poison
@@ -313,6 +342,7 @@ class FloraConfig(_Model):
     pipeline: PipelineSection
     resources: dict[ShardKind, ResourceOverride] = Field(default_factory=dict)
     output: OutputSection
+    weights: WeightsSection = Field(default_factory=WeightsSection)
     retries: RetriesSection = Field(default_factory=RetriesSection)
     observability: ObservabilitySection = Field(default_factory=ObservabilitySection)
 

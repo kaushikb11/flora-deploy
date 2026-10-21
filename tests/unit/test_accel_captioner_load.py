@@ -33,7 +33,7 @@ def runtime_tools(monkeypatch):
 def _write_receipt(d: Path, receipt: dict) -> cl.DerivedPin:
     raw = json.dumps(receipt).encode()
     (d / cc.DERIVED_RECEIPT).write_bytes(raw)
-    return replace(cl.pinned_derived(), receipt_sha256=hashlib.sha256(raw).hexdigest())
+    return replace(cl.pinned_derived(), content_sha256=cc.content_digest(receipt))
 
 
 def _derived(tmp_path: Path, *, revision: str | None = None, shard: bytes = b"x" * 99,
@@ -54,7 +54,7 @@ def _derived(tmp_path: Path, *, revision: str | None = None, shard: bytes = b"x"
         "converter": {"version": cc.CONVERTER_VERSION},
         "source": {"pin": {"revision": revision or pin.revision},
                    "manifest_sha256": dict(pin.expected)["manifest_sha256"]},
-        "files": files, "tools": tools, "dtype_policy": POLICY,
+        "files": files, "tools": tools, "dtype_policy": POLICY, "casts": {},
     }
     return d, _write_receipt(d, receipt)
 
@@ -79,13 +79,14 @@ def test_default_dir_is_layout_derived_path():
         "/weights/derived/captioner-bf16@" + PINS_BY_KEY["captioner"].revision)
 
 
-def test_receipt_digest_is_pinned_as_documented():
+def test_content_digest_pin_is_documented():
     dpin = cl.pinned_derived()
-    assert dpin.receipt_sha256 == (
-        "0e91e467c7ffdb636573e779672d11b203571f7869ca94317f1005eb700d9c65")
+    # Not derivable from the docs (they do not record the per-file sha256s): fails closed
+    # until read from the Volume with `flora prepare --show-receipt` and pinned.
+    assert dpin.content_sha256 is None or len(dpin.content_sha256) == 64
     assert dpin.converter_version == cc.CONVERTER_VERSION and dpin.source_key == "captioner"
     doc = (Path(__file__).parents[2] / "docs" / "captioner-bf16.md").read_text()
-    assert dpin.receipt_sha256 in doc
+    assert "content_sha256" in doc and "--show-receipt" in doc
     assert dict(dpin.proven_with) == {"torch": "2.11.0", "transformers": "5.8.1",
                                       "safetensors": "0.7.0"}
 
@@ -93,12 +94,12 @@ def test_receipt_digest_is_pinned_as_documented():
 def test_unpinned_or_other_receipt_fails_closed(tmp_path):
     d, dpin = _derived(tmp_path)
     models, _ = _fake_models()
-    with pytest.raises(cl.DerivedReceiptError, match="no receipt digest is pinned"):
-        _install(models, d, replace(dpin, receipt_sha256=None))
+    with pytest.raises(cl.DerivedReceiptError, match="no content digest is pinned"):
+        _install(models, d, replace(dpin, content_sha256=None))
     with pytest.raises(cl.DerivedReceiptError, match="!= pinned"):
-        _install(models, d, replace(dpin, receipt_sha256="0" * 64))
-    with pytest.raises(cl.DerivedReceiptError, match="!= pinned"):
-        _install(models, d, None)  # the real pin: a toy receipt is not it
+        _install(models, d, replace(dpin, content_sha256="0" * 64))
+    with pytest.raises(cl.DerivedReceiptError, match="pinned"):
+        _install(models, d, None)  # the real pin (unset or not this toy receipt)
     assert not hasattr(models.snapshot, "__flora_accel_captioner_bf16__")
 
 
@@ -119,12 +120,33 @@ def test_install_redirects_only_the_captioner(tmp_path):
         assert patch.verifications[0]["bytes_hashed"] == 101
         prov = patch.provenance()
         assert prov["full_verify"] and not prov["full_verify_opt_out"]
-        assert prov["receipt_sha256_pinned"] == dpin.receipt_sha256
+        assert prov["content_sha256_pinned"] == dpin.content_sha256
         assert prov["toolchain"]["torch"]["runtime"] == "2.11.0+cu128"
         assert prov["dtype_policy"] == POLICY
         with pytest.raises(RuntimeError, match="already installed"):
             cl.install(models, d)
     assert models.snapshot is orig_snapshot and models.validate_manifest is orig_validate
+
+
+def test_runtime_recomputes_the_content_digest(tmp_path):
+    d, dpin = _derived(tmp_path)
+    receipt = json.loads((d / cc.DERIVED_RECEIPT).read_text())
+    models, _ = _fake_models()
+    # another build of the same content (other timings, host, build tag) loads
+    other = {**receipt, "timings_s": {"total": 999.0}, "created_utc": "2030-01-01T00:00:00Z",
+             "tools": {**TOOLS, "platform": "elsewhere"}}
+    assert _write_receipt(d, other) == dpin
+    _install(models, d, dpin).uninstall()
+    # a stale stored digest is refused even though the recomputed one matches the pin
+    _write_receipt(d, {**receipt, "content_sha256": "f" * 64})
+    with pytest.raises(cl.DerivedReceiptError, match="stored content_sha256"):
+        _install(models, d, dpin)
+    # a receipt edited to claim the pinned digest, with other content, is refused
+    forged = {**receipt, "content_sha256": dpin.content_sha256,
+              "casts": {"F32->BF16:loaded": 1}}
+    (d / cc.DERIVED_RECEIPT).write_text(json.dumps(forged))
+    with pytest.raises(cl.DerivedReceiptError, match="stored content_sha256"):
+        _install(models, d, dpin)
 
 
 def test_full_verify_opt_out_is_recorded(tmp_path, monkeypatch):

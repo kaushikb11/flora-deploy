@@ -3,10 +3,7 @@
 One module per command group, each registering on the shared ``app`` from ``_app``:
 ``prepare`` (version, prepare), ``init``, ``index``, ``plan``, ``deploy``, ``run`` (with
 ``run_local``), ``status``, ``resume``, ``cancel``, ``report``, ``logs``, ``results`` (compose,
-<<<<<<< HEAD
 results), ``certify``. New commands go in their own modules and are imported here.
-=======
-results). New commands go in their own modules and are imported here.
 
 The ``flora`` entry point is :func:`main`: an uncaught exception (a bug, or a refusal some code
 path raised instead of reporting) prints its traceback and exits **2**, never 1, which means

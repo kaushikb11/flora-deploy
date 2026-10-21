@@ -164,6 +164,7 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     "config/__init__.py",
     "config/pins.py",  # hashed by value (nvidia_pins, decode)
     "config/presets.py",  # hashed by value (engine identity); pools are deliberately unhashed
+    "config/receipts.py",  # finds the receipt values; they are hashed by value (derived_weights)
     # export: rebuilt from the parts on every export, never mixed into stored results
     "export/__init__.py",
     "export/compose.py",
@@ -219,6 +220,7 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     # reads back the RunSettings the client planned); which shards run, never what they compute
     "sdk.py",
     "prep/__init__.py",
+    "prep/derived.py",  # which conversions `flora prepare` runs; outputs hashed by receipt
     "prep/download.py",  # downloads are verified against the pins
     "prep/merge_tempseg.py",  # derived weights: hashed by receipt
     "prep/run.py",

@@ -228,29 +228,46 @@ RUNTIME = {
 
 
 # Derived artifacts we build from a pinned snapshot (OPT-2, ``docs/captioner-bf16.md``). The
-# runtime refuses a derived copy whose receipt bytes do not hash to ``receipt_sha256`` (``None``
-# fails closed: nothing is trusted until a receipt is pinned here), whose converter version
-# differs, or whose recorded toolchain differs from ``proven_with`` (the versions the GPU
-# identity proof ran with; local build tags such as ``+cu130`` are not compared).
+# pin is a **content digest** (``prep.convert_captioner.content_digest``): sha256 over only the
+# output-determining fields of ``derived_receipt.json`` (converter version, source pin and
+# manifest digest, dtype policy, cast counts, every file's name / sha256 / size / header
+# digest), never over timings, hosts or build tags. A conversion is byte-deterministic (see the
+# docs), so every user's own build of the same converter version has the same content digest,
+# while its receipt *file* (which identifies one build: ``weights.derived`` and the config hash
+# use that) differs. The runtime recomputes the digest from the receipt it reads (a stored
+# ``content_sha256`` is only cross-checked) and refuses a copy that does not match
+# ``content_sha256`` (``None`` fails closed: nothing is trusted until a digest is pinned here),
+# whose converter version differs, or whose recorded toolchain differs from ``proven_with`` (the
+# versions the GPU identity proof ran with; local build tags such as ``+cu130`` are not compared).
 @dataclass(frozen=True)
 class DerivedPin:
     key: str
     source_key: str  # PINS_BY_KEY key of the snapshot it is derived from
     converter_version: int
-    receipt_sha256: str | None
+    content_sha256: str | None
     proven_with: tuple[tuple[str, str], ...] = ()
 
 
 DERIVED_PINS: tuple[DerivedPin, ...] = (
-    # Receipt written 2026-10-21 by ``convert_app.py --step convert`` to
-    # flora-weights:/derived/captioner-bf16@fef0bbfe.../derived_receipt.json (value recorded in
+    # Built 2026-10-21 by ``convert_app.py --step convert`` (flora-weights:/derived/
+    # captioner-bf16@fef0bbfe.../derived_receipt.json, receipt file sha256 0e91e467... in
     # docs/captioner-bf16.md); identity proven on an H200 with torch 2.11.0+cu130,
-    # transformers 5.8.1 and safetensors 0.7.0.
+    # transformers 5.8.1 and safetensors 0.7.0. Content digest read from that same receipt with
+    # ``flora prepare --show-receipt`` on 2026-10-22.
     DerivedPin(
         key="captioner-bf16",
         source_key="captioner",
         converter_version=1,
-        receipt_sha256="0e91e467c7ffdb636573e779672d11b203571f7869ca94317f1005eb700d9c65",
+        content_sha256="d4c1bea5dbd3e49746a81279df2f27b904fdd2f4a71322df266201c72de0327e",
+        proven_with=(("torch", "2.11.0"), ("transformers", "5.8.1"), ("safetensors", "0.7.0")),
+    ),
+    # Merger v2 (fixed-order FP64 merge, docs/tempseg-merge.md): not built yet. Pin its content
+    # digest after a v2 build and its equivalence check.
+    DerivedPin(
+        key="tempseg-merged",
+        source_key="tempseg",
+        converter_version=2,
+        content_sha256=None,
         proven_with=(("torch", "2.11.0"), ("transformers", "5.8.1"), ("safetensors", "0.7.0")),
     ),
 )

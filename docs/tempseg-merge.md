@@ -22,12 +22,59 @@ vLLM's LoRA path cannot reproduce this. It has no FP32 LoRA dtype and is still a
 
 For each of the 248 adapter targets:
 
+Merger v2:
+
 ```
-W = bf16( fp32(W_base) + (α/r) · (fp32(B) @ fp32(A)) ),    α/r = 64/32 = 2.0
+W = bf16( fp32( fp64(W_base) + (α/r) · Σ_{k=0..r-1} fp64(B[:,k]) · fp64(A[k,:]) ) ),   α/r = 2.0
 ```
 
-The sum is in FP32 and is rounded to BF16 once. PEFT's `merge_and_unload` on a BF16 base would
-round twice.
+Merger v1, which produced the result and equivalence check below, computed
+`fp32(W_base) + (α/r) · (fp32(B) @ fp32(A))` with a BLAS matmul. Either way the delta is added
+at full precision and the sum is rounded to BF16 once at the end. PEFT's `merge_and_unload` on a
+BF16 base would round twice.
+
+### Determinism: why v2, and why its content digest can be pinned
+
+v1 was not reproducible across machines. A BLAS `matmul` picks its blocking, SIMD kernel and
+summation order according to the CPU (AVX2, AVX-512 or AMX) and the thread count. FP32 addition
+is not associative, so the same inputs could give different FP32 deltas on two hosts.
+Occasionally one of those differences crosses a BF16 rounding boundary, and the shard bytes,
+and with them the content digest, differ. `torch.set_num_threads(1)` does not fix this, because
+the single-thread kernel still depends on the CPU.
+
+v2 (`merge_weight`) is byte-deterministic on any IEEE-754 CPU, at any thread count, for four
+reasons:
+1. **Exact products.** `A` and `B` are FP32, with 24-bit significands, so every product
+   `B[i,k]·A[k,j]` has at most 48 significant bits and is exact in FP64 (53 bits). A fused
+   multiply-add and a separate multiply then add therefore give the same result. So does
+   `addcmul_` in either its scalar or SIMD form.
+2. **Fixed order.** The rank sum runs as `r` element-wise FP64 accumulations in a fixed order
+   (k = 0, 1, …, r-1), over row tiles of at most 2^20 elements. Each add is a single IEEE
+   correctly rounded operation per element. No reduction is split across threads or SIMD lanes,
+   so neither can reorder it.
+3. **Single correctly rounded steps.** `×(α/r)` is exact for α/r = 2.0 and correctly rounded in
+   general. The `+ W` step and the FP64 → FP32 cast are also each correctly rounded once.
+4. **Integer cast.** FP32 → BF16 is torch's integer round-to-nearest-even, identical in its
+   scalar and SIMD code (see `docs/captioner-bf16.md`).
+
+The FP64 result is also at least as accurate as v1's FP32 delta. It is not guaranteed to be bit-identical to v1
+or to PEFT's FP32 `merge_and_unload`: an element can differ in the last BF16 bit wherever v1's
+FP32 rounding crossed a boundary. That is why the merger version is 2 and a v1 receipt is not
+reused.
+
+The cost is about `r` = 32 FP64 passes over the 6.92 G merged elements in cache-sized tiles.
+Locally, one 4096 × 12288 target (50 M elements) takes 0.9 s on 4 threads. That projects to
+about 1 min for the whole merge with 2 workers, or a few minutes on the Modal container,
+compared with v1's 45 s. Either is far inside the 30-minute limit.
+
+Because v2 is deterministic, the content digest of `derived_receipt.json` is the same for every
+user's build, and `pins.DERIVED_PINS["tempseg-merged"].content_sha256` can pin it. The content
+digest is the one defined for the Captioner, plus the base pin and the LoRA spec. The merge
+statistics are excluded, since their FP64 sum is a threaded reduction. The digest is still
+`None` because v2 has not been built. Pin it after one v2 build (`flora prepare --show-receipt`
+prints it) and a re-run of the equivalence check below, which was measured on v1. Until then,
+`verify_merged` recomputes the digest and checks any stored value, but has no pin to compare
+against.
 
 - **Adapter spec.** The spec is read from `adapter_config.json` and fails closed on DoRA,
   rsLoRA, bias, `fan_in_fan_out`, rank or alpha patterns, and `modules_to_save`.
@@ -72,7 +119,7 @@ A unit test merges a tiny Qwen3.5 with a real PEFT adapter. The test checks four
 - `A_log`/`dt_bias` are FP32 and equal the base values.
 - The directory loads through NVIDIA's call with no missing or unexpected keys.
 
-### Result
+### Result (merger v1)
 
 Output goes to `flora-weights:/derived/tempseg-merged@114a1076f70eb53f4a58ac045505db3087e79347/`.
 
@@ -160,4 +207,5 @@ uv run modal run src/flora_deploy/modal_app/convert_app.py::tempseg --step equiv
 
 - Wiring the merged directory into a vLLM engine or the `balanced` preset. That is Gate B
   (PLAN.md §9).
-- Pinning the receipt digest in `pins.py`.
+- Building merger v2, re-running the equivalence check on it, and pinning its content digest
+  (`DERIVED_PINS["tempseg-merged"].content_sha256`).

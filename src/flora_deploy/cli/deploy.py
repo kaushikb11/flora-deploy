@@ -97,7 +97,8 @@ def deploy(
     bucket_secret: Annotated[str, typer.Option(
         help="Modal Secret holding the bucket credentials.")] = "flora-bucket",
     receipt: Annotated[list[str] | None, typer.Option(
-        help="Derived-weight receipt NAME=HASH (repeatable), e.g. captioner_bf16=<sha256>.")
+        help="Derived-weight receipt NAME=HASH (repeatable): overrides weights.derived, which "
+             "`flora prepare` records in flora.yaml.")
     ] = None,
     allow_uncertified: Annotated[bool, typer.Option(
         "--allow-uncertified", help="Deploy a preset without Gate certificates.")] = False,
@@ -123,9 +124,12 @@ def deploy(
         cfg = load_config(config, allow_uncertified=allow_uncertified)
     except (ConfigError, OSError) as e:
         raise _fail(str(e)) from None
+    from flora_deploy.config.receipts import resolve as resolve_receipts
+
     try:
         plan = plan_app(cfg, store=store, bucket_secret=bucket_secret,
-                        derived_receipts=_receipts(receipt), allow_uncertified=allow_uncertified,
+                        derived_receipts=resolve_receipts(cfg, _receipts(receipt)),
+                        allow_uncertified=allow_uncertified,
                         min_containers=min_containers, reconcile_cron=reconcile_cron,
                         determinism=determinism)
     except (DeployError, MissingReceiptError, ValueError) as e:

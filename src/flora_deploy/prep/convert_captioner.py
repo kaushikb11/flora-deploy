@@ -50,7 +50,7 @@ import struct
 import sys
 import time
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from importlib import metadata
@@ -288,7 +288,15 @@ def convert_shard(src: Path, dest: Path, policy: DtypePolicy, expected_sha256: s
         f.write(head)
         for name, out_st, _, nbytes in plan_out:
             t = source_tensor(name)
-            out = t if torch_to_st(t.dtype) == out_st else t.to(st_dtype(out_st))
+            if torch_to_st(t.dtype) == out_st:
+                out = t
+            else:
+                # torch's FP32 -> BF16 cast is integer round-to-nearest-even, the same in scalar
+                # and SIMD code on every CPU (byte-deterministic output, docs/captioner-bf16.md),
+                # except for NaN payloads (scalar 0x7FC0, SIMD 0xFFFF): refuse NaN.
+                if t.is_floating_point() and bool(torch.isnan(t).any()):
+                    raise ConversionError(f"{name}: NaN in the source tensor")
+                out = t.to(st_dtype(out_st))
             raw = out.contiguous().reshape(-1).view(torch.uint8).numpy().data
             if len(raw) != nbytes:
                 raise ConversionError(f"{name}: wrote {len(raw)} bytes, planned {nbytes}")
@@ -333,6 +341,63 @@ def load_receipt(derived_dir: Path) -> dict | None:
         return json.loads(receipt_path(derived_dir).read_text())
     except (OSError, ValueError):
         return None
+
+
+# --- content digest (what ``pins.DerivedPin.content_sha256`` pins) ----------------------------
+
+CONTENT_SCHEMA = "flora-derived-content/v1"
+
+
+class ContentDigestError(ValueError):
+    """A receipt lacks a field its content digest needs."""
+
+
+def content_document(receipt: Mapping) -> dict:
+    """The output-determining fields of a derived receipt (Captioner BF16 or TempSeg merge):
+    kind, converter/merger version, source (and base) pin + manifest digest, the LoRA spec,
+    dtype policy, cast counts, and the sorted (name, sha256, size, header sha256) of every file.
+    Timings, hosts, tool versions/build tags, git provenance, worker counts, merge statistics
+    and ``created_utc`` are excluded: two byte-identical builds give the same document."""
+    try:
+        version_key = "merger" if "merger" in receipt else "converter"
+        src = receipt["source"]
+        doc: dict = {
+            "schema": CONTENT_SCHEMA,
+            "receipt_schema": receipt["schema"],
+            "kind": receipt["kind"],
+            version_key: receipt[version_key]["version"],
+            "source": {"pin": src["pin"], "manifest_sha256": src["manifest_sha256"]},
+            "dtype_policy": receipt["dtype_policy"],
+            "casts": receipt["casts"],
+            "files": sorted([f["path"], f["sha256"], f["size"], f.get("header_sha256")]
+                            for f in receipt["files"]),
+        }
+        if "base" in receipt:
+            doc["base"] = {"pin": receipt["base"]["pin"],
+                           "plan_digest": receipt["base"]["plan_digest"]}
+        if "lora" in receipt:
+            doc["lora"] = receipt["lora"]
+    except (KeyError, TypeError) as e:
+        raise ContentDigestError(f"receipt lacks {e} needed for its content digest") from None
+    return doc
+
+
+def content_digest(receipt: Mapping) -> str:
+    """sha256 of the canonical JSON (sorted keys, no whitespace) of :func:`content_document`."""
+    body = json.dumps(content_document(receipt), sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True, allow_nan=False)
+    return hashlib.sha256(body.encode()).hexdigest()
+
+
+def checked_content_digest(receipt: Mapping) -> str:
+    """Recompute the content digest; a stored ``content_sha256`` must agree (it is never
+    trusted on its own). Raises ``ContentDigestError``."""
+    got = content_digest(receipt)
+    stored = receipt.get("content_sha256")
+    if stored is not None and stored != got:
+        raise ContentDigestError(f"stored content_sha256 {stored} != recomputed {got} (the "
+                                 "receipt was edited, or written by other code)")
+    return got
 
 
 def _source_manifest(source: Path, pin) -> dict[str, str]:
@@ -487,6 +552,7 @@ def convert(
                       "per_shard": {s: r["seconds"] for s, r in shard_results.items()}},
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    receipt["content_sha256"] = content_digest(receipt)
     tmp = receipt_path(dest).with_name(DERIVED_RECEIPT + ".tmp")
     tmp.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
     os.replace(tmp, receipt_path(dest))

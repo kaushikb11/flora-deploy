@@ -7,10 +7,12 @@ with ``AutoModelForImageTextToText.from_pretrained(base, dtype=torch.bfloat16)``
 PEFT LoRA (r=32, alpha=64) is attached with FP32 holders, and ``generate`` runs under BF16
 autocast. D3 serves a plain model instead, so this module bakes the adapter in:
 
-    W_merged = bf16( fp32(W_base) + (alpha / r) * (fp32(B) @ fp32(A)) )
+    W_merged = bf16( fp32( fp64(W_base) + (alpha / r) * sum_k fp64(B[:, k]) * fp64(A[k, :]) ) )
 
-for every adapter target, with the sum done in FP32 and one rounding to BF16 at the end (PEFT's
-own ``merge_and_unload`` on a BF16 base would round the delta to BF16 first, then round again).
+for every adapter target: the rank sum in a fixed order in FP64 (exact products, so the result
+is byte-identical on every CPU and thread count; :func:`merge_weight`), then rounded to BF16 at
+the end (PEFT's own ``merge_and_unload`` on a BF16 base would round the delta to BF16 first,
+then round again).
 Every other tensor gets exactly the dtype NVIDIA's loader gives it, by the same rule
 ``convert_captioner`` uses: transformers' ``dtype_plan`` (with NVIDIA's own
 ``_keep_native_gdn_fp32`` applied) and the model's meta dtypes, so ``A_log`` / ``dt_bias`` are
@@ -55,9 +57,12 @@ from pathlib import Path
 
 from flora_deploy.config.pins import PINS_BY_KEY, RepoPin
 from flora_deploy.prep.convert_captioner import (
+    ContentDigestError,
     DtypePolicy,
     _read_whole,
     _sha256_file,
+    checked_content_digest,
+    content_digest,
     encode_header,
     read_header,
     st_dtype,
@@ -69,8 +74,9 @@ from flora_deploy.prep.verify import parse_sha256_manifest, pin_record
 DERIVED_NAME = "tempseg-merged"
 DERIVED_RECEIPT = "derived_receipt.json"
 RECEIPT_SCHEMA = 1
-# Bump whenever the merge rule or the output format changes.
-MERGER_VERSION = 1
+# Bump whenever the merge rule or the output format changes. v2: fixed-order FP64 rank sum
+# (byte-deterministic across machines, so the content digest can be pinned); v1 used BLAS.
+MERGER_VERSION = 2
 SOURCE_KEY = "tempseg"  # nvidia/Flora-TempSeg weights pin (adapter + processor files)
 BASE_KEY = "tempseg_base"  # Qwen/Qwen3.5-9B
 INDEX_NAME = "model.safetensors.index.json"
@@ -223,13 +229,40 @@ def check_target_coverage(targets: Mapping[str, Target], base_keys: Iterable[str
                          f"{sorted(set(targets) - wrapped)[:5]}")
 
 
-def merge_weight(w, a, b, scale: float):
-    """FP32 merge of one target: ``fp32(W) + scale * (fp32(B) @ fp32(A))`` (not yet rounded)."""
+MERGE_TILE_ELEMENTS = 1 << 20  # fp64 accumulator tile (8 MiB): bounded memory, cache-sized
+
+
+def merge_weight(w, a, b, scale: float, *, tile_elements: int = MERGE_TILE_ELEMENTS):
+    """Merge one target, byte-deterministically on any CPU and thread count (merger v2)::
+
+        fp32( fp64(W) + scale * sum_{k=0..r-1} fp64(B[:, k]) * fp64(A[k, :]) )
+
+    Why it is deterministic (``docs/tempseg-merge.md``): ``A``/``B`` are FP32, so each product
+    ``B[i,k] * A[k,j]`` (24 + 24 significand bits) is **exact** in FP64, and fused and unfused
+    multiply-adds give the same result. The rank sum runs in a fixed order (k = 0, 1, ...) as
+    element-wise FP64 adds, each correctly rounded (IEEE 754), so no BLAS kernel, SIMD width or
+    thread split can reorder it. The scale, the add of ``W`` and the FP64 -> FP32 cast are single
+    correctly rounded operations. (A BLAS ``matmul`` chooses its summation order by CPU and
+    thread count, so v1's FP32 ``B @ A`` was not reproducible across machines.) The caller's
+    FP32 -> BF16 cast is torch's integer round-to-nearest-even, identical in scalar and SIMD
+    code. Returns FP32 (not yet rounded to the target dtype)."""
     import torch
 
-    delta = torch.matmul(b.to(torch.float32), a.to(torch.float32))
-    delta.mul_(scale)
-    return w.to(torch.float32) + delta
+    rows_total, cols = w.shape
+    a64 = a.to(torch.float64)
+    b64 = b.to(torch.float64)
+    out = torch.empty((rows_total, cols), dtype=torch.float32)
+    step = max(1, tile_elements // max(1, cols))
+    for i in range(0, rows_total, step):
+        j = min(rows_total, i + step)
+        acc = torch.zeros((j - i, cols), dtype=torch.float64)
+        bt = b64[i:j]
+        for k in range(a64.shape[0]):
+            acc.addcmul_(bt[:, k:k + 1], a64[k:k + 1, :])
+        acc.mul_(scale)
+        acc.add_(w[i:j].to(torch.float64))
+        out[i:j] = acc
+    return out
 
 
 # --- dtype policy ---------------------------------------------------------------------------
@@ -614,6 +647,7 @@ def merge(
                       "per_shard": {s: r["seconds"] for s, r in shard_results.items()}},
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    receipt["content_sha256"] = content_digest(receipt)
     tmp = receipt_path(dest).with_name(DERIVED_RECEIPT + ".tmp")
     tmp.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
     os.replace(tmp, receipt_path(dest))
@@ -633,6 +667,16 @@ def verify_merged(derived_dir: Path, *, full: bool = False) -> dict:
         raise MergeError(f"{derived_dir}: no passing {DERIVED_NAME} receipt")
     if receipt.get("merger", {}).get("version") != MERGER_VERSION:
         raise MergeError("receipt written by another merger version")
+    from flora_deploy.config.pins import DERIVED_PINS_BY_KEY
+
+    try:
+        content = checked_content_digest(receipt)
+    except ContentDigestError as e:
+        raise MergeError(f"{derived_dir}: {e}") from None
+    dpin = DERIVED_PINS_BY_KEY.get(DERIVED_NAME)
+    if dpin is not None and dpin.content_sha256 is not None and content != dpin.content_sha256:
+        raise MergeError(f"{derived_dir}: content digest {content} != pinned "
+                         f"{dpin.content_sha256}")
     want = {f["path"]: f for f in receipt["files"]}
     have = {p.name for p in derived_dir.iterdir() if p.name != DERIVED_RECEIPT}
     if have != set(want):
@@ -647,7 +691,7 @@ def verify_merged(derived_dir: Path, *, full: bool = False) -> dict:
                 raise MergeError(f"{name}: header differs from receipt")
         elif _sha256_file(path) != f["sha256"]:
             raise MergeError(f"{name}: sha256 differs from receipt")
-    return {"files": len(want), "full": full,
+    return {"files": len(want), "full": full, "content_sha256": content,
             "receipt_sha256": hashlib.sha256(receipt_path(derived_dir).read_bytes()).hexdigest()}
 
 

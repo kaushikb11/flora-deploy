@@ -6,7 +6,7 @@ Mirrors the CLI one to one::
     from flora_deploy import sdk
 
     options = sdk.plan("flora.yaml", video_hours=2.0)        # flora plan
-    job = sdk.submit("flora.yaml", receipts={"captioner_bf16": "<sha256>"})   # flora run --detach
+    job = sdk.submit("flora.yaml")                           # flora run --detach
     job.status()                                            # flora status <job>
     job.wait(poll_s=30)                                     # flora run (streaming) + compose
     records = job.results("caption")                        # flora results
@@ -836,8 +836,11 @@ def submit(cfg: Any, *, job_id: str | None = None, store: str | None = None,
 
     ``cfg``: a ``FloraConfig`` or a path. ``receipts`` / ``determinism`` / ``allow_uncertified``
     / ``store`` / ``bucket_secret``: as passed to ``flora deploy`` (they decide the config hash
-    and so which deployment runs it). ``budget_usd`` overrides ``modal.budget_usd``."""
+    and so which deployment runs it). ``receipts`` overrides the config's ``weights.derived``
+    (recorded by ``flora prepare``; ``config.receipts.resolve``). ``budget_usd`` overrides
+    ``modal.budget_usd``."""
     from flora_deploy.config.hashing import MissingReceiptError
+    from flora_deploy.config.receipts import resolve as resolve_receipts
     from flora_deploy.config.schema import to_run_settings
     from flora_deploy.jobs.orchestrator import utc
     from flora_deploy.jobs.planning import NothingToPlan, plan_job
@@ -848,7 +851,8 @@ def submit(cfg: Any, *, job_id: str | None = None, store: str | None = None,
     cfg = _load_cfg(cfg, allow_uncertified=allow_uncertified)
     try:
         plan = (planner or _plan_deployment)(
-            cfg, store=store, bucket_secret=bucket_secret, derived_receipts=dict(receipts or {}),
+            cfg, store=store, bucket_secret=bucket_secret,
+            derived_receipts=resolve_receipts(cfg, receipts),
             allow_uncertified=allow_uncertified, determinism=determinism)
     except (DeployError, MissingReceiptError, ValueError) as e:
         raise FloraError(str(e)) from None
