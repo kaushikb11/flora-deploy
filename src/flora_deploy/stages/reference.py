@@ -632,6 +632,22 @@ def nvidia_result(result: dict) -> dict:
 # caption (calls follow plan order, which is segment order).
 
 TEMPSEG_BUDGET, CAPTION_BUDGET = 1024, 512
+# NVIDIA's ``generate`` stops at ``max_time=300`` s (``models.py:179``): a call near that wall
+# clock can be cut at a load-dependent token count (review 4 M4), so its output is timing-, not
+# input-determined. Such calls are flagged ``timing_dependent`` in ``model_calls``.
+NVIDIA_MAX_TIME_S = 300.0
+TIMING_FLAG_S = 150.0
+
+
+def timing_dependent(call: dict) -> bool:
+    """A call that ran long enough to be near NVIDIA's ``max_time``, or stopped incomplete
+    before its token budget (a time stop, not an EOS / budget stop)."""
+    elapsed = call.get("elapsed_s")
+    if isinstance(elapsed, int | float) and elapsed > TIMING_FLAG_S:
+        return True
+    gen, limit = call.get("generated_tokens"), call.get("output_limit")
+    return (call.get("complete") is False and isinstance(gen, int) and isinstance(limit, int)
+            and gen < limit)
 
 
 def _sha(text: str) -> str:
@@ -656,7 +672,8 @@ def model_calls(events: list[dict], result: dict | None = None) -> list[dict]:
             calls.append(open_call)
         elif kind == "generation_end" and open_call is not None:
             open_call.update(generated_tokens=e.get("generated_tokens"),
-                             complete=bool(e.get("complete")))
+                             complete=bool(e.get("complete")), elapsed_s=e.get("elapsed_s"))
+            open_call["timing_dependent"] = timing_dependent(open_call)
             open_call = None
     if result is not None:
         windows = [w.get("output") for w in result.get("pipeline", {}).get("temporal_windows", [])]
@@ -717,8 +734,32 @@ def compare_model_inputs(a: list[dict], b: list[dict]) -> dict:
     }
 
 
+def determinism_mode(result: dict) -> str:
+    """The D-1 mode a result was produced in (results from before D-1: ``nvidia``)."""
+    det = result.get("flora_reference", {}).get("determinism") or {}
+    return str(det.get("mode") or "nvidia")
+
+
+class ModeMismatch(ValueError):
+    """Two runs in different D-1 determinism modes are different references (never compared)."""
+
+
+def check_same_mode(a: dict[str, dict], b: dict[str, dict]) -> str | None:
+    """Raise :class:`ModeMismatch` unless every result of both runs has the same mode."""
+    modes = {determinism_mode(r) for r in (*a.values(), *b.values())}
+    if len(modes) > 1:
+        raise ModeMismatch(f"runs mix determinism modes {sorted(modes)}: a nvidia-mode and a "
+                           "deterministic-mode reference are never compared (docs/determinism.md)")
+    return next(iter(modes), None)
+
+
 def identity_summary(a: dict[str, dict], b: dict[str, dict]) -> dict:
-    """Per-episode ``compare_model_inputs`` + output agreement for two ``{episode: result}``."""
+    """Per-episode ``compare_model_inputs`` + output agreement for two ``{episode: result}``.
+
+    Refuses runs in different determinism modes. ``complete_coverage``: every episode is in both
+    runs and every call of both was gated (review 4 L5 / M6); ``timing_dependent_calls`` counts
+    calls near NVIDIA's ``max_time`` in either run (M4)."""
+    mode = check_same_mode(a, b)
     episodes = {}
     for ep in sorted(set(a) | set(b)):
         if ep not in a or ep not in b:
@@ -727,6 +768,7 @@ def identity_summary(a: dict[str, dict], b: dict[str, dict]) -> dict:
         ca = a[ep].get("flora_reference", {}).get("model_calls", [])
         cb = b[ep].get("flora_reference", {}).get("model_calls", [])
         row = compare_model_inputs(ca, cb)
+        row["timing_dependent_calls"] = sum(bool(c.get("timing_dependent")) for c in ca + cb)
         row["output_identical"] = comparable_result(a[ep]) == comparable_result(b[ep])
         row["digest_a"], row["digest_b"] = result_digest(a[ep])[:12], result_digest(b[ep])[:12]
         if not row["output_identical"]:
@@ -734,9 +776,16 @@ def identity_summary(a: dict[str, dict], b: dict[str, dict]) -> dict:
                                            limit=5)
         episodes[ep] = row
     both = [r for r in episodes.values() if "missing_in" not in r]
+    calls = sum(max(r["calls_a"], r["calls_b"]) for r in both)
+    gated = sum(r["gated_calls"] for r in both)
     return {
         "episodes": episodes,
+        "determinism_mode": mode,
         "compared": len(both),
+        "missing": len(episodes) - len(both),
+        "coverage": round(gated / calls, 4) if calls else 0.0,
+        "complete_coverage": bool(both) and len(both) == len(episodes) and gated == calls,
+        "timing_dependent_calls": sum(r["timing_dependent_calls"] for r in both),
         "gate_ok": bool(both) and all(r["gate_ok"] for r in both),
         "strict_episodes": sum(r["strict"] for r in both),
         "output_identical_episodes": sum(r["output_identical"] for r in both),
@@ -1124,7 +1173,9 @@ def diff_paths(a: Any, b: Any, path: str = "$", limit: int = 20) -> list[str]:
 
 
 def compare_runs(a: dict[str, dict], b: dict[str, dict]) -> dict:
-    """Compare two ``{episode: result}`` maps on ``comparable_result``."""
+    """Compare two ``{episode: result}`` maps on ``comparable_result`` (same determinism mode
+    only: :class:`ModeMismatch` otherwise)."""
+    check_same_mode(a, b)
     episodes = {}
     for ep in sorted(set(a) | set(b)):
         if ep not in a or ep not in b:

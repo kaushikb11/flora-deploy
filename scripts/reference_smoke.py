@@ -98,6 +98,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="P1a-5s: golden id(s) for the NVIDIA-unmodified arm")
     p.add_argument("--compare-run", help="P1a-5s: earlier run id whose stored fast results "
                                          "the NVIDIA arm is also compared with")
+    p.add_argument("--timeout-min", type=float,
+                   help="per-call timeout (minutes; default reference_app.TIMEOUT_S)")
     p.add_argument("--repeat", type=int, default=1, help="W3-A: run each episode K times")
     p.add_argument("--compare-to", type=Path, help="W3-A: earlier summary to compare digests")
     args = p.parse_args(argv)
@@ -175,6 +177,8 @@ def _worker(args):
         options["cpu"] = args.cpu
     if getattr(args, "memory_gib", None):
         options["memory"] = args.memory_gib * 1024
+    if getattr(args, "timeout_min", None):
+        options["timeout"] = int(args.timeout_min * 60)
     cls = ReferenceWorker.with_options(**options) if options else ReferenceWorker
     return cls(disable=getattr(args, "disable", ""), concurrency=args.concurrency or 4,
                determinism=getattr(args, "determinism", "nvidia"))
@@ -256,7 +260,7 @@ def validate(args) -> int:
     memory_gib = args.memory_gib or MEMORY_MIB / 1024
     cpu = args.cpu or CPU_CORES
     rate = container_rate(cpu, memory_gib)
-    bound_s = STARTUP_TIMEOUT_S + TIMEOUT_S
+    bound_s = STARTUP_TIMEOUT_S + (args.timeout_min * 60 if args.timeout_min else TIMEOUT_S)
     print(f"run {run_id}: {len(ids)} fast, {len(nvidia_ids)} NVIDIA-unmodified; worst case "
           f"{bound_s / 60:.0f} min = ${rate * bound_s:.2f} at ${rate * 3600:.2f}/h")
     summary: dict = {"run_id": run_id, "ids": ids, "nvidia_ids": nvidia_ids,
@@ -292,7 +296,15 @@ def validate(args) -> int:
     else:
         print("FAILED:", summary.get("error"))
     _write(args.summary, summary)
-    ok = bool(v) and all(x.get("ok", x.get("gate_ok", True)) for x in v["identity"].values())
+    if not v:
+        return 1
+    # review 4 M1/L5: fail on 0 calls compared or on partial episode coverage; report the call
+    # coverage (gated / calls) next to it (M6: < 1 in nvidia mode after an output divergence)
+    acc = {k: x for k, x in v["identity"].items() if not k.startswith("summary_")}
+    ok = bool(acc) and all(x["ok"] and x["paired"] > 0 and len(x["episodes"]) == len(nvidia_ids)
+                           for x in acc.values())
+    print("identity gate:", "PASS" if ok else "FAIL",
+          {k: x.get("coverage") for k, x in acc.items()})
     return 0 if ok else 1
 
 

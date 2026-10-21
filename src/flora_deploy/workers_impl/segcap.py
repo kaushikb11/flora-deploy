@@ -218,8 +218,12 @@ class FastExactEngine:
         }
 
     def annotate(self, items: list[dict], *, on_done: OnDone) -> dict:
+        from flora_deploy.accel import gpu_thread as gt
         from flora_deploy.stages.reference import annotate_batch
 
+        if self.gpu_thread is not None and gt._find_mark(self.nv.pipeline.generate) \
+                is not self.gpu_thread:
+            raise RuntimeError("gpu_thread is on but NVIDIA generate() does not run on it")
         self._audit()
         return annotate_batch(
             self.nv, self.session, items, concurrency=min(self.concurrency, max(len(items), 1)),
@@ -436,7 +440,15 @@ class SegcapShardRunner:
             records = stage_records(result, uid=uid, dataset=ref.dataset,
                                     episode_id=ref.episode_id, provenance=self._provenance(inp),
                                     certified=certified, uncertified_reason=reason)
+            # review 4 M4: calls near NVIDIA's max_time=300 are timing-, not input-determined
+            timing = [i for i, c in enumerate(result.get("flora_reference", {})
+                                              .get("model_calls", []))
+                      if c.get("timing_dependent")]
+            if timing:
+                print(f"FLORA_WARN {json.dumps({'uid': uid, 'timing_dependent_calls': timing})}",
+                      flush=True)
             audit = {"schema": AUDIT_SCHEMA, "uid": uid, "stage": "segcap",
+                     "timing_dependent_calls": timing,
                      "shard_id": shard.shard_id, "container_id": self.container_id,
                      "runtime": {**self.engine.runtime_provenance(), "nv_audit": audit_report},
                      "result": result}

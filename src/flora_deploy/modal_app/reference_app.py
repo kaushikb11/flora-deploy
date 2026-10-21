@@ -197,8 +197,14 @@ class ReferenceWorker:
         # initialized, so the class env stays NVIDIA's default for the "nvidia" mode.
         from flora_deploy.accel import determinism
 
-        self.determinism_mode = self.determinism or os.environ.get("FLORA_DETERMINISM",
-                                                                   determinism.NVIDIA)
+        # review 4 M2: the deployed app passes the mode only through FLORA_DETERMINISM (the
+        # spawner instantiates the class without parameters); a parameter that disagrees with
+        # the env is refused rather than silently winning.
+        env_mode = os.environ.get("FLORA_DETERMINISM")
+        if self.determinism and env_mode and self.determinism != env_mode:
+            raise determinism.DeterminismError(
+                f"determinism parameter {self.determinism!r} != FLORA_DETERMINISM {env_mode!r}")
+        self.determinism_mode = self.determinism or env_mode or determinism.NVIDIA
         self.determinism_record = determinism.apply(self.determinism_mode)
 
         from flora_deploy.stages.reference import (
@@ -345,6 +351,7 @@ class ReferenceWorker:
             "prefetch": prefetch,
             "captioner_hash": hash_info or None,
             "bf16_receipt": self.bf16.verifications[0] if self.bf16 else None,
+            "captioner_bf16": self.bf16.provenance() if self.bf16 else None,  # opt-outs visible
             "gpu_thread": self.gpu_thread.provenance() if self.gpu_thread else None,
             "loads": loads,
             "loaded_kinds": list(self.session.loaded_kinds),
@@ -371,7 +378,20 @@ class ReferenceWorker:
                 "pipeline.human_transport": nv.pipeline.human_transport,
                 "pipeline.caption_single": nv.pipeline.caption_single,
                 "pipeline.caption_three": nv.pipeline.caption_three,
-                "pipeline.Predictor.predict": nv.pipeline.Predictor.predict}
+                "pipeline.Predictor.predict": nv.pipeline.Predictor.predict,
+                **self._accel_targets()}
+
+    def _accel_targets(self) -> dict:
+        """Every attribute an ``accel`` patch can replace (review 4 L1: incl. the vendor
+        ``robot_caption_geometry`` / ``unified_input`` targets), from the registry itself."""
+        from flora_deploy.accel.registry import registered, resolve_target
+
+        out = {}
+        for patch in registered().values():
+            for target in patch.targets:
+                owner, attr = resolve_target(self.nv, target)
+                out[target] = getattr(owner, attr)
+        return out
 
     def _install_fast(self) -> None:
         from flora_deploy.accel import apply_patches, gpu_thread
@@ -668,6 +688,8 @@ class ReferenceWorker:
         from flora_deploy.jobs.stores import LocalStore
         from flora_deploy.jobs.types import EpisodeRef, Manifest, Shard, episode_uid
         from flora_deploy.stages.reference import (
+            ModeMismatch,
+            check_same_mode,
             golden_episode_inputs,
             golden_name,
             identity_calls_from_model_calls,
@@ -800,17 +822,23 @@ class ReferenceWorker:
             return {n: identity_calls_from_model_calls(r["flora_reference"]["model_calls"])
                     for n, r in results.items()}
 
-        nv_calls = calls(nvidia["results"])
-        identity = {"vs_this_run": identity_compare(
-            nv_calls, {n: c for n, c in calls(fast).items() if n in nv_calls}),
-            "summary_vs_this_run": identity_summary(
-                nvidia["results"], {n: r for n, r in fast.items() if n in nvidia["results"]})}
+        def compare(name: str, other: dict) -> None:
+            # every NVIDIA-arm episode must be present (missing -> violation, M1 / L5)
+            try:
+                check_same_mode(nvidia["results"], other)  # M2: never across modes
+            except ModeMismatch as e:
+                identity[name] = {"ok": False, "paired": 0, "episodes": {}, "refused": str(e)}
+                return
+            identity[name] = identity_compare(calls(nvidia["results"]), calls(other))
+            identity["summary_" + name] = identity_summary(nvidia["results"], other)
+
+        identity: dict = {}
+        compare("vs_this_run", {n: r for n, r in fast.items() if n in nvidia["results"]})
         if compare_to:
-            d = RUNS_DIR / f"{compare_to}-fast"
-            old = {n: json.loads((d / f"{n}.json").read_text()) for n in nvidia["results"]
-                   if (d / f"{n}.json").is_file()}
-            identity["vs_" + compare_to] = identity_compare(nv_calls, calls(old))
-            identity["summary_vs_" + compare_to] = identity_summary(nvidia["results"], old)
+            d = Path(RUNS_DIR / f"{compare_to}-fast")
+            compare("vs_" + compare_to, {
+                n: json.loads((d / f"{n}.json").read_text()) for n in nvidia["results"]
+                if (d / f"{n}.json").is_file()})
         for v in identity.values():  # numbers only: drop the per-call digests of violations
             for row in v.get("episodes", {}).values():
                 for viol in row.get("violations", []):
