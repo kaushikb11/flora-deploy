@@ -28,6 +28,7 @@ You need:
 
 ```bash
 flora init --template balanced_lerobot       # writes flora.yaml (preset: balanced)
+flora doctor                                 # preflight: config, Modal, HF access, store, weights (no spend)
 flora prepare                                # download + verify the weights into your Modal Volume,
                                              # build the derived weights, record them in flora.yaml
 flora index                                  # scan the dataset
@@ -100,6 +101,30 @@ Exit codes:
 
 Jobs are resumable. A preempted or crashed container loses at most the shard it was working on.
 An episode that keeps crashing workers is isolated and excluded rather than failing the job.
+
+## Output
+
+Each stage gets a JSONL file (one nested record per episode) and a Parquet file (flattened; one
+row per segment for `segment` / `caption`), plus a `summary.json`, under
+`<sink>/flora/<job>/<config_hash>/output/`. Every record carries `uid`, `certified` and
+`provenance`. Join stages on `uid`. Excluded episodes have no record; `summary.json` counts them.
+Example records (synthetic, shortened):
+
+```json
+{"stage":"segment","uid":"org-demo--episode_000000","certified":false,"uncertified_reason":"uncertified_stack","segments":[{"event_id":"event_0000","start_s":0.0,"end_s":3.5,"caption":null,"status":"complete"}],"provenance":{"preset":"balanced","engine":"vllm-0.24.0-offline"}}
+{"stage":"caption","uid":"org-demo--episode_000000","certified":false,"uncertified_reason":"uncertified_stack","segments":[{"event_id":"event_0000","start_s":0.0,"end_s":3.5,"caption":"The left arm lifts the cup lid.","status":"complete"}]}
+{"stage":"reward.terminal","uid":"org-demo--episode_000000","terminal":{"score":5,"expected_score":4.6,"probabilities":[0.0,0.0,0.05,0.3,0.65],"rationale":null}}
+{"stage":"reward.dense","uid":"org-demo--episode_000000","dense":{"per_step":[3,3,2,3],"segments":[{"start_s":0.0,"end_s":2.0,"score":3,"label":"normal"}]}}
+```
+
+```python
+import pandas as pd
+caption, terminal = pd.read_parquet("caption.parquet"), pd.read_parquet("terminal.parquet")
+labels = caption.merge(terminal[["uid", "terminal_score"]], on="uid")
+```
+
+Get the files with `flora results --job <job> --stage caption --format parquet --out caption.parquet`.
+Every field is described in [`docs/output-format.md`](docs/output-format.md).
 
 ## Python SDK
 

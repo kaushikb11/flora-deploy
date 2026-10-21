@@ -21,6 +21,7 @@ from flora_deploy.cli import (  # noqa: F401  (registers commands)
     cancel,
     certify,
     deploy,
+    doctor,
     index,
     init,
     logs,

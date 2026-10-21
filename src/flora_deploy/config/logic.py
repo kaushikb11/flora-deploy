@@ -150,6 +150,7 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     "cli/cancel.py",
     "cli/certify.py",
     "cli/deploy.py",
+    "cli/doctor.py",  # preflight checks; metadata calls only
     "cli/index.py",
     "cli/init.py",
     "cli/logs.py",

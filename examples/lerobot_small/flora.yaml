@@ -1,0 +1,33 @@
+# flora.yaml: the balanced preset on a small public LeRobot dataset.
+# lerobot/aloha_static_cups_open (MIT): 50 episodes of ~8 s each, 3 cameras, ~0.5 GB.
+# tests/unit/test_examples.py validates this file.
+
+project: lerobot-small
+license_ack: research-only          # NVIDIA's Flora models: non-commercial research only
+
+modal:
+  environment: main
+  max_gpus: 4                       # one container per shard kind below
+  budget_usd: 15                    # hard cap; also set the Environment budget `flora doctor` prints
+
+preset: balanced
+allow_uncertified: true             # balanced has no Gate certificates yet, so records are
+                                    # certified=false with uncertified_reason uncertified_stack
+
+input:
+  format: lerobot_v3
+  repo: lerobot/aloha_static_cups_open
+  revision: d793c969cf716001dcca18a0842c3d7e9de9e41b
+  cameras:                          # cam_low is not used
+    observation.images.cam_high: main
+    observation.images.cam_left_wrist: left_wrist
+    observation.images.cam_right_wrist: right_wrist
+
+pipeline:
+  stages: [segment, caption, reward.terminal, reward.dense]
+  embodiment: yam                   # bimanual robot with 3 synchronized views
+  episode_instruction: {source: dataset_task}
+
+output:
+  sink: s3://my-bucket/flora/lerobot-small   # or volume://flora-results/lerobot-small
+  formats: [parquet, jsonl]
