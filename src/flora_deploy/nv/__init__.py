@@ -23,6 +23,13 @@ Contract (implemented by WS-B in ``linker.py``, ``session.py``, ``capture.py``):
   ``__call__(text=..., videos=..., video_metadata=..., do_sample_frames=False, ...)`` as a
   ``CapturedRequest`` (prompt text, uint8 frame arrays, metadata dicts). The call returns a
   ``_CapturedInputs`` whose only allowed operation is ``.pop('video_metadata', default)``.
+  ``CapturedRequest.context_budget`` is NVIDIA's output budget for the request's model kind.
+
+- ``check_context_budget(prompt_token_ids_len, budget)`` (``budget.py``): NVIDIA's 32k guard
+  from ``models.generate``, raising an error that is also NVIDIA's ``InputErrorForModel``.
+
+- ``worker_init(family, code_dir)`` / ``NvRef`` (``linker.py``): process-pool initializer and
+  picklable NVIDIA function reference for spawn/forkserver pools (PLAN.md D12).
 """
 
 from __future__ import annotations
@@ -47,6 +54,10 @@ _EXPORTS = {
     "load_family": "linker",
     "code_dir_for": "linker",
     "NvFamily": "linker",
+    "NvRef": "linker",
+    "worker_init": "linker",
+    "check_context_budget": "budget",
+    "ContextBudgetError": "budget",
     "CachedSession": "session",
     "CaptureProcessor": "capture",
     "CapturedRequest": "capture",

@@ -75,7 +75,9 @@ class CachedSession:
     def audit(self) -> dict:
         """NVIDIA's per-kind load audit records, merged across inner sessions."""
         merged: dict = {}
-        for session in self._sessions.values():
+        with self._lock:
+            sessions = list(self._sessions.values())
+        for session in sessions:
             merged.update(getattr(session, "audit", {}) or {})
         return merged
 

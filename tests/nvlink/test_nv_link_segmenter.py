@@ -11,7 +11,6 @@ segments with emit-core support, in canonical order. Scenarios hide one event fr
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import json
 from fractions import Fraction
 from pathlib import Path
@@ -256,8 +255,10 @@ def test_quality_policies_differ(nv, pool, n_views, fails):
 
 @pytest.mark.parametrize(("pool", "n_views"), [("human", 1), ("yam", 1), ("yam", 3), ("dex", 3)])
 def test_glue_matches_nvidia_pipeline_segment(nv, monkeypatch, pool, n_views):
-    """Our constructions equal what NVIDIA's own ``pipeline.segment()`` builds: same dataclass
-    fields (predictor aside) and the same segments for a 3-round retry scenario."""
+    """Our binding, source and constructions equal what NVIDIA's own ``pipeline.segment()``
+    builds. Spies on NVIDIA's own classes record the arguments NVIDIA passes to them; we build
+    ours purely from ``segment_glue`` under the same spies and compare argument by argument (the
+    predictor aside), then run both engines on a 3-round retry scenario."""
     a = nv.production
     L = Layout(nv, pool)
     renderer = SCENARIOS["directional_retry"][0]
@@ -267,44 +268,135 @@ def test_glue_matches_nvidia_pipeline_segment(nv, monkeypatch, pool, n_views):
         duration_us=int(L.duration_s * 1_000_000), size=(640, 480), cfr=True,
     )
     videos = {role: main for role in ["main", "left_wrist", "right_wrist"][:n_views]}
+    fine_cls, hier_cls = a.FineSubtaskSegmenter, a.HierarchicalSubtaskSegmenter
 
-    built = []
-    original = a.HierarchicalSubtaskSegmenter
+    def norm(value):
+        if isinstance(value, _Canned):
+            return "<predictor>"
+        if isinstance(value, fine_cls):
+            return "<fine>"
+        if type(value).__name__ == "NoCoarse":
+            return "<NoCoarse>"
+        return value
 
-    def spy(*args, **kwargs):
-        built.append(original(*args, **kwargs))
-        return built[-1]
+    def spying(calls):
+        def spy_for(cls):
+            def spy(*args, **kwargs):
+                calls.append((cls.__name__, [norm(v) for v in args],
+                              {k: norm(v) for k, v in kwargs.items()}))
+                return cls(*args, **kwargs)
+            return spy
+        monkeypatch.setattr(a, "FineSubtaskSegmenter", spy_for(fine_cls))
+        monkeypatch.setattr(a, "HierarchicalSubtaskSegmenter", spy_for(hier_cls))
 
-    nv_predictors = []
+    nv_calls, nv_seen = [], []
 
     def predictor_factory(videos, source, pool_, bound, model, proc, instruction, progress):
-        nv_predictors.append(SyncPredictor(nv, source, bound, lambda r, w: renderer(L, r, w)))
-        return nv_predictors[-1]
+        nv_seen.append((source, bound))
+        return SyncPredictor(nv, source, bound, lambda r, w: renderer(L, r, w))
 
     class FakeSession:
         def load(self, kind):
             assert kind == "tempseg"
             return None, None
 
-    monkeypatch.setattr(a, "HierarchicalSubtaskSegmenter", spy)
+    spying(nv_calls)
     monkeypatch.setattr(nv.pipeline, "Predictor", predictor_factory)
     nv_segments, _ = nv.pipeline.segment(videos, pool, FakeSession(), "", lambda *a, **k: None)
     monkeypatch.undo()
+    ((nv_source, nv_bound),) = nv_seen
 
-    result, ours = _run(nv, SyncPredictor, pool, n_views, renderer)
-    assert result == ("ok", nv_segments)
-    assert len(ours.requests) == len(nv_predictors[0].requests) == 3
-
-    (nv_engine,) = built
-    our_engine = glue.segmenter_for(nv, nv_predictors[0], nv_predictors[0].binding, pool, n_views)
-
-    def fields(obj, skip):
-        return {f.name: getattr(obj, f.name) for f in dataclasses.fields(obj) if f.name not in skip}
-
-    assert fields(our_engine, {"fine_segmenter", "coarse_segmenter"}) == fields(
-        nv_engine, {"fine_segmenter", "coarse_segmenter"}
+    # binding and source: ours from the glue alone
+    binding = glue.model_binding(nv, pool)
+    assert binding == nv_bound
+    source = glue.annotation_source(
+        nv, source_id=glue.source_id_for(main.sha256), location=str(main.path),
+        duration_s=main.duration_s, fps=float(main.rate),
     )
-    assert type(our_engine.coarse_segmenter) is type(nv_engine.coarse_segmenter)
-    assert fields(our_engine.fine_segmenter, {"predictor"}) == fields(
-        nv_engine.fine_segmenter, {"predictor"}
-    )
+    assert source == nv_source
+
+    our_calls = []
+    spying(our_calls)
+    predictor = SyncPredictor(nv, source, binding, lambda r, w: renderer(L, r, w))
+    engine = glue.segmenter_for(nv, predictor, binding, pool, n_views)
+    monkeypatch.undo()
+    assert [c[0] for c in nv_calls] == ["FineSubtaskSegmenter", "HierarchicalSubtaskSegmenter"]
+    assert our_calls == nv_calls
+
+    rows = _rows(asyncio.run(engine.segment_async(source)))
+    assert rows == nv_segments
+    assert len(predictor.requests) == 3
+
+
+class _NoEOS(RuntimeError):
+    pass
+
+
+@pytest.mark.parametrize("error", ["nvidia_input_error", "context_budget", "other"])
+@pytest.mark.parametrize(("pool", "n_views"), [("human", 1), ("yam", 3)])
+def test_predictor_error_mid_retry_propagates(nv, pool, n_views, error):
+    """L3: an exception from the predictor in retry round 1 (e.g. NVIDIA's InputErrorForModel for
+    a missing EOS, or our 32k guard) propagates out of ``segment_async`` unchanged, for predict
+    and apredict alike: NVIDIA repairs only ``FineSegmentationOutputError``, so there is no
+    repair and no conservative completion."""
+    from flora_deploy.nv.budget import check_context_budget
+
+    def raise_it():
+        if error == "nvidia_input_error":
+            raise nv.models.InputErrorForModel("no complete output")
+        if error == "context_budget":
+            check_context_budget(40_000, 1024, nv=nv)
+        raise _NoEOS("no complete output")
+
+    def renderer(L, r, w):
+        if r == 1:
+            raise_it()
+        return SCENARIOS["recentered_retry"][0](L, r, w)
+
+    L = Layout(nv, pool)
+    for cls in (SyncPredictor, AsyncPredictor):
+        source = _source(nv, L.duration_s)
+        binding = glue.model_binding(nv, pool)
+        predictor = cls(nv, source, binding, lambda r, w: renderer(L, r, w))
+        engine = glue.segmenter_for(nv, predictor, binding, pool, n_views)
+        with pytest.raises(Exception) as info:
+            asyncio.run(engine.segment_async(source))
+        assert len(predictor.requests) == 2
+        if error == "other":
+            assert type(info.value) is _NoEOS
+        else:
+            assert isinstance(info.value, nv.models.InputErrorForModel)
+        if error == "context_budget":
+            assert info.value.prompt_tokens == 40_000
+
+
+def test_concurrent_episodes_on_one_loop(nv):
+    """L4 (D14): several episodes awaiting ``apredict`` on one event loop give the same segments
+    as running them one by one."""
+    cases = [("yam", 3, "directional_retry", "ab" * 32),
+             ("human", 1, "conservative_completion", "cd" * 32),
+             ("yam32", 3, "recentered_retry", "ef" * 32),
+             ("yam", 1, "clean", "01" * 32)]
+
+    def build(pool, n_views, scenario, sha):
+        L = Layout(nv, pool)
+        source = glue.annotation_source(nv, source_id=glue.source_id_for(sha), location="s.mp4",
+                                        duration_s=L.duration_s, fps=30.0)
+        binding = glue.model_binding(nv, pool)
+        predictor = AsyncPredictor(nv, source, binding,
+                                   lambda r, w: SCENARIOS[scenario][0](L, r, w))
+        return glue.segmenter_for(nv, predictor, binding, pool, n_views), source, predictor
+
+    serial = []
+    for case in cases:
+        engine, source, _ = build(*case)
+        serial.append(_rows(asyncio.run(engine.segment_async(source))))
+
+    async def together():
+        built = [build(*case) for case in cases]
+        results = await asyncio.gather(*(e.segment_async(s) for e, s, _ in built))
+        return results, [p for _, _, p in built]
+
+    results, predictors = asyncio.run(together())
+    assert [_rows(r) for r in results] == serial
+    assert [p.awaited for p in predictors] == [SCENARIOS[c[2]][1] for c in cases]

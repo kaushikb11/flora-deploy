@@ -13,7 +13,16 @@ plain metadata dict per video. Everything else (``video_token``, ``apply_chat_te
 
 The value returned to NVIDIA's code is a ``_CapturedInputs``. NVIDIA's builders only ever do
 ``inputs.pop('video_metadata', None)`` on it; any other use (indexing, ``dict()``, attribute access)
-means our assumptions about NVIDIA's code no longer hold, so it raises.
+means our assumptions about NVIDIA's code no longer hold, so it raises. Note that
+``temporal_inputs`` pops and returns the inputs, but ``three_view_caption_inputs``,
+``processor_inputs`` and ``caption_single``'s inline call return the object as is, and
+``pipeline.caption_*`` hands it straight to ``models.generate`` (which calls ``dict(inputs)`` and
+raises). Driving ``pipeline.caption_*`` with a ``CaptureProcessor`` therefore requires replacing
+``pipeline.generate``, as the nvlink tests do.
+
+Process boundaries: ``CapturedRequest`` (str, uint8 arrays, plain dicts) pickles and is what
+should cross them. ``CaptureProcessor`` also pickles/copies (its state is the real processor and
+the captured requests), but shipping a whole HF processor between processes is rarely wanted.
 """
 
 from __future__ import annotations
@@ -52,6 +61,18 @@ class CapturedRequest:
     videos: list[tuple[np.ndarray, dict]]
     # The remaining keyword arguments of the call (return_tensors, padding, return_metadata).
     call_kwargs: dict = field(default_factory=dict)
+    # ``max_new_tokens`` NVIDIA passes to ``models.generate`` for this request's model kind
+    # (``nv.budget.budget_for``: 1024 TempSeg, 512 Captioner at the current pin); None if unknown.
+    context_budget: int | None = None
+
+    def check_context(self, prompt_token_ids_len: int, *, nv: Any = None) -> None:
+        """NVIDIA's 32k guard for this request (``nv.budget.check_context_budget``)."""
+        from flora_deploy.nv.budget import check_context_budget
+
+        if self.context_budget is None:
+            raise CaptureError("request has no context_budget; build the CaptureProcessor with "
+                               "budget= (or CaptureProcessor.for_kind)")
+        check_context_budget(prompt_token_ids_len, self.context_budget, nv=nv)
 
     def video_metadata_objects(self) -> list[Any]:
         """Metadata as transformers ``VideoMetadata`` objects (for HF replay)."""
@@ -71,7 +92,7 @@ def frames_to_uint8(video: Any) -> np.ndarray:
     its own conversion and the two could differ.
     """
     if isinstance(video, np.ndarray):
-        arr = video
+        arr = video.copy()  # never alias the caller's buffer
         if arr.ndim != 4:
             raise CaptureError(f"video array must be (T, H, W, 3), got shape {arr.shape}")
     else:
@@ -185,12 +206,29 @@ class _CapturedInputs:
 class CaptureProcessor:
     """Proxy for the real HF processor that records the final ``__call__``.
 
-    ``requests`` keeps every captured call in order; ``captured`` is the latest one.
+    ``requests`` keeps every captured call in order; ``captured`` is the latest one (use one
+    proxy per call site, or ``pop_request``, when several episodes share a processor).
+    ``budget`` is recorded as each request's ``context_budget``.
     """
 
-    def __init__(self, real: Any):
+    _OWN = ("_real", "requests", "_budget")
+
+    def __init__(self, real: Any, *, budget: int | None = None):
         object.__setattr__(self, "_real", real)
         object.__setattr__(self, "requests", [])
+        object.__setattr__(self, "_budget", budget)
+
+    @classmethod
+    def for_kind(cls, nv: Any, real: Any, kind: str) -> CaptureProcessor:
+        """Proxy whose requests carry NVIDIA's output budget for ``kind`` (from NVIDIA's
+        ``pipeline.py`` call sites)."""
+        from flora_deploy.nv.budget import budget_for
+
+        return cls(real, budget=budget_for(nv, kind))
+
+    @property
+    def budget(self) -> int | None:
+        return self._budget
 
     @property
     def captured(self) -> CapturedRequest | None:
@@ -201,7 +239,19 @@ class CaptureProcessor:
         return self._real
 
     def __getattr__(self, name: str) -> Any:
+        # Never delegate our own state or dunders: during unpickling/copying the instance has no
+        # ``_real`` yet, and delegating would recurse forever.
+        if name in self._OWN or (name.startswith("__") and name.endswith("__")):
+            raise AttributeError(name)
         return getattr(self._real, name)
+
+    def __getstate__(self) -> dict:
+        return {"real": self._real, "requests": list(self.requests), "budget": self._budget}
+
+    def __setstate__(self, state: dict) -> None:
+        object.__setattr__(self, "_real", state["real"])
+        object.__setattr__(self, "requests", list(state["requests"]))
+        object.__setattr__(self, "_budget", state.get("budget"))
 
     def __setattr__(self, name: str, value: Any) -> None:
         # e.g. NVIDIA's models.processor() sets ``chat_template``; keep the real one in sync.
@@ -236,7 +286,8 @@ class CaptureProcessor:
                 )
             pairs.append((frames, md_dict))
         call_kwargs = {k: v for k, v in kwargs.items() if k != "do_sample_frames"}
-        self.requests.append(CapturedRequest(prompt=text[0], videos=pairs, call_kwargs=call_kwargs))
+        self.requests.append(CapturedRequest(prompt=text[0], videos=pairs, call_kwargs=call_kwargs,
+                                             context_budget=self._budget))
         return _CapturedInputs(
             list(video_metadata), has_metadata=bool(kwargs.get("return_metadata", False))
         )
