@@ -1,0 +1,71 @@
+"""Gate C local entrypoint: ``uv run modal run scripts/gatec.py [--max-requests 2] [--out PATH]``.
+
+Stages the public sample video into the ``flora-golden`` Volume (``samples/wse/``) if missing,
+runs ``flora-gatec.run_gate_c`` for the TempSeg and Captioner processors in parallel (two L40S
+containers, ephemeral app), writes the JSON results outside the repo, and prints the Markdown
+tables for ``docs/gate-c.md``. The results hold token counts, positions and grids only.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import time
+import urllib.request
+from pathlib import Path
+
+from flora_deploy.layout import GOLDEN_VOLUME
+from flora_deploy.modal_app.gatec_app import SAMPLE_DIR, app, run_gate_c
+from flora_deploy.validate.gatec import case_verdicts, render_report
+
+# Big Buck Bunny, 10 s, 640x360, H.264, 30 fps CFR (c) Blender Foundation, CC BY 3.0.
+SAMPLE_NAME = "bbb_360_10s.mp4"
+SAMPLE_URL = "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_Buck_Bunny_360_10s_1MB.mp4"
+SAMPLE_SHA256 = "77145c94c11f3754207499158df22406e1fe7635553c1c86dc5e881dfeb32016"
+L40S_USD_PER_H = 1.95
+
+
+def stage_sample() -> None:
+    import modal
+
+    vol = modal.Volume.from_name(GOLDEN_VOLUME, create_if_missing=True, version=2)
+    try:
+        present = {Path(e.path).name for e in vol.listdir(SAMPLE_DIR)}
+    except Exception:  # directory missing
+        present = set()
+    if SAMPLE_NAME in present:
+        print(f"sample present: {SAMPLE_DIR}/{SAMPLE_NAME}")
+        return
+    req = urllib.request.Request(SAMPLE_URL, headers={"User-Agent": "curl/8.7.1"})
+    data = urllib.request.urlopen(req, timeout=60).read()
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != SAMPLE_SHA256:
+        raise RuntimeError(f"sample sha256 {digest} != expected {SAMPLE_SHA256}")
+    with vol.batch_upload() as batch:
+        batch.put_file(io.BytesIO(data), f"{SAMPLE_DIR}/{SAMPLE_NAME}")
+    print(f"staged {SAMPLE_DIR}/{SAMPLE_NAME} ({len(data)} bytes, sha256 {digest})")
+
+
+@app.local_entrypoint()
+def main(max_requests: int = 2, out: str = "~/.cache/flora-deploy/gatec/results.json"):
+    stage_sample()
+    t0 = time.time()
+    calls = {kind: run_gate_c.spawn(kind, SAMPLE_NAME, max_requests)
+             for kind in ("tempseg", "captioner")}
+    results = {kind: call.get() for kind, call in calls.items()}
+    wall = time.time() - t0
+    gpu_s = sum(r["timings"]["total_s"] for r in results.values())
+    path = Path(out).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(dict(results=results, wall_s=wall), indent=1, default=str))
+    rows = [row for r in results.values() for row in r["rows"]]
+    for kind, r in results.items():
+        print(f"\n== {kind}: {r['gpu']} {r['versions']} timings {r['timings']}")
+        print("video processor attr diff vs NVIDIA:", r["video_processor_attr_diff"] or "none")
+    print("\n" + render_report(rows))
+    verdict = case_verdicts(rows, "wrapped")
+    print("wrapped verdict:", "PASS" if verdict and all(verdict.values()) else "FAIL", verdict)
+    print(f"wall {wall:.0f}s; in-function GPU time {gpu_s:.0f}s "
+          f"(≈${gpu_s / 3600 * L40S_USD_PER_H:.2f} at ${L40S_USD_PER_H}/h, excl. container start)")
+    print(f"results: {path}")

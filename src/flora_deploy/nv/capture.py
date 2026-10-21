@@ -248,6 +248,60 @@ class CaptureProcessor:
         return self.requests.pop(0)
 
 
+VIDEO_TOKEN = "<|video_pad|>"
+VISION_START = "<|vision_start|>"
+VISION_END = "<|vision_end|>"
+
+
+def wrap_bare_video_tokens(prompt: str, n_videos: int) -> str:
+    """Gate C fix: bare ``<|video_pad|>`` -> ``<|vision_start|><|video_pad|><|vision_end|>``.
+
+    Why: vLLM 0.24.0's Qwen3-VL processor only expands the full triplet (its ``PromptReplacement``
+    target and ``_replace_video_token_placeholders`` both match ``vision_start, video_pad,
+    vision_end``). A prompt with NVIDIA's bare token finds 0 placeholders for N videos and the
+    request is rejected. HF's ``Qwen3VLProcessor`` accepts both shapes.
+
+    Why the HF model inputs do not change (``docs/gate-c.md`` has the full argument and the test
+    evidence): for each video in order, transformers 5.8.1 ``Qwen3VLProcessor.__call__`` replaces
+    the first ``vision_start + video_token + vision_end`` if the text contains one, otherwise the
+    first bare ``video_token``, with the same per-frame string
+    ``<t seconds><|vision_start|><|placeholder|>*n<|vision_end|>``. That string contains no
+    ``video_token``, and every expansion ends in ``vision_end``, so a later bare token can never
+    look wrapped. With no vision start/end tokens in the input, the bare prompt and the wrapped
+    prompt therefore expand to the identical text, and the identical ``input_ids``.
+
+    Preconditions (checked; ``CaptureError`` otherwise), which every NVIDIA builder meets:
+    - the prompt has exactly ``n_videos`` video tokens and no vision start/end tokens (mixed
+      shapes would reorder HF's replacements);
+    - each video token is preceded by a newline. vLLM tokenizes each ``<t seconds>`` string on
+      its own, while HF tokenizes it in context; after a newline the two agree (Gate C measured
+      it), after arbitrary text a merge across the boundary is possible.
+    """
+    if VISION_START in prompt or VISION_END in prompt:
+        raise CaptureError("prompt already contains vision start/end tokens; only bare "
+                           "video tokens are supported")
+    if prompt.count(VIDEO_TOKEN) != n_videos:
+        raise CaptureError(f"prompt has {prompt.count(VIDEO_TOKEN)} video tokens for "
+                           f"{n_videos} videos")
+    parts = prompt.split(VIDEO_TOKEN)
+    for i, before in enumerate(parts[:-1]):
+        if not before.endswith("\n"):
+            raise CaptureError(f"video token {i} is not preceded by a newline")
+    return prompt.replace(VIDEO_TOKEN, VISION_START + VIDEO_TOKEN + VISION_END)
+
+
+def vllm_prompt(request: CapturedRequest) -> dict:
+    """The vLLM prompt dict for a captured request (Gate C: wrapped video tokens).
+
+    ``{"prompt": ..., "multi_modal_data": {"video": [(uint8 THWC, metadata dict), ...]}}``. The
+    metadata dicts are passed as captured (``duration`` may be None; vLLM 0.24.0 accepts it).
+    """
+    return {
+        "prompt": wrap_bare_video_tokens(request.prompt, len(request.videos)),
+        "multi_modal_data": {"video": [(frames, dict(md)) for frames, md in request.videos]},
+    }
+
+
 def replay(proc: Any, request: CapturedRequest, **overrides: Any):
     """Run a captured request through a real HF processor with ndarray frames (as vLLM would
     receive them). Returns the processor's ``BatchFeature``."""
