@@ -106,3 +106,59 @@ Rules:
   - certificates for the D16 matrix;
   - measured $/video-hour vs `exact`;
   - GPU utilization >60% while busy.
+
+---
+
+## Update after review 3 (2026-10-21): what's left and how it's split
+
+**Budget:** $14.23 spent, **$35.77 left**.
+
+### Lessons that change the plan
+
+1. **Integration seams hid the critical bugs.** Each piece passed its own tests, but C1 (Modal raises the *builtin* `TimeoutError`), C2 (quarantine resolved under listing lag) and C3 (Volume never reloaded) only appeared when real pieces were wired together or checked against real Modal behavior. So:
+   - every worker must pass a shared **conformance suite**;
+   - every Modal-facing piece must pass a cheap **real-Modal CPU canary** before any GPU run.
+2. **"exact" means identical model inputs, not identical outputs.**
+   - D-1 traced output variance to cuDNN attention on H200.
+   - Fix-H showed vLLM batch grouping changes Rewarder numbers.
+   - Certification compares against the oracle's *measured* run-to-run noise.
+   - Every record states whether deterministic mode was on.
+3. **Missing components** that the earlier plan assumed:
+   - an **index job** (`flora index`: dataset → episode index receipts in the store);
+   - the **app factory** (one deployed app per config with module-scope workers, D10);
+   - **compose/export**.
+
+### Coordinator first (after Fix-J1/J2 land)
+
+| ID | Work |
+|---|---|
+| **C1-conformance** | `tests/conformance/`: one suite every `ShardWorker` and `Store` implementation must pass (attempt marker first, skip-done, parts listing per the new `ShardReceipt.parts` rule, receipt last, preempt mark on SIGINT, NVIDIA failures → `EpisodeError` not crash, records validate as `flora_labels_v1`, idempotent re-run). Workers get it for free by parametrizing over their factory. |
+| **C2-canary harness** | `tests/modal/` + `scripts/canary.py`: a real-Modal **CPU-only** run (cents) of orchestrator + VolumeStore/BucketStore + a trivial CPU worker: real `FunctionCall` polling, real Volume reload, real Dict lease, real preemption via `simulate_preemption()`. Gate for every Modal-facing merge. |
+
+### Wave D (parallel; ≤4–5 agents at a time)
+
+| ID | Depends on | Builds | Cap |
+|---|---|---|---|
+| **P1a-5r RewardWorker** | Fix-H (merged), J1 | `ShardWorker` around `stages/reward.py`; passes conformance | $0.5 |
+| **P1a-5c compose/export** | J1 | parts → deduped `flora_labels_v1` JSONL + Parquet per stage, per config hash; `flora results` reader | $0 |
+| **P1a-6a app factory + deploy** | J2, Fix-CFG | `build_app(cfg)`: module-scope worker classes decorated from `RunSettings` pools (GPU, containers, `@modal.concurrent`, cpu/memory, timeouts, retries, Volumes, secrets), orchestrator + reconciler cron, `--emit` script; `flora deploy` | $0.5 (canary) |
+| **P1a-6b index job** | Fix-C (merged), J1 | `flora index`: CPU Modal fan-out over a dataset (LeRobot v2.1/v3, mp4 dir) → index receipts + `EpisodeRef`s in the store; reuses W3-C staging logic; resumable | $0.5 |
+| **P1a-5s SegcapWorker** | **S1** | `ShardWorker` around the fast exact worker (identity-proven); passes conformance | $1 |
+| **R-int canary run** | C2, 6a | Run the canary on Modal; must pass before S3 | $0.5 |
+
+### Wave E (integration)
+
+| ID | Depends on | Builds | Cap |
+|---|---|---|---|
+| **S2 golden build** (coordinator + 1 tooling agent) | S1 | Oracle ×2 (NVIDIA defaults) on the 42 golden episodes, plus ×1 in deterministic mode if budget allows; Rewarder reference on 12; per-call input digests stored. Writes `docs/measurements-p0.md`, decides Gate D, PLAN v4. **Stop rule:** halt if projection exceeds cap after the first 10 episodes. | $8 |
+| **P1a-6c CLI/SDK** | 6a, 6b, 5c | `flora run/status/resume/results/report/cancel` wired to orchestrator, reconciler, planner and compose; SDK `submit/Job`; README quickstart | $0 |
+| **S3 e2e + chaos** | Wave D, 6c, R-int | Internal v0.1: real `flora index → plan → run` on ~8 golden episodes, outputs vs S2 oracle (inputs identical; outputs within noise); chaos: `simulate_preemption()`, injected OOM episode, orchestrator kill, budget stop/resume | $4 |
+
+### Wave F (the cheap path)
+
+| ID | Depends on | Builds | Cap |
+|---|---|---|---|
+| **P1b-1 vLLM engines** | Fix-X, P1b-0 (merged), Fix-E (merged) | Offline `LLM` + micro-batcher for merged TempSeg and BF16 Captioner; `vllm_prompt` + `assert_engine_kwargs` + 32k budget; Gate A (`dt_bias` FP32) measured | $3 |
+| **P1b-2 certification** | S2, P1b-1 | `balanced` vs oracle: L0 (input parity) and L3 (task metrics within oracle noise); certificates for the D16 matrix | $6 |
+
+**Reserve ≈ $8.** Every branch gets an independent re-review before merge. Thematic reviewers (like review 3) run at each wave boundary to catch integration seams.

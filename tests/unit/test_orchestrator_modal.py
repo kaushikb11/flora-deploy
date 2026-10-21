@@ -1,11 +1,17 @@
-"""Modal-facing pieces, offline: the TimeoutError-subclass trap, ModalSpawner over fake Cls /
-FunctionCall APIs, the Dict lease, and the app's module-scope definitions."""
+"""Modal-facing pieces, offline: what ``FunctionCall.get(timeout=0)`` really raises in the
+installed modal (1.6.2), ModalSpawner over fake Cls / FunctionCall APIs, the Dict lease, the
+TickDriver (refresh, budget hard cap hook, transient-error retry), the scheduled reconciler and
+the app's module-scope definitions."""
 
 from __future__ import annotations
 
+import builtins
+import importlib.metadata
+import inspect
 from dataclasses import asdict
 
 import pytest
+from modal import exception as mx
 
 from flora_deploy.jobs.orchestrator import DictLease
 from flora_deploy.jobs.types import ShardReceipt
@@ -18,24 +24,20 @@ from flora_deploy.modal_app.orchestrator_app import (
 from tests.fakes.jobs import FakeClock, FakeDict
 
 
-# Mirrors modal.exception: both "terminal" errors subclass the "pending" TimeoutError.
-class FakeTimeoutError(Exception):
-    pass
-
-
-class FakeOutputExpiredError(FakeTimeoutError):
-    pass
-
-
-class FakeFunctionTimeoutError(FakeTimeoutError):
-    pass
-
-
 class FakeInputCancellation(BaseException):
     pass
 
 
-FAKE = ModalErrors(FakeTimeoutError, FakeOutputExpiredError, FakeFunctionTimeoutError,
+# Offline errors for the spawner tests: same shape as modal_errors(), self-made classes.
+class FakeOutputExpiredError(Exception):
+    pass
+
+
+class FakeFunctionTimeoutError(Exception):
+    pass
+
+
+FAKE = ModalErrors((builtins.TimeoutError,), FakeOutputExpiredError, FakeFunctionTimeoutError,
                    (FakeInputCancellation,))
 
 
@@ -46,33 +48,71 @@ def _raise(exc):
 
 
 RECEIPT = ShardReceipt("s1", "segcap", "c", "ta-1", ("u",), (), ("p",), "H200", 1.0, "t")
+REAL = modal_errors()
 
 
-@pytest.mark.parametrize("errors", [FAKE, modal_errors()], ids=["fake", "modal"])
-def test_timeout_subclasses_are_not_read_as_pending(errors):
-    assert issubclass(errors.output_expired, errors.timeout)
-    assert issubclass(errors.function_timeout, errors.timeout)
-    assert status_from_get("fc", _raise(errors.timeout()), errors).state == "pending"
-    assert status_from_get("fc", _raise(errors.output_expired()), errors).state == "expired"
-    st = status_from_get("fc", _raise(errors.function_timeout("24h")), errors)
+def test_still_running_call_is_pending_exactly_as_modal_raises_it():
+    """modal 1.6.2 ``poll_function``: ``raise TimeoutError()``, the *builtin*, no args."""
+    assert status_from_get("fc", _raise(builtins.TimeoutError()), REAL).state == "pending"
+    # the review's trap: before the fix this came back "failed" and every running shard was
+    # respawned without cancelling the original call
+    assert REAL.pending == (builtins.TimeoutError,)
+
+
+def test_real_modal_terminal_errors_map_to_terminal_states():
+    assert status_from_get("fc", _raise(mx.OutputExpiredError()), REAL).state == "expired"
+    st = status_from_get("fc", _raise(mx.FunctionTimeoutError("24h")), REAL)
     assert st.state == "failed" and "FunctionTimeoutError" in st.error
-    assert status_from_get("fc", _raise(errors.cancelled[0]()), errors).state == "cancelled"
-    st = status_from_get("fc", _raise(ValueError("user bug")), errors)
+    assert status_from_get("fc", _raise(mx.InputCancellation()), REAL).state == "cancelled"
+    st = status_from_get("fc", _raise(mx.InternalFailure("boom")), REAL)  # a call result
+    assert st.state == "failed"
+    st = status_from_get("fc", _raise(ValueError("user bug")), REAL)
     assert st.state == "failed" and "user bug" in st.error
+    # a worker's own TimeoutError("...") re-raised by get(): a failure, not pending forever
+    st = status_from_get("fc", _raise(builtins.TimeoutError("hf download timed out")), REAL)
+    assert st.state == "failed" and "hf download" in st.error
+    # modal's own TimeoutError family is not "pending" (only the builtin is)
+    assert status_from_get("fc", _raise(mx.TimeoutError()), REAL).state == "failed"
 
 
-def test_naive_ordering_would_fall_into_the_trap():
-    """Documents why the order matters: a TimeoutError-first handler swallows expiry."""
-    def naive(get):
-        try:
-            get()
-        except FakeTimeoutError:
-            return "pending"
-        except FakeOutputExpiredError:  # unreachable
-            return "expired"
+def test_transient_client_errors_keep_the_call_pending():
+    for exc in (mx.ConnectionError("reset"), mx.ServiceError("503"), mx.InternalError("x"),
+                mx.ResourceExhaustedError("slow down")):
+        st = status_from_get("fc", _raise(exc), REAL)
+        assert st.state == "pending" and st.error.startswith("transient"), exc
 
-    assert naive(_raise(FakeOutputExpiredError())) == "pending"
-    assert status_from_get("fc", _raise(FakeOutputExpiredError()), FAKE).state == "expired"
+
+def test_exception_classes_and_order_match_installed_modal():
+    """Subclass facts the except-clause order in ``status_from_get`` relies on."""
+    assert not issubclass(builtins.TimeoutError, mx.TimeoutError)
+    assert not issubclass(mx.TimeoutError, builtins.TimeoutError)
+    for cls in (mx.OutputExpiredError, mx.FunctionTimeoutError):
+        assert issubclass(cls, mx.TimeoutError) and not issubclass(cls, builtins.TimeoutError)
+    for cls in REAL.transient:
+        assert not issubclass(cls, (builtins.TimeoutError, mx.OutputExpiredError,
+                                    mx.FunctionTimeoutError))
+    assert issubclass(mx.InputCancellation, BaseException)
+    assert not issubclass(mx.InputCancellation, Exception)
+
+
+def test_installed_modal_still_raises_what_we_assume():
+    """Fails loudly if a modal upgrade changes what a pending/expired ``get(timeout=0)`` raises:
+    re-check ``modal_errors()`` and the notes in ``orchestrator_app`` before bumping the pin."""
+    import modal._functions as mf
+    from modal._utils import function_utils as fu
+
+    assert importlib.metadata.version("modal") == "1.6.2"
+    src = inspect.getsource(mf._Invocation.poll_function)
+    assert "raise OutputExpiredError()" in src
+    assert "raise TimeoutError()" in src
+    # the bare name resolves to the builtin: _functions does not import modal's TimeoutError
+    assert "TimeoutError" not in vars(mf)
+    assert mf.OutputExpiredError is mx.OutputExpiredError
+    src = inspect.getsource(mf._FunctionCall.get)
+    assert "poll_function(timeout=timeout" in src
+    src = inspect.getsource(fu._process_result)
+    assert "raise FunctionTimeoutError(" in src and "raise InternalFailure(" in src
+    assert fu.FunctionTimeoutError is mx.FunctionTimeoutError
 
 
 @pytest.mark.parametrize("result", [RECEIPT, asdict(RECEIPT)], ids=["dataclass", "dict"])
@@ -95,7 +135,7 @@ class _FC:
         return self.outcome
 
     def cancel(self, terminate_containers=False):
-        self.cancelled = True
+        self.cancelled = "terminate" if terminate_containers else True
 
 
 class _CallAPI:
@@ -110,7 +150,7 @@ class _Method:
 
     def spawn(self, *args):
         self.log.append((self.cls_name, args))
-        return _FC(f"fc-{len(self.log)}", FakeTimeoutError())
+        return _FC(f"fc-{len(self.log)}", builtins.TimeoutError())
 
 
 class _ClsAPI:
@@ -135,7 +175,9 @@ def test_modal_spawner_spawn_poll_cancel_with_fake_apis():
     _FC.registry[cid2].outcome = FakeOutputExpiredError()
     assert sp.poll(cid2).state == "expired"
     sp.cancel(cid)
-    assert _FC.registry[cid].cancelled
+    assert _FC.registry[cid].cancelled is True
+    sp.terminate(cid2)
+    assert _FC.registry[cid2].cancelled == "terminate"
     with pytest.raises(ValueError, match="no worker class"):
         sp.spawn("caption", "job", "s3", "cfg")
 
@@ -178,7 +220,7 @@ def test_orchestrator_app_definitions_are_module_scope():
 
     assert oa.app.name == "flora-orchestrator"
     assert oa.TIMEOUT_S == 24 * 3600 and oa.CPU_CORES <= 0.5
-    for fn in (oa.run, oa.reconcile):
+    for fn in (oa.run, oa.reconcile, oa.reconcile_watched):
         raw = fn._raw_f_  # private, but the only offline handle on the decorated function
         assert raw.__qualname__ == raw.__name__  # module scope, not nested/serialized
     assert "nonpreemptible: true" in str(oa.run._spec_.scheduler_placement)
