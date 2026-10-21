@@ -1,5 +1,8 @@
 # flora.yaml: the balanced preset on a small public LeRobot dataset.
-# lerobot/aloha_static_cups_open (MIT): 50 episodes of ~8 s each, 3 cameras, ~0.5 GB.
+# lerobot/aloha_static_cups_open (MIT): 50 episodes of ~8 s each, 4 cameras (cam_high,
+# cam_low, cam_left_wrist, cam_right_wrist; meta/info.json at the pinned revision), ~0.5 GB.
+# Flora takes 1 view or 3: cam_high -> main plus the two wrists, cam_low dropped, as the golden
+# set maps it (validate/golden_selection_v1.json). Embodiment: yam (bimanual ALOHA, 3 views).
 # tests/unit/test_examples.py validates this file.
 
 project: lerobot-small
@@ -25,7 +28,7 @@ input:
 
 pipeline:
   stages: [segment, caption, reward.terminal, reward.dense]
-  embodiment: yam                   # bimanual robot with 3 synchronized views
+  embodiment: yam                   # bimanual ALOHA arms, 3 synchronized views (NVIDIA's yam pool)
   episode_instruction: {source: dataset_task}
 
 output:

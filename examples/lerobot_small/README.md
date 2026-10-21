@@ -1,7 +1,12 @@
 # lerobot_small
 
 The `balanced` preset on [`lerobot/aloha_static_cups_open`](https://huggingface.co/datasets/lerobot/aloha_static_cups_open)
-(MIT; 50 episodes of about 8 s, 3 cameras, about 0.5 GB), pinned to a full commit.
+(MIT; 50 episodes of about 8 s, about 0.5 GB), pinned to a full commit.
+
+**Embodiment: `yam`** (bimanual ALOHA arms; NVIDIA's `yam` pool, as in the golden set). The
+dataset has 4 cameras; Flora takes 1 view or 3, so the config maps `cam_high` to `main`,
+`cam_left_wrist` and `cam_right_wrist` to the wrist roles, and leaves `cam_low` out (camera keys
+from `meta/info.json` at the pinned revision).
 Set `output.sink` to your bucket or Volume, then run `flora doctor -c flora.yaml` and follow the
 "Run on Modal" steps in the top-level README.
 
