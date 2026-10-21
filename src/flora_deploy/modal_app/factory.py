@@ -425,7 +425,7 @@ def plan_app(
     allow_uncertified: bool = False,
     min_containers: int = 0,
     reconcile_cron: str | None = None,
-    determinism: str = "nvidia",
+    determinism: str | None = None,
     registry: Mapping[str, WorkerRef] | None = None,
     index_function: tuple[str, str] | None = INDEX_FUNCTION,
     missing_workers: Literal["error", "skip"] = "error",
@@ -437,16 +437,31 @@ def plan_app(
     ``output.sink``). ``derived_receipts``: as for ``config.hashing.config_hash`` (exact segcap
     needs ``captioner_bf16``). ``missing_workers="skip"`` leaves out kinds whose worker class is
     not importable yet (listed in ``skipped``) instead of refusing; ``flora deploy`` never skips.
-    ``hash_kwargs``: extra ``config_hash`` arguments (tests)."""
+    ``hash_kwargs``: extra ``config_hash`` arguments (tests). ``determinism`` (``flora deploy
+    --determinism``) overrides ``pipeline.determinism`` through ``config.schema.with_pipeline``,
+    so it changes the config hash, the app name and the store paths (review 4 H3); workers get
+    ``config.schema.output_settings`` (``FLORA_DETERMINISM``, ``FLORA_TERMINAL_MODE``)."""
     from flora_deploy.accel import determinism as det
     from flora_deploy.config.hashing import config_hash
     from flora_deploy.config.presets import find_certificates, get_preset, needs_certificate
-    from flora_deploy.config.schema import to_run_settings
+    from flora_deploy.config.schema import (
+        ConfigError,
+        output_settings,
+        to_run_settings,
+        with_pipeline,
+    )
     from flora_deploy.modal_app import orchestrator_app as oa
     from flora_deploy.modal_app.images import image_fingerprint
 
-    if determinism not in det.MODES:
+    if determinism is not None and determinism not in det.MODES:
         raise DeployError(f"determinism {determinism!r}: use one of {', '.join(det.MODES)}")
+    if determinism is not None and determinism != cfg.pipeline.determinism:
+        try:
+            cfg = with_pipeline(cfg, determinism=determinism)
+        except ConfigError as e:
+            raise DeployError(str(e)) from None
+    outputs = output_settings(cfg)
+    determinism = str(outputs["determinism"])
     if min_containers < 0:
         raise DeployError("min_containers must be >= 0")
     reg = dict(WORKERS if registry is None else registry)
@@ -520,7 +535,10 @@ def plan_app(
         volumes.update(media.volumes)
         env = {**_recipe_env(ref.recipe, determinism), **base_env, **instruction_env(cfg),
                "FLORA_MEDIA_ROOT": media.root,
-               "FLORA_DETERMINISM": determinism, "FLORA_SHARD_KINDS": ",".join(kinds),
+               "FLORA_DETERMINISM": determinism,
+               "FLORA_TERMINAL_MODE": str(outputs["terminal_mode"]),
+               "FLORA_OUTPUT_SETTINGS": json.dumps(outputs, sort_keys=True),
+               "FLORA_SHARD_KINDS": ",".join(kinds),
                "FLORA_STAGE_HASHES": json.dumps({k: ch.stage_hashes[k] for k in kinds},
                                                 sort_keys=True)}
         timeout = worker_timeout_s(rs.shard_target_gpu_minutes, preset=cfg.preset,

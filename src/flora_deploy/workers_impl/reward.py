@@ -578,11 +578,13 @@ class RewardShardRunner:
                 f"episode {ref.uid!r}: no task instruction (the index receipt has none and "
                 "FLORA_INSTRUCTION_TEXT is unset); NVIDIA's reward prompts need one: use "
                 "episode_instruction.source dataset_task with tasks, or fixed + text")
-        videos = tuple(self.resolver.resolve(ref.uid, role, idx.sources[role])
-                       for role in collage_order(idx.sources))
+        roles = collage_order(idx.sources)
+        videos = tuple(self.resolver.resolve(ref.uid, role, idx.sources[role]) for role in roles)
+        sources = tuple((role, idx.sources[role].uri, idx.sources[role].start_s,
+                         idx.sources[role].end_s) for role in roles)  # provenance (L4)
         envelope_ok = True if self.settings.envelope == "ignore" else ref.envelope_ok
         ep = R.Episode(id=ref.episode_id, task=str(task), videos=videos, dataset=ref.dataset,
-                       envelope_ok=envelope_ok)
+                       envelope_ok=envelope_ok, sources=sources)
         if ep.uid != ref.uid:
             raise RuntimeError(f"index receipt is for {ep.uid!r}, manifest says {ref.uid!r}")
         R.validate_episodes([ep])
@@ -640,13 +642,20 @@ class RewardShardRunner:
         if errors:
             sink.add(errors=errors)
             sink.flush()
+        planned = shard.episodes  # NVIDIA groups follow the planned order (review 4 M3)
+        if shard.bisected_from:  # a child keeps its parent's groups
+            parent = next((p for p in manifests.load().shards
+                           if p.shard_id == shard.bisected_from), None)
+            if parent is not None and set(shard.episodes) <= set(parent.episodes):
+                planned = parent.episodes
         if episodes:
             R.run(self.engine.llm, self.nv, self.engine.processor, episodes, mode,
                   tail_trim_s=s.tail_trim_s, spec=self.engine.spec, models=dict(s.models),
                   gpu=s.gpu, preset=s.preset, certificate=s.certificate,
                   config_extra=dict(s.config_extra), limits=s.limits, decoder=s.decoder,
                   workers=s.workers, sink=sink,
-                  shard_id=shard.shard_id, container_id=self.container_id)
+                  shard_id=shard.shard_id, container_id=self.container_id,
+                  planned=planned)
         sink.flush()
         self._next_k[key] = sink.k
 

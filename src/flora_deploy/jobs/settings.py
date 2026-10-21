@@ -55,6 +55,10 @@ class RunSettings:
     scaledown_s: float = WORKER_SCALEDOWN_S  # deployed workers' ``scaledown_window``
     min_containers: int = 0  # warm containers per worker class (``flora deploy --min-containers``)
     max_episode_error_rate: float = MAX_EPISODE_ERROR_RATE
+    # Hashed, output-affecting run modes (``config.hashing.output_settings``): the exact segcap
+    # worker's GPU determinism mode and the reward.terminal mode. Workers apply exactly these.
+    determinism: str = "nvidia"
+    terminal_mode: str = "terminal"  # or "terminal_rationale"
 
     def __post_init__(self) -> None:
         if self.budget_usd <= 0:

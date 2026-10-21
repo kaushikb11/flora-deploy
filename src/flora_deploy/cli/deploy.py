@@ -104,8 +104,9 @@ def deploy(
     min_containers: Annotated[int, typer.Option(help="Warm containers per worker class.")] = 0,
     reconcile_cron: Annotated[str | None, typer.Option(
         help="Schedule the reconciler: 'on' (every 10 min) or a cron string.")] = None,
-    determinism: Annotated[str, typer.Option(
-        help="GPU determinism mode for the exact worker: nvidia | deterministic.")] = "nvidia",
+    determinism: Annotated[str | None, typer.Option(
+        help="Override pipeline.determinism (exact segcap worker): nvidia | deterministic. "
+             "Hashed: it changes the config hash and the app.")] = None,
     emit: Annotated[Path | None, typer.Option(
         "--emit", help="Write the equivalent standalone script here instead of deploying.")
     ] = None,

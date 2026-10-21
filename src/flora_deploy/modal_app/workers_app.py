@@ -183,9 +183,17 @@ def gpu_name() -> str | None:
 def reward_settings_from_env(env: Mapping[str, str] = os.environ, *,
                              gpu: str | None = None) -> RewardWorkerSettings:
     from flora_deploy.config.pins import PINS_BY_KEY
+    from flora_deploy.stages.reward import TERMINAL_MODE_ENV, terminal_mode
 
+    mode = env.get("FLORA_TERMINAL_MODE")  # config.schema.output_settings, set by the factory
+    if mode:
+        if mode not in ("terminal", "terminal_rationale"):
+            raise RuntimeError(f"FLORA_TERMINAL_MODE {mode!r}")
+        mode = terminal_mode(mode == "terminal_rationale", env)  # a legacy override must agree
+    else:
+        mode = env.get(TERMINAL_MODE_ENV, "terminal")
     return RewardWorkerSettings(
-        terminal_mode=env.get("FLORA_REWARD_TERMINAL_MODE", "terminal"),
+        terminal_mode=mode,
         preset=env.get("FLORA_PRESET", "exact"),
         models={"rewarder": PINS_BY_KEY["rewarder"].revision},
         gpu=gpu, config_extra={"image": ra.IMAGE_FP},

@@ -556,4 +556,5 @@ def to_run_settings(
         scaledown_s=scaledown_s,
         min_containers=min_containers,
         max_episode_error_rate=cfg.retries.max_episode_error_rate,
+        **output_settings(cfg),
     )

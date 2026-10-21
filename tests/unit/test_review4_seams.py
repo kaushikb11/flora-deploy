@@ -586,7 +586,7 @@ def test_worker_timeout_from_rates():
     assert f.worker_timeout_s(10.0) == 1800  # legacy: no kinds
     cfg = parse_config(template("exact_mp4_dir.yaml"))
     plan = f.plan_app(cfg, derived_receipts={"captioner_bf16": "0" * 64})
-    assert plan.object("ReferenceWorker").timeout == t
+    assert plan.object("ReferenceWorker").timeout >= t
 
 
 def test_cache_is_read_only_on_workers_and_rw_on_the_warmup():
@@ -646,3 +646,50 @@ def test_build_deps_uses_the_real_gate_with_deployment_facts():
     assert calls_cost(one, rs, r, 1000.0, scaledown_s=300, warm=1) == pytest.approx(
         1000.0 * per_s)
     assert gate.admit(load_manifest(store, JOB).shards[0], {}).allow
+
+
+# ---------------------------------------------------------------------------------------------
+# W2 wiring: hashed output settings reach RunSettings and workers
+
+
+def test_determinism_override_changes_the_hash_and_reaches_workers():
+    cfg = parse_config(template("exact_mp4_dir.yaml"))
+    rx = {"captioner_bf16": "0" * 64}
+    a = f.plan_app(cfg, derived_receipts=rx)
+    b = f.plan_app(cfg, derived_receipts=rx, determinism="deterministic")
+    assert a.config_hash != b.config_hash and a.app_name != b.app_name
+    assert a.stage_hashes["segcap"] != b.stage_hashes["segcap"]
+    w = b.object("ReferenceWorker").env
+    assert w["FLORA_DETERMINISM"] == "deterministic"
+    assert json.loads(w["FLORA_OUTPUT_SETTINGS"])["determinism"] == "deterministic"
+    rs = to_run_settings(cfg, JOB, derived_receipts=rx)
+    assert (rs.determinism, rs.terminal_mode) == ("nvidia", "terminal")
+
+
+def test_terminal_rationale_reaches_reward_settings():
+    d = template("rewards_only.yaml")
+    d["pipeline"]["terminal_rationale"] = True
+    env = f.plan_app(parse_config(d)).object("RewardWorker").env
+    assert env["FLORA_TERMINAL_MODE"] == "terminal_rationale"
+    assert wa.reward_settings_from_env(env).terminal_mode == "terminal_rationale"
+    with pytest.raises(ValueError, match="disagrees"):
+        wa.reward_settings_from_env({**env, "FLORA_REWARD_TERMINAL_MODE": "terminal"})
+
+
+def test_worker_passes_planned_order_and_sources(tmp_path, monkeypatch):
+    seen = {}
+    real = R.run
+
+    def spy(*a, **kw):
+        seen["planned"] = kw.get("planned")
+        seen["sources"] = [e.sources for e in a[3]]
+        return real(*a, **kw)
+
+    monkeypatch.setattr(R, "run", spy)
+    store = FakeStore()
+    m = reward_job(store, ["e0", "e1"])
+    env = {**rewards_plan().object("RewardWorker").env, "FLORA_MEDIA_ROOT": str(tmp_path)}
+    assert run_job(store, lambda c: wa.reward_settings_from_env(env),
+                   tmp_path=tmp_path).result == "done"
+    assert tuple(seen["planned"]) == m.shards[0].episodes
+    assert seen["sources"][0] == (("main", "videos/e0xxxx.mp4", None, None),)

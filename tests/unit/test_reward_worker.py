@@ -186,7 +186,7 @@ def test_terminal_shard_records_parts_and_receipt_last(tmp_path, lag):
     assert [r.uid for r in records] == list(shard.episodes)
     assert all(r.stage == "reward.terminal" and r.provenance.config_hash == CFG
                and r.certified and r.terminal is not None for r in records)
-    assert records[0].provenance.source["camera_0"]["uri"] == "/v/ammmm"
+    assert records[0].provenance.source["main"]["uri"] == "/v/ammmm"  # role-keyed
     audits = [json.loads(line) for k in (0, 1) for line in store.get_bytes(
         PATHS.audit(CFG, shard.kind, shard.shard_id, "c1", k)).decode().splitlines()]
     assert [a["uid"] for a in audits] == list(shard.episodes)
@@ -211,7 +211,7 @@ def test_dense_shard_three_views_in_collage_order(tmp_path):
     (part,) = rec.parts
     (r,) = P.read_part(jf_of(store), part)
     assert r.stage == "reward.dense" and r.dense is not None and r.dense.per_step
-    assert [r.provenance.source[f"camera_{i}"]["uri"] for i in range(3)] == [
+    assert [r.provenance.source[r_]["uri"] for r_ in ("left_wrist", "main", "right_wrist")] == [
         "/v/llllll", "/v/mmmmmm", "/v/rrrrrr"]
 
 
