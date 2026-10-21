@@ -14,8 +14,9 @@
   :func:`modal_billing_provider` reads Modal's hourly billing, and the gate takes the largest of
   the three (:class:`SpendReport`).
 * **Estimates** (:class:`RateTableEstimator`): ``planner/rates.json``, the same measured rates
-  ``flora plan`` uses (exact segcap 8.62 container-s per video-s at c=1, 4.08 at c=4), plus its
-  per-container startup, calibrated online from finished calls. ``Shard.est_gpu_seconds``
+  ``flora plan`` uses (exact segcap 6.4 container-s per video-s at c=4 with the deployed
+  ``gpu_thread``, P1a-5s), plus its per-container startup, calibrated online from finished
+  calls. ``Shard.est_gpu_seconds``
   (placeholder manifest rates, :class:`ManifestEstimator`) is only a fallback.
 * **Projection** (:func:`project`): spend + in-flight (remaining estimate) + queued + future
   container starts.
@@ -424,11 +425,13 @@ class RateTableEstimator:
     """Estimates from ``planner/rates.json`` (:class:`~flora_deploy.planner.rates.RateTable`).
 
     Shard cost = video seconds × ``container_s_per_video_s`` for (preset, kind, cameras,
-    concurrency = the pool's ``max_inputs``), e.g. exact segcap 8.62 container-s per video-s at
-    c=1 and 4.08 at c=4. Video seconds come from ``durations`` (uid -> seconds, from the manifest's
-    ``EpisodeRef.duration_s``) or, without them, are recovered from ``est_gpu_seconds`` by
-    dividing out the manifest's placeholder rate (``jobs.manifest.DEFAULT_RATES``). ``quantile=
-    "upper"`` charges the top of each rate's error bar (``× (1 + uncertainty)``)."""
+    concurrency = the pool's ``max_inputs``, features = the deployed configuration's,
+    ``planner.rates.DEPLOYED_FEATURES``), e.g. exact segcap 6.4 container-s per video-s (c=4,
+    gpu_thread; the only usable cu128 row, so c=1 uses it too). Video seconds come from
+    ``durations`` (uid -> seconds, from the manifest's ``EpisodeRef.duration_s``) or, without
+    them, are recovered from ``est_gpu_seconds`` by dividing out the manifest's placeholder
+    rate (``jobs.manifest.DEFAULT_RATES``). ``quantile="upper"`` charges the top of each
+    rate's error bar (``× (1 + uncertainty)``)."""
 
     table: RateTable
     preset: str
@@ -576,7 +579,9 @@ class ProjectionBudgetGate:
 
     **Estimates** default to ``planner/rates.json`` (:class:`RateTableEstimator`), the numbers
     ``flora plan`` uses, and are calibrated online: per kind, the mean of (observed wall time −
-    startup) / (estimate × max_inputs) over finished calls, never below ``calibration``."""
+    startup) / (estimate × max_inputs) over finished calls, never below ``calibration``; the
+    startup is subtracted only from calls that needed a new container (no earlier call of the
+    kind ended within ``scaledown_s`` before the spawn)."""
 
     settings: RunSettings
     store: Store
@@ -696,6 +701,14 @@ class ProjectionBudgetGate:
             return cal
         by_id = self._shard_map()
         ratios: dict[str, list[float]] = {}
+        # Review 5 M-C / review 4 M5: startup is paid once per container, not per call. A call
+        # spawned when an earlier call of its kind had ended within ``scaledown_s`` ran on that
+        # warm container: its wall time is all work. Only the other ("cold") calls have the
+        # startup subtracted (subtracting it from every call under-calibrates long jobs).
+        ended: dict[str, list[float]] = {}
+        for c in self._state.calls:
+            if c.ended_at is not None:
+                ended.setdefault(c.kind, []).append(c.ended_at)
         for c in self._state.calls:
             s = by_id.get(c.shard_id)
             if c.outcome != "success" or c.ended_at is None or s is None:
@@ -703,7 +716,10 @@ class ProjectionBudgetGate:
             est = self._cs(s) * max(self.settings.pools[s.kind].max_inputs, 1)
             if est <= 0:
                 continue
-            work = max(c.ended_at - c.spawned_at - self._startup(s.kind), 0.0)
+            warm = any(c.spawned_at - self.scaledown_s <= t <= c.spawned_at
+                       for t in ended.get(c.kind, ()))
+            startup = 0.0 if warm else self._startup(s.kind)
+            work = max(c.ended_at - c.spawned_at - startup, 0.0)
             ratios.setdefault(s.kind, []).append(work / est)
         for kind, rs in ratios.items():
             cal[kind] = max(cal.get(kind, 1.0), sum(rs) / len(rs))

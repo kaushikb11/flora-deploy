@@ -181,10 +181,13 @@ def test_incomplete_job_needs_partial(store):
 
 
 def test_failed_episodes_poison_pills_and_errors_in_summary(store):
-    probe, _ = setup_job(LocalStore(store.root / "probe"), target_min=0.01)
+    # terminal shards hold whole NVIDIA groups of 8 (review 5 M-B): 9 episodes give a group
+    # of 8 and a single-episode group (the one that is poison-pilled below)
+    probe, _ = setup_job(LocalStore(store.root / "probe"), n=9, target_min=0.01)
     terms = [s for s in probe.shards if s.kind == "reward.terminal"]
-    assert len(terms) == 4  # one episode per shard at this target
-    m, jf = setup_job(store, target_min=0.01, skip=(terms[0].shard_id, terms[1].shard_id))
+    assert [len(t.episodes) for t in terms] == [8, 1]
+    m, jf = setup_job(store, n=9, target_min=0.01,
+                      skip=(terms[0].shard_id, terms[1].shard_id))
     # NVIDIA failed one episode: the receipt lists it as failed, with an error file.
     uid = terms[0].episodes[0]
     finish(jf, m, terms[0], failed=(uid,))
@@ -195,12 +198,12 @@ def test_failed_episodes_poison_pills_and_errors_in_summary(store):
     quarantine(jf, terms[1], created_utc="2026-01-02", starts=3)
     s = compose(store, JOB).summary
     st = s["stages"]["reward.terminal"]
-    # 2 of 4 excluded: resolved, but above the error-rate guard (not a clean "complete")
+    # 2 of 9 excluded: resolved, but above the error-rate guard (not a clean "complete")
     assert not s["complete"] and s["status"] == "completed_with_errors"
-    assert s["problems"] == ["reward.terminal: 2 of 4 episodes excluded (50% > 10%)"]
+    assert s["problems"] == ["reward.terminal: 2 of 9 episodes excluded (22% > 10%)"]
     assert compose(store, JOB, max_error_rate=0.5).summary["status"] == "complete"
-    assert st["records"] == 2 and st["excused"] == 2 and st["missing"] == 0
-    assert st["episodes"] == {"done": 2, "failed": 1, "poison_pill": 1}
+    assert st["records"] == 7 and st["excused"] == 2 and st["missing"] == 0
+    assert st["episodes"] == {"done": 7, "failed": 1, "poison_pill": 1}
     assert s["poison_pills"] == [f"{terms[1].episodes[0]}/reward.terminal"]
     assert s["errors"]["by_kind"]["nv_failure"] == 1
     assert s["errors"]["by_stage"]["reward.terminal"] >= 1

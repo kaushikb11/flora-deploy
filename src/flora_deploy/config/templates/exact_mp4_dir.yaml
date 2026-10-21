@@ -30,6 +30,7 @@ pipeline:
     source: fixed                   # dataset_task | fixed | none
     text: Fold the towel.
   envelope: warn                    # warn | enforce | ignore
+  # determinism: nvidia             # nvidia | deterministic (D-1, a different reference)
 
 resources:
   segcap: {max_containers: 2}       # 2 x H200 (the preset's GPU)

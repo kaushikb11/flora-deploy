@@ -7,6 +7,7 @@ import pytest
 
 from flora_deploy.jobs.manifest import (
     DEFAULT_RATES,
+    NVIDIA_TERMINAL_GROUP,
     build_manifest,
     load_manifest,
     manifest_from_json,
@@ -109,6 +110,21 @@ def test_packing_respects_target_and_groups_by_file(seed):
         flat = [u for s in shards for u in s.episodes]
         assert sorted(flat) == sorted(by_uid)
         rate = DEFAULT_RATES[kind]
+        if kind == "reward.terminal":  # review 5 M-B: whole NVIDIA groups of the job order
+            job = [e.uid for e in m.episodes]
+            assert flat == job
+            pos = 0
+            for a in shards:
+                assert pos % NVIDIA_TERMINAL_GROUP == 0  # every boundary is a group boundary
+                pos += len(a.episodes)
+                est = sum(by_uid[u].duration_s * rate for u in a.episodes)
+                assert a.est_gpu_seconds == pytest.approx(est)
+                assert est <= target + 1e-6 or len(a.episodes) <= NVIDIA_TERMINAL_GROUP
+            for a, b in zip(shards, shards[1:], strict=False):
+                nxt = b.episodes[:NVIDIA_TERMINAL_GROUP]
+                g_est = sum(by_uid[u].duration_s * rate for u in nxt)
+                assert a.est_gpu_seconds + g_est > target - 1e-6
+            continue
         for s in shards:
             est = sum(by_uid[u].duration_s * rate for u in s.episodes)
             assert s.est_gpu_seconds == pytest.approx(est)
@@ -148,3 +164,27 @@ def test_manifest_json_roundtrip_and_store():
     store = FakeStore()
     save_manifest(store, m)
     assert load_manifest(store, m.job_id) == m
+
+
+@pytest.mark.parametrize("target_min", [117 / 60, 1.5, 0.01, 100.0])
+def test_terminal_shards_hold_whole_nvidia_groups(target_min):
+    """Review 5 M-B: 20 episodes of 9 terminal GPU-s each. Next-fit by duration alone cuts
+    13 + 7 at a 117 s target; terminal shards are cut on NVIDIA's group boundaries (8) of the
+    job's episode list instead, whatever the target, so a group never spans shards. Other
+    kinds keep the duration packing."""
+    idx = [make_index("d", f"e{i:02d}", f"/f{i:02d}.mp4", 30.0) for i in range(20)]
+    m = build_manifest(idx, make_settings(target_min=target_min), created_utc="t",
+                       rates={"reward.terminal": 0.3, "segcap": 0.3})
+    job = [e.uid for e in m.episodes]
+    term = [s.episodes for s in m.shards if s.kind == "reward.terminal"]
+    assert [u for s in term for u in s] == job
+    cuts, pos = set(), 0
+    for s in term[:-1]:
+        pos += len(s)
+        cuts.add(pos)
+    assert all(c % NVIDIA_TERMINAL_GROUP == 0 for c in cuts)
+    want = {117 / 60: {8}, 1.5: {8, 16}, 0.01: {8, 16}, 100.0: set()}[target_min]
+    assert cuts == want
+    if target_min == 117 / 60:  # the duration packing (segcap) is the reviewer's 13 + 7
+        seg = [len(s.episodes) for s in m.shards if s.kind == "segcap"]
+        assert seg == [13, 7]

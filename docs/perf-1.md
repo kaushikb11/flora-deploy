@@ -38,7 +38,8 @@ or logits were written anywhere.
   - The `python:3.12.10-slim-bookworm` base switch is not involved: the slowdown is entirely
     inside the cuDNN SDPA graph build. The `cu130_slim` variant is in the lab but was not run;
     the budget went to the A/B.
-- **Fix in our layer, opt-in, fidelity-neutral: `accel.gpu_thread`.**
+- **Fix in our layer, fidelity-neutral: `accel.gpu_thread`** (introduced here as an opt-in;
+  wired and **on by default** in the exact worker since P1a-5s, see below).
   - It runs every NVIDIA `generate` on one persistent thread, so each shape's graph is built
     once per container instead of once per call.
   - It changes no input, no argument, no backend and no kernel selection. Only the OS thread
@@ -160,7 +161,7 @@ So a non-cuDNN backend is a *different, self-consistent* reference. It is accept
 explicit D-1 `deterministic` opt-in, recorded in provenance and never compared bit-for-bit
 against default references.
 
-## The opt-in: `flora_deploy.accel.gpu_thread`
+## `flora_deploy.accel.gpu_thread` (on by default since P1a-5s)
 
 - `GpuThread()` is one persistent worker thread. `run(fn, ...)` executes `fn` there and waits:
   - results and exceptions pass through unchanged;
@@ -183,11 +184,12 @@ against default references.
   - the mode guard, with fakes and with real CPU torch;
   - double-install refusal;
   - restore.
-- **Not wired** into `reference_app.py` or `stages/reference.py`, which other agents own. To
-  wire it, in `ReferenceWorker.load`:
-  1. call `gpu_thread.install(nv, patcher)` before `install_gpu_lock`;
-  2. add an `ExactProfile` toggle `gpu_thread`, on by default;
-  3. record `provenance()` in `load_report.profile` and batch provenance.
+- **Wired (P1a-5s).** `stages.reference.ExactProfile.gpu_thread` is a toggle, **on by
+  default**: the exact worker installs `gpu_thread` once per container, before the GPU lock, and
+  records `provenance()` in the load report and the batch provenance. It is disabled only
+  through the profile's `disable` list (`gpu_thread`), which the deploy factory never sets, so
+  every deployed exact worker runs with it. The rate table treats it as a deployed feature
+  (`planner.rates.DEPLOYED_FEATURES`).
 
 ### Expected effect (projection, not yet measured end to end)
 
@@ -212,19 +214,31 @@ Generation GPU-seconds per video-second:
   also costs one prefill build (≈ 1.3 s).
 - The worst case (every Captioner step cold) is still ~2.2× faster than today.
 
-### Proposed `planner/rates.json` corrections (not applied here)
+### `planner/rates.json` (as applied; review 5 M-C)
 
-| Entry (`exact`, `segcap`, cameras 1) | Now | Proposal |
+This section originally proposed 7.0 measured (no `gpu_thread`) and 4.35 projected (with it).
+P1a-5s then measured the wired worker, and the table now holds:
+
+| Entry (`exact`, `segcap`, cameras `*`) | Value | Status |
 |---|---|---|
-| concurrency 4 | 4.08 container-s/video-s, "measured" (W3-A, **cu130 image**) | **Current image as is: 7.0** (S1 measured 0.143 video-h/GPU-h, ±35%, status `measured`). **With `gpu_thread`: 4.35** (≈ 0.23 video-h per container-h: the GPU bound drops from 6.3 to ≤ 3.9 GPU-s per video-s, and W3-A's 0.245 is the CPU/straggler ceiling at c=4). Status `projected`, ±35%, until a run confirms it |
-| concurrency 8 | 2.5, projected | Keep, but only valid with `gpu_thread` **and** a long-lived container with a warm Captioner. Otherwise ≈ 4 |
+| concurrency 4, `gpu_thread` on (deployed) | **6.4** container-s/video-s (P1a-5s: 6 golden episodes, 80.97 video-s, 519 s) | `measured`, ±35%. The default for `flora plan` and the budget gate |
+| concurrency 4, `gpu_thread` off | 7.0 (S1) | `measured`, `excludes: [gpu_thread]` |
+| concurrency 4, `gpu_thread`, Perf-1 projection | 4.35 | `stale` (superseded by the 6.4 measurement of the same configuration) |
+| concurrency 8 | 2.5 | `projected`, `requires: [gpu_thread, long_lived_container]`: a projection option only |
 
-At $5.68/h:
-- current image ≈ **$40** per video-h;
-- with `gpu_thread` ≈ **$25** per video-h, projected;
-- long-lived c=8 ≈ $14.
+The 6.4 is honest for the deployed configuration but carries known biases:
+- it is a 1-/3-view mix (half the episodes are 3-view), so it is bucketed cameras `*`;
+- the run's container had 160 GiB of memory ($6.20/h, $39.7/video-h), while the preset's
+  default pool is 96 GiB ($5.68/h, **$36.4/video-h**); plans price the configured pool;
+- it includes the per-shard fill/drain idle (≈110 s fill bubble plus the drain tail, ≈21% of the
+  wall; generation alone is 5.04 GPU-s per video-s), which recurs on every shard at the default
+  10-GPU-minute shards. Overlapping shards would remove most of it (≈5.2, a projection);
+- the Captioner stayed cold (short-lived container), and the run overlapped an FP32 Captioner
+  prefetch that production does not do (pessimistic).
 
-The W3-A $23 figure belongs to the cu130 image.
+The 4.35 projection was ≈1.5× too optimistic for a short-lived container: TempSeg warmed as
+predicted (0.41 → 0.27 s/token), the Captioner did not. Long-lived c=8 ≈ $14 stays a
+projection. The W3-A $23 figure belongs to the cu130 image.
 
 **Next step (≈ $0.6):** one cu128 run of the lab with `--threads`. Its `fresh_thread` /
 `gpu_thread_1` / `gpu_thread_2` / `main_thread_again` modes on w0 directly confirm the cache

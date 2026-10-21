@@ -16,13 +16,15 @@ persists results per round:
   (tested); only numerics can tell groupings apart.
 - **Stable NVIDIA groups (review 4 M3).** NVIDIA's terminal score depends on its batch-mates.
   The default grouping is a pure function of the *planned* episode order (``run(planned=...)``:
-  the job's or shard's original episode list, as NVIDIA's script would read a jobs file):
+  the **job's** original episode list, as NVIDIA's script would read the whole jobs file; the
+  manifest cuts ``reward.terminal`` shards on group boundaries, so a shard holds whole groups,
+  review 5 M-B):
   episode at planned position ``p`` belongs to terminal group ``p // max_num_seqs``, and dense
   clip ``j`` of an episode to chunk ``j // max_num_seqs``. Episodes already done, failed or
   skipped on a resume or bisection leave *holes* in their group (a partial group) and never
   shift the other groups' boundaries. Every audit records its ``grouping`` (group id, planned
   members, the batch that actually ran, ``aligned`` and why not: ``partial_group``,
-  ``budget_split``, ``retry_singleton``, ``packed``).
+  ``group_outside_planned``, ``budget_split``, ``retry_singleton``, ``packed``).
 - Video decoding (NVIDIA's ``Collage``) runs on a thread pool or a spawn process pool
   (``nv.pool_initializer()``), a bounded number of episodes ahead, so round k+1 decodes while
   round k generates.
@@ -605,7 +607,10 @@ def config_hash(nv, mode: str, *, spec: EngineSpec | None, models: dict[str, str
     image fingerprint). The decoder is excluded (it never changes outputs). Round limits are
     excluded too, but they are *not* output-neutral in general: ``align="packed"`` and budget
     splits change batch composition, hence numerics. ``exact`` uses ``align="nvidia"``, whose
-    groups depend only on the planned order, and every audit records its ``grouping``."""
+    groups depend only on the job's planned order, and every audit records its ``grouping``.
+    :func:`run` adds ``{"grouping": "packed"}`` to ``extra`` in packed mode (so the record's
+    ``provenance.config_hash`` differs from NVIDIA mode's) and leaves those records
+    uncertified (``packed_grouping``)."""
     from flora_deploy import LOGIC_VERSION
 
     core = nv.core
@@ -829,13 +834,24 @@ def _prepared_stream(nv, mode: str, episodes: Sequence[Episode], pool: Executor 
 
 
 def plan_positions(episodes: Sequence[Episode], planned: Sequence[str] | None, offset: int,
-                   group: int) -> tuple[list[int], Callable[[int], list[str]]]:
-    """Planned position of every episode, and ``members(g)``: the planned uids of terminal
-    group ``g`` (positions ``g*group .. (g+1)*group - 1``). ``episodes`` must be a subsequence
-    of ``planned``, in planned order (a caller bug otherwise, so it raises)."""
+                   group: int, total: int | None = None
+                   ) -> tuple[list[int], Callable[[int], tuple[list[str], bool]]]:
+    """Planned position of every episode, and ``members(g)``: ``(uids, complete)`` for terminal
+    group ``g`` (job positions ``g*group .. (g+1)*group - 1``). ``episodes`` must be a
+    subsequence of ``planned``, in planned order (a caller bug otherwise, so it raises).
+
+    ``planned`` covers job positions ``offset .. offset+len(planned)-1`` of a planned order of
+    ``total`` episodes (default ``total = offset + len(planned)``: the list runs to the end of
+    the job). ``complete`` is False when part of the group lies outside that window (a group
+    cut by a shard edge, review 5 M-B): its true members are unknown here, so it is never
+    reported as aligned."""
     if offset < 0:
         raise ValueError(f"planned_offset {offset} < 0")
     uids = [e.uid for e in episodes] if planned is None else [str(u) for u in planned]
+    end = offset + len(uids)
+    total = end if total is None else int(total)
+    if total < end:
+        raise ValueError(f"planned_total {total} < planned_offset + len(planned) = {end}")
     index: dict[str, int] = {}
     for i, uid in enumerate(uids):
         if uid in index:
@@ -849,9 +865,10 @@ def plan_positions(episodes: Sequence[Episode], planned: Sequence[str] | None, o
     if any(b <= a for a, b in zip(positions, positions[1:], strict=False)):
         raise ValueError("episodes are not in their planned order (NVIDIA groups follow it)")
 
-    def members(g: int) -> list[str]:
-        lo, hi = max(0, g * group - offset), max(0, (g + 1) * group - offset)
-        return uids[lo:hi]
+    def members(g: int) -> tuple[list[str], bool]:
+        lo, hi = g * group, min((g + 1) * group, total)
+        complete = lo >= offset and hi <= end
+        return uids[max(0, lo - offset):max(0, hi - offset)], complete
 
     return positions, members
 
@@ -865,21 +882,29 @@ def run(llm, nv, processor, episodes: Sequence[Episode], mode: str, *,
         audit_ref: Callable[[Episode], str] | None = None, shard_id: str = "adhoc",
         container_id: str = "local", clock: Callable[[], float] = time.perf_counter,
         planned: Sequence[str] | None = None, planned_offset: int = 0,
+        planned_total: int | None = None,
         ) -> RewardRun:
     """Score ``episodes`` in ``mode`` in size-bounded ``llm.generate`` rounds (module doc).
 
-    ``planned``: the original planned episode uids (the job's episode order, or the shard's
-    with ``planned_offset`` = the shard's first job position), of which ``episodes`` is the
-    remaining subsequence. NVIDIA groups are taken from these positions, so a resume or a
-    bisection that drops done/failed episodes keeps every other episode's batch-mates. Without
-    it, positions are the indices of ``episodes`` (NVIDIA's script run on this list)."""
+    ``planned``: the original planned episode uids, of which ``episodes`` is the remaining
+    subsequence: the **job's** reward-episode order (the reward worker passes the manifest's
+    episode list, review 5 M-B), as NVIDIA's script would read the whole jobs file. A window of
+    it is allowed: ``planned_offset`` = its first job position and ``planned_total`` = the
+    job's length (default: the window runs to the job's end); a group that the window cuts is
+    run with the members it has and flagged ``group_outside_planned`` (never ``aligned``).
+    NVIDIA groups are taken from job positions, so a resume or a bisection that drops
+    done/failed episodes keeps every other episode's batch-mates, and shard sizing never picks
+    them. Without ``planned``, positions are the indices of ``episodes`` (NVIDIA's script run
+    on this list)."""
     check_mode(mode)
     episodes = validate_episodes(episodes)
     limits = limits or RoundLimits()
     if spec is not None and limits.align == "nvidia":  # NVIDIA's group is its max_num_seqs
         limits = dataclasses.replace(limits, nvidia_group=int(spec.args["max_num_seqs"]))
     positions, members_of = plan_positions(episodes, planned, planned_offset,
-                                           limits.nvidia_group)
+                                           limits.nvidia_group, planned_total)
+    if limits.align != "nvidia":  # review 5 L-c: visible in every record, not only the audit
+        config_extra = {**(config_extra or {}), "grouping": limits.align}
     anchor = "list" if planned is None else "planned"
     lookahead = lookahead or max(2, 2 * workers)
     stage = STAGES[mode]
@@ -895,7 +920,14 @@ def run(llm, nv, processor, episodes: Sequence[Episode], mode: str, *,
         "requests": [], "flagged": {}, "limits": asdict(limits), "decoder": decoder,
         "workers": workers if decoder != "inline" else 0, "config_hash": base.config_hash,
         "grouping": {"align": limits.align, "anchor": anchor, "group": limits.nvidia_group,
-                     "planned_offset": planned_offset, "unaligned": 0},
+                     "planned_offset": planned_offset,
+                     "planned_total": (planned_offset + len(planned) if planned_total is None
+                                       else planned_total) if planned is not None else None,
+                     "planned_digest": hashlib.sha256("\n".join(
+                         str(u) for u in (planned if planned is not None
+                                          else [e.uid for e in episodes])).encode()
+                     ).hexdigest()[:16],
+                     "unaligned": 0},
     }
     out = RewardRun(mode, [], [], [], stats)
     if not episodes:
@@ -927,9 +959,11 @@ def run(llm, nv, processor, episodes: Sequence[Episode], mode: str, *,
                 reasons.append("budget_split")
         else:
             g = pos // group_size
-            members = members_of(g)
+            members, complete = members_of(g)
             out_g.update(grouping_id=f"terminal:{g}", members=members,
                          batch=batch_of.get(number, []))
+            if not complete:
+                reasons.append("group_outside_planned")
             if out_g["batch"] != members:
                 reasons.append("partial_group")
             if g in split_groups:
@@ -991,6 +1025,8 @@ def run(llm, nv, processor, episodes: Sequence[Episode], mode: str, *,
                   outputs=[o.outputs[0].text for o, _ in outs])
             return
         certified, reason = certification(ep)
+        if certified and limits.align != "nvidia":  # not NVIDIA's batches: not the reference
+            certified, reason = False, "packed_grouping"
         group_info = grouping(number)
         if not group_info["aligned"] and limits.align == "nvidia":
             flags["unaligned"] = group_info["reasons"]
@@ -1245,14 +1281,28 @@ def compare(mode: str, reference: Sequence[dict[str, Any]], batched: dict[str, A
 
 def same_outputs(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
     """Two batched runs (``RewardRun.as_json()``, e.g. rounds vs one unbounded call): records,
-    NVIDIA audit lines and errors must be equal, in order."""
+    NVIDIA audit lines and errors must be equal, in order. Labels are compared without the
+    grouping-dependent provenance (``config_hash``, certification: packed mode marks its records,
+    review 5 L-c); ``provenance_equal`` reports whether those match too."""
+    def labels(run):
+        out = []
+        for r in run["records"]:
+            r = dict(r)
+            r.pop("certified", None)
+            r.pop("uncertified_reason", None)
+            r["provenance"] = {k: v for k, v in (r.get("provenance") or {}).items()
+                               if k != "config_hash"}
+            out.append(r)
+        return out
+
     def nv_lines(run):
         return [x["nv"] for x in run["audits"]]
 
     def errs(run):
         return [(e["uid"], e["kind"], e["message"]) for e in run["errors"]]
 
-    result = {"records_equal": a["records"] == b["records"],
+    result = {"records_equal": labels(a) == labels(b),
+              "provenance_equal": a["records"] == b["records"],
               "nv_equal": nv_lines(a) == nv_lines(b), "errors_equal": errs(a) == errs(b),
               "num_records": [len(a["records"]), len(b["records"])]}
     result["identical"] = all(result[k] for k in ("records_equal", "nv_equal", "errors_equal"))

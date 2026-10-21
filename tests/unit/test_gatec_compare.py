@@ -194,13 +194,16 @@ def test_gate_verdict_needs_clean_builds_and_full_coverage():
                                     row("golden-human")]},
                "captioner": {"rows": [row("golden-human")]}}
     cases = ["temporal-human", "golden-human"]
-    v = G.gate_verdict(builds, results, expected_parts=parts, expected_cases=cases)
+    hfref = {"image": "img_hfref"}
+    v = G.gate_verdict(builds, results, expected_parts=parts, expected_cases=cases,
+                       reference=hfref)
     assert v["passed"], v
     assert v["coverage"] == {"captioner": {"built": 1, "compared": 1, "passed": 1},
                              "tempseg": {"built": 3, "compared": 3, "passed": 3}}
 
-    def verdict(builds=builds, results=results, cases=cases):
-        return G.gate_verdict(builds, results, expected_parts=parts, expected_cases=cases)
+    def verdict(builds=builds, results=results, cases=cases, **kw):
+        return G.gate_verdict(builds, results, expected_parts=parts, expected_cases=cases,
+                              **{"reference": hfref, **kw})
 
     # a build error fails the gate, even though every compared row passed
     errs = [dict(b) for b in builds]
@@ -226,19 +229,28 @@ def test_gate_verdict_needs_clean_builds_and_full_coverage():
 
     # review 4 L3: a golden pool below its request quota fails (the recorded run's tianji
     # TempSeg had 5 of 6)
-    v = G.gate_verdict(builds, results, expected_parts=parts, expected_cases=cases, quota=2)
+    v = verdict(quota=2)
     assert not v["passed"]
     assert "tempseg golden:human: 1 of 2 requests (quota shortfall)" in v["problems"]
-    assert G.gate_verdict(builds, results, expected_parts=parts, expected_cases=cases,
-                          quota=1)["passed"]
+    assert verdict(quota=1)["passed"]
     own = [dict(b, quota=3) if b["part"].startswith("golden:") else b for b in builds]
-    assert not G.gate_verdict(own, results, expected_parts=parts, expected_cases=cases)["passed"]
+    assert not verdict(builds=own)["passed"]
     assert any("no quota" in w for w in verdict()["warnings"])
+    # review 5 M-A: a build's own lower quota never lowers the caller's floor
+    low = [dict(b, quota=1) if b["part"].startswith("golden:") else b for b in builds]
+    assert not verdict(builds=low, quota=2)["passed"]
+    assert not verdict(builds=own, quota=1)["passed"]  # nor does the caller lower the build's
+    # review 5 M-A: a pool the golden selection cannot fill fails with that reason
+    cap = {"human": {"episodes": 1, "max_requests": 1, "satisfiable": False}}
+    v = verdict(quota=2, capacity=cap)
+    assert not v["passed"] and v["unsatisfiable"] == ["human"]
+    assert any("1 of 2 requests (quota shortfall: the golden selection has 1 episode(s)" in p
+               for p in v["problems"])
+    assert any("unsatisfiable" in w for w in v["warnings"])
 
     # review 3 C2: an HF reference outside img_hfref needs a passing cross-check
     def ref(image, check=None):
-        return G.gate_verdict(builds, results, expected_parts=parts, expected_cases=cases,
-                              quota=1, reference={"image": image, "cross_check": check})
+        return verdict(quota=1, reference={"image": image, "cross_check": check})
 
     assert ref("img_hfref")["passed"]
     assert not ref("img_vllm")["passed"]
@@ -249,7 +261,27 @@ def test_gate_verdict_needs_clean_builds_and_full_coverage():
     drift = G.reference_cross_check(rec, [{**rec[0], "hf_pixels_digest": "q"}])
     assert drift["mismatches"] == ["c#0"] and not ref("img_vllm", drift)["passed"]
     assert not G.reference_cross_check(rec, [])["passed"]
-    assert any("C2" in w for w in verdict()["warnings"])
+    # review 5 M-A: no recorded reference is a FAIL, unless explicitly allowed (a warning)
+    v = verdict(reference=None)
+    assert not v["passed"] and any("C2" in p for p in v["problems"])
+    v = verdict(reference=None, allow_unverified_reference=True)
+    assert v["passed"] and any("C2" in w for w in v["warnings"])
+
+
+def test_golden_capacity_counts_staged_eligible_episodes():
+    from flora_deploy.validate.gatec_driver import golden_capacity
+
+    manifest = {"episodes": [
+        {"pool": "tianji", "status": "staged", "oracle_eligible": True},
+        {"pool": "tianji", "status": "staged", "oracle_eligible": True},
+        {"pool": "tianji", "status": "failed", "oracle_eligible": True},
+        {"pool": "human", "status": "staged", "oracle_eligible": False},
+        *[{"pool": "yam", "status": "staged", "oracle_eligible": True}] * 9,
+    ]}
+    cap = golden_capacity(manifest, 6)
+    assert cap["tianji"] == {"episodes": 2, "max_requests": 6, "satisfiable": True}
+    assert cap["human"] == {"episodes": 0, "max_requests": 0, "satisfiable": False}
+    assert cap["yam"]["satisfiable"] and not golden_capacity(manifest, 7)["tianji"]["satisfiable"]
 
 
 def test_results_provenance():

@@ -10,6 +10,13 @@ then (ephemeral app ``flora-gatec``):
 
 Writes the JSON results outside the repo and prints the Markdown tables for ``docs/gate-c.md``.
 The results hold token counts, positions, grids and digests only (no prompt or task text).
+
+The verdict (review 5 M-A) applies every criterion: the golden ``--quota`` per pool and kind
+(checked against the golden selection before anything is spent: a pool that cannot reach it is
+reported up front and FAILS), and the HF reference image (build_part runs it in ``img_vllm``,
+so C2 needs an ``img_hfref`` cross-check, which does not exist yet: the gate FAILS on C2
+until it does). ``--rescore PATH`` re-scores a recorded results file under the same rules
+without running anything on a GPU.
 """
 
 from __future__ import annotations
@@ -23,8 +30,9 @@ from pathlib import Path
 
 from flora_deploy.layout import GOLDEN_VOLUME
 from flora_deploy.modal_app.gatec_app import SAMPLE_DIR, app, build_part, run_gate_c
-from flora_deploy.validate.gatec import gate_verdict, render_report, results_provenance
-from flora_deploy.validate.gatec_driver import CASES, GOLDEN_POOLS
+from flora_deploy.validate.gatec import render_report, results_provenance
+from flora_deploy.validate.gatec_driver import golden_capacity, run_parts, run_verdict
+from flora_deploy.validate.golden import GOLDEN_PREFIX, MANIFEST_NAME
 
 # Big Buck Bunny, 10 s, 640x360, H.264, 30 fps CFR (c) Blender Foundation, CC BY 3.0.
 SAMPLE_NAME = "bbb_360_10s.mp4"
@@ -32,6 +40,31 @@ SAMPLE_URL = "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_Buck_
 SAMPLE_SHA256 = "77145c94c11f3754207499158df22406e1fe7635553c1c86dc5e881dfeb32016"
 L40S_USD_PER_H = 1.95
 KINDS = ("tempseg", "captioner")
+
+
+def golden_manifest() -> dict:
+    import modal
+
+    vol = modal.Volume.from_name(GOLDEN_VOLUME, version=2)
+    return json.loads(b"".join(vol.read_file(f"{GOLDEN_PREFIX}/{MANIFEST_NAME}")))
+
+
+def preflight(capacity: dict[str, dict], quota: int) -> None:
+    for pool, c in capacity.items():
+        if not c["satisfiable"]:
+            print(f"WARNING: golden:{pool} has {c['episodes']} episode(s), at most "
+                  f"{c['max_requests']} requests < quota {quota}: the gate will FAIL for this "
+                  "pool until the golden selection gains episodes")
+
+
+def print_verdict(verdict: dict) -> None:
+    print("coverage:", verdict["coverage"])
+    for problem in verdict["problems"]:
+        print("problem:", problem)
+    for warning in verdict["warnings"]:
+        print("warning:", warning)
+    print("wrapped verdict:", "PASS" if verdict["passed"] else "FAIL",
+          f"failed cases {verdict['failed_cases']}" if verdict["failed_cases"] else "")
 
 
 def stage_sample() -> None:
@@ -57,14 +90,21 @@ def stage_sample() -> None:
 
 @app.local_entrypoint()
 def main(max_requests: int = 2, quota: int = 6, golden: bool = True,
-         out: str = "~/.cache/flora-deploy/gatec/results.json"):
+         out: str = "~/.cache/flora-deploy/gatec/results.json", rescore: str = ""):
+    capacity = golden_capacity(golden_manifest(), quota) if golden else None
+    if capacity:
+        preflight(capacity, quota)
+    if rescore:  # re-score a recorded run under the current criteria; nothing runs
+        doc = json.loads(Path(rescore).expanduser().read_text())
+        has_golden = any(b["part"].startswith("golden:") for b in doc["builds"])
+        print_verdict(run_verdict(doc["builds"], doc["results"], golden=has_golden,
+                                  quota=quota, capacity=capacity))
+        return
     stage_sample()
     t0 = time.time()
     run_id = time.strftime("%Y%m%d-%H%M%S")
     provenance = {"run_id": run_id, **results_provenance(cwd=str(Path(__file__).parent))}
-    parts = ["cases:synthetic", "cases:sample"]
-    if golden:
-        parts += [f"golden:{pool}" for pool in GOLDEN_POOLS]
+    parts = run_parts(golden)
     calls = [build_part.spawn(kind, part, run_id, SAMPLE_NAME, max_requests, quota)
              for kind in KINDS for part in parts]
     builds = [c.get() for c in calls]
@@ -80,11 +120,10 @@ def main(max_requests: int = 2, quota: int = 6, golden: bool = True,
     gpu_s = sum(r["timings"]["total_s"] for r in results.values())
     path = Path(out).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
-    verdict = gate_verdict(
-        builds, results, expected_parts=[(kind, part) for kind in KINDS for part in parts],
-        expected_cases=[*CASES, *([f"golden-{pool}" for pool in GOLDEN_POOLS] if golden else [])])
+    verdict = run_verdict(builds, results, golden=golden, quota=quota, capacity=capacity)
     path.write_text(json.dumps(dict(provenance=provenance, verdict=verdict, results=results,
-                                    builds=builds, wall_s=wall, build_wall_s=build_wall),
+                                    builds=builds, quota=quota, capacity=capacity,
+                                    wall_s=wall, build_wall_s=build_wall),
                                indent=1, default=str))
     rows = [row for r in results.values() for row in r["rows"]]
     for kind, r in results.items():
@@ -92,11 +131,7 @@ def main(max_requests: int = 2, quota: int = 6, golden: bool = True,
               f"vLLM pixel dtypes {r['vllm_pixel_dtypes']}")
         print("video processor attr diff vs NVIDIA:", r["video_processor_attr_diff"] or "none")
     print("\n" + render_report(rows))
-    print("coverage:", verdict["coverage"])
-    for problem in verdict["problems"]:
-        print("problem:", problem)
-    print("wrapped verdict:", "PASS" if verdict["passed"] else "FAIL",
-          f"failed cases {verdict['failed_cases']}" if verdict["failed_cases"] else "")
+    print_verdict(verdict)
     print(f"git {provenance['git_sha']}{' (dirty)' if provenance['git_dirty'] else ''}, "
           f"images {provenance['image_fingerprints']}")
     print(f"wall {wall:.0f}s (build {build_wall:.0f}s); in-function GPU time {gpu_s:.0f}s "

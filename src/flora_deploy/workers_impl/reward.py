@@ -14,7 +14,9 @@ a stale ledger or stale parts.
    with ``attempts.write_upstream_failures`` and never run (reward shards have no
    ``depends_on`` today; the step is generic);
 4. the remaining episodes go through one ``stages.reward.run`` call. Its rounds mirror NVIDIA's
-   ``generate`` grouping by default (``RoundLimits(align="nvidia")``) and it hands each round to
+   ``generate`` grouping by default (``RoundLimits(align="nvidia")``), over the **job's**
+   planned episode list (``planned=`` the manifest's episodes, review 5 M-B; the manifest cuts
+   terminal shards on NVIDIA group boundaries), and it hands each round to
    a :class:`ShardPartSink`, which appends the round to local files and copies them whole to the
    store (``JobPaths.part`` / ``audit`` / ``errors``, one ``k`` per flush). Episode inputs come
    from the index receipt each ``EpisodeRef.index_ref`` names: the task and one video per camera
@@ -63,6 +65,7 @@ import os
 import threading
 import time
 import uuid
+import warnings
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -71,6 +74,7 @@ from typing import Any
 from flora_deploy.jobs import attempts as A
 from flora_deploy.jobs import progress as P
 from flora_deploy.jobs.deps import StoreManifestSource
+from flora_deploy.jobs.manifest import NVIDIA_TERMINAL_GROUP
 from flora_deploy.jobs.orchestrator import utc
 from flora_deploy.jobs.store import Store
 from flora_deploy.jobs.types import (
@@ -642,13 +646,18 @@ class RewardShardRunner:
         if errors:
             sink.add(errors=errors)
             sink.flush()
-        planned = shard.episodes  # NVIDIA groups follow the planned order (review 4 M3)
-        if shard.bisected_from:  # a child keeps its parent's groups
-            parent = next((p for p in manifests.load().shards
-                           if p.shard_id == shard.bisected_from), None)
-            if parent is not None and set(shard.episodes) <= set(parent.episodes):
-                planned = parent.episodes
+        # NVIDIA groups follow the *job's* planned order (review 4 M3, review 5 M-B): the
+        # manifest's episode list is the jobs file NVIDIA's script would read whole. A shard
+        # (or a bisection child) gets the batch-mates the job gives it, whatever the shard
+        # sizing; a group the shard does not hold whole is flagged, never "aligned".
+        planned = [e.uid for e in manifests.base().episodes]
         if episodes:
+            group = int((self.engine.spec.args if self.engine.spec else {}).get(
+                "max_num_seqs", NVIDIA_TERMINAL_GROUP))
+            if shard.kind == "reward.terminal" and group != NVIDIA_TERMINAL_GROUP:
+                warnings.warn(f"engine max_num_seqs {group} != the manifest's terminal group "
+                              f"{NVIDIA_TERMINAL_GROUP}: shards cut NVIDIA groups (flagged "
+                              "unaligned)", RuntimeWarning, stacklevel=2)
             R.run(self.engine.llm, self.nv, self.engine.processor, episodes, mode,
                   tail_trim_s=s.tail_trim_s, spec=self.engine.spec, models=dict(s.models),
                   gpu=s.gpu, preset=s.preset, certificate=s.certificate,
