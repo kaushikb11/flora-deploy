@@ -1,0 +1,36 @@
+# flora.yaml: score policy rollouts with the Flora Rewarder only (terminal + dense rewards).
+# Every key is documented in exact_lerobot.yaml. Unknown keys are an error.
+
+project: my-rollout-rewards
+
+# NVIDIA's Flora models are licensed for non-commercial research only. Required.
+license_ack: research-only
+
+modal:
+  environment: main
+  max_gpus: 2
+  budget_usd: 10
+  region: null
+  tags: {team: eval}
+
+preset: exact                       # rewards run NVIDIA's offline vLLM engine on H100!
+
+input:
+  format: mp4_dir
+  path: ./rollouts
+  stage_to: null
+
+pipeline:
+  stages: [reward.terminal, reward.dense]
+  embodiment: yam                   # human | yam | yam32 | dex | tianji
+  episode_instruction:
+    source: dataset_task            # task text from the dataset; or `fixed` + `text`
+  envelope: warn
+
+resources:
+  reward.terminal: {gpu: H100!, max_containers: 1}
+  reward.dense: {gpu: H100!, max_containers: 1}
+
+output:
+  sink: s3://my-bucket/flora/rollout-rewards
+  formats: [parquet]

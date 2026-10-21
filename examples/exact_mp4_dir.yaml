@@ -1,0 +1,36 @@
+# flora.yaml: label a directory of MP4 episodes with NVIDIA's own pipeline (`exact` preset).
+# Every key is documented in exact_lerobot.yaml. Unknown keys are an error.
+
+project: my-mp4-labels
+
+# NVIDIA's Flora models are licensed for non-commercial research only. Required.
+license_ack: research-only
+
+modal:
+  environment: main
+  max_gpus: 2                       # workspace GPU cap; all pools together stay under it
+  budget_usd: 10                    # hard spend cap
+  region: null
+  tags: {}
+
+preset: exact                       # exact | balanced
+
+input:
+  format: mp4_dir                   # one MP4 per episode
+  path: ./videos                    # local directory
+  stage_to: null
+
+pipeline:
+  stages: [segment, caption]        # add reward.terminal / reward.dense for rewards
+  embodiment: human                 # human | yam | yam32 | dex | tianji
+  episode_instruction:
+    source: fixed                   # dataset_task | fixed | none
+    text: Fold the towel.
+  envelope: warn                    # warn | enforce | ignore
+
+resources:
+  segcap: {max_containers: 2}       # 2 x H200 (the preset's GPU)
+
+output:
+  sink: volume://flora-results/my-mp4-labels
+  formats: [jsonl]
