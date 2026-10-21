@@ -78,3 +78,23 @@ def test_cleanup_keep_deletes_no_volume(h0, modal_calls):
     calls, _ = modal_calls
     h0.cleanup([], "r1", [], [], keep=True)
     assert not [c for c in calls if c[:3] == ["modal", "volume", "delete"]]
+
+
+def test_watch_dicts_are_per_run(h0, tmp_path, monkeypatch, request):
+    """Review 9a M2: the fake app's watch Dict was named from the stage hashes only, so two H0
+    runs (or any two fake deploys of the same configs) shared one, and either run's cleanup
+    deleted the other's."""
+    names: dict[str, list[str]] = {}
+    for rid in ("10220142abcd", "10220143ef01"):
+        w = tmp_path / rid
+        for job in ("human", "yam"):
+            (w / h0.JOB_SPECS[job].data).mkdir(parents=True, exist_ok=True)
+        monkeypatch.chdir(w)
+        names[rid] = [h0.plans(h0.write_config(w, job, rid))["fake"].watch_dict
+                      for job in ("human", "yam")]
+    mine, theirs = names.values()
+    assert len(set(mine)) == 2 and not set(mine) & set(theirs), names
+    calls, _ = request.getfixturevalue("modal_calls")  # after planning: it stubs out modal
+    h0.cleanup([], "10220142abcd", [], mine, keep=True)
+    deleted = [c[4] for c in calls if c[:3] == ["modal", "dict", "delete"]]
+    assert deleted == mine

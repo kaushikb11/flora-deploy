@@ -539,7 +539,10 @@ def cleanup(app_names: list[str], run_id: str, job_ids: list[str], watch_dicts: 
                 notes.append(f"lease {key} removed")
     except Exception as e:  # noqa: BLE001
         notes.append(f"lease cleanup: {e!r}")
-    for d in watch_dicts:
+    for d in watch_dicts:  # this run's fake apps' own Dicts (named per app: review 9a M2)
+        if not d.startswith("flora-watch-fake-"):  # never a real app's watch Dict
+            notes.append(f"watch Dict {d}: not a fake app's; kept")
+            continue
         p = subprocess.run(["modal", "dict", "delete", "--yes", d, "--env", env],
                            capture_output=True, text=True)
         notes.append(f"modal dict delete {d}: rc={p.returncode}")
