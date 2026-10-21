@@ -2,10 +2,14 @@
 
 All job state is files in a ``Store`` (the user's bucket by default). Status is always *derived*
 from these files; nothing here is held only in memory or in Modal Queue/Dict.
+
+Identity: episode ids from datasets are NOT unique across datasets (every LeRobot dataset has
+``episode_000001``), so every job-level key uses ``episode_uid(dataset, episode_id)``.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -15,14 +19,38 @@ JobState = Literal[
     "indexed", "planned", "running", "composing", "done", "failed", "budget_stopped", "cancelled"
 ]
 
+# A shard's unit of work. ``segcap`` is the exact preset's combined segment+caption worker
+# (NVIDIA's pipeline runs both stages per episode); it emits records for both stages.
+ShardKind = Literal["segment", "caption", "segcap", "reward.terminal", "reward.dense",
+                    "reward.rubric"]
+
 MAX_STARTS_BEFORE_QUARANTINE = 3  # D15
+
+_SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
+
+
+def safe_key(value: str) -> str:
+    """Validate a path component (shard ids, uids, container ids). Raises ValueError."""
+    if not _SAFE.match(value) or ".." in value:
+        raise ValueError(f"unsafe key {value!r}: use [A-Za-z0-9._-], max 200 chars")
+    return value
+
+
+def episode_uid(dataset: str, episode_id: str) -> str:
+    """Job-unique, path-safe episode key: ``<dataset slug>--<episode id>``.
+
+    ``dataset`` is e.g. an HF repo id (``lerobot/aloha_static_coffee``) or a local dir name.
+    """
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", dataset).strip("-.") or "dataset"
+    return safe_key(f"{slug}--{re.sub(r'[^A-Za-z0-9._-]+', '-', episode_id)}")
 
 
 @dataclass(frozen=True)
 class EpisodeRef:
-    episode_id: str
+    uid: str  # episode_uid(dataset, episode_id); the key used everywhere in a job
     dataset: str
-    pool: str  # human | yam | yam32 | dex | tianji (single-view robot uses its pool's rules)
+    episode_id: str  # as the source dataset names it
+    pool: str  # human | yam | yam32 | dex | tianji
     duration_s: float
     oracle_eligible: bool
     envelope_ok: bool
@@ -31,11 +59,11 @@ class EpisodeRef:
 
 @dataclass(frozen=True)
 class Shard:
-    shard_id: str  # stable: "<stage>-<seq>" or "<stage>-ep-<episode_id>" after bisection
-    stage: Stage
-    episodes: tuple[str, ...]  # episode_ids
+    shard_id: str  # path-safe: "<kind>-<seq>" or "<kind>-ep-<uid>" after bisection
+    kind: ShardKind
+    episodes: tuple[str, ...]  # episode uids
     est_gpu_seconds: float
-    depends_on: tuple[str, ...] = ()  # e.g. caption shard depends on its segment shard
+    depends_on: tuple[str, ...] = ()  # e.g. a caption shard depends on its segment shard
     bisected_from: str | None = None
 
 
@@ -50,10 +78,13 @@ class Manifest:
 
 @dataclass(frozen=True)
 class AttemptMarker:
+    """One file per container start of a shard, named by container id, so concurrent or
+    Modal-retried starts never overwrite each other. Starts = number of distinct markers."""
+
     shard_id: str
-    attempt: int  # 1-based start count
-    container_id: str
+    container_id: str  # unique per container (MODAL_TASK_ID); part of the file name
     started_utc: str
+    orchestrator_attempt: int  # the spawn number the orchestrator assigned (single writer)
 
 
 @dataclass(frozen=True)
@@ -61,12 +92,12 @@ class ShardReceipt:
     """Written LAST by a worker; its existence means the shard is done."""
 
     shard_id: str
+    kind: ShardKind
     config_hash: str
-    attempt: int
-    episodes_done: tuple[str, ...]
-    episodes_failed: tuple[str, ...]  # recorded in errors/, not retried within this shard
-    parts: tuple[str, ...]  # store paths of the part-files holding this shard's records
     container_id: str
+    episodes_done: tuple[str, ...]  # uids
+    episodes_failed: tuple[str, ...]  # uids with EpisodeError files; not retried in this shard
+    parts: tuple[str, ...]  # store paths of the part-files holding this shard's records
     gpu: str | None
     wall_seconds: float
     finished_utc: str
@@ -74,14 +105,18 @@ class ShardReceipt:
 
 @dataclass(frozen=True)
 class ContainerReceipt:
-    """Spend accounting over the container lifetime (D15/§8 budget)."""
+    """Spend accounting over the container lifetime (§8 budget)."""
 
     container_id: str
     app: str
     gpu: str | None
     gpu_count: int
-    cpu_cores: float
-    memory_gib: float
+    cpu_request: float  # physical cores
+    cpu_limit: float | None
+    memory_request_gib: float
+    memory_limit_gib: float | None
+    region: str | None
+    preemptible: bool
     started_utc: str
     heartbeat_utc: str
     stopped_utc: str | None = None
@@ -89,10 +124,21 @@ class ContainerReceipt:
 
 @dataclass(frozen=True)
 class EpisodeError:
-    episode_id: str
+    uid: str
     stage: Stage
     shard_id: str
-    attempt: int
-    kind: str  # "nv_failure" (NVIDIA semantics) | "infra" | "poison_pill"
+    container_id: str
+    kind: Literal["nv_failure", "infra", "poison_pill"]  # nv_failure = NVIDIA's own semantics
     message: str
     diagnostics: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ControlRecord:
+    """Operator/orchestrator decisions that status is derived from (no in-memory state)."""
+
+    kind: Literal["quarantine", "cancel", "budget_stop", "resume"]
+    target: str  # shard_id for quarantine; job_id otherwise
+    reason: str
+    created_utc: str
+    detail: dict = field(default_factory=dict)

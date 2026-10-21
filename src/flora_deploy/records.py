@@ -74,7 +74,9 @@ class RubricReward:
 
 @dataclass(frozen=True)
 class StageRecord:
-    episode_id: str
+    uid: str  # jobs.types.episode_uid(dataset, episode_id): unique within a job
+    dataset: str
+    episode_id: str  # as the source dataset names it (not unique across datasets)
     stage: Stage
     provenance: Provenance
     certified: bool
@@ -91,9 +93,34 @@ class StageRecord:
             raise ValueError("certified records have no reason; uncertified records need one")
 
     def to_json(self) -> str:
+        """Canonical JSON. NaN/inf are rejected (ValueError): stages must not emit them."""
         return json.dumps(asdict(self), sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> StageRecord:
+        if d.get("schema") != SCHEMA:
+            raise ValueError(f"unsupported record schema {d.get('schema')!r}")
+        d = dict(d)
+        d["provenance"] = Provenance(**d["provenance"])
+        d["segments"] = tuple(Segment(**s) for s in d.get("segments", ()))
+        if d.get("terminal"):
+            t = dict(d["terminal"])
+            t["probabilities"] = tuple(t["probabilities"])
+            d["terminal"] = TerminalReward(**t)
+        if d.get("dense"):
+            d["dense"] = DenseReward(segments=tuple(d["dense"]["segments"]),
+                                     per_step=tuple(d["dense"]["per_step"]))
+        if d.get("rubric"):
+            r = dict(d["rubric"])
+            r["scores"] = tuple(r["scores"])
+            d["rubric"] = RubricReward(**r)
+        return cls(**d)
+
+    @classmethod
+    def from_json(cls, line: str) -> StageRecord:
+        return cls.from_dict(json.loads(line))
 
 
 def record_key(rec: StageRecord) -> tuple[str, str]:
     """Dedupe key used by compose."""
-    return (rec.episode_id, rec.stage)
+    return (rec.uid, rec.stage)
