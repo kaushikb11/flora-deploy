@@ -29,3 +29,16 @@ def test_anything_else_fails():
         ok, _ = wh.equivalence_ok(res({"vs_merged": bad}))
         assert not ok, bad
     assert not wh.equivalence_ok(res({}))[0]  # no GDN verdict at all is not a pass
+
+
+def test_global_cap_override_raises_never_lowers():
+    proj = {s: wh.Projection(step=s, items=[]) for s in wh.STEPS}
+    derived = wh.plan_global_cap("balanced-only", proj)
+    assert wh.plan_global_cap("balanced-only", proj, derived + 1.0) == derived + 1.0
+    assert wh.plan_global_cap("balanced-only", proj, derived - 1.0) == derived
+
+
+def test_cap_override_round_trips_through_the_state():
+    st = wh.State("r", 0.0, "2026-10-22T00:00:00Z", cap_override=5.6)
+    assert wh.State.from_json(st.to_json()).cap_override == 5.6
+    assert wh.State.from_json({**st.to_json(), "cap_override": None}).cap_override is None
