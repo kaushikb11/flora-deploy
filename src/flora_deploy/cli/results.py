@@ -222,7 +222,8 @@ def results(
     if ids:
         console.print("certificate: " + ", ".join(ids), soft_wrap=True)
     if len(label_rows) > limit:
-        console.print(f"... {len(label_rows) - limit} more rows (raise --limit or use "
+        more = len(label_rows) - limit
+        console.print(f"... {more} more row{'s' if more != 1 else ''} (raise --limit or use "
                       "--format jsonl)", soft_wrap=True)
 
 

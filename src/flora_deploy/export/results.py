@@ -72,11 +72,22 @@ def store_from_uri(uri: str, *, endpoint_url: str | None = None,
             return VolumeStore(mount / sub if sub else mount)
         return ClientVolumeStore.from_uri(f"modal-volume://{u.netloc}/{sub}",
                                           environment=environment)
-    raise ValueError(f"store {uri!r}: use file://, s3:// or modal-volume://")
+    hint = (f" (a volume:// sink is the store modal-volume://{uri[len('volume://'):]})"
+            if u.scheme == "volume" else "")
+    raise ValueError(f"store {uri!r}: use file://, s3:// or modal-volume://{hint}")
 
 
 def resolve_config_hash(store: Store, job_id: str, config_hash: str | None = None) -> str:
-    return config_hash or load_manifest(store, job_id).config_hash
+    if config_hash:
+        return config_hash
+    try:
+        return load_manifest(store, job_id).config_hash
+    except FileNotFoundError:
+        # A bare FileNotFoundError names only the store path; say what it means and what to do.
+        raise ResultsNotFound(
+            f"job {job_id!r} has no manifest in this store, so it has not been run here: check "
+            "the job id and --store (`flora status` reads the same ones), or start it with "
+            "`flora run`") from None
 
 
 def _path(store: Store, job_id: str, stage: str, fmt: str, config_hash: str | None
