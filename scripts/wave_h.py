@@ -140,8 +140,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import _runbook as rb  # noqa: E402 - state, billing, heartbeat, stop rules (shared)
-import spend as _spend  # noqa: E402 - the project budget (FLORA_PROJECT_BUDGET_USD)
 import h0_rehearsal as h0  # noqa: E402 - the same staging and configs as H0
+import spend as _spend  # noqa: E402 - the project budget (FLORA_PROJECT_BUDGET_USD)
 
 STATE = ROOT / "reports" / "wave-h" / "state.json"
 REPORT = ROOT / "reports" / "wave-h" / "runbook.md"  # docs/wave-h-report.md: wave_h_finalize.py

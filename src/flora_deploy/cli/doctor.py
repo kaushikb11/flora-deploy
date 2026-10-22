@@ -608,8 +608,8 @@ def run_checks(config: Path, probes: Probes) -> list[Check]:
     hf, token = check_hf(probes)
     out += hf
     if cfg is None:
-        out.append(Check("rest", "warn", "store, cache, weights, certificate, budget and input checks "
-                         "skipped (the config did not load)", "fix the config first"))
+        out.append(Check("rest", "warn", "store, cache, weights, certificate, budget and input "
+                         "checks skipped (the config did not load)", "fix the config first"))
         return out
     steps: Iterable[Callable[[], list[Check] | Check]] = (
         lambda: check_store(probes, cfg),
