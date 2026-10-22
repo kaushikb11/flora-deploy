@@ -27,6 +27,16 @@ sc = _load("scale_test")
 wh = sys.modules["wave_h"]
 
 
+@pytest.fixture(autouse=True)
+def full_profile(monkeypatch):
+    """These tests are about the full profile (``lite`` is the CLI default and has its own
+    tests, ``test_scale_test_lite.py``)."""
+    monkeypatch.setattr(sc, "DEFAULT_PROFILE", "full")
+    prev = sc.use_profile("full")
+    yield
+    sc.use_profile(prev)
+
+
 @pytest.fixture
 def offline(monkeypatch, tmp_path):
     """No billing, no Modal: every runner is recorded instead of run."""
@@ -331,16 +341,28 @@ def test_measure_utilization_cold_start_idle_and_pipelining():
 
 
 def _good_run(mode: str = "real") -> dict:
-    """A synthetic ``report`` result that passes all 14 criteria."""
+    """A synthetic ``report`` result that passes every criterion."""
     n = sc.pool_sizes()
     pool = {k: {"peak_concurrent": n[k], "time_to_peak_s": 100, "utilization": 0.55,
                 "utilization_working": 0.9, "preempted_starts": 1, "preempted_recovered": 1}
             for k in sc.POOLS}
+    conts = [{"container_id": f"{k}-{i}", "kind": k, "shards": 2, "busy_s": 100.0 + i,
+              "video_s": 250.0, "container_s_per_video_s": round((100.0 + i) / 250, 4),
+              "prewarmed": False} for k in sc.POOLS for i in range(n[k])]
     return {"state": "done", "records": {"missing": 0, "duplicates": 0}, "sizes": n,
             "measure": {"pools": pool, "idle_share": 0.3, "idle_share_excl_outage": 0.1,
                         "pipelining": {"first_caption_after_first_segment_s":
                                        330 if mode == "real" else 7,
-                                       "overlap_s": 900}},
+                                       "overlap_s": 900},
+                        "containers": conts},
+            "drain": [{"container_id": c["container_id"], "kind": c["kind"],
+                       "class": c["kind"], "drain_at": 100.0, "ended_at": 110.0,
+                       "alive": False, "gap_s": 10.0, "ok": True} for c in conts],
+            "prewarm": {"ok": True, "detail": "pre-warm on time"},
+            "cache": {k: {"ok": True, "detail": "", "states": {"cold": 3},
+                          "published_before": False} for k in sc.POOLS},
+            "batch_fill": {k: {"mean_batch": 6.0, "busy_fraction": 0.8, "fill": 0.2}
+                           for k in sc.POOLS},
             "projection_error": {"actual_usd": 11.0, "upper_usd": 19.2, "nominal_usd": 11.5,
                                  "vs_nominal": -0.04, "billed": True},
             "chaos": {"preempt_segment": {}, "preempt_caption": {}, "kill_orchestrator": {}},
@@ -353,18 +375,18 @@ def _verdicts(r: dict, mode: str = "real") -> dict[int, str]:
     return {x["id"]: x["verdict"] for x in sc.evaluate(r, mode)}
 
 
-def test_criteria_are_the_14_of_the_doc_and_all_automatic():
+def test_criteria_are_the_19_of_the_doc_and_all_automatic():
     rows = sc.evaluate(_good_run(), "real")
-    assert [x["id"] for x in rows] == list(range(1, 15))
+    assert [x["id"] for x in rows] == list(range(1, 20))
     assert all(x["auto"] for x in rows) and not sc.MANUAL
     assert {x["verdict"] for x in rows} == {"PASS"}, [x for x in rows if x["verdict"] != "PASS"]
-    assert sc.criteria_summary(rows) == "14 PASS, 0 FAIL, 0 n.a. (14 of 14 automatic)"
-    # the doc's table lists the same 14, in order
+    assert sc.criteria_summary(rows) == "19 PASS, 0 FAIL, 0 n.a. (19 of 19 automatic)"
+    # the doc's table lists the same 19, in order
     doc = (Path(__file__).resolve().parents[2] / "docs" / "scale-test.md").read_text()
     table = doc.split("## Success criteria", 1)[1].split("\n## ", 1)[0]
     ids = [int(line.split("|")[1]) for line in table.splitlines()
            if line.startswith("| ") and line.split("|")[1].strip().isdigit()]
-    assert ids == list(range(1, 15))
+    assert ids == list(range(1, 20))
 
 
 def test_criteria_targets_derive_from_the_rates():
@@ -400,12 +422,19 @@ FAILS = {  # criterion -> edits to the good run that make it FAIL
     12: [("timings.status.p95", 11.0)],
     13: [("timings.report_s", 31.0)],
     14: [("timings.compose_rc", 1)],
+    15: [("measure.containers", [])],
+    16: [("drain", [{"container_id": "c", "kind": "caption", "class": "caption",
+                     "drain_at": 100.0, "ended_at": 200.0, "alive": False, "gap_s": 100.0,
+                     "ok": False}])],
+    17: [("prewarm.ok", False)],
+    18: [("cache.caption.ok", False)],
+    19: [("batch_fill.segment.busy_fraction", 0.3)],
 }
 
 
 @pytest.mark.parametrize("cid", sorted(FAILS))
 def test_each_criterion_fails_on_its_own(cid):
-    assert sorted(FAILS) == list(range(1, 15))
+    assert sorted(FAILS) == list(range(1, 20))
     r = _good_run()
     for path, v in FAILS[cid]:
         _set(r, path, v)
@@ -448,7 +477,7 @@ def test_missing_data_is_a_fail_not_a_pass():
 
 def test_local_marks_container_and_money_criteria_na_with_a_reason():
     rows = {x["id"]: x for x in sc.evaluate(_good_run("local"), "local")}
-    for i in (3, 4, 5, 7, 8, 9):
+    for i in (3, 4, 5, 7, 8, 9, 15, 16, 17, 18, 19):
         assert rows[i]["verdict"] == "n.a." and rows[i]["reason"]
     for i in (1, 2, 6, 10, 11, 12, 13, 14):
         assert rows[i]["verdict"] == "PASS", rows[i]
@@ -468,7 +497,7 @@ def test_report_rechecks_spend_once_billing_lands():
     run.billed_usd = 30.0  # the bill landed: over the upper projection
     rows = {x["id"]: x for x in sc.recheck(st, "real")}
     assert rows[7]["verdict"] == "FAIL" and rows[8]["verdict"] == "FAIL"
-    assert "(14 of 14 automatic)" in sc.render_report(st, "real", sc.projections("real"))
+    assert "(19 of 19 automatic)" in sc.render_report(st, "real", sc.projections("real"))
 
 
 # --------------------------------------------------------------------------------------------

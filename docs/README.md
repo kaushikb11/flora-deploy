@@ -55,7 +55,7 @@ Start with the repository [`README.md`](../README.md) (users) or [`PLAN.md`](PLA
 | [`golden-manifest-v1.md`](golden-manifest-v1.md) | What is staged in flora's test set ("golden set") v1: counts, media, licenses, coverage | maintainer |
 | [`golden-manifest-v2.md`](golden-manifest-v2.md) | The 12-episode `human` certification set for the certified run (staged, verified) | maintainer |
 | [`wave-h-report.md`](wave-h-report.md) | The first measured `balanced` run: $/video-hour, startup, the rates in `planner/rates.json` | maintainer |
-| [`scale-test.md`](scale-test.md) | A one-video-hour `balanced` scale test: prepared, not yet run on Modal | maintainer |
+| [`scale-test.md`](scale-test.md) | The `balanced` scale test: a quarter-hour lite profile (the default) and a one-video-hour full one, prepared, not yet run on Modal | maintainer |
 
 ## Upstream
 

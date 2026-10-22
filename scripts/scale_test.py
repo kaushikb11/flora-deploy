@@ -1,18 +1,29 @@
-"""Scale test of ``balanced`` (``docs/scale-test.md``): about one video-hour, several containers
-per pool, through the real ``flora index -> plan -> deploy -> run -> report`` path.
+"""Scale test of ``balanced`` (``docs/scale-test.md``): several containers per pool, through the
+real ``flora index -> plan -> deploy -> run -> report`` path.
 
 Usage::
 
     uv run python scripts/scale_test.py                          # dry run (the default): plan
+    uv run python scripts/scale_test.py --sizing                 # + the size options
     uv run python scripts/scale_test.py --mode local --execute   # local fake run (no Modal)
     uv run python scripts/scale_test.py --mode fake-modal --yes-spend  # CPU rehearsal (~cents)
     uv run python scripts/scale_test.py --mode real --yes-spend  # the GPU run (resumable)
     uv run python scripts/scale_test.py --mode real --report     # rewrite the report
+    uv run python scripts/scale_test.py --finalize [--write]     # fold its rates into rates.json
 
-Modes (one state file each, ``reports/scale-test/<mode>/state.json``):
+Profiles (``--profile``, :data:`PROFILES`):
 
-* ``real``: the pinned EgoDex subset (:data:`DATASET`, 128 episodes, 0.980 video-h), ``preset:
-  balanced``, ``segment`` on 2 x L40S and ``caption`` on 3 x H100!;
+* ``lite`` (the default): the first 32 episodes (0.223 video-h), ``segment`` on 2 x L40S and
+  ``caption`` on 2 x H100!, no chaos. It measures each pool's throughput with two containers
+  (rate samples for ``--finalize``), pipelining, the job-end drain, the caption pre-warm, the
+  compile cache per shard, batch fill, and spend against the projection;
+* ``full``: all 128 episodes (0.980 video-h), 2 x L40S + 3 x H100!, three chaos actions.
+
+Modes (one state file each, ``reports/scale-test/<mode>/state.json`` for ``full`` and
+``reports/scale-test/<profile>/<mode>/state.json`` otherwise):
+
+* ``real``: the pinned EgoDex subset (:data:`DATASET`) at the profile's size, ``preset:
+  balanced``;
 * ``fake-modal``: the same job shape on Modal with ``flora deploy/run --fake-models`` (CPU fake
   workers, the real factory app, orchestrator, Volumes and reconciler) over :data:`FAKE_EPISODES`
   small synthetic episodes with the same total video length, so the manifest has the same number
@@ -56,6 +67,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import hashlib
 import json
 import math
@@ -105,28 +117,146 @@ DATASET: dict[str, Any] = {
     "episode_s": {"min": 3.07, "median": 13.7, "max": 78.33},  # from meta/episodes (5.5 MB)
     "bytes": 2_985_280_594,  # 13 concatenated AV1 MP4s (2.43 GB) + parquet
 }
-VIDEO_S = DATASET["total_frames"] / DATASET["fps"]  # 3529.2 s = 0.980 video-h
+FULL_VIDEO_S = DATASET["total_frames"] / DATASET["fps"]  # 3529.2 s = 0.980 video-h
 HF = "https://huggingface.co"
+
+# Every episode's frame count and source MP4 (``videos/<key>/chunk-000/file-<i>.mp4``), in
+# episode-index order, from ``meta/episodes/chunk-000/file-000.parquet`` at the pinned revision
+# (git blob sha1 below; fetched 2026-10-22). They give the subsets' exact video length and
+# shard packing offline; ``index`` checks the indexed length against them.
+EPISODES_BLOB_SHA1 = "d58e8fbd29082d252097ac14416e4ef3bdc95b22"
+EPISODE_FRAMES: tuple[int, ...] = (
+    1199, 313, 253, 1633, 211, 1209, 334, 260, 185, 1600, 349, 1134, 212, 1208, 1231, 1370,
+    1514, 215, 350, 1361, 257, 266, 1481, 930, 297, 1644, 276, 217, 334, 288, 335, 1584,
+    284, 1372, 266, 324, 1595, 1771, 201, 1797, 1165, 256, 273, 1127, 242, 224, 1775, 1526,
+    228, 1570, 316, 1085, 320, 1496, 1218, 411, 264, 1352, 269, 241, 2350, 335, 241, 1711,
+    272, 331, 1510, 1889, 251, 305, 251, 252, 221, 1018, 314, 287, 1518, 1482, 258, 347,
+    889, 2140, 266, 263, 1345, 1130, 237, 1362, 243, 1147, 1708, 268, 236, 92, 1371, 233,
+    199, 1390, 1909, 332, 1681, 232, 2148, 243, 1167, 1462, 251, 264, 268, 906, 1236, 249,
+    218, 1685, 1327, 1163, 1180, 1485, 852, 999, 1123, 302, 1216, 1076, 1072, 217, 1708, 1226)
+EPISODE_FILE: tuple[int, ...] = (
+    *[0] * 13, *[1] * 9, *[2] * 11, *[3] * 10, *[4] * 10, *[5] * 10, *[6] * 13, *[7] * 9,
+    *[8] * 12, *[9] * 7, *[10] * 11, *[11] * 8, *[12] * 5)
+
+
+def subset_video_s(n: int) -> float:
+    """Video seconds of the first ``n`` episodes (by episode index)."""
+    return sum(EPISODE_FRAMES[:n]) / DATASET["fps"]
+
+
+# ---------------------------------------------------------------------------------------------
+# Profiles: which episodes, which pools, which chaos
+
+
+@dataclass(frozen=True)
+class Profile:
+    """One size of the test. ``episodes``: the first N by episode index (``flora index --limit
+    N``; every episode for ``full``). ``packing``: ``exact`` packs the real mode's shards from
+    the pinned episode table as ``jobs.manifest`` does; ``even`` splits the video into equal
+    shards (``full`` keeps it, so its documented numbers stay comparable)."""
+
+    name: str
+    episodes: int
+    pools: Mapping[str, Mapping[str, Any]]
+    shard_target_gpu_min: float
+    chaos: tuple[str, ...]
+    packing: str = "even"
+    blurb: str = ""
+
+    @property
+    def video_s(self) -> float:
+        return subset_video_s(self.episodes)
+
+    @property
+    def source_files(self) -> int:
+        return len(set(EPISODE_FILE[:self.episodes]))
+
+    @property
+    def tag(self) -> str:
+        """Prefix of job ids and project names (``full`` keeps the original ``scale-<run>``)."""
+        return "" if self.name == "full" else f"{self.name}-"
+
+    def with_size(self, episodes: int | None = None, pools: Mapping[str, int] | None = None
+                  ) -> Profile:
+        """This profile at another episode count / pool sizes (the options table)."""
+        p = {k: {**v, "max_containers": int((pools or {}).get(k, v["max_containers"]))}
+             for k, v in self.pools.items()}
+        return dataclasses.replace(self, episodes=episodes or self.episodes, pools=p)
+
+
+ALL_CHAOS = ("preempt_segment", "preempt_caption", "kill_orchestrator")
+PROFILES: dict[str, Profile] = {
+    # 32 episodes (0.223 video-h; 18 under 15 s and 14 of 30 s or more), 2 + 2 containers, no
+    # chaos: about a quarter of the full test's money, enough to measure every pool with two
+    # containers (docs/scale-test.md "Lite profile"). 2 GPU-minute shards: ~4 segment and ~8
+    # caption shards, so each container runs at least two and captions start while segment
+    # still runs.
+    "lite": Profile("lite", 32, {"segment": {"gpu": "L40S", "max_containers": 2},
+                                 "caption": {"gpu": "H100!", "max_containers": 2}},
+                    shard_target_gpu_min=2.0, chaos=(), packing="exact",
+                    blurb="first 32 episodes, 2 + 2 containers, no chaos"),
+    # 2 + 3: the cheapest size with >= 2 containers per pool whose upper wall is within the hour
+    # at the measured rates (docs/scale-test.md "Pool sizing"; :func:`pool_sizing`,
+    # :func:`recommend`). caption (0.906 container-s per video-s, 2.5x segment) is the
+    # bottleneck: a third segment container only adds a cold start and a drained idle tail.
+    # 4 GPU-minute shards at the manifest's packing rates (segment 0.5, caption 1.0 GPU-s per
+    # video-s): ~480 video-s per segment shard (~8 shards), ~240 per caption shard (~15).
+    "full": Profile("full", DATASET["total_episodes"],
+                    {"segment": {"gpu": "L40S", "max_containers": 2},
+                     "caption": {"gpu": "H100!", "max_containers": 3}},
+                    shard_target_gpu_min=4.0, chaos=ALL_CHAOS, packing="even",
+                    blurb="all 128 episodes, 2 + 3 containers, three chaos actions"),
+}
+DEFAULT_PROFILE = "lite"
+
+# The active profile's values, rebound by :func:`use_profile` (``--profile``; the tests switch
+# with it too). Functions read them at call time.
+PROFILE: Profile = PROFILES[DEFAULT_PROFILE]
+POOLS: dict[str, dict[str, Any]] = {}
+VIDEO_S = 0.0
+SHARD_TARGET_GPU_MIN = 0.0
+CHAOS: tuple[str, ...] = ()
+FAKE_EPISODES = 0
+INDEX_UNITS = 0
 
 # Synthetic stand-in (fake modes): media.synth single-view clips, 3..6 s (mean 4.5 s), so the
 # total matches VIDEO_S and the manifest packs to the same number of shards.
 FAKE_MIN_S, FAKE_MAX_S = 3.0, 6.0
-FAKE_EPISODES = round(VIDEO_S / ((FAKE_MIN_S + FAKE_MAX_S) / 2))  # 784
+
+
+def use_profile(p: Profile | str) -> Profile:
+    """Make ``p`` the active profile; returns the previous one."""
+    global PROFILE, POOLS, VIDEO_S, SHARD_TARGET_GPU_MIN, CHAOS, FAKE_EPISODES, INDEX_UNITS
+    prev = PROFILE
+    PROFILE = PROFILES[p] if isinstance(p, str) else p
+    POOLS = {k: dict(v) for k, v in PROFILE.pools.items()}
+    VIDEO_S = PROFILE.video_s
+    SHARD_TARGET_GPU_MIN = PROFILE.shard_target_gpu_min
+    CHAOS = tuple(PROFILE.chaos)
+    FAKE_EPISODES = round(VIDEO_S / ((FAKE_MIN_S + FAKE_MAX_S) / 2))  # full: 784, lite: 178
+    INDEX_UNITS = PROFILE.source_files  # one per concatenated source MP4 (full: 13, lite: 3)
+    return prev
+
+
+@contextlib.contextmanager
+def profile_ctx(p: Profile | str):
+    prev = use_profile(p)
+    try:
+        yield PROFILE
+    finally:
+        use_profile(prev)
+
+
+use_profile(DEFAULT_PROFILE)
 
 # ---------------------------------------------------------------------------------------------
 # Job shape
 
-# 2 + 3: the cheapest size with >= 2 containers per pool whose upper wall is within the hour
-# at the measured rates (docs/scale-test.md "Pool sizing"; :func:`pool_sizing`,
-# :func:`recommend`). caption (0.906 container-s per video-s, 2.5x segment) is the bottleneck:
-# a third segment container only adds a cold start and a drained idle tail.
-POOLS = {"segment": {"gpu": "L40S", "max_containers": 2},
-         "caption": {"gpu": "H100!", "max_containers": 3}}
-MAX_GPUS = 5
-# 4 GPU-minutes per shard at the manifest's packing rates (segment 0.5, caption 1.0 GPU-s per
-# video-s): ~480 video-s per segment shard (~8 shards), ~240 per caption shard (~15), so each
-# segment container runs ~4 shards and captions can start after the first segment shard.
-SHARD_TARGET_GPU_MIN = 4.0
+def max_gpus() -> int:
+    """``modal.max_gpus``: every pool at its size at once (full 5, lite 4)."""
+    return sum(int(v["max_containers"]) for v in POOLS.values())
+
+
 STORE_VOLUME = {"real": "flora-scale", "fake-modal": "flora-scale-fake"}
 MEDIA_VOLUME = {"real": "flora-scale-media", "fake-modal": "flora-scale-fake-media"}
 
@@ -211,7 +341,9 @@ def verify_dataset(fetch: Callable[[str], bytes] | None = None) -> dict[str, Any
     raw = fetch(info_url())
     problems = check_info(raw)
     return {"ok": not problems, "problems": problems, "url": info_url(),
-            "video_s": round(VIDEO_S, 1), "tracked_usd": 0.0, "apps": []}
+            "video_s": round(FULL_VIDEO_S, 1), "profile": PROFILE.name,
+            "subset": {"episodes": PROFILE.episodes, "video_s": round(VIDEO_S, 2)},
+            "tracked_usd": 0.0, "apps": []}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -328,8 +460,61 @@ def shard_video_s(kind: str) -> float:
     return SHARD_TARGET_GPU_MIN * 60.0 / DEFAULT_RATES[kind]
 
 
-def shard_counts(video_s: float = VIDEO_S) -> dict[str, int]:
+def _even_counts(video_s: float) -> dict[str, int]:
     return {k: max(1, math.ceil(video_s / shard_video_s(k))) for k in POOLS}
+
+
+ShardPlan = dict[str, list[Any]]  # segment: [video_s]; caption: [(video_s, (segment idx, ...))]
+
+
+def exact_plan(episodes: int, target_gpu_min: float, *, scale: float = 1.0) -> ShardPlan:
+    """The shards ``jobs.manifest.build_manifest`` packs from the first ``episodes`` episodes of
+    the pinned table: grouped by source MP4, in episode order, at the manifest's packing rates;
+    each caption shard depends on the segment shards that own its episodes. ``scale``: stretch
+    every duration (the indexed length against the table's)."""
+    from types import SimpleNamespace
+
+    from flora_deploy.jobs.manifest import DEFAULT_RATES, _pack
+
+    fps = DATASET["fps"]
+    groups: dict[int, list[Any]] = {}
+    for i in range(episodes):
+        groups.setdefault(EPISODE_FILE[i], []).append(
+            SimpleNamespace(uid=f"episode_{i:06d}", duration_s=EPISODE_FRAMES[i] / fps * scale))
+    ordered = [groups[f] for f in sorted(groups)]
+    dur = {e.uid: e.duration_s for g in ordered for e in g}
+    seg = _pack(ordered, DEFAULT_RATES["segment"], target_gpu_min * 60.0)
+    owner = {u: j for j, (uids, _) in enumerate(seg) for u in uids}
+    cap = _pack(ordered, DEFAULT_RATES["caption"], target_gpu_min * 60.0)
+    return {"segment": [sum(dur[u] for u in uids) for uids, _ in seg],
+            "caption": [(sum(dur[u] for u in uids), tuple(dict.fromkeys(owner[u] for u in uids)))
+                        for uids, _ in cap]}
+
+
+def even_plan(video_s: float) -> ShardPlan:
+    """Equal shards at the profile's shard target (caption shard ``j`` depends on the segment
+    shards its video span overlaps)."""
+    n = _even_counts(video_s)
+    seg_v, cap_v = video_s / n["segment"], video_s / n["caption"]
+    cap = []
+    for j in range(n["caption"]):
+        lo = int(j * cap_v // seg_v)
+        hi = min(n["segment"] - 1, int(((j + 1) * cap_v - 1e-6) // seg_v))
+        cap.append((cap_v, tuple(range(lo, hi + 1))))
+    return {"segment": [seg_v] * n["segment"], "caption": cap}
+
+
+def shard_plan(video_s: float | None = None, mode: str = "real") -> ShardPlan:
+    """The active profile's shards: ``exact`` (real mode, pinned table) or ``even``."""
+    v = VIDEO_S if video_s is None else video_s
+    if PROFILE.packing == "exact" and mode == "real":
+        return exact_plan(PROFILE.episodes, SHARD_TARGET_GPU_MIN, scale=v / PROFILE.video_s)
+    return even_plan(v)
+
+
+def shard_counts(video_s: float | None = None, mode: str = "real") -> dict[str, int]:
+    p = shard_plan(video_s, mode)
+    return {k: len(p[k]) for k in POOLS}
 
 
 def pool_sizes(sizes: Mapping[str, int] | None = None) -> dict[str, int]:
@@ -401,8 +586,9 @@ MIN_CONTAINERS = 0  # `flora deploy --min-containers` for this run (the default)
 
 
 def simulate(sizes: Mapping[str, int], rates: Mapping[str, KindRate],
-             video_s: float = VIDEO_S, *, upper: bool = False,
-             prewarm: bool = MIN_CONTAINERS == 0) -> dict[str, Any]:
+             video_s: float | None = None, *, upper: bool = False,
+             prewarm: bool = MIN_CONTAINERS == 0, mode: str = "real",
+             plan: ShardPlan | None = None) -> dict[str, Any]:
     """Shard-level schedule of the run without chaos: every ``segment`` shard is queued at
     t=0, a ``caption`` shard is queued once the segment shards covering its episodes have
     receipts (per-shard ``depends_on``), each pool autoscales up to its size, a container
@@ -411,7 +597,8 @@ def simulate(sizes: Mapping[str, int], rates: Mapping[str, KindRate],
     job-aware drain), and the app stops :data:`IDLE_AFTER_JOB_S` after the last receipt.
     ``prewarm``: one caption container is spawned a caption startup before the first caption
     shard is runnable (a perfect ready estimate; it is charged from its spawn). ``upper``:
-    rates and startups at ``1 + uncertainty``. Returns ``{"wall_s", "pools": {kind:
+    rates and startups at ``1 + uncertainty``. ``plan``: the shards (default
+    :func:`shard_plan` of the active profile). Returns ``{"wall_s", "pools": {kind:
     PoolSim}, "pipelining"}``."""
     from flora_deploy.jobs.settings import WORKER_SCALEDOWN_S
     from flora_deploy.planner.options import POOL_END_TAIL_S
@@ -422,17 +609,12 @@ def simulate(sizes: Mapping[str, int], rates: Mapping[str, KindRate],
     def start(k: str) -> float:
         return rates[k].startup_s * ((1 + rates[k].startup_unc) if upper else 1.0)
 
-    n_shards = shard_counts(video_s)
-    seg_v = video_s / n_shards["segment"]
-    cap_v = video_s / n_shards["caption"]
-    seg_c, seg_sp = _schedule([(0.0, seg_v * rate("segment"))] * n_shards["segment"],
+    plan = plan or shard_plan(video_s, mode)
+    seg_c, seg_sp = _schedule([(0.0, v * rate("segment")) for v in plan["segment"]],
                               sizes["segment"], start("segment"), WORKER_SCALEDOWN_S)
     seg_end = [e for _, e in seg_sp]
-    cap_in = []
-    for j in range(n_shards["caption"]):
-        lo = int(j * cap_v // seg_v)
-        hi = min(n_shards["segment"] - 1, int(((j + 1) * cap_v - 1e-6) // seg_v))
-        cap_in.append((max(seg_end[lo:hi + 1]), cap_v * rate("caption")))
+    cap_in = [(max(seg_end[i] for i in deps), v * rate("caption"))
+              for v, deps in plan["caption"]]
     cap_in.sort(key=lambda x: x[0])
     pre_at = max(0.0, cap_in[0][0] - start("caption")) if prewarm and cap_in else None
     cap_c, cap_sp = _schedule(cap_in, sizes["caption"], start("caption"), WORKER_SCALEDOWN_S,
@@ -470,21 +652,27 @@ def simulate(sizes: Mapping[str, int], rates: Mapping[str, KindRate],
     return out
 
 
-def run_wall_s(mode: str, video_s: float = VIDEO_S, *, upper: bool = False,
+def run_wall_s(mode: str, video_s: float | None = None, *, upper: bool = False,
                table: Any = None, warm: bool | None = None,
                sizes: Mapping[str, int] | None = None) -> float:
-    """Wall seconds of the run: the shard schedule (:func:`simulate`) plus the reconciler gap
-    of the orchestrator kill (half the cron period nominal, the whole wait upper)."""
-    sim = simulate(pool_sizes(sizes), kind_rates(mode, table, warm=warm), video_s, upper=upper)
-    gap = RECONCILE_WAIT_S if upper else RECONCILE_WAIT_S / 2
+    """Wall seconds of the run: the shard schedule (:func:`simulate`) plus, when the profile
+    kills the orchestrator, the reconciler gap (half the cron period nominal, the whole wait
+    upper)."""
+    sim = simulate(pool_sizes(sizes), kind_rates(mode, table, warm=warm), video_s, upper=upper,
+                   mode=mode)
+    gap = 0.0
+    if "kill_orchestrator" in CHAOS:
+        gap = RECONCILE_WAIT_S if upper else RECONCILE_WAIT_S / 2
     return sim["wall_s"] + gap
 
 
-def project(step: str, mode: str, video_s: float = VIDEO_S, table: Any = None, *,
+def project(step: str, mode: str, video_s: float | None = None, table: Any = None, *,
             warm: bool | None = None, sizes: Mapping[str, int] | None = None
             ) -> wh.Projection:
-    """What ``step`` costs in ``mode`` (nominal and upper; see ``docs/scale-test.md``).
-    ``warm``: the warm-start variant; ``sizes``: pool sizes other than :data:`POOLS`."""
+    """What ``step`` costs in ``mode`` (nominal and upper; see ``docs/scale-test.md``), for
+    the active profile. ``warm``: the warm-start variant; ``sizes``: pool sizes other than
+    :data:`POOLS`. Chaos items are charged only for the profile's chaos actions."""
+    video_s = VIDEO_S if video_s is None else video_s
     p = wh.Projection(step)
     if step in ("verify", "plan", "report") or mode == "local":
         return p
@@ -507,8 +695,9 @@ def project(step: str, mode: str, video_s: float = VIDEO_S, table: Any = None, *
     r = kind_rates(mode, table, warm=warm)
     n = pool_sizes(sizes)
     shapes = pools_for(mode)
-    nom = simulate(n, r, video_s)["pools"]
-    up = simulate(n, r, video_s, upper=True)["pools"]
+    nom = simulate(n, r, video_s, mode=mode)["pools"]
+    up = simulate(n, r, video_s, upper=True, mode=mode)["pools"]
+    plan = shard_plan(video_s, mode)
     for kind, (c, _) in shapes.items():
         k, a, b = r[kind], nom[kind], up[kind]
         s_up = k.startup_s * (1 + k.startup_unc)
@@ -524,10 +713,14 @@ def project(step: str, mode: str, video_s: float = VIDEO_S, table: Any = None, *
         # container is not yet confirmed live (``jobs.pools``; criterion 9 measures it)
         p.add(f"{kind}: idle tail x{a.starts} (drained / stop)", c, a.tail_s,
               upper_s=b.starts * (WORKER_SCALEDOWN_S + CLIENT_SLACK_S))
-        shard = shard_video_s(kind) * k.cs_per_video_s
-        p.add(f"{kind}: 1 preemption (replacement start + lost shard)", c,
-              k.startup_s + shard / 2, upper_s=s_up + shard * (1 + k.uncertainty))
-        if kind == "caption":  # the orchestrator kill: captions idle, scale down, restart
+        vs = [x if kind == "segment" else x[0] for x in plan[kind]]
+        shard = (sum(vs) / len(vs) if PROFILE.packing == "exact" else shard_video_s(kind)) \
+            * k.cs_per_video_s  # the mean shard (exact packing), else the shard target
+        if f"preempt_{kind}" in CHAOS:
+            p.add(f"{kind}: 1 preemption (replacement start + lost shard)", c,
+                  k.startup_s + shard / 2, upper_s=s_up + shard * (1 + k.uncertainty))
+        if kind == "caption" and "kill_orchestrator" in CHAOS:
+            # the orchestrator kill: captions idle, scale down, restart
             p.add(f"caption: reconciler gap x{n[kind]} (idle {WORKER_SCALEDOWN_S} s + "
                   "restart)", c, n[kind] * (WORKER_SCALEDOWN_S + k.startup_s),
                   upper_s=n[kind] * (WORKER_SCALEDOWN_S + s_up))
@@ -553,9 +746,10 @@ SIZING_TARGET_WALL_S = 3600.0  # the recommendation finishes within an hour, eve
 
 
 def pool_sizing(ns: Sequence[int] = (1, 2, 3, 4), *, warm: bool | None = None,
-                table: Any = None, video_s: float = VIDEO_S) -> list[dict[str, Any]]:
+                table: Any = None, video_s: float | None = None) -> list[dict[str, Any]]:
     """The wall-clock / cost trade-off of every ``segment`` x ``caption`` pool size in ``ns``
     (real mode; the run step with its chaos, and the bare schedule without it)."""
+    video_s = VIDEO_S if video_s is None else video_s
     rows = []
     r = kind_rates("real", table, warm=warm)
     usd_s = container_rates("real")
@@ -592,6 +786,58 @@ def recommend(rows: Sequence[Mapping[str, Any]], max_wall_s: float = SIZING_TARG
     return min(ok, key=lambda x: (x["usd"], x["wall_s"])) if ok else None
 
 
+# The lite size options (``--sizing`` with ``--profile lite``): episode counts x pool sizes, at
+# the lite profile's shard target and chaos. The recommendation must stay within
+# LITE_UPPER_MAX_USD at the upper projection (about $10-15 of the project budget is left after
+# the certified run).
+LITE_EPISODES = (16, 32, 48)
+LITE_POOLS = ((1, 2), (2, 2), (2, 3))
+LITE_UPPER_MAX_USD = 7.0
+
+
+def size_options(base: Profile | None = None, episodes: Sequence[int] = LITE_EPISODES,
+                 pools: Sequence[tuple[int, int]] = LITE_POOLS, *, warm: bool | None = None,
+                 table: Any = None) -> list[dict[str, Any]]:
+    """Every (episodes, segment x caption) size of ``base`` (default: the lite profile):
+    nominal / upper totals over all steps (the caps' basis), the run's wall, shards, and
+    whether each pool reaches its size and gives every container at least two shards in the
+    schedule (so each container yields a rate sample and the pools pipeline)."""
+    base = base or PROFILES["lite"]
+    rows = []
+    for n_ep in episodes:
+        for a, b in pools:
+            prof = base.with_size(n_ep, {"segment": a, "caption": b})
+            with profile_ctx(prof):
+                ps = projections("real", table, warm=warm)
+                sim = simulate(pool_sizes(), kind_rates("real", table, warm=warm))
+                counts = shard_counts()
+                rows.append({
+                    "episodes": n_ep, "segment": a, "caption": b,
+                    "video_s": round(VIDEO_S, 1), "shards": counts,
+                    "usd": round(sum(p.usd for p in ps.values()), 2),
+                    "usd_upper": round(sum(p.usd_upper for p in ps.values()), 2),
+                    "wall_s": round(run_wall_s("real", table=table, warm=warm)),
+                    "wall_upper_s": round(run_wall_s("real", upper=True, table=table,
+                                                     warm=warm)),
+                    "peak": {k: sim["pools"][k].peak for k in POOLS},
+                    "shards_per_container": {k: round(counts[k] / POOLS[k]["max_containers"],
+                                                      1) for k in POOLS},
+                    "overlap_s": round(sim["pipelining"]["overlap_s"])})
+    return rows
+
+
+def recommend_size(rows: Sequence[Mapping[str, Any]], max_upper_usd: float = LITE_UPPER_MAX_USD,
+                   min_per_pool: int = 2) -> Mapping[str, Any] | None:
+    """The lite recommendation: at least ``min_per_pool`` containers per pool that the schedule
+    reaches, two or more shards per container, pipelined pools (overlap > 0), and an upper
+    total within ``max_upper_usd``; of those, the most video (more samples per container),
+    then the cheapest."""
+    ok = [x for x in rows if x["usd_upper"] <= max_upper_usd + 1e-9 and x["overlap_s"] > 0
+          and all(x[k] >= min_per_pool and x["peak"][k] >= x[k]
+                  and x["shards_per_container"][k] >= 2 for k in POOLS)]
+    return max(ok, key=lambda x: (x["video_s"], -x["usd"])) if ok else None
+
+
 def planner_options(mode: str = "real") -> list[Any]:
     """``flora plan``'s options for this workload, offline (the dry run prints them)."""
     from flora_deploy.config.presets import get_preset
@@ -604,9 +850,9 @@ def planner_options(mode: str = "real") -> list[Any]:
 
     w = WorkloadSummary.from_dict({"groups": [{"pool": "human", "cameras": 1,
                                                "video_s": VIDEO_S,
-                                               "episodes": DATASET["total_episodes"]}]})
+                                               "episodes": PROFILE.episodes}]})
     req = PlanRequest(workload=w, stages=("segment", "caption"),
-                      presets=("balanced", "exact"), max_gpus=MAX_GPUS,
+                      presets=("balanced", "exact"), max_gpus=max_gpus(),
                       budget_usd=global_cap("real"))
     bal = get_preset("balanced").pools
     from dataclasses import replace
@@ -618,16 +864,15 @@ def planner_options(mode: str = "real") -> list[Any]:
 # ---------------------------------------------------------------------------------------------
 # Chaos (pure decision; the runners act on it)
 
-CHAOS = ("preempt_segment", "preempt_caption", "kill_orchestrator")
-
-
 @dataclass
 class Chaos:
     """Which chaos action is due for a status sample (``flora status --json``). Each fires
     once: a ``segment`` preemption once a segment shard is done and at least two are left, a
-    ``caption`` preemption at 25% of the caption shards, an orchestrator kill at 50%."""
+    ``caption`` preemption at 25% of the caption shards, an orchestrator kill at 50%.
+    ``enabled``: the actions to fire (default: every one, :data:`ALL_CHAOS`; ``run`` passes
+    the profile's)."""
 
-    enabled: tuple[str, ...] = CHAOS
+    enabled: tuple[str, ...] = ALL_CHAOS
     fired: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def due(self, sample: Mapping[str, Any]) -> str | None:
@@ -680,12 +925,12 @@ def config_text(mode: str, *, project: str, run_id: str, budget_usd: float,
     if derived:
         weights = "weights:\n  derived:\n" + "".join(
             f"    {k}: {v}\n" for k, v in sorted(derived.items()))
-    return f"""# Scale test ({mode}); generated by scripts/scale_test.py
+    return f"""# Scale test ({PROFILE.name} profile, {mode}); generated by scripts/scale_test.py
 project: {project}
 license_ack: research-only
 modal:
   environment: main
-  max_gpus: {MAX_GPUS}
+  max_gpus: {max_gpus()}
   budget_usd: {budget_usd:.2f}
   tags: {{flora-scale-test: "{run_id}"}}
 preset: balanced
@@ -711,7 +956,7 @@ retries:
 def job_id_for(mode: str, run_id: str) -> str:
     from flora_deploy.jobs.store import fake_job_id
 
-    j = f"scale-{run_id}"
+    j = f"scale-{PROFILE.tag}{run_id}"
     return j if mode == "real" else fake_job_id(j)
 
 
@@ -787,10 +1032,13 @@ def measure(files: Mapping[str, Sequence[Mapping[str, Any]]], durations: Mapping
         if ft is not None:
             finished_after.setdefault((rc["kind"], rc["shard_id"]), []).append(ft)
     latency: dict[str, list[float]] = {}
+    first_call: dict[str, tuple[float, str]] = {}  # container -> (first attempt start, call id)
     for a in files.get("attempts", []):
         cid, kind = a["container_id"], a["kind"]
         kind_of[cid] = kind
         t0 = _t(a.get("started_utc"))
+        if t0 is not None and (cid not in first_call or t0 < first_call[cid][0]):
+            first_call[cid] = (t0, str(a.get("call_id") or ""))
         r = receipts.get((a["shard_id"], cid))
         t1 = _t(r["finished_utc"]) if r else _t(a.get("ended_utc"))
         if a.get("preempted"):
@@ -870,7 +1118,47 @@ def measure(files: Mapping[str, Sequence[Mapping[str, Any]]], durations: Mapping
         round(sum(p["idle_usd_excl_outage"] for p in out["pools"].values()) / total_usd, 3)
         if total_usd else None)
     out["observed_usd"] = round(total_usd, 4)
+    out["containers"] = per_container(files, durations, spans, life, kind_of, first_call,
+                                      spawned, containers)
     return out
+
+
+PREWARM_LEAD_S = 5.0  # a container up this long before its first call was spawned: pre-warmed
+
+
+def per_container(files: Mapping[str, Sequence[Mapping[str, Any]]],
+                  durations: Mapping[str, float], spans: Mapping[str, list[tuple]],
+                  life: Mapping[str, tuple[float, float]], kind_of: Mapping[str, str],
+                  first_call: Mapping[str, tuple[float, str]], spawned: Mapping[str, float],
+                  containers: Mapping[str, Mapping[str, float]] | None) -> list[dict[str, Any]]:
+    """One row per container that ran a shard: its kind, busy seconds, the video seconds of
+    the episodes its receipts finished, its container-seconds per video-second (a rate sample
+    for ``--finalize``), shards finished, its first call's spawn-to-start latency, and whether
+    it was **pre-warmed** (Modal started it more than :data:`PREWARM_LEAD_S` before its first
+    call was spawned: the caption pre-warm, whose spawn-to-start is not a startup)."""
+    rows = []
+    done: dict[str, list[Mapping[str, Any]]] = {}
+    for r in files.get("receipts", []):
+        done.setdefault(str(r.get("container_id")), []).append(r)
+    for cid in sorted(life):
+        sp = spans.get(cid, [])
+        rs = done.get(cid, [])
+        video = sum(durations.get(u, 0.0) for r in rs for u in r.get("episodes_done", ()))
+        busy = sum(s[1] - s[0] for s in sp)
+        t_first, call = first_call.get(cid, (None, ""))
+        t_spawn = spawned.get(call)
+        obs = (containers or {}).get(cid)
+        prewarmed = bool(obs and t_spawn is not None
+                         and obs["start"] < t_spawn - PREWARM_LEAD_S)
+        rows.append({
+            "container_id": cid, "kind": kind_of.get(cid), "shards": len(rs),
+            "busy_s": round(busy, 1), "video_s": round(video, 1),
+            "container_s_per_video_s": round(busy / video, 4) if video else None,
+            "spawn_to_start_s": (round(t_first - t_spawn, 1)
+                                 if t_first is not None and t_spawn is not None else None),
+            "started": round(life[cid][0], 1), "ended": round(life[cid][1], 1),
+            "prewarmed": prewarmed})
+    return rows
 
 
 def first_spawn_after(ledgers: Sequence[Mapping[str, Any]], t: float) -> float | None:
@@ -899,9 +1187,20 @@ CRITERIA: dict[str, Any] = {
 }
 LAUNCH_MARGIN_S = 120.0  # `flora run --detach` -> orchestrator up -> first spawn, + scheduling
 
-# The 14 criteria: (number, name). Every one is automatic: computed by :func:`evaluate` from
+# Added with the lite profile (they apply to full as well): what a run must prove beyond the 14.
+BATCH_FILL = {"mean_batch_min": 2.0, "busy_fraction_min": 0.60}
+# The engines' request caps after Fix-13 (TempSeg on L40S, Captioner on H100): batch fill is
+# reported as the mean batch against them.
+ENGINE_MAX_NUM_SEQS = {"segment": 48, "caption": 16}
+MIN_CONTAINERS_MEASURED = 2  # per pool: containers with a finished shard (rate samples)
+DRAIN_BOUND_S = h0.DRAIN_BOUND_S  # 30 s: a drained container must be gone this long after
+TAIL_WATCH_S = DRAIN_BOUND_S + 15.0  # after the job ends: keep sampling containers this long
+TAIL_POLL_S = 5.0  # ... this often (the resolution of the measured drain)
+
+# The criteria: (number, name). Every one is automatic: computed by :func:`evaluate` from
 # what ``run`` and ``report`` record. MANUAL lists the ones that are not (none today); each
-# would carry the reason it cannot be read from the recorded data.
+# would carry the reason it cannot be read from the recorded data. 1-14 are the original
+# criteria; 15-19 were added with the lite profile.
 CRITERION_NAMES: tuple[tuple[int, str], ...] = (
     (1, "end state"),
     (2, "lost or duplicate records"),
@@ -917,9 +1216,84 @@ CRITERION_NAMES: tuple[tuple[int, str], ...] = (
     (12, "flora status p95"),
     (13, "flora report"),
     (14, "flora compose"),
+    (15, "throughput per pool from several containers"),
+    (16, "scale to zero at the end of the job"),
+    (17, "caption pre-warm"),
+    (18, "compile cache, per shard"),
+    (19, "batch fill"),
 )
 MANUAL: dict[int, str] = {}
 LOCAL_NA = "local: calls run on threads, with no containers, cold starts or money"
+LOCAL_FAKE_NA = ("local: fake engines compile nothing and simulate their batches, so cache "
+                 "and batch figures mean nothing")
+NO_CHAOS_NA = ("not fired by the {profile} profile: a stopped container's lost half shard "
+               "would count as busy time and skew the per-container rate samples this profile "
+               "exists to take, and the two replacement starts cost ~$0.75; judged by the "
+               "full profile and the local / fake-modal rehearsals")
+NO_KILL_NA = ("not fired by the {profile} profile: the reconciler runs every 10 minutes, about "
+              "as long as this job's whole caption phase, so a kill would double the wall and "
+              "its idle cost (~$1.80) would swamp the throughput and idle measurements; judged "
+              "by the full profile and the local / fake-modal rehearsals")
+
+
+def batch_fill(audits: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Per pool, from the shard audit rows (``shard_audit``; the batcher's stats,
+    ``engines.microbatch.BatcherStats``): shards, rounds, the mean batch (weighted by rounds),
+    the largest batch, the GPU-busy fraction (generate seconds over the batcher's wall
+    seconds) and the fill (mean batch over the engine's request cap,
+    :data:`ENGINE_MAX_NUM_SEQS`)."""
+    acc: dict[str, dict[str, float]] = {}
+    for a in audits:
+        if not a.get("shard_audit") or a.get("stage") not in POOLS:
+            continue
+        b = a.get("batcher") or {}
+        x = acc.setdefault(a["stage"], {"shards": 0, "rounds": 0, "batched": 0.0,
+                                        "max": 0, "gen": 0.0, "wall": 0.0})
+        x["shards"] += 1
+        r = int(b.get("rounds") or 0)
+        x["rounds"] += r
+        x["batched"] += float(b.get("mean_batch") or 0.0) * r
+        x["max"] = max(x["max"], int(b.get("max_batch") or 0))
+        x["gen"] += float(b.get("generate_s") or 0.0)
+        x["wall"] += float(b.get("wall_s") or 0.0)
+    out = {}
+    for k, x in acc.items():
+        mean = x["batched"] / x["rounds"] if x["rounds"] else None
+        out[k] = {"shards": int(x["shards"]), "rounds": int(x["rounds"]),
+                  "mean_batch": round(mean, 2) if mean is not None else None,
+                  "max_batch": int(x["max"]),
+                  "busy_fraction": round(x["gen"] / x["wall"], 3) if x["wall"] else None,
+                  "fill": (round(mean / ENGINE_MAX_NUM_SEQS[k], 3)
+                           if mean is not None and k in ENGINE_MAX_NUM_SEQS else None)}
+    return out
+
+
+def cache_by_kind(audits: Sequence[Mapping[str, Any]], receipts: Sequence[Mapping[str, Any]],
+                  warm_kinds: Sequence[str] = ()) -> dict[str, dict[str, Any]]:
+    """Per pool: the compile-cache provenance of every shard (``h0_rehearsal.
+    cache_provenance_check``: every shard names a state) and the states seen. A pool whose
+    cache was published before the run (``warm_kinds``, from ``plan``) must load it on every
+    shard (``warm``)."""
+    out = {}
+    for k in POOLS:
+        ok, detail = h0.cache_provenance_check(list(audits), list(receipts), kinds=(k,))
+        states: dict[str, int] = {}
+        seen: set[str] = set()
+        for d in [a for a in audits if a.get("shard_audit") and a.get("stage") == k] + \
+                [r for r in receipts if r.get("kind") == k]:
+            sid = str(d.get("shard_id"))
+            v = next((d[c] for c in h0.CACHE_KEYS if d.get(c) is not None), None)
+            if sid in seen or v is None:
+                continue
+            seen.add(sid)
+            s = (v.get("state") or v.get("source")) if isinstance(v, dict) else v
+            states[str(s)] = states.get(str(s), 0) + 1
+        warm = k in warm_kinds
+        if ok and warm and set(states) != {"warm"}:
+            ok, detail = False, f"{detail}; a cache was published before the run, but not " \
+                                "every shard loaded it"
+        out[k] = {"ok": ok, "detail": detail, "states": states, "published_before": warm}
+    return out
 
 
 def criteria_targets(mode: str, sizes: Mapping[str, int] | None = None,
@@ -930,7 +1304,7 @@ def criteria_targets(mode: str, sizes: Mapping[str, int] | None = None,
     caption: the upper caption cold start plus the margin."""
     n = pool_sizes(sizes)
     r = kind_rates(mode, table, warm=False)
-    up = simulate(n, r, upper=True)
+    up = simulate(n, r, upper=True, mode=mode)
     poll = POLL_S.get(mode, 30.0)
     return {**CRITERIA, "sizes": n,
             "time_to_peak_max_s": {k: round((up["pools"][k].t_peak or 0.0) + poll
@@ -947,10 +1321,11 @@ def _all(oks: Sequence[bool | None]) -> bool | None:
 
 def evaluate(r: Mapping[str, Any], mode: str, targets: Mapping[str, Any] | None = None
              ) -> list[dict[str, Any]]:
-    """PASS / FAIL / n.a. for each of the 14 criteria (:data:`CRITERION_NAMES`) from the
-    ``run`` + ``report`` results. A value the run did not record is a FAIL ("not
-    recorded"): every criterion is meant to be measured. ``n.a.`` is only for criteria that
-    cannot apply in ``local`` (``reason`` says why)."""
+    """PASS / FAIL / n.a. for each criterion (:data:`CRITERION_NAMES`) from the ``run`` +
+    ``report`` results. A value the run did not record is a FAIL ("not recorded"): every
+    criterion is meant to be measured. ``n.a.`` is only for criteria that cannot apply in
+    ``local``, or for chaos the profile does not fire (``chaos_enabled``); ``reason`` says
+    why."""
     T = dict(targets or criteria_targets(mode, r.get("sizes")))
     sizes = T["sizes"]
     local = mode == "local"
@@ -1033,18 +1408,27 @@ def evaluate(r: Mapping[str, Any], mode: str, targets: Mapping[str, Any] | None 
                                                   else s <= T["idle_share_max"]),
         LOCAL_NA if local else "")
     chaos = r.get("chaos") or {}
+    enabled = tuple(r.get("chaos_enabled", ALL_CHAOS))  # a report without it ran every action
+    prof = r.get("profile", "full")
 
     def pre(k: str, p: Mapping[str, Any]) -> tuple[Any, bool | None]:
         n_pre, n_rec = p.get("preempted_starts", 0), p.get("preempted_recovered", 0)
         if f"preempt_{k}" not in chaos:
             return "not fired", False
         return f"{n_rec}/{n_pre}", n_pre >= 1 and n_rec == n_pre
-    v, ok = per_pool(pre)
-    add(10, v, ">= 1 preempted start per pool, each shard finished by a later attempt", ok)
+    pre_tgt = ">= 1 preempted start per pool, each shard finished by a later attempt"
+    if not any(a.startswith("preempt_") for a in enabled):
+        add(10, None, pre_tgt, None, NO_CHAOS_NA.format(profile=prof))
+    else:
+        v, ok = per_pool(pre)
+        add(10, v, pre_tgt, ok)
     orch = r.get("orchestrator") or {}
     rv = orch.get("revive_s")
     by = "flora resume" if local else "the reconciler"
-    if not orch.get("killed"):
+    if "kill_orchestrator" not in enabled:
+        add(11, None, f"killed, revived by {by} <= {T['reconciler_revive_max_s']} s", None,
+            NO_KILL_NA.format(profile=prof))
+    elif not orch.get("killed"):
         add(11, None, f"killed, revived by {by} <= {T['reconciler_revive_max_s']} s",
             False, "the orchestrator kill did not fire")
     else:
@@ -1062,7 +1446,87 @@ def evaluate(r: Mapping[str, Any], mode: str, targets: Mapping[str, Any] | None 
     cp, crc = tm.get("compose_s"), tm.get("compose_rc", 0)
     add(14, cp, f"<= {T['compose_max_s']} s and exit 0",
         None if cp is None else cp <= T["compose_max_s"] and crc == 0)
+    _evaluate_proofs(r, local, add)
     return [rows[i] for i, _ in CRITERION_NAMES]
+
+
+def _evaluate_proofs(r: Mapping[str, Any], local: bool,
+                     add: Callable[..., None]) -> None:
+    """Criteria 15-19 (added with the lite profile; see :func:`evaluate`)."""
+    m = r.get("measure") or {}
+    rows = [c for c in m.get("containers") or () if c.get("kind") in POOLS]
+    tgt15 = (f">= {MIN_CONTAINERS_MEASURED} containers per pool with a finished shard and "
+             "a measured container-s per video-s")
+    if local:
+        add(15, None, tgt15, None, LOCAL_NA)
+    elif not rows:
+        add(15, None, tgt15, None)
+    else:
+        val, oks = {}, []
+        for k in POOLS:
+            xs = [c for c in rows if c["kind"] == k and c.get("shards")
+                  and c.get("container_s_per_video_s")]
+            rs = [c["container_s_per_video_s"] for c in xs]
+            busy = sum(c["busy_s"] for c in xs)
+            video = sum(c["video_s"] for c in xs)
+            val[k] = {"containers": len(xs),
+                      "container_s_per_video_s": round(busy / video, 4) if video else None,
+                      "range": [min(rs), max(rs)] if rs else None}
+            oks.append(len(xs) >= MIN_CONTAINERS_MEASURED)
+        add(15, val, tgt15, all(oks))
+    tgt16 = (f"every worker container gone <= {DRAIN_BOUND_S:.0f} s after its pool drained "
+             "(container lifetimes against the orchestrator's drain record)")
+    dr = r.get("drain")
+    if local:
+        add(16, None, tgt16, None, LOCAL_NA)
+    elif not dr:
+        add(16, None, tgt16, None)
+    else:
+        workers = [x for x in dr if x.get("kind") is not None]
+        ok, detail = h0.drain_check(workers, DRAIN_BOUND_S)
+        gaps = {k: max((x["gap_s"] for x in workers if x["kind"] == k
+                        and x.get("gap_s") is not None), default=None) for k in POOLS}
+        add(16, {"max_gap_s": gaps, "detail": detail[:300]}, tgt16, ok)
+    tgt17 = ("caption pre-warm planned and started, first caption container within "
+             f"{h0.PREWARM_TOL_S:.0f} s of the planned start")
+    pw = r.get("prewarm")
+    if local:
+        add(17, None, tgt17, None, LOCAL_NA)
+    elif not pw:
+        add(17, None, tgt17, None)
+    else:
+        add(17, pw.get("detail"), tgt17, bool(pw.get("ok")))
+    tgt18 = ("every shard names its compile-cache state; a pool whose cache was published "
+             "before the run loads it on every shard")
+    cache = r.get("cache")
+    if local:
+        add(18, None, tgt18, None, LOCAL_FAKE_NA)
+    elif not cache:
+        add(18, None, tgt18, None)
+    else:
+        oks = [cache.get(k, {}).get("ok") for k in POOLS]
+        missing = any(o is None for o in oks)  # no shard of a pool names a cache: a FAIL
+        add(18, {k: {"states": cache.get(k, {}).get("states"),
+                     "published_before": cache.get(k, {}).get("published_before")}
+                 for k in POOLS}, tgt18, False if missing else all(oks),
+            "not recorded: a pool's shards carry no compile-cache provenance" if missing else "")
+    tgt19 = (f"mean batch >= {BATCH_FILL['mean_batch_min']:g} and GPU-busy fraction >= "
+             f"{BATCH_FILL['busy_fraction_min']:g} per pool (shard audit rows; caps "
+             + ", ".join(f"{k} {v}" for k, v in ENGINE_MAX_NUM_SEQS.items()) + ")")
+    bf = r.get("batch_fill")
+    if local:
+        add(19, None, tgt19, None, LOCAL_FAKE_NA)
+    elif not bf or any(k not in bf for k in POOLS):
+        add(19, bf or None, tgt19, None)
+    else:
+        oks = []
+        for k in POOLS:
+            mb, busy = bf[k].get("mean_batch"), bf[k].get("busy_fraction")
+            oks.append(None if mb is None or busy is None else
+                       mb >= BATCH_FILL["mean_batch_min"]
+                       and busy >= BATCH_FILL["busy_fraction_min"])
+        add(19, {k: {x: bf[k].get(x) for x in ("mean_batch", "fill", "busy_fraction")}
+                 for k in POOLS}, tgt19, _all(oks))
 
 
 def criteria_summary(rows: Sequence[Mapping[str, Any]]) -> str:
@@ -1157,7 +1621,8 @@ def run_verify(ctx: Ctx) -> dict[str, Any]:
 
 def _write_config(ctx: Ctx, derived: Mapping[str, str] | None = None) -> None:
     budget = max(0.01, caps(ctx.mode)["run"]) if ctx.mode != "local" else 50.0
-    ctx.cfg.write_text(config_text(ctx.mode, project=f"scale-{ctx.run}", run_id=ctx.run,
+    ctx.cfg.write_text(config_text(ctx.mode, project=f"scale-{PROFILE.tag}{ctx.run}",
+                                   run_id=ctx.run,
                                    budget_usd=budget, derived=derived), encoding="utf-8")
 
 
@@ -1172,7 +1637,7 @@ def run_index(ctx: Ctx) -> dict[str, Any]:
     if ctx.mode == "real":
         ctx.note_app("flora-index")
         ctx.sh([fl, "index", "--config", str(ctx.cfg), "--job", ctx.job_id, "--store",
-                ctx.store_uri, "--out", str(summary)], timeout=3600)
+                ctx.store_uri, "--out", str(summary), *index_limit_args()], timeout=3600)
         usd = project("index", "real").items[0]["usd_per_h"] / 3600 * (time.time() - t0)
     else:
         local_store = ctx.work / "store"
@@ -1186,9 +1651,36 @@ def run_index(ctx: Ctx) -> dict[str, Any]:
         usd = 0.0
     s = json.loads(summary.read_text())
     c = s.get("counts", {})
-    return {"ok": c.get("indexed", 0) > 0 and not s.get("failed"), "counts": c,
-            "video_s": s.get("video_s"), "wall_s": round(time.time() - t0, 1),
-            "tracked_usd": round(usd, 4), "apps": []}
+    problems = subset_problems(c, s.get("video_s")) if ctx.mode == "real" else []
+    return {"ok": c.get("indexed", 0) > 0 and not s.get("failed") and not problems,
+            "counts": c, "video_s": s.get("video_s"), "subset_problems": problems,
+            "wall_s": round(time.time() - t0, 1), "tracked_usd": round(usd, 4), "apps": []}
+
+
+SUBSET_VIDEO_TOL = 0.01  # indexed video length vs the pinned table (container vs frame count)
+
+
+def index_limit_args() -> list[str]:
+    """``flora index --limit N`` for a subset profile: the first N episodes by episode index
+    (``media.sources.lerobot_v3`` lists them in that order). Nothing for the full dataset."""
+    n = PROFILE.episodes
+    return [] if n >= DATASET["total_episodes"] else ["--limit", str(n)]
+
+
+def subset_problems(counts: Mapping[str, Any], video_s: Any) -> list[str]:
+    """Why the indexed episodes are not the profile's subset (empty: they are): the count, and
+    the video length against the pinned per-episode frame counts within
+    :data:`SUBSET_VIDEO_TOL`."""
+    out = []
+    want = PROFILE.episodes
+    if int(counts.get("episodes", want)) != want or int(counts.get("indexed", 0)) != want:
+        out.append(f"indexed {counts.get('indexed')} of {counts.get('episodes')} episodes; "
+                   f"the {PROFILE.name} profile is the first {want}")
+    if video_s is None:
+        out.append("the index summary has no video_s")
+    elif abs(float(video_s) / VIDEO_S - 1) > SUBSET_VIDEO_TOL:
+        out.append(f"indexed {float(video_s):.1f} video-s; the pinned table says {VIDEO_S:.1f}")
+    return out
 
 
 def run_plan(ctx: Ctx) -> dict[str, Any]:
@@ -1209,9 +1701,18 @@ def run_plan(ctx: Ctx) -> dict[str, Any]:
                 f"{(r['wall_s'] or 0) / 3600:.2f} h, {r['peak_gpus']} GPUs, {r['status']}")
     ctx.log(f"  this run ({ctx.mode}): nominal ${proj.usd:.2f}, upper ${proj.usd_upper:.2f}, "
             f"{video:.0f} video-s")
+    warm_kinds: list[str] = []
+    if ctx.mode == "real":  # a read of flora-cache (no container): which pools start warm
+        with contextlib.suppress(Exception):
+            from flora_deploy.cli.plan import published_cache_kinds
+            from flora_deploy.config.schema import load_config
+
+            warm_kinds = list(published_cache_kinds(load_config(ctx.cfg,
+                                                                allow_uncertified=True)))
+        ctx.log(f"  compile cache published for: {warm_kinds or 'no pool (cold starts)'}")
     return {"ok": p.returncode == 0, "options": rows, "video_s": video,
             "projection": {"usd": proj.usd, "usd_upper": proj.usd_upper},
-            "tracked_usd": 0.0, "apps": []}
+            "warm_kinds": warm_kinds, "tracked_usd": 0.0, "apps": []}
 
 
 def _app_name(ctx: Ctx) -> str:
@@ -1255,6 +1756,7 @@ class Monitor:
         self.containers: dict[str, dict[str, float]] = {}
         self.kinds: dict[str, str] = {}  # container_id -> pool kind (attempt markers)
         self.t0 = time.time()
+        self.last_poll: float | None = None  # a container last seen then is still alive
 
     def status(self) -> dict[str, Any] | None:
         t = time.time()
@@ -1280,6 +1782,8 @@ class Monitor:
         p = subprocess.run(["modal", "container", "list", "--json"], capture_output=True,
                            text=True, timeout=120)
         now = time.time()
+        if p.returncode == 0:
+            self.last_poll = now
         n = 0
         with contextlib.suppress(ValueError):
             for c in json.loads(p.stdout):
@@ -1299,6 +1803,34 @@ class Monitor:
 
     def unmatched(self) -> bool:
         return any(cid not in self.kinds for cid in self.containers)
+
+    def live_workers(self) -> list[str]:
+        """Worker containers seen in the last successful poll."""
+        if self.last_poll is None:
+            return []
+        return [cid for cid, c in self.containers.items()
+                if cid in self.kinds and c["end"] >= self.last_poll - 1e-6]
+
+    def watch_tail(self, *, until_s: float = TAIL_WATCH_S, every_s: float = TAIL_POLL_S,
+                   sleep: Callable[[float], None] = time.sleep) -> None:
+        """After the job ends: sample containers every ``every_s`` until no worker container
+        is left or ``until_s`` passed, so each one's end is known to ``every_s`` (criterion
+        16) before ``modal app stop`` ends them all."""
+        t_end = time.time() + until_s
+        while time.time() < t_end:
+            sleep(every_s)
+            self.poll_containers()
+            if not self.live_workers():
+                return
+
+    def seen(self) -> dict[str, dict[str, Any]]:
+        """Containers as ``h0_rehearsal.drain_rows`` reads them: start, and end unless it was
+        still alive at the last poll."""
+        lp = self.last_poll
+        return {cid: {"app": self.app, "started_at": c["start"],
+                      "ended_at": None if lp is not None and c["end"] >= lp - 1e-6
+                      else c["end"]}
+                for cid, c in self.containers.items()}
 
     def observed_usd(self) -> float:
         """Container-seconds seen so far, each at its own class's $/s (:func:`container_rates`):
@@ -1388,7 +1920,7 @@ def run_run(ctx: Ctx) -> dict[str, Any]:
     wall_limit = (run_wall_s(mode, video, upper=True, warm=False) + CLIENT_SLACK_S
                   if mode != "local" else 3600.0)
     slack_usd = CLIENT_SLACK_S * sum(rates[k] * n for k, (_, n) in pools.items())
-    chaos = Chaos(fired=dict(ctx.st.step("run").result.get("chaos") or {}))
+    chaos = Chaos(enabled=CHAOS, fired=dict(ctx.st.step("run").result.get("chaos") or {}))
     app = None if mode == "local" else _app_name(ctx)
     mon = Monitor(ctx, app, rates)
     out: dict[str, Any] = {"app": app, "job_id": ctx.job_id, "budget_usd": round(budget, 4),
@@ -1401,23 +1933,23 @@ def run_run(ctx: Ctx) -> dict[str, Any]:
     resume_proc: subprocess.Popen | None = None
     end_state = None
     try:
+        pre = [k for k in POOLS if f"preempt_{k}" in CHAOS]
         if mode == "local":
-            inject = "preempt:segment-*x1,preempt:caption-*x1"
+            inject = ",".join(f"preempt:{k}-*x1" for k in pre)
             args = [fl, "run", "--local", "--fake-models", "--config", str(ctx.cfg), "--job",
-                    ctx.job_id, "--store", str(ctx.work / "store"), "--inject", inject, "--json"]
-            chaos.fired.update({"preempt_segment": {"inject": inject},
-                                "preempt_caption": {"inject": inject}})
+                    ctx.job_id, "--store", str(ctx.work / "store"),
+                    *(["--inject", inject] if inject else []), "--json"]
+            chaos.fired.update({f"preempt_{k}": {"inject": inject} for k in pre})
             proc = _popen(args, ctx.work, logs["run"])
         else:
             ctx.note_app(app)  # type: ignore[arg-type]
-            if mode == "fake-modal":
+            if mode == "fake-modal" and pre:
                 from flora_deploy.modal_app.workers_app import fake_faults_path
 
                 store = _fake_store(ctx)
                 store.put_bytes(fake_faults_path(ctx.job_id),
-                                json.dumps({"preempt": {"segment": 2, "caption": 2}}).encode())
-                chaos.fired.update({"preempt_segment": {"fake_faults": "segment@2"},
-                                    "preempt_caption": {"fake_faults": "caption@2"}})
+                                json.dumps({"preempt": dict.fromkeys(pre, 2)}).encode())
+                chaos.fired.update({f"preempt_{k}": {"fake_faults": f"{k}@2"} for k in pre})
             ctx.sh([fl, "run", "--config", str(ctx.cfg), "--detach", "--job", ctx.job_id,
                     "--budget", f"{budget:.2f}", "--poll", str(ctx.poll_s), *_modal_flags(ctx)],
                    timeout=900)
@@ -1485,6 +2017,8 @@ def run_run(ctx: Ctx) -> dict[str, Any]:
                     ctx.sh([fl, "cancel", ctx.job_id, "--config", str(ctx.cfg)], check=False)
                 break
             time.sleep(ctx.poll_s)
+        if app is not None and end_state is not None:
+            mon.watch_tail()  # each worker's end after the job-end drain (criterion 16)
     finally:
         try:
             for p in (proc, resume_proc):
@@ -1506,7 +2040,8 @@ def run_run(ctx: Ctx) -> dict[str, Any]:
                     mark_app(ctx.st, "stopped", ctx.state_path)
     out.update(state=end_state, chaos=chaos.fired, orchestrator=orch, samples=mon.samples,
                status_s=[round(x, 2) for x in mon.status_s], containers=mon.containers,
-               container_kinds=mon.kinds, wall_s=round(time.time() - t0, 1),
+               container_kinds=mon.kinds, seen=mon.seen(), last_poll=mon.last_poll,
+               wall_s=round(time.time() - t0, 1),
                observed_usd=round(mon.observed_usd(), 4))
     rep = subprocess.run([fl, "report", ctx.job_id, *ctx.store_args(), "--json"], cwd=ctx.work,
                          capture_output=True, text=True, timeout=900)
@@ -1632,10 +2167,43 @@ def run_report(ctx: Ctx) -> dict[str, Any]:
            "records": records, "projection_error": pe, "timings": timings,
            "orchestrator": run.get("orchestrator"), "chaos": run.get("chaos"),
            "launches": len(job.spec.get("launches") or []), "sizes": pool_sizes(),
-           "startup_variant": "warm" if ASSUME_WARM else "cold"}
+           "startup_variant": "warm" if ASSUME_WARM else "cold",
+           "profile": PROFILE.name, "chaos_enabled": list(CHAOS),
+           "episodes": PROFILE.episodes}
+    if ctx.mode != "local":
+        res.update(proof_inputs(job, ctx, run, rep, files))
     res["criteria"] = evaluate(res, ctx.mode)
     res.update(ok=rp.returncode in (0, 3) and bool(meas["pools"]), tracked_usd=0.0, apps=[])
     return res
+
+
+def proof_inputs(job: Any, ctx: Ctx, run: Mapping[str, Any], rep: Mapping[str, Any],
+                 files: Mapping[str, Sequence[Mapping[str, Any]]]) -> dict[str, Any]:
+    """What criteria 15-19 and ``--finalize`` read, from the job store (the orchestrator's
+    drain and pre-warm records, the shard audit rows) and ``flora report``'s per-container
+    rows: ``drain`` (``h0_rehearsal.drain_rows``), ``prewarm``, ``cache``, ``batch_fill`` and
+    ``report_containers``."""
+    from flora_deploy.jobs.pools import read_drains, read_prewarm_plans
+    from flora_deploy.jobs.store import JobPaths
+
+    root = JobPaths(ctx.job_id).root
+    drains, prewarms = read_drains(job.store, root, job.config_hash)
+    plans = read_prewarm_plans(job.store, root, job.config_hash)
+    report_rows = [dict(c) for c in (rep.get("spend") or {}).get("containers") or ()]
+    seen = dict(run.get("seen") or {})
+    out: dict[str, Any] = {"report_containers": report_rows,
+                           "warm_kinds": list(ctx.st.step("plan").result.get("warm_kinds") or ())}
+    if seen:
+        bound = DRAIN_BOUND_S
+        out["drain"] = h0.drain_rows(str(run.get("app")), report_rows, seen,
+                                     {k: tuple(v) for k, v in drains.items()}, {},
+                                     observed_until=run.get("last_poll"), bound_s=bound)
+    ok, detail = h0.prewarm_check(plans, prewarms, report_rows, seen)
+    out["prewarm"] = {"ok": ok, "detail": detail, "plan": plans.get("caption")}
+    audits = h0.job_audits(job.store, root)
+    out["cache"] = cache_by_kind(audits, list(files.get("receipts") or ()), out["warm_kinds"])
+    out["batch_fill"] = batch_fill(audits)
+    return out
 
 
 RUNNERS: dict[str, Callable[[Ctx], dict[str, Any]]] = {
@@ -1668,7 +2236,7 @@ def recheck(st: wh.State, mode: str) -> list[dict[str, Any]]:
 
 def render_report(st: wh.State, mode: str, projs: Mapping[str, wh.Projection]) -> str:
     c = caps(mode)
-    lines = [f"# Scale test report ({mode})", "",
+    lines = [f"# Scale test report ({PROFILE.name} profile, {mode})", "",
              "Generated by `scripts/scale_test.py` (plan: `docs/scale-test.md`). Numbers only.", "",
              f"Run `{st.run_id}`: spent **${st.spent:.2f}** of the ${global_cap(mode):.2f} "
              "global cap.", "",
@@ -1689,8 +2257,16 @@ def render_report(st: wh.State, mode: str, projs: Mapping[str, wh.Projection]) -
             how = x["reason"] or ("" if x["auto"] else "manual")
             lines.append(f"| {x['id']} | {x['criterion']} | {x['value']} | {x['target']} | "
                          f"{x['verdict']} | {how} |")
+        if mode == "real":
+            samples, notes, refusals = finalize_samples(st)
+            lines += ["", "## Rate samples (`--finalize` folds these into planner/rates.json)",
+                      ""]
+            for (tbl, kind), xs in sorted(samples.items()):
+                vals = ", ".join(f"{x['value']:g}" for x in xs)
+                lines.append(f"- {kind} {tbl}: {len(xs)} sample(s): {vals}")
+            lines += [f"- note: {n}" for n in notes] + [f"- refused: {r}" for r in refusals]
         for key in ("measure", "projection_error", "timings", "orchestrator", "chaos",
-                    "records"):
+                    "records", "drain", "prewarm", "cache", "batch_fill"):
             lines += ["", f"## {key}", "", "```json",
                       json.dumps(rep.result.get(key), indent=1, default=str)[:8000], "```"]
     for name in STEPS:
@@ -1702,19 +2278,27 @@ def render_report(st: wh.State, mode: str, projs: Mapping[str, wh.Projection]) -
 
 def print_plan(st: wh.State, mode: str, projs: Mapping[str, wh.Projection], out=print) -> None:
     c, g = caps(mode), global_cap(mode)
-    out(f"Scale test ({mode}) run {st.run_id}: spent ${st.spent:.2f} of ${g:.2f}")
+    out(f"Scale test, {PROFILE.name} profile ({PROFILE.blurb}; --profile "
+        f"{' | '.join(PROFILES)}), {mode}, run {st.run_id}: spent ${st.spent:.2f} of ${g:.2f}")
     if mode == "real":
         d = DATASET
+        sub = PROFILE.episodes < d["total_episodes"]
+        durs = [f / d["fps"] for f in EPISODE_FRAMES[:PROFILE.episodes]]
         out(f"  dataset {d['repo']}@{d['revision'][:12]} {d['path']}: "
-            f"{d['total_episodes']} episodes, {VIDEO_S:.0f} video-s ({VIDEO_S / 3600:.3f} h), "
-            f"{d['codec']} {d['resolution']}, embodiment {d['embodiment']}")
+            + (f"the first {PROFILE.episodes} of {d['total_episodes']} episodes by episode "
+               "index (flora index --limit), " if sub else f"{d['total_episodes']} episodes, ")
+            + f"{VIDEO_S:.0f} video-s ({VIDEO_S / 3600:.3f} h; episodes {min(durs):.1f}-"
+              f"{max(durs):.1f} s, median {statistics.median(durs):.1f} s), "
+              f"{d['codec']} {d['resolution']}, embodiment {d['embodiment']}")
     else:
         out(f"  synthetic: {FAKE_EPISODES} episodes x {FAKE_MIN_S:g}-{FAKE_MAX_S:g} s "
             f"(~{VIDEO_S:.0f} video-s)")
     out("  pools: " + ", ".join(f"{k} {v['max_containers']} x "
                                f"{v['gpu'] if mode == 'real' else 'CPU fake worker'}"
                                for k, v in POOLS.items())
-        + f"; shards ~{shard_counts()} at {SHARD_TARGET_GPU_MIN:g} GPU-min")
+        + f"; shards {'' if PROFILE.packing == 'exact' and mode == 'real' else '~'}"
+          f"{shard_counts(mode=mode)} at {SHARD_TARGET_GPU_MIN:g} GPU-min; chaos "
+          f"{', '.join(CHAOS) or 'none'}")
     for name in STEPS:
         p = projs[name]
         s = st.steps.get(name, wh.StepState())
@@ -1758,8 +2342,28 @@ def print_variants(mode: str, out=print) -> None:
             f"{run_wall_s(mode, upper=True, warm=warm) / 60:.0f} min")
 
 
+def print_size_options(out=print) -> None:
+    """The lite size options (``--sizing`` with a subset profile): episodes x pools."""
+    rows = size_options()
+    rec = recommend_size(rows)
+    out(f"  size options (cold start, all steps; recommended: >= 2 containers per pool that "
+        f"the schedule reaches, >= 2 shards per container, pipelined, upper <= "
+        f"${LITE_UPPER_MAX_USD:.2f}; then the most video):")
+    out("    episodes video-h  seg cap  shards seg/cap  nominal   upper  wall  upper  peak")
+    for x in rows:
+        mark = " <- recommended" if rec is x else ""
+        out(f"    {x['episodes']:8d} {x['video_s'] / 3600:7.3f}  {x['segment']:3d} "
+            f"{x['caption']:3d}  {x['shards']['segment']:6d}/{x['shards']['caption']:<6d}  "
+            f"${x['usd']:6.2f} ${x['usd_upper']:6.2f} {x['wall_s'] / 60:4.0f}m "
+            f"{x['wall_upper_s'] / 60:5.0f}m  {x['peak']['segment']}/{x['peak']['caption']}"
+            f"{mark}")
+
+
 def print_sizing(out=print) -> None:
     """The pool-size trade-off (``--sizing``)."""
+    if PROFILE.name != "full":
+        print_size_options(out)
+        return
     for warm in (False, True):
         rows = pool_sizing(warm=warm)
         rec = recommend(rows)
@@ -1799,8 +2403,185 @@ def run_projection(st: wh.State, mode: str, projs: Mapping[str, wh.Projection]
     return project("run", mode, float(v)) if v else projs["run"]
 
 
+# ---------------------------------------------------------------------------------------------
+# Finalize: the run's per-container rates into planner/rates.json, as more samples
+
+RATES_PATH = ROOT / "src" / "flora_deploy" / "planner" / "rates.json"
+COSTS_DOC = ROOT / "docs" / "costs.md"
+
+
+def _wf() -> Any:
+    import wave_h_finalize as wf  # scripts/, on sys.path above: the shared fold
+
+    return wf
+
+
+def finalize_samples(st: wh.State) -> tuple[dict[tuple[str, str], list[dict[str, Any]]],
+                                            list[str], list[str]]:
+    """``({(table, kind): samples}, notes, refusals)`` from a finished real run's ``report``
+    step. ``table`` is ``rate`` or ``startup:<cold|warm>``. One rate sample per container
+    that finished a shard: ``flora report``'s busy seconds (``wave_h_finalize.RECEIPT_FIELDS``)
+    over the video seconds its receipts finished; at least :data:`MIN_CONTAINERS_MEASURED`
+    usable containers per pool, else that pool is refused. One startup sample per container
+    that was not pre-warmed, filed under the compile-cache state every shard of its pool
+    named (a pool with mixed or unnamed states folds no startup). Nothing is folded unless
+    the job ended ``done`` with no lost or duplicate record."""
+    wf = _wf()
+    rep = st.steps.get("report")
+    res = rep.result if rep and rep.status == "done" else {}
+    if not res:
+        return {}, [], ["no finished report step in the state"]
+    refusals: list[str] = []
+    if res.get("state") != "done":
+        refusals.append(f"the job ended {res.get('state')!r}, not 'done'")
+    rec = res.get("records") or {}
+    if not rec or int(rec.get("missing", 0)) + int(rec.get("duplicates", 0)):
+        refusals.append(f"records not clean: {rec or 'not recorded'}")
+    if refusals:
+        return {}, [], refusals
+    t_done = rep.attempts[-1].finished if rep.attempts else None
+    date = time.strftime("%Y-%m-%d", time.gmtime(t_done or time.time()))
+    source = f"docs/scale-test.md (scale test {res.get('profile', PROFILE.name)} run {st.run_id})"
+    rows = {str(c["container_id"]): c for c in res.get("report_containers") or ()}
+    out: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    notes: list[str] = []
+    for kind in POOLS:
+        gpu = POOLS[kind]["gpu"].rstrip("!")
+        rate, starts = [], []
+        for c in (res.get("measure") or {}).get("containers") or ():
+            if c.get("kind") != kind:
+                continue
+            cid = str(c["container_id"])
+            r = rows.get(cid)
+            why = None
+            if r is None or any(r.get(f) is None for f in wf.RECEIPT_FIELDS):
+                why = f"no `flora report` row with {', '.join(wf.RECEIPT_FIELDS)}"
+            elif not wf.same_gpu(wf.ran_on(r), gpu):
+                why = f"ran on {wf.ran_on(r)!r}, not {gpu}"
+            elif not c.get("shards") or float(c.get("video_s") or 0) < wf.MIN_VIDEO_S:
+                why = f"{c.get('video_s')} video-s finished (< {wf.MIN_VIDEO_S:.0f})"
+            if why:
+                notes.append(f"{kind} container {cid[-8:]}: dropped: {why}")
+                continue
+            base = {"source": source, "date": date, "unit": "container", "n": 1,
+                    "container": cid[-12:], "gpu": wf.ran_on(r)}
+            rate.append({**base, "value": round(float(r["busy_s"]) / float(c["video_s"]), 4),
+                         "video_s": round(float(c["video_s"]), 1)})
+            if c.get("prewarmed"):
+                notes.append(f"{kind} container {cid[-8:]}: pre-warmed, so its spawn-to-start "
+                             "is not a startup; no startup sample")
+            else:
+                starts.append({**base, "value": round(float(r["startup_s"]), 1)})
+        if len(rate) < MIN_CONTAINERS_MEASURED:
+            refusals.append(f"{kind}: {len(rate)} usable container(s); at least "
+                            f"{MIN_CONTAINERS_MEASURED}")
+            continue
+        out[("rate", kind)] = rate
+        states = set(((res.get("cache") or {}).get(kind) or {}).get("states") or {})
+        if starts and len(states) == 1 and states <= {"cold", "warm"}:
+            (state,) = states
+            out[(f"startup:{state}", kind)] = [{**s, "compile_cache": state} for s in starts]
+        elif starts:
+            notes.append(f"{kind}: compile-cache states {sorted(states) or 'not recorded'}: "
+                         "the startups cannot be filed under one row; none folded")
+    return out, notes, refusals
+
+
+def folded_rates(data: Mapping[str, Any], samples: Mapping[tuple[str, str], list[dict]]
+                 ) -> dict[str, Any]:
+    """``rates.json`` with ``samples`` folded into the ``balanced`` rows
+    (``wave_h_finalize.fold_samples``): the rate row of each pool, and the startup row of the
+    compile-cache state the samples were timed with. The rows' earlier measurements (the
+    certified run's) stay as their ``base`` sample, unchanged."""
+    wf = _wf()
+    new = json.loads(json.dumps(data))
+    for (table, kind), xs in samples.items():
+        if table == "rate":
+            rows = [r for r in new["rates"] if r["preset"] == "balanced" and r["kind"] == kind]
+        else:
+            cache = table.split(":", 1)[1]
+            rows = [r for r in new["startup"] if r["preset"] == "balanced" and r["kind"] == kind
+                    and (r.get("compile_cache") == cache
+                         or (cache == "cold" and r.get("compile_cache") is None))]
+        if len(rows) != 1:
+            raise wf.FoldRefused(f"rates.json: expected one balanced {kind} {table} row, "
+                                 f"found {len(rows)}")
+        folded = wf.fold_samples(rows[0], xs, kind="rate" if table == "rate" else "startup")
+        rows[0].clear()
+        rows[0].update(folded)
+    new["updated"] = max([str(new.get("updated") or "")]
+                         + [str(x["date"]) for xs in samples.values() for x in xs])
+    return new
+
+
+def finalize_main(args: argparse.Namespace, out=print) -> int:
+    """``--finalize``: print what folding the run's samples changes; ``--write`` applies it
+    (``rates.json``, and the generated tables of ``docs/costs.md`` when it is the repository's
+    rates file). Exit 0 written or nothing to do, 1 refused, 2 bad arguments."""
+    from flora_deploy.planner.rates import RateTable
+
+    wf = _wf()
+    if args.mode != "real":
+        out("--finalize folds a real run only (fake and local runs measure no GPU rates)")
+        return 2
+    spath = (args.state or state_path(args.mode)).resolve()
+    if not spath.exists():
+        out(f"{spath}: no state")
+        return 1
+    st = wh.load_state(spath)
+    samples, notes, refusals = finalize_samples(st)
+    for n in notes:
+        out(f"  note: {n}")
+    for r in refusals:
+        out(f"  REFUSED: {r}")
+    if not samples:
+        out("nothing folded")
+        return 1
+    rates = (args.rates or RATES_PATH).resolve()
+    data = json.loads(rates.read_text(encoding="utf-8"))
+    try:
+        new = folded_rates(data, samples)
+        table = RateTable.from_dict(new, source=str(rates))  # the loader must accept it
+    except (wf.FoldRefused, ValueError) as e:
+        out(f"  REFUSED: {e}")
+        return 1
+    for (tbl, kind) in samples:
+        key = "rates" if tbl == "rate" else "startup"
+        old = [r for r in data[key] if r["preset"] == "balanced" and r["kind"] == kind]
+        now = [r for r in new[key] if r["preset"] == "balanced" and r["kind"] == kind]
+        f = wf.VALUE_FIELD["rate" if tbl == "rate" else "startup"]
+        for o, n in zip(old, now, strict=True):
+            if o != n:
+                out(f"  {kind} {tbl}: {o.get(f)} (n={o.get('n')}, +/-{o.get('uncertainty')}, "
+                    f"{o.get('status')}) -> {n.get(f)} (n={n.get('n')}, "
+                    f"+/-{n.get('uncertainty')})")
+    text = wf.dump_json(new)
+    outputs = {rates: text}
+    if args.rates is None and COSTS_DOC.exists():
+        import cost_table  # scripts/
+
+        outputs[COSTS_DOC] = cost_table.render(COSTS_DOC.read_text(encoding="utf-8"),
+                                               table=dataclasses.replace(
+                                                   table, source="planner/rates.json"))
+    changed = {p: t for p, t in outputs.items() if p.read_text(encoding="utf-8") != t}
+    if not changed:
+        out("  nothing to change (already folded)")
+        return 0
+    for p in changed:
+        out(f"  {'update' if args.write else 'would update'} {p}")
+    if args.write:
+        for p, t in changed.items():
+            p.write_text(t, encoding="utf-8")
+    else:
+        out("dry run: nothing written (pass --write to apply)")
+    return 0
+
+
 def state_path(mode: str) -> Path:
-    return ROOT / "reports" / "scale-test" / mode / "state.json"
+    """``reports/scale-test/<mode>/`` for ``full`` (where it always was), else
+    ``reports/scale-test/<profile>/<mode>/``."""
+    base = ROOT / "reports" / "scale-test"
+    return (base if PROFILE.name == "full" else base / PROFILE.name) / mode / "state.json"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1821,12 +2602,25 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--assume-warm", action="store_true",
                     help="price the warm-start variant (seeded compile cache); caps stay cold")
     ap.add_argument("--sizing", action="store_true",
-                    help="dry run: also print the pool-size trade-off (1-4 per pool)")
+                    help="dry run: also print the size options (lite: episodes x pools; "
+                         "full: 1-4 per pool)")
+    ap.add_argument("--profile", choices=tuple(PROFILES), default=DEFAULT_PROFILE,
+                    help=f"test size (default {DEFAULT_PROFILE}): "
+                    + "; ".join(f"{k}: {p.blurb}" for k, p in PROFILES.items()))
+    g.add_argument("--finalize", action="store_true",
+                   help="fold a finished real run's per-container rates into "
+                        "planner/rates.json as more samples (dry run unless --write)")
+    ap.add_argument("--write", action="store_true", help="--finalize: write rates.json")
+    ap.add_argument("--rates", type=Path, default=None,
+                    help="--finalize: the rates file (default planner/rates.json)")
     args = ap.parse_args(argv)
     global ASSUME_WARM
     prev, ASSUME_WARM = ASSUME_WARM, bool(args.assume_warm)
     try:
-        return _main(args)
+        with profile_ctx(args.profile):
+            if args.finalize:
+                return finalize_main(args)
+            return _main(args)
     finally:
         ASSUME_WARM = prev
 

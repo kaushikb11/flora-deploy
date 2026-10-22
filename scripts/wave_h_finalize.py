@@ -378,9 +378,13 @@ def updated_rates(data: Mapping[str, Any], ms: Mapping[tuple[str, str], Measurem
         rows = [r for r in new["rates"] if r["preset"] == preset and r["kind"] == kind]
         if len(rows) != 1:
             raise SystemExit(f"rates.json: expected one {preset} {kind} row, found {len(rows)}")
+        foreign = folded_elsewhere(rows[0])  # other runs' samples (a scale test): kept
+        rows[0].pop("samples", None)
         rows[0].update(container_s_per_video_s=m.rate, uncertainty=m.uncertainty,
                        status="measured", source=source, date=date, n=m.n,
                        image=engine_image(preset, kind), provenance=prov)
+        if foreign:
+            rows[0].update(fold_samples(rows[0], foreign, kind="rate"))
         k = len(m.startups)
         spread = (f"{m.startups[0]:.0f} s, one container: no range, so the error band is "
                   f"±{SINGLE_SAMPLE_FLOOR:.0%}" if k == 1
@@ -401,14 +405,110 @@ def updated_rates(data: Mapping[str, Any], ms: Mapping[tuple[str, str], Measurem
                     "compile_cache": existing[0]["compile_cache"], "n": k}
                 srow = {**{x: srow[x] for x in ("preset", "kind", "startup_s", "uncertainty",
                                                 "status", "compile_cache", "n")}, **srow}
+            foreign = folded_elsewhere(existing[0])
             existing[0].clear()
             existing[0].update(srow)
+            if foreign:
+                existing[0].update(fold_samples(existing[0], foreign, kind="startup"))
         else:
             star = next((i for i, r in enumerate(new["startup"])
                          if r["preset"] == preset and r["kind"] == "*"), len(new["startup"]))
             new["startup"].insert(star, srow)
     new["updated"] = max(str(new.get("updated") or ""), date)
     return new
+
+
+# Samples folded in from later runs (``scripts/scale_test.py --finalize``). A measured row is one
+# run's pooled figure. A later run adds its own samples beside it instead of replacing it. The
+# row's first measurement becomes the ``base`` sample, kept verbatim: its value, ``n``, video
+# seconds and per-job range, read back from the provenance this script writes. The pooled value,
+# ``n`` and the band are recomputed over every sample. A re-fold from the same source replaces
+# that source's samples only, so folding is idempotent. A later ``--write`` of this script
+# re-pools the other sources' samples over its own new base.
+VALUE_FIELD = {"rate": "container_s_per_video_s", "startup": "startup_s"}
+_VIDEO_RE = re.compile(r"\(([\d.]+) video s\)")
+_JOB_RANGE_RE = re.compile(r"(\d+\.\d+)-(\d+\.\d+) per job")
+_STARTUP_RANGE_RE = re.compile(r"(\d+)-(\d+) s\b")
+
+
+class FoldRefused(ValueError):
+    pass
+
+
+def folded_elsewhere(row: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """The samples a row carries from other runs (everything but its ``base``)."""
+    return [dict(x) for x in row.get("samples") or () if x.get("origin") != "base"]
+
+
+def base_sample(row: Mapping[str, Any], *, kind: str) -> dict[str, Any] | None:
+    """The row's own measurement as one sample (None: not measured, e.g. a placeholder)."""
+    if row.get("status") != "measured":
+        return None
+    prov = str(row.get("provenance") or "")
+    out: dict[str, Any] = {"origin": "base", "source": row.get("source"),
+                           "date": row.get("date"), "n": int(row.get("n") or 1),
+                           "value": float(row[VALUE_FIELD[kind]]),
+                           "uncertainty": row.get("uncertainty"), "provenance": prov}
+    if kind == "rate":
+        v = _VIDEO_RE.search(prov)
+        r = _JOB_RANGE_RE.search(prov)
+        out.update(unit="job", video_s=float(v.group(1)) if v else None,
+                   range=[float(r.group(1)), float(r.group(2))] if r else None)
+    else:
+        r = _STARTUP_RANGE_RE.search(prov)
+        out.update(unit="container", compile_cache=row.get("compile_cache"),
+                   range=[float(r.group(1)), float(r.group(2))] if r else None)
+    return out
+
+
+def fold_samples(row: Mapping[str, Any], add: Sequence[Mapping[str, Any]], *, kind: str
+                 ) -> dict[str, Any]:
+    """``row`` with ``add`` folded in as more samples (see the comment above). Rates are pooled
+    weighted by video seconds (busy seconds over video seconds, as :class:`Measurement` does);
+    startups are weighted by container. The band is ``max(25%, (max - min) / mean)`` over every
+    sample value (a base sample with a per-job range contributes both ends), and ``n`` is the
+    samples' total. Raises :class:`FoldRefused` when a rate sample has no video seconds."""
+    field_ = VALUE_FIELD[kind]
+    have = [dict(x) for x in row.get("samples") or ()]
+    if not have:
+        b = base_sample(row, kind=kind)
+        have = [b] if b else []
+    sources = {x.get("source") for x in add}
+    keep = [x for x in have if x.get("origin") == "base" or x.get("source") not in sources]
+    samples = keep + [{**dict(x), "origin": "fold"} for x in add]
+    if not samples:
+        raise FoldRefused(f"no samples for {row.get('preset')} {row.get('kind')}")
+    if kind == "rate":
+        lacks = [x.get("source") for x in samples if not x.get("video_s")]
+        if lacks:
+            raise FoldRefused(f"{row.get('preset')} {row.get('kind')}: rate sample(s) without "
+                              f"video seconds ({lacks}); cannot pool them")
+        w = [float(x["video_s"]) for x in samples]
+    else:
+        w = [float(x.get("n") or 1) for x in samples]
+    pooled = sum(float(x["value"]) * wi for x, wi in zip(samples, w, strict=True)) / sum(w)
+    values = [float(v) for x in samples for v in (x.get("range") or [x["value"]])]
+    n = sum(int(x.get("n") or 1) for x in samples)
+    mean = sum(values) / len(values)
+    band = (SINGLE_SAMPLE_FLOOR if n == 1 else
+            round(max(UNCERTAINTY_FLOOR, (max(values) - min(values)) / mean if mean else 1.0),
+                  2))
+    base = next((x for x in samples if x.get("origin") == "base"), None)
+    folds = [x for x in samples if x.get("origin") != "base"]
+    unit = "weighted by video s" if kind == "rate" else "weighted by container"
+    fmt = "{:.3f}" if kind == "rate" else "{:.0f} s"
+    note = (f"pooled over n={n} sample(s), {unit}: "
+            + (f"base {base['source']} n={base['n']}; " if base else "")
+            + f"{len(folds)} folded from "
+            + ", ".join(sorted({str(x.get('source')) for x in folds}))
+            + f"; values {fmt.format(min(values))}-{fmt.format(max(values))}, error band "
+              f"max({UNCERTAINTY_FLOOR:.0%}, range/mean)")
+    return {**dict(row), field_: round(pooled, 3 if kind == "rate" else 1),
+            "uncertainty": band, "status": "measured", "n": n,
+            "date": max(str(x.get("date") or "") for x in samples) or row.get("date"),
+            "source": (base or folds[0]).get("source"),
+            "provenance": f"{base['provenance']} | {note}" if base else note,
+            "samples": samples}
 
 
 def dump_json(d: Any) -> str:

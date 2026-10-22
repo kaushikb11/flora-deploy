@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -58,6 +58,10 @@ class RateEntry:
     excludes: tuple[str, ...] = ()  # features under which the rate is invalid (measured without)
     source: str | None = None  # where the measurement lives (doc / run id); see MEASURED_SLOTS
     n: int | None = None  # samples (jobs) behind a measured rate; shown with it (n=1: ±50%+)
+    # The individual measurements a pooled row was folded from (``scripts/scale_test.py
+    # --finalize``): one dict per sample (source, unit, value, video_s, n). Kept for history and
+    # the band's spread; lookups use only the pooled fields above.
+    samples: tuple[dict[str, Any], ...] = field(default=(), compare=False, hash=False)
 
     def usable(self, features: Features | None = None) -> bool:
         f = resolve_features(features)
@@ -80,6 +84,7 @@ class StartupEntry:
     # with: "cold" (compiled from scratch) or "warm" (loaded a seeded cache); None when not
     # recorded (projections, placeholders).
     compile_cache: str | None = None
+    samples: tuple[dict[str, Any], ...] = field(default=(), compare=False, hash=False)
 
 
 # Rows a later measurement wave flips from ``placeholder`` to ``measured`` by editing rates.json
@@ -126,7 +131,8 @@ class RateTable:
         for i, r in enumerate(data.get("rates", [])):
             try:
                 e = RateEntry(**{**r, "requires": tuple(r.get("requires") or ()),
-                                 "excludes": tuple(r.get("excludes") or ())})
+                                 "excludes": tuple(r.get("excludes") or ()),
+                                 "samples": tuple(r.get("samples") or ())})
             except TypeError as exc:
                 raise RatesFileError(f"{source}: rates[{i}]: {exc}") from None
             _check(e.container_s_per_video_s > 0, f"{source}: rates[{i}] must be positive")
@@ -136,7 +142,7 @@ class RateTable:
             rates.append(e)
         for i, s in enumerate(data.get("startup", [])):
             try:
-                e2 = StartupEntry(**s)
+                e2 = StartupEntry(**{**s, "samples": tuple(s.get("samples") or ())})
             except TypeError as exc:
                 raise RatesFileError(f"{source}: startup[{i}]: {exc}") from None
             _check(e2.startup_s >= 0, f"{source}: startup[{i}] must be >= 0")
