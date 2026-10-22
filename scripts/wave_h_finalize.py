@@ -557,6 +557,19 @@ def missing_for_certified(cert: Mapping[str, Any]) -> list[str]:
 # 3. Report
 
 
+def step_status(st: wh.State, name: str) -> str:
+    """The step's status as the report shows it. A state from before the lab became step (d2)
+    ran the lab inline in (d) and marked (d) failed when only the lab failed: (d) is ``done``
+    when every deployed job it ran ended ``done``, and the lab's outcome is named apart."""
+    s = st.steps[name]
+    if name != "balanced" or not inline_lab(st) or s.status != "failed":
+        return s.status
+    jobs = jobs_of(st, name)
+    if jobs and all(r.get("state") == "done" for r in jobs.values()):
+        return "done (its inline lab failed; the lab is step d2 now)"
+    return s.status
+
+
 def billing_rows(st: wh.State) -> tuple[list[list[str]], list[str]]:
     rows, warnings = [], []
     for name in wh.STEPS:
@@ -586,7 +599,8 @@ def billing_rows(st: wh.State) -> tuple[list[list[str]], list[str]]:
                                 f"({gap:+.2f}); the list prices or the receipts are off")
             else:
                 billing = "reconciled"
-        rows.append([wh.TITLES[name], s.status, str(len(s.attempts)), usd(wh.CAPS_USD[name]),
+        rows.append([wh.TITLES[name], step_status(st, name), str(len(s.attempts)),
+                     usd(wh.CAPS_USD[name]),
                      usd(s.tracked_usd), usd(s.charged(st.billed_at)), usd(s.billed_usd),
                      billing])
     return rows, warnings
@@ -906,11 +920,14 @@ def cost_block(f: Findings) -> str | None:
     bal, ex = f.cost.get("balanced"), f.cost.get("exact")
     if not bal:
         return None
-    vs = f", against ${ex['usd_per_video_h']:.2f} for `exact`" if ex else ""
-    return (f"Measured in Wave H-lite ({f.date}): `balanced` costs about "
-            f"**${bal['usd_per_video_h']:.2f} per video-hour** (±{bal['uncertainty']:.0%})\n"
-            f"at Modal list prices for segmentation + captioning{vs}. Rewards and the cold\n"
-            "start of each container are extra; details in `docs/wave-h-report.md`.")
+    # README wording (no internal run names): the busy-only figure, said plainly to be busy-only
+    vs = f" (`exact`: ${ex['usd_per_video_h']:.2f})" if ex else ""
+    return (f"`balanced` costs about **${bal['usd_per_video_h']:.2f} per video-hour** of GPU "
+            f"work (±{bal['uncertainty']:.0%}) for segmentation + captioning{vs},\n"
+            f"measured {f.date} at Modal list prices. Startup (a few minutes per container), "
+            "idle time and\n"
+            "rewards are extra and dominate small jobs: `flora plan` shows the all-in estimate "
+            "for your dataset.")
 
 
 # ---------------------------------------------------------------------------------------------

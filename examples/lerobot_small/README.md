@@ -10,9 +10,10 @@ are used: `cam_high` as the main view and the two wrist cameras. `cam_low` is no
 keys from `meta/info.json` at the pinned revision).
 
 Set `output.sink` to your bucket or Volume, then run `flora doctor -c flora.yaml` and follow the
-"Run on Modal" steps in the top-level README.
+"Label your own data" steps in the [top-level README](../../README.md#label-your-own-data).
 
-**Estimated cost: about $1 to $3** for the labelling job (segment, caption, terminal and dense
-rewards), from `flora plan --video-hours 0.11 --episodes 50`. This is an estimate: the segment
-and caption rates are placeholders until measured. It does not include the one-time
-`flora prepare` and weight conversions. `budget_usd: 15` caps the job either way.
+**Estimated cost: about $2 (range $1.40 to $3.20)** for the labelling job (segment, caption,
+terminal and dense rewards), from `flora plan --video-hours 0.11 --episodes 50`. That is the
+all-in estimate: GPU work plus each container's startup, from rates measured on one small run
+(±50%). It does not include the one-time `flora prepare` and weight conversions.
+`budget_usd: 15` caps the job either way.
