@@ -494,6 +494,9 @@ class Job:
         if hasattr(gate, "spend_report"):
             from flora_deploy.jobs.pools import read_drains
 
+            if st.state not in TERMINAL:  # the projection reads attempt markers (startups)
+                self._prefetch(manifest, ("attempts",))
+
             # the orchestrator's drains and pre-warm containers too: a pre-warm container is
             # billed from its start whether or not a call ever reached it
             drains, prewarms = read_drains(self.store, JobPaths(self.job_id).root,

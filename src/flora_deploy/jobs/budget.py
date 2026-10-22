@@ -746,6 +746,7 @@ class ProjectionBudgetGate:
     _marker_tick: dict[str, tuple[int, tuple[float, str] | None]] = field(
         default_factory=dict, init=False, repr=False)
     _no_marker: set[str] = field(default_factory=set, init=False, repr=False)
+    _open: tuple[tuple[Any, ...], set[str]] | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.safety_margin < 1.0:
@@ -859,6 +860,8 @@ class ProjectionBudgetGate:
         hit = self._markers.get(c.call_id)
         if hit is not None or c.call_id in self._no_marker:
             return hit
+        if c.ended_at is not None and c.kind not in self._open_kinds():
+            return None  # a finished kind: nothing left to project, so no read
         seen = self._marker_tick.get(c.call_id)
         if seen is not None and seen[0] == self._tick:
             return seen[1]
@@ -873,6 +876,18 @@ class ProjectionBudgetGate:
         else:
             self._marker_tick[c.call_id] = (self._tick, m)
         return m
+
+    def _open_kinds(self) -> set[str]:
+        """Kinds with a shard still to finish or a live call (once per tick): only their calls'
+        markers can change a projection."""
+        stamp = (self._tick, self._cache_at, len(self._done), id(self._state))
+        if self._open is None or self._open[0] != stamp:
+            skip = self._done | set(self.quarantined())
+            kinds = {s.kind for s in self.shards() if s.shard_id not in skip}
+            if self._state is not None:
+                kinds |= {c.kind for c in self._state.live()}
+            self._open = (stamp, kinds)
+        return self._open[1]
 
     def _prewarm_call(self, kind: str) -> str | None:
         """Call id of ``kind``'s first call when it went to a pre-warm container (pre-warms are
