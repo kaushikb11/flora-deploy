@@ -1,8 +1,9 @@
 """`flora deploy`: build the config's Modal app (``modal_app.factory``) and deploy it.
 
-``--dry-run`` prints the plan without contacting Modal; every run also prints each stage's Gate
-certificate status on its GPU (certified / provisional / fail / none, or reference for
-``exact``) and why (``cli._certs``); ``--emit out.py`` writes the equivalent
+``--dry-run`` prints the plan without contacting Modal; every run also prints each stage's
+certificate status on its GPU in plain words ("certified (human, L40S)", "not certified",
+"certified for human, not for yam", or reference for ``exact``) and why (``cli._certs``);
+``--emit out.py`` writes the equivalent
 standalone script for review instead of deploying. A real deploy records the deployment (app
 name, stage hashes, image fingerprints, worker classes) in the job store at
 ``flora/deployments/<app>.json``.
@@ -97,16 +98,19 @@ def _certificates(cfg: Any, plan: Any, derived_content: dict[str, str] | None
 
 
 _CERT_STYLE = {"reference": "green", "certified": "green", "provisional": "yellow",
-               "none": "yellow", "fail": "red", "unknown": "red"}
+               "none": "yellow", "other_embodiment": "yellow", "other_build": "yellow",
+               "fail": "red", "unknown": "red"}
 
 
 def _print_certificates(certs: dict[str, dict[str, Any]]) -> None:
     from rich.markup import escape
 
     for kind, c in certs.items():
-        style = _CERT_STYLE.get(c["status"], "yellow")
+        style = _CERT_STYLE.get(c.get("state", c["status"]), "yellow")
+        label = c.get("label") or c["status"]
         console.print(f"  certificate {kind} on {c['gpu'] or 'cpu'}: "
-                      f"[{style}]{c['status']}[/{style}] - {escape(c['why'])}")
+                      f"[{style}]{escape(label)}[/{style}] - {escape(c['why'])}",
+                      soft_wrap=True)
 
 
 def _print_plan(plan: Any) -> None:
@@ -142,7 +146,8 @@ def deploy(
              "`flora prepare` records in flora.yaml.")
     ] = None,
     allow_uncertified: Annotated[bool, typer.Option(
-        "--allow-uncertified", help="Deploy a preset without Gate certificates.")] = False,
+        "--allow-uncertified", help="Deploy even if a stage has no accuracy certificate for "
+                                    "this config (its records say certified: false).")] = False,
     min_containers: Annotated[int, typer.Option(help="Warm containers per worker class.")] = 0,
     reconcile_cron: Annotated[str | None, typer.Option(
         help="Schedule the reconciler: 'on' (every 10 min) or a cron string.")] = None,

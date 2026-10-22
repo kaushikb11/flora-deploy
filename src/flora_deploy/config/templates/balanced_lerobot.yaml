@@ -15,9 +15,11 @@ modal:
 
 # balanced: vLLM engines on stage-separated pools: TempSeg on an L40S, the Captioner on an
 # H100!, the Rewarder on an H100!. Workers scale from zero, so you pay only while a job runs.
-# It has no accuracy certificates yet, so it needs `allow_uncertified: true` (its records are
-# marked certified: false). exact: NVIDIA's own HF pipeline on an H200, the certification
-# reference (`flora init --template exact_lerobot`).
+# A stage runs as certified when an accuracy certificate covers it for your embodiment and GPU.
+# Any stage without one needs `allow_uncertified: true` (its records say certified: false).
+# `flora doctor` shows each stage's status; once every stage is certified, remove the line.
+# exact: NVIDIA's own HF pipeline on an H200, the certification reference
+# (`flora init --template exact_lerobot`).
 preset: balanced
 allow_uncertified: true
 

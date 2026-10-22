@@ -167,7 +167,7 @@ flora deploy [OPTIONS]
 | `--store` (env `FLORA_STORE`) |  | Job store seen by containers: modal-volume://name[/path] or s3\|r2\|gs://bucket[/prefix] (default: output.sink). |
 | `--bucket-secret` | `flora-bucket` | Modal Secret holding the bucket credentials. |
 | `--receipt` |  | Derived-weight receipt NAME=HASH (repeatable): overrides weights.derived, which `flora prepare` records in flora.yaml. |
-| `--allow-uncertified` | off | Deploy a preset without Gate certificates. |
+| `--allow-uncertified` | off | Deploy even if a stage has no accuracy certificate for this config (its records say certified: false). |
 | `--min-containers` | `0` | Warm containers per worker class. |
 | `--reconcile-cron` |  | Schedule the reconciler: 'on' (every 10 min) or a cron string. |
 | `--determinism` |  | Override pipeline.determinism (exact segcap worker): nvidia \| deterministic. Hashed: it changes the config hash and the app. |

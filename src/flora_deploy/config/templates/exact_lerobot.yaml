@@ -16,8 +16,9 @@ modal:
   tags: {}                          # extra key/value tags on every Modal object
 
 # exact: NVIDIA's HF code on H200 + NVIDIA's vLLM Rewarder on H100!; outputs are the reference.
-# balanced: vLLM engines on stage-separated pools. It has no accuracy certificates yet, so it is
-# refused unless you also set `allow_uncertified: true` (outputs then are not certified).
+# balanced: vLLM engines on stage-separated pools. A stage without an accuracy certificate for
+# your embodiment and GPU is refused unless you also set `allow_uncertified: true` (its outputs
+# then are not certified).
 preset: exact
 allow_uncertified: false
 

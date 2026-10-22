@@ -425,17 +425,62 @@ def matching(preset: str, pools: Mapping[str, Any], *,
     return out
 
 
+REFERENCE_PRESET = "exact"
+_KEY_KWARGS = ("modes", "derived_content", "dtbias_fp32", "engines", "image_fingerprint",
+               "logic_root")
+
+
+def reference_identical(preset: str, kind: str, gpu: str, **kwargs: Any) -> bool:
+    """**Reference by identity**: ``kind`` under ``preset`` on ``gpu`` runs exactly what
+    ``exact`` runs for that kind, so it is the reference like ``exact`` itself and needs no
+    certificate. True only when ``exact`` has the kind, ``gpu`` is ``exact``'s pool GPU for it,
+    and the two live key documents (:func:`key_document`, same modes / derived content /
+    fingerprints / logic) are equal once the ``preset`` field alone is removed. Computed, never
+    listed: any divergence (engine, engine args, image, pins, decode, derived weights, modes,
+    logic digest, GPU) or a key that cannot be computed makes it False (fail closed).
+    ``kwargs``: as for :func:`matching` (``engines`` overrides ``preset``'s side only)."""
+    from flora_deploy.config.presets import get_preset
+
+    if preset == REFERENCE_PRESET:
+        return True
+    ref = get_preset(REFERENCE_PRESET)
+    if kind not in ref.engines or ref.pools[kind].gpu != gpu:
+        return False
+    kw = {k: kwargs[k] for k in _KEY_KWARGS if k in kwargs}
+    engine = (kw.pop("engines", None) or {}).get(kind)
+    modes = (kw.pop("modes", None) or {}).get(kind)
+    try:
+        mine = key_document(preset, kind, gpu, modes=modes, engine=engine, **kw)
+        theirs = key_document(REFERENCE_PRESET, kind, gpu, modes=modes, **kw)
+    except (CertKeyError, KeyError):
+        return False
+    return ({k: v for k, v in mine.items() if k != "preset"}
+            == {k: v for k, v in theirs.items() if k != "preset"})
+
+
+def reference_kinds(preset: str, pools: Mapping[str, Any], **kwargs: Any) -> set[str]:
+    """The kinds of ``pools`` that are :func:`reference_identical` (all of them for
+    ``exact``). The config gate (``config.presets.find_certificates``) and :func:`status` both
+    use this, so what may run without a certificate and what is shown as reference agree."""
+    return {k for k, p in pools.items() if reference_identical(preset, k, p.gpu, **kwargs)}
+
+
 def status(preset: str, pools: Mapping[str, Any], **kwargs: Any) -> dict[str, dict[str, Any]]:
     """Per shard kind of ``pools``: ``{"gpu", "status", "certificate"}`` where status is
-    ``reference`` (``exact``), ``certified``, ``provisional``, ``fail``, ``none``, or
+    ``reference`` (``exact``, or :func:`reference_identical`), ``certified``, ``provisional``,
+    ``fail``, ``none``, or
     ``unverified_weights`` (the kind needs derived-weight content digests the caller lacks)."""
-    if preset == "exact":
+    if preset == REFERENCE_PRESET:
         return {k: {"gpu": p.gpu, "status": "reference", "certificate": None}
                 for k, p in pools.items()}
     found = matching(preset, pools, **kwargs)
+    ref = reference_kinds(preset, pools, **kwargs)
     dc = kwargs.get("derived_content") or {}
     out = {}
     for k, p in pools.items():
+        if k in ref:  # reference by identity: as exact itself, no certificate needed
+            out[k] = {"gpu": p.gpu, "status": "reference", "certificate": None}
+            continue
         best = (found.get(k) or [None])[0]
         st = best["verdict"] if best else "none"
         if best is None and any(n not in dc for n in needed_derived(preset, k)):

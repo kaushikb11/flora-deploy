@@ -76,9 +76,9 @@ same `<stage_hash>` directory.
 * `outside_reference_envelope`: the episode fails one of NVIDIA's input checks (length, size,
   frame rate, cameras; see `docs/media-notes.md`, "Envelope"), and `pipeline.envelope: warn` let
   it run anyway;
-* `uncertified_stack`: the preset has no Gate certificate for this shard kind and GPU (every
-  `balanced` segment and caption record today, since `allow_uncertified: true` is needed to
-  run that preset);
+* `uncertified_stack`: no accuracy certificate covers this stage on this GPU for the job's
+  embodiment, and `allow_uncertified: true` let it run anyway (`flora doctor` and `flora plan`
+  show each stage's status);
 * `uncovered_pool`: no certificate covers the episode's embodiment pool;
 * `oracle_ineligible_source`: the source video cannot be cut so that it decodes to exactly the
   source frames, so the record cannot be compared with the reference;

@@ -57,8 +57,12 @@ def certified_options(cfg, options, derived_content=None) -> set[str]:
 WIDE_COLUMNS = 120
 
 
-def fidelity_label(o) -> str:
-    """``reference`` / ``certified`` / ``uncertified``: what the option's records will say."""
+def fidelity_label(o, certs: dict[str, dict] | None = None) -> str:
+    """``reference`` / ``certified`` / ``partly certified`` / ``uncertified``: what the option's
+    records will say (``certs``: its :func:`certificate_status`, to tell partly certified)."""
+    if o.certification == "needs certificates" and certs and any(
+            c.get("state") in ("certified", "reference") for c in certs.values()):
+        return "partly certified"
     return {"needs certificates": "uncertified"}.get(o.certification, o.certification)
 
 
@@ -71,20 +75,16 @@ def status_label(o) -> str:
     return "projection" if o.requires else o.status
 
 
-def certificate_note(cfg, o, content) -> str | None:
-    """One line on the option's certificates (``None`` for the reference preset): the pools that
-    have one, or that none do yet."""
+def certificate_note(cfg, o, content, certs: dict[str, dict] | None = None) -> str | None:
+    """One line on the option's certificates (``None`` for the reference preset): each stage's
+    status in plain words, or that none has one yet."""
     if o.preset == "exact":
         return None
-    certs = certificate_status(cfg, o, content)
-    ok = [k for k, c in certs.items() if c["status"] in ("certified", "reference")]
-    if not ok:
+    certs = certs if certs is not None else certificate_status(cfg, o, content)
+    if all(c.get("state") == "none" for c in certs.values()):
         return (f"no accuracy certificates for {o.preset} yet (its records say certified: "
                 "false; `exact` is the reference)")
-    if len(ok) == len(certs):
-        return "certified on every pool"
-    return "certified: " + ", ".join(ok) + "; not yet: " + ", ".join(
-        k for k in certs if k not in ok)
+    return "; ".join(f"{k} {c['label']}" for k, c in certs.items())
 
 
 def _gpus_label(o) -> str:
@@ -118,6 +118,7 @@ def _print_plan(cfg, workload, req, deadline_s, options, best, rates, table, con
         s = status_label(o)
         return f"[{colour[s]}]{s}[/{colour[s]}]"
 
+    cs = {o.name: certificate_status(cfg, o, content) for o in options if o.preset != "exact"}
     wide = term_width() >= WIDE_COLUMNS
     if wide:
         t = Table(show_lines=False)
@@ -126,20 +127,21 @@ def _print_plan(cfg, workload, req, deadline_s, options, best, rates, table, con
             t.add_column(col)
         for i, o in enumerate(options, 1):
             t.add_row(str(i) + (" *" if o is best else ""), escape(o.name), cost(o), wall(o),
-                      str(o.peak_gpus), fidelity_label(o), escape(rates_label(o)), status(o))
+                      str(o.peak_gpus), fidelity_label(o, cs.get(o.name)),
+                      escape(rates_label(o)), status(o))
         console.print(t)
     for i, o in enumerate(options, 1):
         if not wide:
             mark = " [bold](recommended)[/bold]" if o is best else ""
             console.print(f"[bold]{i}. {escape(o.name)}[/bold]{mark}: {status(o)}, "
-                          f"{fidelity_label(o)}", soft_wrap=True)
+                          f"{fidelity_label(o, cs.get(o.name))}", soft_wrap=True)
             console.print(f"   cost {cost(o)}", soft_wrap=True)
             console.print(f"   wall-clock {wall(o)}, {o.peak_gpus} GPUs at peak", soft_wrap=True)
             console.print(f"   rates {escape(rates_label(o))}", soft_wrap=True)
         console.print(f"  {i}. pools: {escape(_gpus_label(o))}", soft_wrap=True)
         for f in o.flags:
             console.print(f"  {i}. {escape(f)}", soft_wrap=True)
-        note = certificate_note(cfg, o, content)
+        note = certificate_note(cfg, o, content, cs.get(o.name))
         if note:
             console.print(f"  {i}. certificates: {escape(note)}", soft_wrap=True)
     if any("!" in k.gpu for o in options for k in o.kinds):

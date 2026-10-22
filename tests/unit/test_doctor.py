@@ -288,9 +288,11 @@ def test_certificates_paths(tmp_path):
     # balanced, no certificates exist, allow_uncertified: true (the README's config): the
     # expected state, said once, not a warning per shard kind
     c = run(FakeProbes())
-    certs = [k for k in c if k.startswith("certificates")]
+    certs = [k for k in c if k.startswith("certificates") and "reward" not in k]
     assert len(certs) == 1 and c[certs[0]].status == "pass"
     assert "certified: false" in c[certs[0]].message
+    # the rewards run NVIDIA's own engine, as exact does: the reference, no certificate needed
+    assert c["certificates.reward.terminal"].status == "pass"
     c = run(FakeProbes(certs={"segment": "certified", "caption": "missing"}))
     assert c["certificates.segment"].status == "pass"
     assert c["certificates.caption"].status == "pass"  # missing, but allowed

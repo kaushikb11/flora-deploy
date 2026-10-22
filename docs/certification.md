@@ -267,11 +267,48 @@ must apply to the same pool on other data (archive/PLAN-v3.md §9).
 One lookup for every caller (H7): `certkey.lookup_context(cfg, kinds, derived_content=...)`
 gives embodiment, modes and content digests to:
 - config validation (`parse_config(..., derived_content=...)`): refuses a non-`exact` preset
-  unless every pool has a deciding `certified` certificate, or `allow_uncertified` is set;
+  unless every pool has a deciding `certified` certificate, or `allow_uncertified` is set. The
+  opt-in is one boolean: a config whose every stage is covered needs none, and the refusal
+  names each stage that is not covered and why, in plain words
+  (`config.presets.refusal_message`), e.g. `reward.terminal on H100!: no certificate;
+  embodiment yam: segment/caption certified for human only`. Records say per stage whether
+  they are certified, so a per-stage knob would add config without adding information;
 - `plan_app(..., derived_content=...)` (`flora deploy`): the same check;
 - `flora plan`: each non-`exact` option's per-pool status (`certified` / `provisional` /
   `fail` / `none` / `unverified_weights`), and `recommended()` treats an all-certified option
   like the reference, so a cheaper certified `balanced` wins over `exact`.
+
+`flora plan`, `flora doctor` and `flora deploy` print each stage's status in plain words
+(`config.presets.coverage_label`): `certified (human, L40S)`, `not certified`, `certified for
+human, not for yam`. `flora doctor` also says when `allow_uncertified: true` is no longer
+needed. `flora results` shows each record's `certified` flag in plain words and the
+certificate id (`provenance.certificate`). `scripts/wave_h_finalize.py` rewrites the README's
+`wave-h:certified` and `wave-h:allow-uncertified` blocks from the certificates it writes.
+
+### Reference by identity
+
+A (preset, kind) runs exactly what `exact` runs when its live key document
+(`key_document(preset, kind, gpu, ...)`, with the config's modes and derived content) equals
+`exact`'s for the same kind once the `preset` field alone is removed, and the pool GPU is
+`exact`'s pool GPU for that kind. Then it is the **reference**, like `exact` itself: no
+certificate is needed and none applies (a measured `fail` does not revoke it, as it would not
+revoke `exact`). The rule is `certkey.reference_identical` / `reference_kinds`; the config gate
+and the deploy factory get it through `config.presets.find_certificates` (a
+`reference:exact-identical` entry, no file) and `certkey.status` reports `reference`, so plan,
+doctor and deploy say `reference (NVIDIA's own engine, no certificate needed)`.
+
+Today this holds for `balanced`'s `reward.terminal`, `reward.dense` and `reward.rubric` on
+`H100!`: same engine (`nvidia-vllm-offline`), image, pins, modes and logic. It is computed
+from the key documents, never listed, so it fails closed: a different engine argument, image,
+pin, run mode, logic digest or GPU (or a key that cannot be computed) makes the kind need a
+certificate again. `segment` and `caption` are never reference by identity: `exact` has no such
+kinds (it runs them as `segcap` on NVIDIA's HF code).
+
+Records: the reward stage stamps `certified` from NVIDIA's envelope alone in both presets
+(`stages/reward.py`, `certification`), with `provenance.certificate` null, which is what this
+rule says while it holds. Applying the rule at stamping time as well (so a divergent reward
+stack's records say `uncertified_stack`) belongs in `workers_impl/certstamp.py`
+(`CertStamp.apply`, which has the record's `cert_key`), calling `certkey.reference_identical`.
 
 Not wired yet: the CLI and SDK do not pass content digests (W1-Prepare's `content_digest`), so
 `segment`/`caption` certificates match only through the API until integration.

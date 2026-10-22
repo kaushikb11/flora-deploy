@@ -1,10 +1,13 @@
-"""Gate certificate status per shard kind, with the reason: the one place the CLI asks
+"""Certificate status per shard kind, with the reason: the one place the CLI asks
 ``validate.certkey`` (``flora deploy``, ``flora plan``, ``flora doctor``).
 
-``certkey.status`` is called here and nowhere else in the CLI, so a change to its signature is a
-change to this module only. Each entry is ``{"gpu", "status", "certificate", "why"}`` where
-status is ``reference`` (``exact``), ``certified``, ``provisional``, ``fail``, ``none`` or
-``unverified_weights`` (the derived weights' content digests are unknown: fail closed).
+``certkey.status`` is called here (through ``config.presets.coverage``) and nowhere else in the
+CLI, so a change to its signature is a change to this module only. Each entry is ``{"gpu",
+"status", "certificate", "why", "label", "state"}`` where status is ``reference``
+(``exact``), ``certified``, ``provisional``, ``fail``, ``none`` or ``unverified_weights`` (the
+derived weights' content digests are unknown: fail closed); ``label`` is the status in plain
+words (``certified (human, L40S)``, ``not certified``, ``certified for human, not for yam``)
+and ``state`` the ``presets.Coverage`` state behind it.
 """
 
 from __future__ import annotations
@@ -50,15 +53,17 @@ def certificate_report(cfg: Any, pools: Mapping[str, str | None], *,
     under ``preset`` (default ``cfg.preset``) with ``cfg``'s embodiment and run modes and the
     derived weights' content digests (``derived_content``; without them a kind that needs
     derived weights is ``unverified_weights``)."""
-    from flora_deploy.validate.certkey import lookup_context, needed_derived, status
+    from flora_deploy.config.presets import coverage, coverage_label
+    from flora_deploy.validate.certkey import lookup_context, needed_derived
 
     preset = preset or cfg.preset
     ns = {k: SimpleNamespace(gpu=g) for k, g in pools.items()}
-    raw = status(preset, ns, **lookup_context(cfg, ns, derived_content=derived_content))
-    embodiment = getattr(getattr(cfg, "pipeline", None), "embodiment", None)
+    ctx = lookup_context(cfg, ns, derived_content=derived_content)
+    embodiment = ctx.pop("embodiment")
+    cov = coverage(preset, ns, embodiment=embodiment, **ctx)
     out: dict[str, dict[str, Any]] = {}
-    for kind, r in raw.items():
-        st, cid, gpu = r.get("status", "none"), r.get("certificate"), r.get("gpu")
+    for kind, cv in cov.items():
+        st, cid, gpu = cv.status, cv.certificate, pools.get(kind, cv.gpu)
         if st == "reference":
             why = "exact is NVIDIA's reference stack: no certificate needed"
         elif st == "unverified_weights":
@@ -77,5 +82,6 @@ def certificate_report(cfg: Any, pools: Mapping[str, str | None], *,
                 why += f": {', '.join(reasons)}"
             if st != "certified":
                 why += " (does not unlock the preset)"
-        out[kind] = {"gpu": gpu, "status": st, "certificate": cid, "why": why}
+        out[kind] = {"gpu": gpu, "status": st, "certificate": cid, "why": why,
+                     "label": coverage_label(cv, embodiment), "state": cv.state}
     return out

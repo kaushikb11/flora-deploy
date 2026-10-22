@@ -16,7 +16,9 @@ Certification (D9, D16): ``exact`` is the reference by construction. Every other
 Gate certificate matching (shard kind, GPU, engine spec) before it may run (``find_certificates``;
 the registry is ``config/certificates/``, the match rule ``validate/certkey.py``). Without a
 ``certified`` one (``provisional`` does not count), ``balanced`` is refused unless the config
-opts in with ``allow_uncertified: true`` (its records are then an uncertified stack).
+opts in with ``allow_uncertified: true`` (its records are then an uncertified stack). A config
+whose every stage is certified for its embodiment needs no opt-in; otherwise the refusal names
+each stage that is not covered and why (``coverage`` / ``refusal_message``, in plain words).
 
 GPU overrides are checked against ``GPU_MEMORY_GIB`` (Modal GPU types) and a per-shard-kind
 minimum (``min_gpu_memory_gib``): exact ``segcap`` keeps TempSeg and Captioner resident (80.95 GiB
@@ -27,8 +29,8 @@ Memory values are the pre-P0 defaults; P0 measurements replace them (§6.7).
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass, field
+from collections.abc import Collection, Mapping
+from dataclasses import dataclass, field, replace
 
 from flora_deploy.jobs.settings import PoolSettings, Preset
 from flora_deploy.jobs.types import ShardKind
@@ -245,12 +247,172 @@ def find_certificates(preset: str, pools: Mapping[str, PoolSettings], *,
     by shard kind (``validate.certkey.matching``; pass ``**certkey.lookup_context(cfg, pools,
     derived_content=...)``: embodiment, modes, derived content digests). The deciding (newest)
     certificate must be ``certified``: provisional ones never count, and a newer ``fail``
-    revokes an older ``certified``."""
-    from flora_deploy.validate.certkey import matching
+    revokes an older ``certified``.
+
+    A kind that is the reference by identity (``certkey.reference_identical``: its live key
+    equals ``exact``'s but for the preset name, e.g. ``balanced``'s rewards, which run NVIDIA's
+    own engine) needs no certificate: it is returned as ``Certificate(REFERENCE_ID, ...,
+    verdict="reference")``, so every gate that asks this function (config validation, the
+    deploy factory) applies the same rule."""
+    from flora_deploy.validate.certkey import matching, reference_kinds
 
     out: dict[str, Certificate] = {}
     for kind, certs in matching(preset, pools, modes=modes, **kwargs).items():
         best = certs[0]
         if best["verdict"] == "certified":
             out[kind] = Certificate(best["id"], preset, kind, best["gpu"], best["verdict"])
+    if preset != "exact":
+        for kind in reference_kinds(preset, pools, modes=modes, **kwargs):
+            out[kind] = Certificate(REFERENCE_ID, preset, kind, pools[kind].gpu, "reference")
     return out
+
+
+# ``Certificate.id`` of a kind that is the reference by identity (no certificate file).
+REFERENCE_ID = "reference:exact-identical"
+
+
+# ---------------------------------------------------------------------------------------------
+# Coverage in plain words: which stages of a config a certificate covers, and why not
+
+
+@dataclass(frozen=True)
+class Coverage:
+    """How far the certificates cover one shard kind's pool for the config's embodiment.
+
+    ``state``: ``reference`` (``exact``), ``certified``, ``other_embodiment`` (certified on this
+    GPU and stack for ``embodiments``, not for this one), ``other_build`` (a certificate exists
+    for this kind and GPU, but for another stack: engine, image, pins, modes, code or weights),
+    ``provisional``, ``fail``, ``unverified_weights`` (the derived weights' content digests are
+    unknown, so a certificate cannot be checked) or ``none``. ``status`` is ``certkey.status``'s
+    raw value."""
+
+    kind: str
+    gpu: str
+    state: str
+    status: str
+    certificate: str | None = None
+    embodiments: tuple[str, ...] = ()
+
+    @property
+    def unlocks(self) -> bool:
+        return self.state in ("reference", "certified")
+
+
+def coverage(preset: str, pools: Mapping[str, object], *, embodiment: str | None,
+             **match_kw) -> dict[str, Coverage]:
+    """Shard kind -> :class:`Coverage` of ``pools`` (kind -> anything with ``.gpu``) under
+    ``preset`` for ``embodiment``. ``match_kw``: as for ``certkey.matching`` (modes,
+    derived_content, cert_dir, ...)."""
+    from flora_deploy.validate import certkey
+
+    raw = certkey.status(preset, pools, embodiment=embodiment, **match_kw)
+    certs = None
+    out: dict[str, Coverage] = {}
+    for kind, r in raw.items():
+        gpu, st, cid = str(r.get("gpu")), str(r.get("status", "none")), r.get("certificate")
+        if st in ("reference", "certified", "provisional", "fail"):
+            out[kind] = Coverage(kind, gpu, st, st, cid,
+                                 (embodiment,) if st == "certified" and embodiment else ())
+            continue
+        if certs is None:
+            certs = certkey.load_certificates(match_kw.get("cert_dir"))
+        near = [c for c in certs if c.get("preset") == preset and c.get("kind") == kind
+                and c.get("gpu") == gpu]
+        if not near:
+            out[kind] = Coverage(kind, gpu, "none", st)
+            continue
+        if st == "unverified_weights":
+            out[kind] = Coverage(kind, gpu, st, st)
+            continue
+        others = sorted({str(e) for c in near if c.get("verdict") == "certified"
+                         for e in c.get("covered_pools") or ()} - {embodiment})
+        one = {kind: pools[kind]}
+        ok = tuple(e for e in others
+                   if kind in find_certificates(preset, one, embodiment=e,  # type: ignore[arg-type]
+                                                **match_kw))
+        out[kind] = (Coverage(kind, gpu, "other_embodiment", st, embodiments=ok) if ok
+                     else Coverage(kind, gpu, "other_build", st))
+    return out
+
+
+_NOT_COVERED = {
+    "none": "no certificate",
+    "provisional": "only a provisional certificate",
+    "fail": "its certificate failed",
+    "other_build": "certified for another build (engine, image, models, run modes, code or "
+                   "weights changed)",
+    "unverified_weights": "certificate not checked without the prepared weights (run `flora "
+                          "prepare`)",
+}
+
+
+def coverage_label(c: Coverage, embodiment: str | None) -> str:
+    """The status of one stage in plain words, e.g. ``certified (human, L40S)``, ``not
+    certified`` or ``certified for human, not for yam``."""
+    if c.state == "reference":
+        return "reference (NVIDIA's own engine, no certificate needed)"
+    if c.state == "certified":
+        return f"certified ({embodiment}, {c.gpu})"
+    if c.state == "other_embodiment":
+        return f"certified for {', '.join(c.embodiments)}, not for {embodiment}"
+    if c.state == "none":
+        return "not certified"
+    return f"not certified ({_NOT_COVERED.get(c.state, c.state)})"
+
+
+def uncovered_parts(cov: Mapping[str, Coverage], embodiment: str | None) -> list[str]:
+    """What keeps a config from being fully certified, one phrase per problem, e.g.
+    ``reward.terminal on H100!: no certificate`` and ``embodiment yam: segment/caption certified
+    for human only`` (kinds certified for the same other embodiments are named together)."""
+    parts: list[str] = []
+    by_emb: dict[tuple[str, ...], list[str]] = {}
+    for c in cov.values():
+        if c.unlocks:
+            continue
+        if c.state == "other_embodiment":
+            by_emb.setdefault(c.embodiments, []).append(c.kind)
+        else:
+            parts.append(f"{c.kind} on {c.gpu}: {_NOT_COVERED.get(c.state, 'not certified')}")
+    for embs, kinds in by_emb.items():
+        parts.append(f"embodiment {embodiment}: {'/'.join(kinds)} certified for "
+                     f"{', '.join(embs)} only")
+    return parts
+
+
+def uncertified_message(preset: str, cov: Mapping[str, Coverage],
+                        embodiment: str | None) -> str | None:
+    """Why a config of ``preset`` may not run without ``allow_uncertified`` (``None`` when every
+    stage is covered). When no stage has any certificate, the message is the one used before
+    certificates existed."""
+    missing = [c for c in cov.values() if not c.unlocks]
+    if not missing:
+        return None
+    if all(c.state in ("none", "reference") for c in cov.values()):
+        return (f"preset {preset!r} has no accuracy certificate for "
+                f"{', '.join(f'{c.kind} on {c.gpu}' for c in missing)} (a provisional "
+                "certificate does not count; config/certificates/), so its outputs are not "
+                "certified faithful to NVIDIA's. Use preset 'exact', or set "
+                "`allow_uncertified: true` (or pass --allow-uncertified) to run it as an "
+                "uncertified stack")
+    ok = [c.kind for c in cov.values() if c.state == "certified"]
+    ref = [c.kind for c in cov.values() if c.state == "reference"]
+    have = "; ".join(f"{w}: {', '.join(ks)}" for w, ks in (("certified", ok), ("reference", ref))
+                     if ks)
+    have = f" ({have})" if have else ""
+    return (f"preset {preset!r} is not certified for every stage of this config{have}: "
+            f"{'; '.join(uncovered_parts(cov, embodiment))}. Add `allow_uncertified: true` "
+            "to flora.yaml (or pass --allow-uncertified) to run it anyway: those stages' "
+            "records then say certified: false. Or use preset 'exact'")
+
+
+def refusal_message(preset: str, pools: Mapping[str, object], certified: Collection[str], *,
+                    embodiment: str | None, **match_kw) -> str:
+    """Config validation's refusal (``allow_uncertified`` unset, a kind of ``pools`` not in
+    ``certified``, the kinds ``find_certificates`` found): :func:`uncertified_message` of the
+    :func:`coverage` of ``pools``, with ``certified`` taken as given."""
+    cov = coverage(preset, pools, embodiment=embodiment, **match_kw)
+    for k in certified:
+        if k in cov and not cov[k].unlocks:
+            cov[k] = replace(cov[k], state="certified", embodiments=(str(embodiment),))
+    msg = uncertified_message(preset, cov, embodiment)
+    return msg or f"preset {preset!r}: not every stage is certified"
