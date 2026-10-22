@@ -608,13 +608,16 @@ def balanced_job_seconds(video_s: float, table: Any = None, *,
 
 
 def project(step: str, manifest: Mapping[str, Any], spec: PlanSpec | None = None, *,
-            reuse: Iterable[str] = (), lab_done: bool = False) -> Projection:
+            reuse: Iterable[str] = (), lab_done: bool = False,
+            witness_only: bool = False) -> Projection:
     """What ``step`` is expected to cost (nominal rates; ``usd_upper``: upper quantiles plus
     every cold start, scale-down tail and client slack the step can incur). ``spec``: the
     plan's episodes (default: the golden/v1 six). ``reuse``: lab kinds whose saved result is
     reused (:func:`lab_reuse`), priced at $0. ``lab_done`` (certified plan): the lab's L0 +
     Gate A evidence already exists (:func:`lab_already_done`), so the step starts nothing: $0
-    (and the global cap leaves it out: the step never runs)."""
+    (and the global cap leaves it out: the step never runs). ``witness_only`` (certified (d),
+    :func:`witness_pending`): only the cold witness re-runs, so (d) is priced at its items; the
+    global cap keeps the whole step's upper (``cap_usd_upper``)."""
     spec = spec or SPECS[DEFAULT_PLAN]
     dur = durations(manifest)
     eps = episodes_in(manifest, spec.episodes)
@@ -653,6 +656,10 @@ def project(step: str, manifest: Mapping[str, Any], spec: PlanSpec | None = None
             for kind, c in (("segment", seg), ("caption", cap)):
                 p.add(f"cold witness {kind} {job} ({len(neps)} ep, {nv:.1f} s{work(kind)}, "
                       "forced cold)", c, ws[kind][0], upper_s=ws[kind][1])
+            if witness_only:  # (d)'s job is done: the witness alone re-runs
+                full = p.usd_upper
+                p.items = [i for i in p.items if i["what"].startswith("cold witness")]
+                p.cap_usd_upper = full
         p.peak_usd_per_s = seg.usd_per_s() + cap.usd_per_s()
     elif step == "lab" and lab_done:
         p.add("balanced lab: L0 + Gate A already done (evidence present): skipped",
@@ -755,14 +762,17 @@ def plan_caps(plan: str, projections: Mapping[str, Projection]) -> dict[str, flo
 
 
 def plan_projections(plan: str, manifest: Mapping[str, Any], *, lab_done: bool = False,
-                     reuse: Iterable[str] = (), spec: PlanSpec | None = None
-                     ) -> dict[str, Projection]:
+                     reuse: Iterable[str] = (), spec: PlanSpec | None = None,
+                     witness_only: bool = False) -> dict[str, Projection]:
     """Every step's projection on the plan's episodes (``lab_done`` only applies to
     ``certified``: the other plans run their lab; ``reuse``: :func:`lab_reuse`; ``spec``:
-    default the plan's, :func:`spec_for` for another embodiment)."""
+    default the plan's, :func:`spec_for` for another embodiment; ``witness_only``:
+    :func:`witness_pending`, (d) priced at its cold witness alone)."""
     spec = spec or SPECS[plan]
     return {s: project(s, manifest, spec, lab_done=lab_done and plan == CERTIFIED,
-                       reuse=reuse if s == "lab" else ()) for s in STEPS}
+                       reuse=reuse if s == "lab" else (),
+                       witness_only=witness_only and plan == CERTIFIED and s == "balanced")
+            for s in STEPS}
 
 
 def lab_engine_hashes(kind: str) -> dict[str, str]:
@@ -1573,10 +1583,12 @@ def run_balanced(ctx: Ctx) -> dict[str, Any]:
     from flora_deploy.config.schema import load_config
 
     require_tempseg_pin(ctx)
-    episodes = balanced_episodes(ctx.manifest, ctx.spec)
-    derived = resolve_receipts(["captioner_bf16", "tempseg_merged"], require_pin=True)
     rate = (pool_container("segment", "balanced").usd_per_s()
             + pool_container("caption", "balanced").usd_per_s())
+    if ctx.spec.shared_data and witness_pending(ctx.st):
+        return rerun_cold_witness(ctx, rate)
+    episodes = balanced_episodes(ctx.manifest, ctx.spec)
+    derived = resolve_receipts(["captioner_bf16", "tempseg_merged"], require_pin=True)
     cfg, job_id = _stage_job(ctx, f"balanced-{ctx.spec.embodiment}", episodes,
                              embodiment=ctx.spec.embodiment,
                              stages=("segment", "caption"), budget=ctx.caps["balanced"],
@@ -1648,6 +1660,38 @@ def run_cold_witness(ctx: Ctx, cfg: Path, rate: float, *, spent: float) -> dict[
     return {**r, "compile_cache": "off", "episodes": len(ctx.spec.noise)}
 
 
+def rerun_cold_witness(ctx: Ctx, rate: float) -> dict[str, Any]:
+    """(d) re-entered with its deployed job done and its cold witness not
+    (:func:`witness_pending`): run the witness alone (its own job and app, this attempt's
+    number) on the job's saved config; the job's record (and so its records) is reused. This
+    attempt's spend is the witness's."""
+    prev = ctx.st.step("balanced").result
+    main = dict(prev["jobs"][JOB])
+    cfg = Path(str(main.get("cfg") or ""))
+    if not main.get("cfg") or not cfg.is_file():
+        raise RuntimeError(f"cold witness re-run: (d)'s job config {main.get('cfg')!r} is gone; "
+                           "re-run (d) in full")
+    w = run_cold_witness(ctx, cfg, rate, spent=0.0)
+    out: dict[str, Any] = {k: prev[k] for k in ("episodes", "derived_content") if k in prev}
+    out.update({"ok": w.get("state") == "done", "jobs": {JOB: main}, "witness_jobs": {JOB: w},
+                "tracked_usd": float(w.get("spend") or 0.0),
+                "report_error": bool(w.get("report_error")),
+                "apps": [w["app"]] if "app" in w else [], "witness_only": True})
+    if not out["ok"]:
+        out["error"] = (f"cold witness job ended {w.get('state')!r}"
+                        + (f" ({w['error']})" if w.get("error") else ""))
+    return out
+
+
+def witness_pending(st: State) -> bool:
+    """(d)'s deployed job is done but its cold witness is missing or not done, on a state that
+    needs one (the certified plan, or a result that ran one): only the witness re-runs."""
+    res = (st.steps.get("balanced") or StepState()).result
+    if not balanced_job_done(st) or (st.plan != CERTIFIED and "witness_jobs" not in res):
+        return False
+    return ((res.get("witness_jobs") or {}).get(JOB) or {}).get("state") != "done"
+
+
 def balanced_job_done(st: State) -> bool:
     """(d)'s deployed job finished (``done``), whatever its step's status says: a state from
     before the lab became its own step marks (d) ``failed`` when only the lab failed."""
@@ -1657,9 +1701,11 @@ def balanced_job_done(st: State) -> bool:
 
 def adopt_balanced_job(st: State) -> bool:
     """Mark (d) ``done`` when its deployed job finished but the step failed on the lab it
-    used to run inline (the 2026-10-22 state). Returns whether it changed anything."""
+    used to run inline (the 2026-10-22 state). Never while its cold witness is pending
+    (:func:`witness_pending`): (d) is done only when both are. Returns whether it changed
+    anything."""
     s = st.steps.get("balanced")
-    if s is None or s.status == "done" or not balanced_job_done(st):
+    if s is None or s.status == "done" or not balanced_job_done(st) or witness_pending(st):
         return False
     s.status = "done"
     s.notes.append("deployed job done; its lab part moved to step lab (d2), re-run there")
@@ -1899,6 +1945,9 @@ def run_lab(ctx: Ctx, *, missing: Callable[[Iterable[str]], list[str]] | None = 
     if not balanced_job_done(ctx.st):
         raise RuntimeError("the lab runs against (d)'s finished deployed job; (d) has none "
                            "(run --only balanced first)")
+    if witness_pending(ctx.st):
+        raise RuntimeError("(d)'s cold witness is not done; the lab waits for it (run --only "
+                           "balanced: it re-runs the witness alone)")
     job = bal["jobs"][JOB]
     episodes = [e for e in bal.get("episodes") or () if e in ctx.spec.lab_episodes]
     bound: dict[str, str] | None = None
@@ -2462,6 +2511,9 @@ def print_status(st: State, projections: Mapping[str, Projection], *, plan: str,
                    None) if last else None
         stop = next((n for n in s.notes if n.startswith("stop rule")), None)
         why = f"  [{err or stop}]" if (err or stop) and s.status != "done" else ""
+        if name == "balanced" and witness_pending(st):
+            why += (f"  [witness pending: will re-run the {len(spec.noise)}-episode cold job "
+                    "only]")
         out(f"  {title[name]:66s} {s.status:9s} cap ${caps[name]:.2f}  attempts "
             f"{len(s.attempts)}  charged ${s.charged(wm):.2f}  tracked ${s.tracked_usd:.2f}"
             + ("" if s.billed_usd is None else f"  billed ${s.billed_usd:.2f}") + why)
@@ -2562,9 +2614,13 @@ def main(argv: list[str] | None = None) -> int:
               f"{', '.join(miss)})")
     lab_done = args.plan == CERTIFIED and lab_already_done()[0]
     reuse = () if lab_done else lab_reuse(st, spec)
+    pending = args.plan == CERTIFIED and witness_pending(st)
     projections = plan_projections(args.plan, manifest, lab_done=lab_done, reuse=reuse,
-                                   spec=spec)
+                                   spec=spec, witness_only=pending)
     caps = plan_caps(args.plan, projections)
+    if pending:
+        print(f"note: (d)'s deployed job is done; witness pending: will re-run the "
+              f"{len(spec.noise)}-episode cold job only")
     if reuse:
         print(f"note: lab reuses the saved {', '.join(reuse)} result(s) (evidence, run "
               f"{st.run_id}, (d)'s episodes); only the rest runs")
