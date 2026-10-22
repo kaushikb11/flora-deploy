@@ -136,6 +136,8 @@ flora plan [OPTIONS]
 | `--live-prices`, `--no-live-prices` | --no-live-prices | Read prices from Workspace.billing.rates() (needs Modal credentials). |
 | `--write` |  | Write option N (1-based) into the config. |
 | `--json` | off | Print options as JSON. |
+| `--check-cache` | off | Price balanced pools whose compile cache is published on flora-cache (needs Modal credentials) with the warm startup row. |
+| `--assume-warm` | off | Projection: price every pool's startup warm, as if a compile cache were published. |
 
 ### `flora estimate`
 

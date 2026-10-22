@@ -225,7 +225,13 @@ def fake_stack(monkeypatch, tmp_path, tempseg_pinned):
     monkeypatch.setattr(workers_app, "gpu_name", lambda: "NVIDIA H100 80GB HBM3")
     monkeypatch.setattr(ba, "derived_dir", lambda n: tmp_path / n)
     monkeypatch.setattr(ba, "check_extra_state", lambda d: [])
-    monkeypatch.setattr(ba, "cache_env", lambda kind: {})
+    cache = SimpleNamespace(env={}, status=SimpleNamespace(as_json=lambda: {"state": "cold"}))
+
+    def prepare_cache(kind, spec, content, env):
+        calls.append(f"cache:{kind}:{content[:1]}")
+        return cache
+
+    monkeypatch.setattr(ba, "prepare_cache", prepare_cache)
     monkeypatch.setattr(captioner_load, "full_verify_default", lambda: True)
 
     def verify(name, directory, recorded, *, background=False, **_):
@@ -288,8 +294,8 @@ def _expected_calls(kind):
     gpu = "L40S" if kind == "segment" else "H100!"
     return name, gpu, [
         "preflight", f"verify:{name}:{BAL_RECEIPTS[name]}:True",
-        f"stamp:{kind}:NVIDIA H100 80GB HBM3:['{name}']", "nv", f"processor:{proc}",
-        f"spec:{kind}:{gpu}", "engine", f"files:{name}", "accel"]
+        f"stamp:{kind}:NVIDIA H100 80GB HBM3:['{name}']", f"spec:{kind}:{gpu}",
+        f"cache:{kind}:d", "nv", f"processor:{proc}", "engine", f"files:{name}", "accel"]
 
 
 @pytest.mark.parametrize("kind", ["segment", "caption"])
@@ -314,8 +320,10 @@ def test_build_runner_order_and_parts(fake_stack, kind):
     assert inner.info.config_extra == {"derived": {name: "d" * 64}}
     assert startup["kind"] == kind and startup["derived_files"] == {name: True}
     assert startup["spec"]["gpu"] == gpu and startup["accel"] == {"patches": ["p"]}
-    assert set(startup["marks"]) == {"preflight", "derived_receipts", "cert_key", "engine",
-                                     "derived_files"}
+    assert set(startup["marks"]) == {"preflight", "derived_receipts", "cert_key",
+                                     "compile_cache", "engine", "derived_files"}
+    assert startup["compile_cache"] == {"state": "cold"}
+    assert runner.compile_cache is not None
 
 
 @pytest.mark.parametrize("kind", ["segment", "caption"])

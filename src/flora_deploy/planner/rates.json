@@ -8,6 +8,7 @@
   },
   "balanced_slot": "The `balanced` segment and caption rows below are the measurement slot (planner.rates.MEASURED_SLOTS). To record a measurement, edit only those rows: set `container_s_per_video_s`, `uncertainty`, `status` (placeholder -> measured), `source` (the doc or run that measured it), `date`, `image` and `provenance`; no code change is needed. Their status must be placeholder or measured, and a measured row must name its source and date. Until then `flora plan` labels every option that uses them `estimate (placeholder)`.",
   "note": "`status`: measured | projected | placeholder | stale. `stale` entries were measured on another image or superseded by a measurement of the same configuration; they are kept for history only and lookups skip them. `requires` names worker features a rate depends on; `excludes` names features whose presence makes the rate invalid (the S1 row was measured with gpu_thread off). The deployed configuration's features are `planner.rates.DEPLOYED_FEATURES` (gpu_thread: `stages.reference.ExactProfile.gpu_thread`, on by default since P1a-5s); a rate that needs a feature outside it (e.g. `long_lived_container`) only appears in projection options, which are never recommended. At equal concurrency a measured entry beats a projected one whatever its `requires` (review 5 M-C). `image`: the image the entry was measured or projected on. `cameras` \"*\": measured on a 1-/3-view mix. Determinism mode (`pipeline.determinism: deterministic`, cuDNN SDPA off) has no rate of its own: docs/determinism.md measured <= 3% end to end before gpu_thread; it is not re-measured on the current profile and does not pay the cold cuDNN graph tax, so its rate will differ; do not reuse these rows for it without a measurement.",
+  "startup_note": "`compile_cache` on a startup row: `cold` (timed compiling from scratch), `warm` (timed loading a published compile cache, engines/compile_cache.py) or absent (projections). Lookups skip `warm` rows unless the caller prices warm: `RateTable.startup_for(..., warm=True)`, which `flora plan` does for a pool only when a cache is published for its key (`--check-cache`) or with `--assume-warm` (a projection). `jobs.budget` always charges the cold row. The balanced `warm` rows are placeholders until a warm start is measured.",
   "rates": [
     {
       "preset": "exact",
@@ -256,6 +257,26 @@
       "status": "projected",
       "provenance": "W3-B expectation for vLLM TempSeg/Captioner with the Rewarder recipe: ~100-130 s per fresh container (docs/cold-start.md)",
       "date": "2026-10-21"
+    },
+    {
+      "preset": "balanced",
+      "kind": "segment",
+      "startup_s": 150,
+      "uncertainty": 0.6,
+      "status": "placeholder",
+      "compile_cache": "warm",
+      "provenance": "not measured: a fresh L40S container that loads a verified balanced-cc compile cache (engines/compile_cache.py). Basis: the 2026-10-22 lab's TempSeg engine builds with a warm cache, 201 s (baseline, weights still prefetching) and 102 s (plugin child, same container); plus @enter's preflight and derived-weight checks. Used only when a cache is published for the pool's key or with assume_warm (docs/cold-start.md, Warm start)",
+      "date": "2026-10-22"
+    },
+    {
+      "preset": "balanced",
+      "kind": "caption",
+      "startup_s": 180,
+      "uncertainty": 0.6,
+      "status": "placeholder",
+      "compile_cache": "warm",
+      "provenance": "not measured: a fresh H100 container that loads a verified balanced-cc compile cache. Basis: the Rewarder's fresh-container warm-cache start on H100, 224-229 s with ~95 s of then-uncached Triton JIT that the keyed cache now carries (docs/cold-start.md), against 325 s measured cold. Used only when a cache is published for the pool's key or with assume_warm (docs/cold-start.md, Warm start)",
+      "date": "2026-10-22"
     }
   ]
 }

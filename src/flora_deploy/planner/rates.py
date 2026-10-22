@@ -22,6 +22,7 @@ that actually runs).
 from __future__ import annotations
 
 import json
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
@@ -202,7 +203,27 @@ class RateTable:
         return min(cands, key=lambda e: (e.concurrency, STATUS_RANK[e.status],
                                          -len(e.requires)))
 
-    def startup_for(self, preset: str, kind: str) -> StartupEntry:
+    def startup_for(self, preset: str, kind: str, *, warm: bool = False) -> StartupEntry:
+        """The startup row of ``(preset, kind)``: exact kind before ``reward.*`` style prefixes
+        before ``"*"``, then exact preset before ``"*"``.
+
+        ``warm=False`` (the default, what ``jobs.budget`` charges) never returns a
+        ``compile_cache: warm`` row: a container is priced as if it compiles. ``warm=True``
+        (a published compile cache exists for the pool's key, or a projection assumes one:
+        :func:`startup_cache`) prefers the best ``warm`` row and falls back to the default
+        lookup when the kind has none."""
+        if warm:
+            hit = self._startup_lookup(preset, kind, lambda e: e.compile_cache == "warm")
+            if hit is not None:
+                return hit
+        hit = self._startup_lookup(preset, kind, lambda e: e.compile_cache != "warm")
+        if hit is None:
+            return StartupEntry(preset, kind, 0.0, 0.0, "placeholder",
+                                "no startup entry; startup not charged", "")
+        return hit
+
+    def _startup_lookup(self, preset: str, kind: str,
+                        keep: Callable[[StartupEntry], bool]) -> StartupEntry | None:
         def score(e: StartupEntry) -> tuple[int, int] | None:
             p = 0 if e.preset == preset else 1 if e.preset == "*" else None
             if p is None:
@@ -217,8 +238,15 @@ class RateTable:
                 return None
             return (k, p)
 
-        scored = [(s, e) for e in self.startup if (s := score(e)) is not None]
+        scored = [(s, e) for e in self.startup if keep(e) and (s := score(e)) is not None]
         if not scored:
-            return StartupEntry(preset, kind, 0.0, 0.0, "placeholder",
-                                "no startup entry; startup not charged", "")
+            return None
         return min(scored, key=lambda t: t[0])[1]
+
+
+def startup_cache(kind: str, *, warm_kinds: Collection[str] = (),
+                  assume_warm: bool = False) -> bool:
+    """Whether ``kind``'s containers are priced warm: a compile cache is published for its key
+    (``warm_kinds``, e.g. from ``engines.compile_cache.published``) or the caller projects one
+    (``assume_warm``). Never inferred: no evidence, cold."""
+    return bool(assume_warm or kind in warm_kinds)

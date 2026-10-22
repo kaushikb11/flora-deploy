@@ -288,10 +288,12 @@ def startup_row(table: Any, kind: str, cache: str) -> Any | None:
     return rows[0] if rows else None
 
 
-def kind_rates(mode: str, table: Any = None, *, warm: bool | None = None
-               ) -> dict[str, KindRate]:
+def kind_rates(mode: str, table: Any = None, *, warm: bool | None = None,
+               warm_kinds: tuple[str, ...] = ()) -> dict[str, KindRate]:
     """Per pool kind: the work rate and the startup the projection uses. ``warm``: the
-    warm-start variant (default :data:`ASSUME_WARM`)."""
+    warm-start variant for every pool (default :data:`ASSUME_WARM`); ``warm_kinds``: pools
+    priced warm because a compile cache is published for their key
+    (``engines.compile_cache.published_kinds``). The others are priced cold."""
     from flora_deploy.planner.rates import RateTable
 
     warm = ASSUME_WARM if warm is None else warm
@@ -304,7 +306,7 @@ def kind_rates(mode: str, table: Any = None, *, warm: bool | None = None
         e = t.rate("balanced", kind, 1, 1)
         cold = startup_row(t, kind, "cold") or t.startup_for("balanced", kind)
         s, su, sst, cache = cold.startup_s, cold.uncertainty, cold.status, cold.compile_cache
-        if warm:
+        if warm or kind in warm_kinds:
             w = startup_row(t, kind, "warm")
             if w is not None:
                 s, su, sst, cache = w.startup_s, w.uncertainty, w.status, "warm"

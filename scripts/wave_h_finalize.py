@@ -385,7 +385,8 @@ def updated_rates(data: Mapping[str, Any], ms: Mapping[tuple[str, str], Measurem
                 "provenance": (f"Wave H-lite run {run_id}: spawn to first attempt of n={k} "
                                f"fresh {m.gpu} container(s), {spread} ({source})"),
                 "date": date, "source": source}
-        existing = [r for r in new["startup"] if r["preset"] == preset and r["kind"] == kind]
+        existing = [r for r in new["startup"] if r["preset"] == preset and r["kind"] == kind
+                    and r.get("compile_cache") != "warm"]  # the warm row is its own slot
         if existing:
             # the compile-cache state the startup was measured with is not in the state; keep
             # the one recorded beside the row (``wave_h.startup_basis`` reads it), so --write

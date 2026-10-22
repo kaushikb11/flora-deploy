@@ -431,14 +431,24 @@ def startup_basis(table: Any = None) -> dict[str, str]:
     return out
 
 
+def warm_startup_s(st: Any) -> tuple[float, str] | None:
+    """A startup row timed (or placeheld) with a loaded compile cache, as is; ``None`` when
+    ``st`` is not a ``compile_cache: warm`` row (price it cold instead)."""
+    if getattr(st, "compile_cache", None) != "warm":
+        return None
+    return float(st.startup_s), f"{st.status} warm"
+
+
 def balanced_job_seconds(video_s: float, table: Any = None, *,
-                         compile_factor: float = COLD_COMPILE_FACTOR
+                         compile_factor: float = COLD_COMPILE_FACTOR,
+                         warm_kinds: tuple[str, ...] = ()
                          ) -> dict[str, tuple[float, float]]:
     """One balanced job (one app): kind -> (nominal, upper) container-seconds. Each pool has
     its own cold start, its startup scaled by ``compile_factor`` (a cold compile cache:
-    :data:`COLD_COMPILE_FACTOR`); the segment container then idles through the scale-down
-    window while captions run (the caption shards wait for it); both stay up through the client
-    slack."""
+    :data:`COLD_COMPILE_FACTOR`), except the pools in ``warm_kinds`` (a compile cache is
+    published for their key), priced with the warm startup row when there is one; the segment
+    container then idles through the scale-down window while captions run (the caption shards
+    wait for it); both stay up through the client slack."""
     from flora_deploy.jobs.settings import WORKER_SCALEDOWN_S
     from flora_deploy.planner.rates import RateTable
 
@@ -447,8 +457,8 @@ def balanced_job_seconds(video_s: float, table: Any = None, *,
     work: dict[str, tuple[float, float, float]] = {}
     for kind in ("segment", "caption"):
         e = t.rate("balanced", kind, 1, 1)
-        st = t.startup_for("balanced", kind)
-        start, _basis = cold_startup_s(st, compile_factor)
+        st = t.startup_for("balanced", kind, warm=kind in warm_kinds)
+        start, _basis = warm_startup_s(st) or cold_startup_s(st, compile_factor)
         work[kind] = (start, video_s * e.container_s_per_video_s,
                       max(e.uncertainty, st.uncertainty))
     cap_nominal = work["caption"][0] + work["caption"][1]

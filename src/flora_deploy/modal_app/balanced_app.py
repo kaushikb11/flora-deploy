@@ -39,8 +39,15 @@ build:
    with ``fatal=workers_app._die``: after a CUDA fault / dead engine the attempt is marked and
    the container exits (it is replaced; the start does not count toward D15).
 
-Compile caches: ``flora-cache:/balanced/<engine kind>`` is mounted read-only and copied to
-container-local disk (``FLORA_CACHE_MODE=ro``, M7); ``balanced_lab`` is its writer.
+Compile caches (:func:`prepare_cache`, ``engines.compile_cache``): keyed by image, versions,
+the compile-relevant engine spec, plugin flag, model content and GPU. ``flora-cache`` stays
+mounted read-only (``FLORA_CACHE_MODE=ro``, M7): a verified ``balanced-cc/<key>`` manifest is
+copied to container-local disk, else the lab's unkeyed ``balanced/<engine kind>`` cache (same
+GPU and plugin flag only), else the engine compiles cold. A build that fails on a loaded cache
+is retried once cold (:func:`build_engine`). A container that compiled publishes its cache
+once, after its first shard ran generates (``WorkerCache.maybe_publish``: a ``modal.Dict``
+lease, upload through the Volume client API, manifest last; ``FLORA_COMPILE_CACHE_PUBLISH=0``
+turns it off).
 
 ``run_shard`` is the ``workers.ShardWorker`` contract (``max_inputs`` is 1: the runner runs a
 shard's episodes concurrently inside one input). ``@modal.exit`` flushes and marks a running
@@ -53,7 +60,6 @@ import dataclasses
 import hashlib
 import json
 import os
-import shutil
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -67,6 +73,10 @@ from flora_deploy.modal_app.factory import DERIVED_RECEIPTS_ENV
 
 LOCAL_CACHE = Path("/tmp/flora-cache/balanced")
 ENGINE_KINDS = {"segment": "tempseg", "caption": "captioner"}
+PUBLISH_ENV = "FLORA_COMPILE_CACHE_PUBLISH"  # "0": never publish (default: publish once)
+# The GPU each unkeyed lab cache (``balanced_lab.GPUS``, ``flora-cache:/balanced/<kind>``) was
+# compiled on: vLLM's AOT key has no GPU factor, so another GPU never seeds from it.
+LEGACY_LAB_GPUS = {"tempseg": "L40S", "captioner": "H100"}
 DERIVED_FOR_KIND = {"segment": "tempseg_merged", "caption": "captioner_bf16"}
 
 
@@ -205,18 +215,69 @@ def check_extra_state(directory: Path) -> list[str]:
     return check(idx["weight_map"])
 
 
-def cache_env(engine_kind: str, *, mount: Path | str = CACHE_MOUNT,
-              local: Path = LOCAL_CACHE) -> dict[str, str]:
-    """``balanced_lab.cache_env`` layout, copied from the read-only mount to local disk."""
-    seed = Path(mount) / "balanced" / engine_kind
-    dest = local / engine_kind
-    if seed.is_dir() and not dest.exists():
-        shutil.copytree(seed, dest, symlinks=True)
-    env = {"VLLM_CACHE_ROOT": str(dest / "vllm"), "TRITON_CACHE_DIR": str(dest / "triton"),
-           "CUDA_CACHE_PATH": str(dest / "cuda"), "XDG_CACHE_HOME": str(dest / "xdg")}
-    for p in env.values():
-        Path(p).mkdir(parents=True, exist_ok=True)
-    return env
+def _image_fp(env: Mapping[str, str]) -> str | None:
+    from flora_deploy.modal_app.rewarder_app import IMAGE_FP_ENV
+
+    try:
+        from flora_deploy.modal_app.images import image_fingerprint
+
+        return image_fingerprint("img_vllm")
+    except OSError:
+        return env.get(IMAGE_FP_ENV) or None
+
+
+def prepare_cache(kind: str, spec: Any, model_content: str | None,
+                  env: Mapping[str, str] = os.environ, *, mount: Path | str = CACHE_MOUNT,
+                  local_root: Path = LOCAL_CACHE, image_fp: str | None = None,
+                  log: Callable[[str], None] = print) -> Any:
+    """The container's ``compile_cache.WorkerCache`` (module docstring). Never raises: a key
+    that cannot be derived (no image fingerprint, say) means a cold, unpublished cache."""
+    from flora_deploy.engines import compile_cache as cc
+    from flora_deploy.workers_impl.reward import default_container_id
+
+    engine_kind = ENGINE_KINDS[kind]
+    try:
+        image_fp = image_fp or _image_fp(env)
+        if not image_fp:
+            raise RuntimeError("no img_vllm fingerprint: the key would not name the image")
+        key = cc.spec_key(spec, model_content=model_content, image_fp=image_fp)
+    except Exception as e:  # noqa: BLE001
+        log(f"compile cache: no key ({type(e).__name__}: {e}); compiling cold, not publishing")
+        local = local_root / f"{engine_kind}-unkeyed"
+        cc.reset_local(local)
+        key = cc.CacheKey({"engine_kind": engine_kind, "dtbias_fp32": False, "gpu": "unknown"})
+        return cc.WorkerCache(key, local, cc.CacheStatus("cold", "unkeyed", reason=str(e)[:500]),
+                              publish_enabled=False, log=log)
+    local = local_root / key.name
+    status = cc.seed(key, mount, local, log=log)
+    plugin = "-dtbias" if spec.dtbias_fp32 else ""
+    legacy = Path(mount) / "balanced" / f"{engine_kind}{plugin}"
+    if status.state == "cold" and status.reason == cc.NO_CACHE \
+            and LEGACY_LAB_GPUS.get(engine_kind) == key.factors["gpu"] \
+            and (legacy / "vllm").is_dir():
+        status = cc.seed_legacy(legacy, local, key, log=log)
+    return cc.WorkerCache(key, local, status, publish_enabled=env.get(PUBLISH_ENV, "1") != "0",
+                          holder=default_container_id(), mount=mount, log=log)
+
+
+def build_engine(spec: Any, cache: Any, engine_cls: Callable[[Any], Any]) -> Any:
+    """``engine_cls(spec)``; when that fails on a loaded (``warm`` / ``legacy``) cache for a
+    reason other than the spec itself, empty the cache and build once more, cold."""
+    from flora_deploy.engines.offline_llm import EngineArgsError, EngineVerifyError
+    from flora_deploy.engines.patches.dt_bias_fp32 import DtBiasActivationError
+
+    try:
+        return engine_cls(spec)
+    except (EngineArgsError, EngineVerifyError, DtBiasActivationError):
+        raise  # deterministic: the same on a cold build
+    except Exception as e:  # noqa: BLE001
+        if cache is None or cache.status.state not in ("warm", "legacy"):
+            raise
+        cache.reset_cold(f"{type(e).__name__}: {e}"[:300])
+        import gc
+
+        gc.collect()
+        return engine_cls(spec)
 
 
 def pool_gpu(kind: str, env: Mapping[str, str] = os.environ) -> str:
@@ -238,7 +299,7 @@ class BalancedStage(NamedTuple):
     the ``certstamp.CertStamp`` to stamp records with (``None``: the container's
     ``FLORA_EMBODIMENT``; a service passes each request's; the key does not depend on it).
     ``info``: the jobs' ``StageInfo``. ``store`` / ``startup``: the job store and the startup
-    facts."""
+    facts. ``cache``: the container's compile cache (``engines.compile_cache.WorkerCache``)."""
 
     engine: Any
     job: Any
@@ -246,6 +307,7 @@ class BalancedStage(NamedTuple):
     info: Any
     store: Any
     startup: dict
+    cache: Any = None  # the compile_cache.WorkerCache
 
 
 def build_stage(kind: str, env: Mapping[str, str] = os.environ) -> BalancedStage:
@@ -310,12 +372,15 @@ def build_stage(kind: str, env: Mapping[str, str] = os.environ) -> BalancedStage
                            derived_content={n: d["content_sha256"] for n, d in derived.items()})
     mark("cert_key")
 
-    os.environ.update(cache_env(ENGINE_KINDS[kind]))  # before vLLM is imported
+    spec = spec_for(kind, str(model_dir), pool_gpu(kind, env))
+    cache = prepare_cache(kind, spec, derived[DERIVED_FOR_KIND[kind]]["content_sha256"], env)
+    os.environ.update(cache.env)  # before vLLM is imported
+    mark("compile_cache")
     nv = load_family(Family.SEGCAP, Path(snapshot_path(PINS_BY_KEY["tempseg_code"],
                                                        WEIGHTS_MOUNT)))
     processor = nv.models.processor(ENGINE_KINDS[kind], model_dir)
-    spec = spec_for(kind, str(model_dir), pool_gpu(kind, env))
-    engine = OfflineEngine(spec)  # validated kwargs, plugin flag check, GDN dtype verify (M6)
+    # validated kwargs, plugin flag check, GDN dtype verify (M6); one cold retry (cache)
+    engine = build_engine(spec, cache, OfflineEngine)
     mark("engine")
     files = {n: (d["files"]() if callable(d["files"]) else d["files"])
              for n, d in derived.items()}  # fail closed before ready
@@ -344,6 +409,7 @@ def build_stage(kind: str, env: Mapping[str, str] = os.environ) -> BalancedStage
                "derived": {n: {k: v for k, v in d.items() if k != "files"}
                            for n, d in derived.items()},
                "derived_files": {n: bool(f) for n, f in files.items()},
+               "compile_cache": cache.status.as_json(),
                "prefetch": stats.as_json() if stats else {"done": getattr(prefetch, "done", None)}}
 
     def stamp_fn(embodiment: str | None = None) -> Any:
@@ -352,7 +418,7 @@ def build_stage(kind: str, env: Mapping[str, str] = os.environ) -> BalancedStage
         return dataclasses.replace(stamp, embodiment=embodiment)
 
     return BalancedStage(engine=engine, job=wrap_job(job, active=active), stamp_fn=stamp_fn,
-                         info=info, store=store, startup=startup)
+                         info=info, store=store, startup=startup, cache=cache)
 
 
 def build_runner(kind: str, env: Mapping[str, str] = os.environ, *,
@@ -367,7 +433,15 @@ def build_runner(kind: str, env: Mapping[str, str] = os.environ, *,
     runner = BalancedShardRunner(st.store, st.engine, wrap_job(st.job, stamp=st.stamp_fn()),
                                  BalancedWorkerSettings(gpu=st.info.gpu), call_id=call_id,
                                  fatal=fatal)
+    runner.compile_cache = st.cache
     return runner, st.startup
+
+
+def after_shard(runner: Any) -> None:
+    """Publish the compile cache once, after a shard (``WorkerCache.maybe_publish``)."""
+    cache = getattr(runner, "compile_cache", None)
+    if cache is not None:
+        cache.maybe_publish(getattr(runner, "engine", None))
 
 
 class RefusedRunner:
@@ -437,7 +511,9 @@ class SegmentWorker:
 
     @modal.method()
     def run_shard(self, job_id: str, shard_id: str, config_hash: str, token: str = ""):
-        return self.runner.run_shard(job_id, shard_id, config_hash, token=token)
+        out = self.runner.run_shard(job_id, shard_id, config_hash, token=token)
+        after_shard(self.runner)
+        return out
 
     @modal.exit()
     def stop(self) -> None:
@@ -457,7 +533,9 @@ class CaptionWorker:
 
     @modal.method()
     def run_shard(self, job_id: str, shard_id: str, config_hash: str, token: str = ""):
-        return self.runner.run_shard(job_id, shard_id, config_hash, token=token)
+        out = self.runner.run_shard(job_id, shard_id, config_hash, token=token)
+        after_shard(self.runner)
+        return out
 
     @modal.exit()
     def stop(self) -> None:

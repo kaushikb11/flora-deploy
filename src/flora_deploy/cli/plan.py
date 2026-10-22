@@ -169,6 +169,32 @@ def _print_plan(cfg, workload, req, deadline_s, options, best, rates, table, con
                       "--deadline / max_gpus, or label fewer episodes.[/red]", soft_wrap=True)
 
 
+def published_cache_kinds(cfg, exists=None) -> tuple[str, ...]:
+    """The balanced shard kinds whose compile cache is published for the key of the pool they
+    would run on (``engines.compile_cache.published_kinds``); ``exists``: a path probe of the
+    ``flora-cache`` Volume (default: through the Modal client). Any error: none (cold)."""
+    from flora_deploy.config.presets import get_preset
+    from flora_deploy.engines.compile_cache import published_kinds
+
+    pools = dict(get_preset("balanced").pools)
+    if cfg.preset == "balanced":
+        pools.update(cfg.pools())
+    gpus = {k: p.gpu for k, p in pools.items()}
+    if exists is None:
+        try:
+            import modal
+
+            from flora_deploy.jobs.stores.client_volume import ClientVolumeStore
+            from flora_deploy.layout import CACHE_VOLUME
+
+            exists = ClientVolumeStore(modal.Volume.from_name(CACHE_VOLUME, version=2)).exists
+        except Exception as e:  # noqa: BLE001
+            console.print(f"[yellow]--check-cache: cannot read flora-cache ({e}); pricing "
+                          "startups cold[/yellow]")
+            return ()
+    return published_kinds(gpus, exists)
+
+
 def _cameras_from_config(cfg) -> int:
     cams = cfg.input.cameras
     return len(cams) if cams else 1
@@ -200,6 +226,12 @@ def plan(
     write: Annotated[int | None, typer.Option(
         help="Write option N (1-based) into the config.")] = None,
     as_json: Annotated[bool, typer.Option("--json", help="Print options as JSON.")] = False,
+    check_cache: Annotated[bool, typer.Option(
+        "--check-cache", help="Price balanced pools whose compile cache is published on "
+        "flora-cache (needs Modal credentials) with the warm startup row.")] = False,
+    assume_warm: Annotated[bool, typer.Option(
+        "--assume-warm", help="Projection: price every pool's startup warm, as if a compile "
+        "cache were published.")] = False,
 ) -> None:
     """Show 2-4 run options (cost, wall-clock, GPUs, certification) and optionally pick one."""
     import yaml
@@ -257,11 +289,13 @@ def plan(
 
     presets = tuple(preset or default_presets())  # balanced first
     deadline_s = parse_duration(deadline) if deadline else None
+    warm_kinds = published_cache_kinds(cfg) if check_cache else ()
     req = PlanRequest(workload=workload, stages=cfg.pipeline.stages, presets=presets,
                       deadline_s=deadline_s,
                       budget_usd=budget if budget is not None else cfg.modal.budget_usd,
                       max_gpus=max_gpus or cfg.modal.max_gpus,
-                      allow_uncertified=cfg.allow_uncertified)
+                      allow_uncertified=cfg.allow_uncertified, warm_kinds=warm_kinds,
+                      assume_warm=assume_warm)
     req = with_pool_overrides(req, cfg.preset, cfg.pools())
     try:
         options = plan_options(req, table=table, rates=rates)
