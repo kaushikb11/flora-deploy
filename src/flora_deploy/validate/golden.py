@@ -1,7 +1,8 @@
 """Golden-set staging (PLAN-v3.md §9, W3-C): selection data -> per-episode oracle inputs + manifest.
 
-The selection is data (``golden_selection_v1.json``, and the human-only certification set
-``golden_selection_v2.json``, next to this module; :data:`SELECTIONS`). A selection's
+The selection is data (``golden_selection_v1.json``, the human-only certification set
+``golden_selection_v2.json`` and the yam (3-view) one ``golden_selection_v3_yam.json``, next to
+this module; :data:`SELECTIONS`). A selection's
 ``version`` decides its prefix: ``golden/v2`` stages under ``<root>/golden/v2/`` and never
 touches v1 (``golden/v1`` below stands for the selection's own prefix). Every episode names
 its dataset (repo + pinned revision + format + license), the episode, the camera key -> role
@@ -28,7 +29,8 @@ the selection entry changed (``selection_digest``) or ``force``. Finally
 ``<root>/golden/v1/manifest.json`` is rebuilt from every record (:func:`build_manifest`).
 Videos and NC-licensed derivatives stay on the private Volume; only the numbers-only summary
 (:func:`summary_markdown`) is committed (``docs/golden-manifest-v1.md``,
-``docs/golden-manifest-v2.md``; v2 is staged and verified by ``scripts/golden_stage.py``).
+``docs/golden-manifest-v2.md``, ``docs/golden-manifest-v3-yam.md``; v2 and v3-yam are staged
+and verified by ``scripts/golden_stage.py``).
 """
 
 from __future__ import annotations
@@ -53,7 +55,8 @@ GOLDEN_PREFIX = PurePosixPath("golden") / "v1"
 # Every version a selection may name. Each stages under its own ``golden/<v>/`` prefix
 # (:func:`prefix_for`), so v2 never rewrites v1's files or manifest.
 SELECTIONS = {"golden/v1": SELECTION_PATH,
-              "golden/v2": Path(__file__).with_name("golden_selection_v2.json")}
+              "golden/v2": Path(__file__).with_name("golden_selection_v2.json"),
+              "golden/v3-yam": Path(__file__).with_name("golden_selection_v3_yam.json")}
 GOLDEN_VERSIONS = tuple(SELECTIONS)
 MANIFEST_NAME = "manifest.json"
 RECORD_NAME = "record.json"

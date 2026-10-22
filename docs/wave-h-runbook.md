@@ -436,6 +436,55 @@ what the same config hashes to now. They still cannot be the certified run's can
 
 So **(d) is rerun on the 12 episodes.** It is about $1.35 nominal, and is priced above.
 
+### Other embodiments (`--embodiment`)
+
+Certificates are per embodiment, so the human run does not cover robot data. `--plan certified
+--embodiment yam` runs the same steps on golden/v3-yam (`docs/golden-manifest-v3-yam.md`: 12
+three-view episodes, 220.2 s, noise subset 5 episodes, 72.2 s). `--embodiment human` is the
+default, and its dry run is byte-identical to the one before the flag existed.
+
+```
+uv run python scripts/golden_stage.py --version golden/v3-yam --verify-only
+uv run python scripts/wave_h.py --plan certified --embodiment yam --dry-run
+```
+
+| | human (default) | yam |
+|---|---|---|
+| golden set | golden/v2 | golden/v3-yam |
+| data dir (uids `<dir>--<id>`) | `cert-human` | `cert-yam` |
+| state, work dir, records | `reports/wave-h/certified/` | `reports/wave-h/certified-yam/` |
+| (b) oracle, nominal / upper | $2.59 / $3.97 | $3.11 / $4.67 |
+| (f) noise | $1.06 / $1.90 | $1.16 / $2.04 |
+| (d) balanced | $1.35 / $2.39 | $1.53 / $2.68 |
+| total, lab already done (global cap) | $5.00 / $8.27 ($8.30) | $5.81 / $9.38 ($9.40) |
+
+- **Separate runs.** Each embodiment has its own state file, so the two runs never collide and
+  resume independently. `--state` pointing at the other embodiment's state is refused. Caps are
+  derived from each embodiment's own projections.
+- **Three-view prices.** The balanced rates were measured on 1-view human episodes. For yam,
+  the share of the work that is generation (lab `generate_s` over (d)'s busy seconds: segment
+  50.4 / 65.4 s, caption 70.5 / 161.5 s) is scaled by the per-request prompt ratio, and the
+  rest stays at 1x (`three_view_scale`). The prompt ratio is 3-view (ALOHA, NVIDIA's own
+  requests, `docs/exact-concurrency.md`) over 1-view (the balanced lab): TempSeg 5,493 / 1,818
+  tokens and Captioner 11,145 / 5,663. That gives **segment x2.56 and caption x1.42**. Exact
+  segcap gets x1.30: the same rule on NVIDIA's call mix, applied to the 1-view half of its
+  measured 1-/3-view mix. The rule assumes yam has as many requests per video second as human
+  (ALOHA had fewer). It keeps decode and frame preparation at 1x, although 11 of the 12
+  episodes are three 640-680x480 views, about 0.45x the pixels of one 1080p view.
+- **The 1-view lab prompts are not short.** The Captioner lab's 4.4k-7k-token requests (2-3
+  videos each) were human single-view captions: NVIDIA's single-view caption prompt carries
+  several clips. Only TempSeg is ~1.8k for 1-view.
+- **Lab (d2).** L0 is per model kind, so the human lab evidence is reused ($0), as for human.
+  It does not exercise three-view balanced requests; Gate C covered three-view rendering
+  against vLLM on golden yam media. If the evidence is missing, the lab runs on yam's first six
+  episodes, priced at the human lab's measured times.
+- **(e)** runs `flora certify` but not `wave_h_finalize.py --write`, which writes the human
+  rates, report and docs. The certificates stay in the work dir until finalize is
+  embodiment-aware.
+- **dex, tianji, yam32** are refused: they have no golden certification set yet
+  (`docs/golden-manifest-v3-yam.md` lists the pinned data and rough prices). Their users need
+  `allow_uncertified: true`.
+
 ### Tested offline
 
 `tests/unit/test_wave_h_certified.py` runs the certified plan's (e) on fake records shaped like

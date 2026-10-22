@@ -1,0 +1,272 @@
+{
+  "version": "golden/v3-yam",
+  "selected": "2026-10-22",
+  "basis": "yam (3-view) certification set for `balanced` (docs/golden-manifest-v3-yam.md): 8 of golden/v1's 9 yam episodes (entries unchanged; robocoin_organize_desk_fail at 53.3 s left out for cost) plus 4 short ManiRewardBench YAM episodes at the same pinned revision, one per new task. 12 episodes: 10 for the certificate plus 2 spares. Only already-pinned datasets; WGO-Bench robot rows (DROID, Galaxea) are single view, so they are not yam 3-view.",
+  "profile_note": "profile is NVIDIA's API profile (human/yam/dex/tianji). Single-view robot episodes use 'yam': any non-human profile with one 'main' view takes NVIDIA's single-view robot path (human segmentation policy, CFR required for captions).",
+  "noise_subset": [
+    "yam/aloha_static_cups_open/episode_000000",
+    "yam/robocoin_classify_object_four/episode_000164",
+    "yam/manirewardbench_yam/stack_plates_000003",
+    "yam/manirewardbench_yam/stack_the_plates_000002",
+    "yam/manirewardbench_yam/take_out_the_chewing_gum_000002"
+  ],
+  "datasets": {
+    "manirewardbench_yam": {
+      "repo": "ajyanggg/manirewardbench_bimanual_yam",
+      "revision": "a70a270d1b4429eb26e30e0ba2dc5965e7736001",
+      "format": "mp4_files",
+      "annotations": "manirewardbench",
+      "annotation_file": "yam_annotations.json",
+      "license": "Apache-2.0",
+      "task_source": "yam_annotations.json[<main file>].task; timed subtasks kept as annotations (dense-progress targets)"
+    },
+    "aloha_static_cups_open": {
+      "repo": "lerobot/aloha_static_cups_open",
+      "revision": "d793c969cf716001dcca18a0842c3d7e9de9e41b",
+      "format": "lerobot_v3",
+      "license": "MIT",
+      "task_source": "meta/episodes tasks"
+    },
+    "aloha_static_towel": {
+      "repo": "lerobot/aloha_static_towel",
+      "revision": "13ad96f5ed0e219e48c72471626a2e3d0eb5aeff",
+      "format": "lerobot_v3",
+      "license": "Apache-2.0",
+      "task_source": "meta/episodes tasks",
+      "extra_files": [
+        "meta/temporal_proportions_dense.json",
+        "meta/temporal_proportions_sparse.json"
+      ]
+    },
+    "aloha_mobile_cabinet": {
+      "repo": "lerobot/aloha_mobile_cabinet",
+      "revision": "7a752b39f7e69de7e38aee485a6bab07528a061a",
+      "format": "lerobot_v3",
+      "license": "Apache-2.0",
+      "task_source": "meta/episodes tasks"
+    },
+    "robocoin_classify_object_four": {
+      "repo": "RoboCOIN/Galaxea_R1_Lite_classify_object_four",
+      "revision": "1b8fbd8d24b9ca70476b2945e8bd61b8a3ab2ad2",
+      "format": "lerobot_v21",
+      "license": "Apache-2.0",
+      "task_source": "meta/episodes.jsonl tasks"
+    }
+  },
+  "episodes": [
+    {
+      "pool": "yam",
+      "dataset": "aloha_static_cups_open",
+      "slug": "episode_000000",
+      "episode": 0,
+      "profile": "yam",
+      "cameras": {
+        "main": "observation.images.cam_high",
+        "left_wrist": "observation.images.cam_left_wrist",
+        "right_wrist": "observation.images.cam_right_wrist"
+      },
+      "dropped_cameras": [
+        "observation.images.cam_low"
+      ],
+      "expected_s": 8.0,
+      "why": "ALOHA static stand-in, AV1 50 fps, cam_low dropped (PLAN 9); shortest 3-view case"
+    },
+    {
+      "pool": "yam",
+      "dataset": "aloha_static_towel",
+      "slug": "episode_000000",
+      "episode": 0,
+      "profile": "yam",
+      "cameras": {
+        "main": "observation.images.cam_high",
+        "left_wrist": "observation.images.cam_left_wrist",
+        "right_wrist": "observation.images.cam_right_wrist"
+      },
+      "dropped_cameras": [
+        "observation.images.cam_low"
+      ],
+      "expected_s": 10.0,
+      "also_reward": [
+        "dense"
+      ],
+      "why": "ALOHA static; ships temporal-proportion priors for dense-reward sanity checks"
+    },
+    {
+      "pool": "yam",
+      "dataset": "aloha_mobile_cabinet",
+      "slug": "episode_000081",
+      "episode": 81,
+      "profile": "yam",
+      "cameras": {
+        "main": "observation.images.cam_high",
+        "left_wrist": "observation.images.cam_left_wrist",
+        "right_wrist": "observation.images.cam_right_wrist"
+      },
+      "expected_s": 30.0,
+      "hard_case": [
+        "camera_file_rollover",
+        "multi_step"
+      ],
+      "why": "ALOHA mobile: cameras of this episode live in different concatenated files; open/store/close"
+    },
+    {
+      "pool": "yam",
+      "dataset": "robocoin_classify_object_four",
+      "slug": "episode_000164",
+      "episode": 164,
+      "profile": "yam",
+      "cameras": {
+        "main": "observation.images.cam_head_left_rgb",
+        "left_wrist": "observation.images.cam_left_wrist_rgb",
+        "right_wrist": "observation.images.cam_right_wrist_rgb"
+      },
+      "dropped_cameras": [
+        "observation.images.cam_head_right_rgb"
+      ],
+      "expected_s": 19.23,
+      "hard_case": [
+        "bimanual"
+      ],
+      "why": "Galaxea R1 Lite 720p AV1 per-episode files (v2.1), two-handed sorting; head-left as main"
+    },
+    {
+      "pool": "yam",
+      "dataset": "manirewardbench_yam",
+      "slug": "stack_plates_000003",
+      "episode": "YAM/stack_plates/000003",
+      "profile": "yam",
+      "cameras": {
+        "main": "YAM/stack_plates/000003/front_rgb.mp4",
+        "left_wrist": "YAM/stack_plates/000003/left_rgb.mp4",
+        "right_wrist": "YAM/stack_plates/000003/right_rgb.mp4"
+      },
+      "expected_s": 21.3,
+      "hard_case": [
+        "many_short_actions"
+      ],
+      "also_reward": [
+        "dense"
+      ],
+      "why": "real YAM, 6 timed subtasks in 21 s (most subtasks per second in the set)"
+    },
+    {
+      "pool": "yam",
+      "dataset": "manirewardbench_yam",
+      "slug": "build_a_pyramid_000004",
+      "episode": "YAM/build_a_pyramid/000004",
+      "profile": "yam",
+      "cameras": {
+        "main": "YAM/build_a_pyramid/000004/front_rgb.mp4",
+        "left_wrist": "YAM/build_a_pyramid/000004/left_rgb.mp4",
+        "right_wrist": "YAM/build_a_pyramid/000004/right_rgb.mp4"
+      },
+      "expected_s": 26.3,
+      "also_reward": [
+        "dense"
+      ],
+      "why": "real YAM, 4 subtasks, ordered stacking"
+    },
+    {
+      "pool": "yam",
+      "dataset": "manirewardbench_yam",
+      "slug": "set_table_000001",
+      "episode": "YAM/set_table/000001",
+      "profile": "yam",
+      "cameras": {
+        "main": "YAM/set_table/000001/front_rgb.mp4",
+        "left_wrist": "YAM/set_table/000001/left_rgb.mp4",
+        "right_wrist": "YAM/set_table/000001/right_rgb.mp4"
+      },
+      "expected_s": 26.7,
+      "hard_case": [
+        "multi_step"
+      ],
+      "also_reward": [
+        "dense"
+      ],
+      "why": "real YAM, 4 subtasks over several objects"
+    },
+    {
+      "pool": "yam",
+      "dataset": "manirewardbench_yam",
+      "slug": "cap_the_glue_stick_000002",
+      "episode": "YAM/cap_the_glue_stick/000002",
+      "profile": "yam",
+      "cameras": {
+        "main": "YAM/cap_the_glue_stick/000002/front_rgb.mp4",
+        "left_wrist": "YAM/cap_the_glue_stick/000002/left_rgb.mp4",
+        "right_wrist": "YAM/cap_the_glue_stick/000002/right_rgb.mp4"
+      },
+      "expected_s": 27.2,
+      "hard_case": [
+        "bimanual_coordination"
+      ],
+      "also_reward": [
+        "dense"
+      ],
+      "why": "both arms hold one object each and join them (closest handover-like case available)"
+    },
+    {
+      "pool": "yam",
+      "dataset": "manirewardbench_yam",
+      "slug": "stack_the_plates_000002",
+      "episode": "YAM/stack_the_plates/000002",
+      "profile": "yam",
+      "cameras": {
+        "main": "YAM/stack_the_plates/000002/front_rgb.mp4",
+        "left_wrist": "YAM/stack_the_plates/000002/left_rgb.mp4",
+        "right_wrist": "YAM/stack_the_plates/000002/right_rgb.mp4"
+      },
+      "expected_s": 10.6,
+      "hard_case": [
+        "many_short_actions"
+      ],
+      "why": "real YAM, shortest episode in the repo: 4 timed subtasks in 10.6 s"
+    },
+    {
+      "pool": "yam",
+      "dataset": "manirewardbench_yam",
+      "slug": "take_out_the_chewing_gum_000002",
+      "episode": "YAM/take_out_the_chewing_gum/000002",
+      "profile": "yam",
+      "cameras": {
+        "main": "YAM/take_out_the_chewing_gum/000002/front_rgb.mp4",
+        "left_wrist": "YAM/take_out_the_chewing_gum/000002/left_rgb.mp4",
+        "right_wrist": "YAM/take_out_the_chewing_gum/000002/right_rgb.mp4"
+      },
+      "expected_s": 12.0,
+      "why": "real YAM, 4 subtasks in 12 s; small-object extraction (fine bimanual grasp)"
+    },
+    {
+      "pool": "yam",
+      "dataset": "manirewardbench_yam",
+      "slug": "remove_the_cap_000005",
+      "episode": "YAM/remove_the_cap/000005",
+      "profile": "yam",
+      "cameras": {
+        "main": "YAM/remove_the_cap/000005/front_rgb.mp4",
+        "left_wrist": "YAM/remove_the_cap/000005/left_rgb.mp4",
+        "right_wrist": "YAM/remove_the_cap/000005/right_rgb.mp4"
+      },
+      "expected_s": 13.3,
+      "hard_case": [
+        "bimanual_coordination"
+      ],
+      "why": "real YAM, 3 subtasks in 13.3 s; the inverse of v1's cap_the_glue_stick"
+    },
+    {
+      "pool": "yam",
+      "dataset": "manirewardbench_yam",
+      "slug": "put_the_pocky_in_the_bin_000005",
+      "episode": "YAM/put_the_pocky_in_the_bin/000005",
+      "profile": "yam",
+      "cameras": {
+        "main": "YAM/put_the_pocky_in_the_bin/000005/front_rgb.mp4",
+        "left_wrist": "YAM/put_the_pocky_in_the_bin/000005/left_rgb.mp4",
+        "right_wrist": "YAM/put_the_pocky_in_the_bin/000005/right_rgb.mp4"
+      },
+      "expected_s": 13.4,
+      "why": "real YAM, 4 subtasks in 13.4 s; pick-and-place into a bin"
+    }
+  ]
+}
