@@ -151,6 +151,24 @@ class StageRecord:
         return cls.from_dict(json.loads(line))
 
 
+def certification(envelope_ok: bool | None, *, stack_certified: bool = True,
+                  stack_reason: UncertifiedReason | None = "uncertified_stack"
+                  ) -> tuple[bool, UncertifiedReason | None]:
+    """The one rule for a record's ``certified`` / ``uncertified_reason`` (every worker kind):
+    certified only when the episode's **measured** envelope verdict is ``True`` (D13: the
+    envelope policy decides which episodes run, never ``certified``; no certificate's evidence
+    covers an out-of-envelope input) **and** the stack is certified: the reference (``exact``,
+    and kinds that are the reference by identity) or a matching committed certificate.
+    ``stack_reason``: the reason when only the stack is not certified."""
+    if envelope_ok is False:
+        return False, "outside_reference_envelope"
+    if envelope_ok is not True:
+        return False, "oracle_ineligible_source"  # no envelope verdict
+    if not stack_certified:
+        return False, stack_reason
+    return True, None
+
+
 def record_key(rec: StageRecord) -> tuple[str, str]:
     """Dedupe key used by compose."""
     return (rec.uid, rec.stage)

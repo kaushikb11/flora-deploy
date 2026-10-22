@@ -186,9 +186,23 @@ def test_certification_per_envelope():
     assert certification(ref) == (True, None)
     out = EpisodeRef("u", DS, "e", "human", 1.0, True, False, "x")
     assert certification(out) == (False, "outside_reference_envelope")
-    assert certification(out, "ignore") == (True, None)
     none = EpisodeRef("u", DS, "e", "human", 1.0, True, None, "x")
     assert certification(none) == (False, "oracle_ineligible_source")
+
+
+def test_envelope_ignore_never_certifies_out_of_envelope(tmp_path):
+    """The policy decides which episodes run, never ``certified`` (no certificate covers them)."""
+    eps = [(f"e{i}", receipt(f"e{i}")) for i in range(2)]
+    store, shard = world(tmp_path, eps, envelope_ok={"e1": False})
+    r, _ = runner(tmp_path, store, envelope="ignore")
+    r.run_shard(JOB, shard.shard_id, CFG)
+    recs = records(store, shard)
+    assert recs
+    for x in recs:
+        if x.uid == uid("e1"):
+            assert not x.certified and x.uncertified_reason == "outside_reference_envelope"
+        else:
+            assert x.certified and x.uncertified_reason is None
 
 
 # --- a full shard ---------------------------------------------------------------------------

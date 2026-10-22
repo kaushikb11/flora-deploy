@@ -648,12 +648,11 @@ def base_provenance(nv, mode: str, *, spec: EngineSpec | None = None,
 
 
 def certification(episode: Episode) -> tuple[bool, str | None]:
-    """certified only inside NVIDIA's reference envelope, per the EpisodeIndex verdict."""
-    if episode.envelope_ok is True:
-        return True, None
-    if episode.envelope_ok is False:
-        return False, "outside_reference_envelope"
-    return False, "oracle_ineligible_source"
+    """certified only inside NVIDIA's reference envelope, per the EpisodeIndex verdict
+    (``records.certification``: the rewards are the reference)."""
+    from flora_deploy.records import certification as rule
+
+    return rule(episode.envelope_ok)
 
 
 # ---------------------------------------------------------------------------

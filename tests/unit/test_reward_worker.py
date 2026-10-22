@@ -523,7 +523,16 @@ def test_envelope_ignore_and_default_task(tmp_path):
     rec = make_runner(store, tmp_path, envelope="ignore", default_task="do it").run_shard(
         JOB, shard.shard_id, CFG)
     (r,) = P.read_part(jf_of(store), rec.parts[0])
-    assert r.certified
+    assert not r.certified and r.uncertified_reason == "outside_reference_envelope"
+
+
+def test_envelope_ignore_keeps_in_envelope_certified(tmp_path):
+    store = FakeStore()
+    shard = tshard(["y"])
+    setup(store, [ep("y", envelope_ok=True)], [shard])
+    rec = make_runner(store, tmp_path, envelope="ignore").run_shard(JOB, shard.shard_id, CFG)
+    (r,) = P.read_part(jf_of(store), rec.parts[0])
+    assert r.certified and r.uncertified_reason is None
 
 
 def test_bisected_child_shard_runs(tmp_path):

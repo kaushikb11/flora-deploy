@@ -530,7 +530,7 @@ class RewardWorkerSettings:
     decoder: str = "thread"
     workers: int = 4
     tail_trim_s: float | None = None  # None: NVIDIA's DENSE_TAIL_TRIM_S
-    envelope: str = "warn"  # D13: "ignore" certifies regardless of the envelope verdict
+    envelope: str = "warn"  # D13 planning policy; never changes ``certified``
     default_task: str | None = None  # the fixed instruction (``FLORA_INSTRUCTION_TEXT``)
     # shard kind -> ``workers_impl.certstamp.CertStamp`` stamped into its records
     cert_stamps: Mapping[str, Any] = field(default_factory=dict)
@@ -669,9 +669,8 @@ class RewardShardRunner:
         videos = tuple(self.resolver.resolve(ref.uid, role, idx.sources[role]) for role in roles)
         sources = tuple((role, idx.sources[role].uri, idx.sources[role].start_s,
                          idx.sources[role].end_s) for role in roles)  # provenance (L4)
-        envelope_ok = True if self.settings.envelope == "ignore" else ref.envelope_ok
         ep = R.Episode(id=ref.episode_id, task=str(task), videos=videos, dataset=ref.dataset,
-                       envelope_ok=envelope_ok, sources=sources)
+                       envelope_ok=ref.envelope_ok, sources=sources)  # measured, never policy
         if ep.uid != ref.uid:
             raise RuntimeError(f"index receipt is for {ep.uid!r}, manifest says {ref.uid!r}")
         R.validate_episodes([ep])

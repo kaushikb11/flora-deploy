@@ -74,7 +74,7 @@ Status: measured 2026-10-21, one H200 container (`cpu=8`, 160 GiB, $6.20/h), eph
 - Step 6: the receipt is written last, with the earlier parts plus this container's own.
 
 Records:
-- `certified` follows the envelope verdict (D13). `envelope=ignore` certifies regardless.
+- `certified` follows the measured envelope verdict (D13). The policy (`warn`/`ignore`) never certifies an out-of-envelope episode.
 - `provenance.engine` is `nvidia-hf`, or `nvidia-hf+deterministic` in D-1 mode, which is a different reference.
 - `provenance.source` holds the camera URIs and ranges; `models` holds the four pins.
 - The rest of the provenance is in the audit line, under `runtime`:
