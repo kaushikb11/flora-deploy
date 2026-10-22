@@ -116,7 +116,8 @@ def _rest(r: dict, job: str) -> None:
         _p("certification: none (fake models)")
     else:
         _p(f"certification: preset {c['preset']} " + (
-            "(uncertified until its accuracy certificates exist)" if c["needs_certificate"]
+            "(segment and caption need accuracy certificates; each stage below)"
+            if c["needs_certificate"]
             else "(NVIDIA's own code: certified unless an episode says otherwise)"))
     for stage, s in ({} if fake else c["stages"]).items():
         share = "-" if s["certified_share"] is None else f"{s['certified_share']:.1%}"

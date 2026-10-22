@@ -13,10 +13,12 @@ flora export --job my-labels --to lerobot --out ./demo-flora --allow-uncertified
     --stages caption,reward.dense --push-to-hub me/demo-flora      # private repo
 ```
 
-**`flora export` refuses uncertified records unless you pass `--allow-uncertified`.** Today that
-covers every `balanced` job: its `segment` and `caption` records are uncertified until a
-certificate exists (its rewards are NVIDIA's own engine and certified). Fake-model records need
-`--allow-fake` instead. A refusal exits 2 and writes nothing.
+**`flora export` refuses uncertified records unless you pass `--allow-uncertified`.** That
+covers a `balanced` job whose `segment` or `caption` has no accuracy certificate for its
+embodiment and GPU: those records say `certified: false` (which certificates exist:
+[`limitations.md`](limitations.md#accuracy-certificates); the rewards are NVIDIA's own engine
+and certified). Fake-model records need `--allow-fake` instead. A refusal exits 2 and writes
+nothing.
 
 `--store` is the job's `output.sink` (the store root, not the `flora/<job>/` directory). Run in
 the directory of `flora.yaml`, `--job` defaults to the config's project (falling back to
