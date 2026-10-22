@@ -323,11 +323,14 @@ def test_child_args_go_through_a_file_not_argv(tmp_path):
     import os
     import subprocess
 
+    # sized from this machine's limit: ARG_MAX is 1 MiB on macOS, 4 MiB on Linux CI runners
+    limit = os.sysconf("SC_ARG_MAX") if hasattr(os, "sysconf") else 2 ** 21
+    need = max(limit, 131072) + 1
+    n = need // (40 * 950) + 1  # each segment row serializes to about 950 bytes
     big = {"out": str(tmp_path / "a.json"), "kind": "captioner",
            "segments": {f"ep{i}": [{"start_s": 0.0, "end_s": 1.0, "metadata": {"x": "y" * 900}}
-                                   for _ in range(40)] for i in range(40)}}
+                                   for _ in range(40)] for i in range(n)}}
     blob = json.dumps(big)
-    limit = os.sysconf("SC_ARG_MAX") if hasattr(os, "sysconf") else 2 ** 21
     assert len(blob) > max(limit, 131072)  # inline, this one argv string could not exec
     argv = lab.child_argv(big)
     assert sum(len(a) for a in argv) < 4096 and blob not in argv
