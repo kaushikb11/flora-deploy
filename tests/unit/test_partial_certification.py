@@ -288,9 +288,9 @@ def test_readme_blocks_follow_the_certificates(human_certs, registry, tmp_path):
     new = fin.certification_blocks(readme, [registry])
     b = blocks(new)
     assert b["certified"] == ("Accuracy certificates: segmentation and captioning for `human` "
-                              "data (L40S / H100!).\nRewards run NVIDIA's own engine, as "
+                              "data (`L40S` / `H100!`).\nRewards run NVIDIA's own engine, as "
                               "`exact` does, and need none. Everything else runs uncertified.\n")
-    assert "Certified today: segmentation and captioning for `human` data (L40S / H100!)" \
+    assert "Certified today: segmentation and captioning for `human` data (`L40S` / `H100!`)" \
         in " ".join(b["allow-uncertified"].split())
     assert "does not need it" in b["allow-uncertified"]
     assert "cert_" not in new.replace(readme, "")

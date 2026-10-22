@@ -1147,6 +1147,12 @@ def cost_block(f: Findings) -> str | None:
             "for your dataset.")
 
 
+def and_list(items: Sequence[str]) -> str:
+    """``a``, ``a and b``, ``a, b and c``."""
+    items = list(items)
+    return items[0] if len(items) == 1 else f"{', '.join(items[:-1])} and {items[-1]}"
+
+
 def certification_blocks(readme: str, cert_dirs: Sequence[Path]) -> str:
     """``readme`` with its ``wave-h:certified`` (one status line under "Label your own data")
     and ``wave-h:allow-uncertified`` (under the Configuration example) blocks written from the
@@ -1176,8 +1182,9 @@ def certification_blocks(readme: str, cert_dirs: Sequence[Path]) -> str:
     parts = []
     for embs, ks in groups.items():
         gpus = list(dict.fromkeys(g for k in ks for g in sorted(kinds[k][1])))  # stage order
-        parts.append(f"{' and '.join(words.get(k, k) for k in ks)} for "
-                     f"{', '.join(f'`{e}`' for e in embs)} data ({' / '.join(gpus)})")
+        parts.append(f"{and_list([words.get(k, k) for k in ks])} for "
+                     f"{and_list([f'`{e}`' for e in embs])} data "
+                     f"({' / '.join(f'`{g}`' for g in gpus)})")
     if not parts:
         status = ("Accuracy certificates: none yet, so `balanced` segmentation and captioning "
                   "records say `certified: false`.\nRewards run NVIDIA's own engine, as "

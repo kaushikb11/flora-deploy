@@ -64,6 +64,12 @@ def statuses(cert_dir: Path | None = None) -> dict[str, dict[str, str]]:
     return out
 
 
+def and_list(items: Sequence[str]) -> str:
+    """``a``, ``a and b``, ``a, b and c``."""
+    items = list(items)
+    return items[0] if len(items) == 1 else f"{', '.join(items[:-1])} and {items[-1]}"
+
+
 def block_certification(cert_dir: Path | None) -> str:
     from flora_deploy.config.presets import get_preset
 
@@ -73,12 +79,17 @@ def block_certification(cert_dir: Path | None) -> str:
     lines = [f"| Embodiment | {head} |", "|---|" + "---|" * len(STAGES)]
     for emb, row in st.items():
         lines.append(f"| `{emb}` | " + " | ".join(WORDS[row[s]] for s in STAGES) + " |")
-    certified = sorted({f"`{s}` for `{e}`" for e, row in st.items() for s in STAGES
-                        if row[s] == "certified"})
+    groups: dict[tuple[str, ...], list[str]] = {}  # certified stages (stage order) -> embodiments
+    for e, row in st.items():
+        if stages := tuple(s for s in STAGES if row[s] == "certified"):
+            groups.setdefault(stages, []).append(e)
+    certified = [f"{and_list([f'`{s}`' for s in ss])} for {and_list([f'`{e}`' for e in es])}"
+                 for ss, es in groups.items()]
     lines.append("")
     if certified:
-        lines.append(f"Certified today: {', '.join(certified)}. Every other `balanced` "
-                     "segmentation or captioning stage needs `allow_uncertified: true`.")
+        lines.append(f"Certified today: {'; '.join(certified)}.\nEvery other `balanced` "
+                     "segmentation or captioning stage needs `allow_uncertified: true`,\nand "
+                     "its records say `certified: false`.")
     else:
         lines.append("Nothing is certified yet, so `balanced` segmentation and captioning need "
                      "`allow_uncertified: true`\nand their records say `certified: false`.")
