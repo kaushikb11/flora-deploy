@@ -484,7 +484,7 @@ def test_path_normalization_for_repo_and_local_inputs():
 
 
 def test_balanced_stage_hash_covers_the_engine_spec():
-    """Review 6 M3: the per-GPU scheduler limits (L40S 32 seqs vs H100 48) change batching,
+    """Review 6 M3: the per-GPU scheduler limits (L40S 48 seqs vs H200 64) change batching,
     hence numerics, so they must key the balanced segment shards; the exact path is not
     affected by a GPU override."""
     from flora_deploy.engines.offline_llm import EngineSpec
@@ -492,7 +492,7 @@ def test_balanced_stage_hash_covers_the_engine_spec():
     bal = set_(set_(base(), "preset", "balanced"), "pipeline.stages",
                ["segment", "caption", "reward.terminal"])
     ref = sh(bal)
-    h100 = sh(set_(bal, "resources", {"segment": {"gpu": "H100"}}))
+    h100 = sh(set_(bal, "resources", {"segment": {"gpu": "H200"}}))
     assert h100["segment"] != ref["segment"] and h100["caption"] != ref["caption"]
     assert h100["reward.terminal"] == ref["reward.terminal"]
     doc = config_hash(parse_config(bal, allow_uncertified=True),

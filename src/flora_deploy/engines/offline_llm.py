@@ -91,21 +91,43 @@ class GpuLimits:
 # Per (kind, GPU) scheduler limits. TempSeg is 9B (19.3 GB merged), the Captioner 27B (54.7 GB
 # BF16). ``max_num_batched_tokens`` 16384 equals the offline LLM's H100 default and holds the
 # longest golden prompt (14.7k tokens) in one prefill chunk; it stays 16384 everywhere, because
-# chunk boundaries change the GDN prefill numerics. ``max_num_seqs`` must stay within the Mamba
-# cache blocks vLLM allocates (#49064): :func:`check_mamba_blocks` fails the build otherwise.
-# Batch fill (WP1c): TempSeg on the L40S 32 -> 64 (about 17 GiB KV left after the weights; a
-# 1.85k-token request needs about 0.11 GiB, so the sequence count binds, not memory), the
-# Captioner on the H100 16 -> 24 (about 15 GiB KV; 0.4 GiB at 4-6k tokens, 0.77 GiB at 10k).
+# chunk boundaries change the GDN prefill numerics. ``max_num_seqs`` must fit a full batch of
+# **worst-case** requests (``WORST_CASE_TOKENS``) in the KV / Mamba cache, so that vLLM never
+# preempts: a preempted GDN sequence recomputes its generated tokens through the chunked-prefill
+# kernel, a path no certificate measured (review 13 B1). ``KV_FIT`` is the arithmetic
+# (:func:`worst_case_fit`); :func:`check_mamba_blocks` checks the same bound on the built engine
+# against the blocks vLLM actually allocated, and fails the build otherwise.
+# TempSeg/L40S: 64 needs about 19.5 GiB at the worst case and has about 17: 48 (fit 55).
+# Captioner/H100: 16, the lab-validated value (fit 18; 24 needed about 20 GiB of 15).
 GPU_LIMITS: Mapping[tuple[str, str], GpuLimits] = {
-    ("tempseg", "L40S"): GpuLimits(64, 16384, 0.90),
+    ("tempseg", "L40S"): GpuLimits(48, 16384, 0.90),
     ("tempseg", "A100-80GB"): GpuLimits(48, 16384, 0.90),
     ("tempseg", "H100"): GpuLimits(48, 16384, 0.90),
     ("tempseg", "H200"): GpuLimits(64, 16384, 0.90),
-    # 32 would fit about 32 typical requests but only about 19 at the 10k-token worst case:
-    # raise it only after a measured H100 run (peak KV use, preemptions) shows it holds.
-    ("captioner", "H100"): GpuLimits(24, 16384, 0.90),
+    # raise it only after a measured H100 run (peak KV use, zero preemptions) shows it holds
+    ("captioner", "H100"): GpuLimits(16, 16384, 0.90),
     ("captioner", "H200"): GpuLimits(32, 16384, 0.90),
 }
+# The longest request (prompt + NVIDIA's output budget) a kind sends, in tokens. TempSeg: one
+# window per request; the 64-frame window measures 1.84-1.86k prompt tokens on every lab call
+# (reports/wave-h/balanced-tempseg.json), the 128-frame ``yam32`` window at most twice that:
+# 4096 + 1024 budget. Captioner: one segment of up to 40 frames x 3 views; the lab's 72 calls
+# average 5.1k, the worst case is taken as 10k (the Batch fill estimate) + 512 budget.
+WORST_CASE_TOKENS: Mapping[str, int] = {"tempseg": 4096 + 1024, "captioner": 10240 + 512}
+# (KV GiB left after the weights at gpu_memory_utilization 0.90, GiB per 1k tokens of one
+# sequence incl. its Mamba state): the Batch fill (WP1c) estimates, TempSeg 0.11 GiB at 1.85k
+# tokens, the Captioner 0.77 GiB at 10k.
+KV_FIT: Mapping[tuple[str, str], tuple[float, float]] = {
+    ("tempseg", "L40S"): (17.0, 0.11 / 1.85),
+    ("captioner", "H100"): (15.0, 0.77 / 10.0),
+}
+
+
+def worst_case_fit(kind: str, gpu: str) -> int:
+    """How many worst-case sequences (``WORST_CASE_TOKENS``) the ``KV_FIT`` memory holds."""
+    kv_gib, per_1k = KV_FIT[(kind, normalize_gpu(gpu))]
+    return int(kv_gib // (per_1k * WORST_CASE_TOKENS[kind] / 1000.0))
+
 
 _GPU_PATTERNS = (("H200", r"H200"), ("H100", r"H100"), ("L40S", r"L40S"),
                  ("A100-80GB", r"A100.*80"))
@@ -341,7 +363,10 @@ class OfflineEngine:
             t0 = time.perf_counter()
             # the worker extension only adds read-only flora_* rpc methods (not hashed: it
             # changes no numerics); it is how gdn_param_dtypes runs in vLLM's engine process
-            llm = LLM(**{**self.kwargs, "worker_extension_cls": WORKER_EXTENSION})
+            # disable_log_stats=False: vLLM's ``vllm:num_preemptions`` counter (``preemptions``);
+            # stats change no numerics, so like the extension it is not hashed
+            llm = LLM(**{**self.kwargs, "worker_extension_cls": WORKER_EXTENSION,
+                         "disable_log_stats": False})
             self.stats["build_s"] = round(time.perf_counter() - t0, 3)
             verify = True if verify is None else verify
         self.llm = llm
@@ -416,18 +441,40 @@ class OfflineEngine:
             self.stats["generate_s"] += time.perf_counter() - t0
         return result
 
+    def preemptions(self) -> int | None:
+        """vLLM's ``vllm:num_preemptions`` counter so far (summed over engines), from
+        ``LLM.get_metrics()`` (needs ``disable_log_stats=False``, which the build sets). None when
+        it cannot be read: unknown, never 0."""
+        get = getattr(self.llm, "get_metrics", None)
+        if not callable(get):
+            return None
+        try:
+            metrics = list(get())
+        except Exception:  # noqa: BLE001 - stats off or another vLLM: unknown
+            return None
+        vals = [getattr(m, "value", None) for m in metrics
+                if getattr(m, "name", None) == PREEMPTION_METRIC]
+        if not vals or not all(isinstance(v, int | float) and not isinstance(v, bool)
+                               for v in vals):
+            return None
+        return int(sum(vals))
+
     def audit(self) -> dict:
         out: dict[str, Any] = {"label": self.name, "spec": self.spec.as_json(),
                                "stats": dict(self.stats)}
         out["resolved"] = resolved_facts(self.llm)
         out["cache_blocks"] = self.cache_blocks
+        out["preemptions"] = self.preemptions()
         return out
 
 
+PREEMPTION_METRIC = "vllm:num_preemptions"
+
+
 def cache_blocks(llm) -> int | None:
-    """The KV / Mamba cache blocks vLLM allocated (``cache_config.num_gpu_blocks``; best
-    effort: the attribute path is internal). For a hybrid model each running sequence holds
-    Mamba state blocks out of this pool."""
+    """The cache blocks the frontend's config says vLLM allocated
+    (``cache_config.num_gpu_blocks``, which the engine core reports back at start); None when
+    the attribute path is not there."""
     try:
         n = llm.llm_engine.vllm_config.cache_config.num_gpu_blocks
     except Exception:  # noqa: BLE001 - internal attribute path
@@ -435,20 +482,75 @@ def cache_blocks(llm) -> int | None:
     return int(n) if isinstance(n, int) and not isinstance(n, bool) else None
 
 
+def kv_cache_layout(llm) -> list[Any] | dict[str, Any]:
+    """Each worker's ``KVCacheConfig`` as plain data (``worker_ext.KV_LAYOUT_RPC``), or
+    ``{"error": ...}``."""
+    from flora_deploy.engines.worker_ext import KV_LAYOUT_RPC
+
+    try:
+        return list(llm.collective_rpc(KV_LAYOUT_RPC))
+    except Exception as exc:  # noqa: BLE001 - reported, and the check fails closed
+        return {"error": repr(exc)[:500]}
+
+
+def _group_kind(spec_name: str) -> str | None:
+    if "Mamba" in spec_name:
+        return "mamba"
+    if any(k in spec_name for k in ("Attention", "SlidingWindow", "ChunkedLocal")):
+        return "attention"  # a sliding window needs at most as many blocks as full attention
+    return None
+
+
+def blocks_per_sequence(groups: Sequence[Mapping[str, Any]], tokens: int) -> int:
+    """Blocks one running sequence of ``tokens`` tokens holds (no prefix caching): one per
+    Mamba group (its state), ``ceil(tokens / block_size)`` per attention group. Raises
+    ``ValueError`` on a group it cannot price."""
+    if not groups:
+        raise ValueError("no KV cache groups")
+    need = 0
+    for g in groups:
+        kind, bs = _group_kind(str(g.get("spec"))), g.get("block_size")
+        if kind is None or type(bs) is not int or bs <= 0:
+            raise ValueError(f"unpriced KV cache group {dict(g)!r}")
+        need += 1 if kind == "mamba" else -(-int(tokens) // bs)
+    return need
+
+
 def check_mamba_blocks(spec: EngineSpec, llm, *, blocks: int | None = None) -> dict[str, Any]:
-    """Fail fast (:class:`EngineVerifyError`) when ``max_num_seqs`` exceeds the cache blocks
-    the built engine has (vLLM #49064: a hybrid model needs Mamba state blocks per running
-    sequence; with fewer blocks the scheduler stalls or errors mid-run instead of at start).
-    Returns ``{"num_gpu_blocks", "max_num_seqs", "checked"}``; ``checked`` is false when vLLM
-    does not expose the count."""
-    n = cache_blocks(llm) if blocks is None else blocks
-    seqs = spec.limits.max_num_seqs
-    if n is not None and n < seqs:
+    """Fail the build (:class:`EngineVerifyError`) unless the cache blocks vLLM allocated hold
+    ``max_num_seqs`` sequences of the kind's worst-case length (``WORST_CASE_TOKENS``): a
+    hybrid sequence holds one block per Mamba group plus ``ceil(L / block_size)`` per attention
+    group (vLLM #49064; with fewer, the scheduler preempts or stalls mid-run instead of failing
+    here). **Fail closed**: a block count or a KV cache layout that cannot be read fails too.
+    ``blocks``: a count to add to the ones read (the smallest decides). Returns the inputs and
+    ``{"num_gpu_blocks", "blocks_per_seq", "needed", "checked": True}``."""
+    seqs, tokens = spec.limits.max_num_seqs, WORST_CASE_TOKENS[spec.kind]
+    where = f"{spec.kind} on {spec.gpu}"
+    layout = kv_cache_layout(llm)
+    try:
+        if isinstance(layout, dict) or not layout:
+            raise ValueError(f"no KV cache layout from the workers: {layout!r}")
+        counts = [n for n in (blocks, cache_blocks(llm), *(w.get("num_blocks") for w in layout))
+                  if type(n) is int]
+        if not counts:
+            raise ValueError("no cache block count")
+        per_seq = max(blocks_per_sequence(list(w.get("groups") or ()), tokens) for w in layout)
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise EngineVerifyError(f"{where}: cannot check max_num_seqs={seqs} against the cache "
+                                f"blocks vLLM allocated ({exc}); refusing to run (#49064)"
+                                ) from None
+    n = min(counts)
+    needed = seqs * per_seq
+    out = {"num_gpu_blocks": n, "max_num_seqs": seqs, "worst_case_tokens": tokens,
+           "blocks_per_seq": per_seq, "needed": needed, "checked": True,
+           "groups": [dict(g) for g in layout[0].get("groups") or ()]}
+    if n < needed:
         raise EngineVerifyError(
-            f"{spec.kind} on {spec.gpu}: max_num_seqs={seqs} exceeds the {n} cache blocks vLLM "
-            f"allocated at gpu_memory_utilization={spec.limits.gpu_memory_utilization} "
-            "(#49064); lower max_num_seqs in GPU_LIMITS")
-    return {"num_gpu_blocks": n, "max_num_seqs": seqs, "checked": n is not None}
+            f"{where}: max_num_seqs={seqs} worst-case sequences ({tokens} tokens, {per_seq} "
+            f"blocks each) need {needed} cache blocks; vLLM allocated {n} at "
+            f"gpu_memory_utilization={spec.limits.gpu_memory_utilization} (#49064); lower "
+            "max_num_seqs in GPU_LIMITS")
+    return out
 
 
 def resolved_facts(llm) -> dict[str, Any]:

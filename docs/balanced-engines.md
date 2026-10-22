@@ -146,7 +146,7 @@ processor cache to be off.
 | `mm_processor_kwargs` | `{"fps": 4, "max_frames": 128}` | `{"fps": 8, "max_frames": 40}` |
 | `limit_mm_per_prompt` | `{"image": 0, "video": 3}` | same |
 | `max_model_len` | 32768 | 32768 |
-| `max_num_seqs` / `max_num_batched_tokens` / `gpu_memory_utilization` | L40S 32 / 16384 / 0.90; H100 48; H200 64 | H100 16 / 16384 / 0.90; H200 32 |
+| `max_num_seqs` / `max_num_batched_tokens` / `gpu_memory_utilization` | L40S 48 / 16384 / 0.90; H100 48; H200 64 (a full batch of worst-case 5.1k-token requests fits: `KV_FIT`) | H100 16 / 16384 / 0.90 (worst case 10.75k tokens: fit 18); H200 32 |
 | `seed` | 0 | 0 |
 | sampling | greedy, 1024 tokens, `stop_token_ids=[<|im_end|>]` | greedy, 512 tokens, `stop_token_ids=[<|im_end|>]` |
 
