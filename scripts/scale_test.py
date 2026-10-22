@@ -270,6 +270,7 @@ LOCAL_LEASE_TTL_S = 35.0  # local.runner lease TTL (30 s) + margin
 POLL_S = {"real": 30.0, "fake-modal": 10.0, "local": 1.0}
 INDEX_UNITS = 13  # one per concatenated source MP4
 INDEX_UNIT_S = (120.0, 600.0)  # nominal / upper per unit (download 200 MB + probe); PLACEHOLDER
+INDEX_PARALLEL = 8  # index units at once (the index step's peak $/s)
 # fake-modal CPU workers (PLACEHOLDERS: not measured at this shape)
 FAKE_RATE = (0.05, 3.0)  # container-s per video-s, relative uncertainty
 FAKE_STARTUP = (45.0, 1.0)  # startup s, relative uncertainty
@@ -682,10 +683,13 @@ def project(step: str, mode: str, video_s: float | None = None, table: Any = Non
             p.add(f"index: {INDEX_UNITS} CPU units (placeholder)", c,
                   INDEX_UNITS * INDEX_UNIT_S[0], upper_s=INDEX_UNITS * INDEX_UNIT_S[1])
             p.peak_usd_per_s = 8 * c.usd_per_s()
+            waves = math.ceil(INDEX_UNITS / INDEX_PARALLEL)  # wall-clock: 8 units at once
+            p.wall = (waves * INDEX_UNIT_S[0], waves * INDEX_UNIT_S[1])
         return p  # fake-modal indexes locally
     if step == "deploy":  # image builds; nothing scales up (min_containers 0)
         c = wh.Container(None, 1.0, 2.0)
         p.add("image builds (placeholder)", c, 60.0, upper_s=600.0)
+        p.wall = (60.0, 600.0)
         p.peak_usd_per_s = c.usd_per_s()
         return p
     if step != "run":
@@ -728,10 +732,11 @@ def project(step: str, mode: str, video_s: float | None = None, table: Any = Non
 
     mult = 1.0 if jp.ORCHESTRATOR_PREEMPTIBLE else 3.0  # non-preemptible: 3x CPU/memory
     orch = wh.Container(None, jp.ORCHESTRATOR_CORES * mult, jp.ORCHESTRATOR_MEMORY_GIB * mult)
-    p.add("orchestrator (CPU) over the wall", orch,
-          run_wall_s(mode, video_s, table=table, warm=warm, sizes=n),
-          upper_s=run_wall_s(mode, video_s, upper=True, table=table, warm=warm, sizes=n)
-          + CLIENT_SLACK_S)
+    wall = (run_wall_s(mode, video_s, table=table, warm=warm, sizes=n),
+            run_wall_s(mode, video_s, upper=True, table=table, warm=warm, sizes=n)
+            + CLIENT_SLACK_S)
+    p.add("orchestrator (CPU) over the wall", orch, wall[0], upper_s=wall[1])
+    p.wall = wall  # the pools run at once: the run's wall is its schedule
     p.peak_usd_per_s = sum(c.usd_per_s() * n[k] for k, (c, _) in shapes.items()) \
         + orch.usd_per_s()
     return p
@@ -2322,6 +2327,12 @@ def print_plan(st: wh.State, mode: str, projs: Mapping[str, wh.Projection], out=
     if mode != "local":
         out(f"  wall: nominal {run_wall_s(mode) / 60:.0f} min, upper "
             f"{run_wall_s(mode, upper=True) / 60:.0f} min")
+        # its steps are one chain (each needs the one before): nothing runs beside another,
+        # so this runbook stays sequential; the line says so in the runbooks' common terms
+        wall = {n: (0.0, 0.0) if (st.steps.get(n) or wh.StepState()).status == "done"
+                else (projs[n].wall_s(), projs[n].wall_s(upper=True)) for n in STEPS}
+        out(rb.wall_line(STEPS, rb.chain(STEPS), wall, label="independent steps at once")
+            + " (one chain: " + " -> ".join(STEPS) + ": it runs sequentially)")
     if upper > g + 1e-9:
         out(f"  NOT HONEST AT ${g:.2f}: the upper total needs ${honest['global']:.2f}")
     if mode == "real":

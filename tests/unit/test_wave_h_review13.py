@@ -169,7 +169,7 @@ def test_balanced_step_runs_the_cold_witness_on_the_noise_subset(tmp_path, monke
         calls.append(("index", job_id, limit))
 
     def run_job(ctx, step, cfg, job_id, **kw):
-        calls.append(("run", job_id, os.environ.get("FLORA_COMPILE_CACHE")))
+        calls.append(("run", job_id, ctx.env.get("FLORA_COMPILE_CACHE")))
         return {"app": "a", "job_id": job_id, "state": "done", "spend": 0.25, "cfg": str(cfg)}
 
     monkeypatch.setattr(wh, "_stage_job", stage_job)

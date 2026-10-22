@@ -389,9 +389,12 @@ _LOCK = threading.Lock()  # setup runs jobs in threads: one writer at a time
 
 
 def sh(args: list[str], *, cwd: Path, timeout: float = 900, check: bool = True,
-       log: Path | None = None) -> subprocess.CompletedProcess:
+       log: Path | None = None, env: dict[str, str] | None = None
+       ) -> subprocess.CompletedProcess:
+    """Run ``args`` (``env``: added to this process's environment for this command only)."""
     print(f"$ {' '.join(args)}", flush=True)
-    p = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    p = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout,
+                       env={**os.environ, **env} if env else None)
     out = (p.stdout or "") + (p.stderr or "")
     tail = "\n".join(out.strip().splitlines()[-12:])
     with _LOCK:
