@@ -35,12 +35,16 @@ b. ``exact_e2e``: the ``exact`` **oracle** on the 6 episodes through the real ``
 d. ``balanced``: ``preset: balanced`` (``allow_uncertified: true``) through the same real
    ``flora deploy`` / ``flora run`` on the same 6 episodes, taken from :data:`EPISODES` (the
    golden selection) directly, never from (b)'s state (one app: ``SegmentWorker`` on L40S,
-   ``CaptionWorker`` on H100); then, **only if that job finished**, the ``balanced_lab`` L0
-   input parity + Gate A on 6 captured requests (``run_tempseg`` / ``run_captioner``). The
-   ``flora-cache`` compile cache has no warm entry for either balanced engine yet, so (d) is
-   priced with a cold-compile startup (:data:`COLD_COMPILE_FACTOR`). The deployed workers mount
-   ``flora-cache`` read-only and never write it back; the lab calls write
-   ``flora-cache:/balanced/<engine>`` and commit it, which is what later runs can start from;
+   ``CaptionWorker`` on H100). Its startup is priced cold (:func:`cold_startup_s`: the
+   measured cold startups as they are; a projection x :data:`COLD_COMPILE_FACTOR`). The deployed
+   workers copy ``flora-cache:/balanced/<engine>`` to local disk and never write it back;
+d2. ``lab``: **only against (d)'s finished job** (``--only lab`` retries it alone), the
+   ``balanced_lab`` L0 input parity + Gate A on 6 captured requests (``run_tempseg``, then
+   ``run_captioner`` on (d)'s segment records), on (d)'s episodes. Preconditions are checked
+   before any container (:func:`lab_preconditions`: episodes, camera files at the lab's paths,
+   segments), and a run that gets no request in is an error, not evidence. Each call compiles
+   two engines (baseline + plugin) and writes ``flora-cache:/balanced/<engine>[-dtbias]``,
+   committed after each engine, which later runs (lab and deployed workers) start from;
 e. ``certify``: offline provisional certification of ``balanced`` from (b) + (d) ($0);
 f. ``noise``: (b)'s job **repeated** (same config file, staged data, stage hash, GPU and
    default mode; a new job id): the noise floor; (e) is re-evaluated. Its episodes are a subset
@@ -111,6 +115,7 @@ import h0_rehearsal as h0  # noqa: E402 - the same staging and configs as H0
 STATE = ROOT / "reports" / "wave-h" / "state.json"
 REPORT = ROOT / "reports" / "wave-h" / "runbook.md"  # docs/wave-h-report.md: wave_h_finalize.py
 RECORDS = ROOT / "reports" / "wave-h" / "records"  # wave_h_finalize.py --fetch writes here
+LAB_OUT = ROOT / "reports" / "wave-h"  # balanced-<kind>.json (wave_h_finalize.py reads them)
 STORE_VOLUME = "flora-wave-h"
 MEDIA_VOLUME = "flora-wave-h-media"
 EMBODIMENT = "human"
@@ -130,21 +135,24 @@ NOISE_EPISODES = EPISODES  # (f) repeats the oracle job: all of its episodes
 # Plans (``--plan``). balanced-only: the user's decision of 2026-10-22 (run the GPU session
 # balanced only, now; the oracle, certification and noise move into one later certified run).
 PLANS: dict[str, tuple[str, ...]] = {
-    "balanced-only": ("tempseg", "preflight", "balanced"),
-    "full": ("tempseg", "preflight", "exact_e2e", "balanced", "certify", "noise"),
+    "balanced-only": ("tempseg", "preflight", "balanced", "lab"),
+    "full": ("tempseg", "preflight", "exact_e2e", "balanced", "lab", "certify", "noise"),
 }
 DEFAULT_PLAN = "balanced-only"
 DEFERRED_NOTE = "deferred to the certified run"
 # Per-step caps (USD): each step's upper projection, priced on the golden selection's expected
 # durations x (1 + DURATION_HEADROOM) (the staged human files run ~5% longer in all), rounded up
-# to 5 cents (``honest_caps``); (d)'s includes the cold compile (:data:`COLD_COMPILE_FACTOR`).
+# to 5 cents (``honest_caps``), on the shipped ``planner/rates.json`` (the balanced rows measured
+# 2026-10-22). (d) is the deployed job alone (its cold-compile startup measured, so not scaled
+# again: :func:`cold_startup_s`); (d2) the lab, priced with two cold compiles per call
+# (:func:`lab_seconds`).
 # Global cap: ``--plan balanced-only`` (default) uses the sum of its steps' upper projections
 # rounded up to $0.10 (:func:`plan_global_cap`); ``--plan full`` the earlier $6.50, which the
 # full plan's upper total does not fit (the dry run says so, and the stop rule refuses the first
 # step whose upper projection no longer fits the cap left). Raising a cap is the user's decision.
 DURATION_HEADROOM = 0.10
-CAPS_USD = {"tempseg": 0.75, "preflight": 0.05, "exact_e2e": 3.30, "balanced": 3.70,
-            "certify": 0.0, "noise": 3.30}
+CAPS_USD = {"tempseg": 0.75, "preflight": 0.05, "exact_e2e": 3.30, "balanced": 2.30,
+            "lab": 2.35, "certify": 0.0, "noise": 3.30}
 GLOBAL_CAP_USD = 6.50  # --plan full; balanced-only derives its own (plan_global_cap)
 # Cold compile (image smoke, 2026-10-22): ``flora-cache`` holds no compile cache for
 # balanced/tempseg or balanced/captioner at the current image key, so (d)'s first L40S and H100
@@ -152,9 +160,28 @@ GLOBAL_CAP_USD = 6.50  # --plan full; balanced-only derives its own (plan_global
 # row of planner/rates.json (130 s, projected with a warm cache) is scaled by the Rewarder's
 # measured cold/warm @enter ratio, 318 s / 229 s (docs/rewarder-smoke.md, docs/cold-start.md).
 COLD_COMPILE_FACTOR = 318.0 / 229.0
-LAB_MAX_S = 600  # (d): <= 10 min per lab call
-LAB_EXPECTED_S = {"tempseg": 420, "captioner": 480}  # two engine loads + 6 episodes each
+# (d2) lab call timing, per kind. Each call builds two engines one after the other (baseline,
+# then the FP32 ``dt_bias`` plugin, each with its own compile cache), so it pays two compiles.
+# Cold builds (2026-10-22 run): TempSeg 270 s baseline + 187 s plugin (lab, L40S); Captioner
+# 325 s (the deployed caption worker's cold startup on H100; the lab's own build was cut off by
+# the old 600 s deadline), assumed for the plugin build too. Work: the stage over the 6
+# episodes (the deployed job's busy 65 s / 161 s), L0 replay and two Gate A generations.
+LAB_BUILD_S = {"tempseg": (270.0, 190.0), "captioner": (325.0, 325.0)}  # (baseline, plugin)
+LAB_WORK_S = {"tempseg": 125.0, "captioner": 225.0}
+LAB_OVERHEAD_S = 30.0  # container start, weight prefetch, child spawn
+LAB_UNCERTAINTY = 0.25
 LAB_SLACK_S = 60  # lab: client timeout -> cancel -> container gone
+LAB_TIMEOUT_S = 20 * 60  # modal_app/balanced_lab.py TIMEOUT_S: the container's hard limit
+
+
+def lab_seconds(kind: str) -> tuple[float, float]:
+    """(expected, client deadline) seconds of one lab call with both compiles cold."""
+    expected = LAB_OVERHEAD_S + sum(LAB_BUILD_S[kind]) + LAB_WORK_S[kind]
+    return expected, min(float(LAB_TIMEOUT_S), expected * (1 + LAB_UNCERTAINTY))
+
+
+LAB_EXPECTED_S = {k: lab_seconds(k)[0] for k in LAB_BUILD_S}
+LAB_DEADLINE_S = {k: lab_seconds(k)[1] for k in LAB_BUILD_S}
 TEMPSEG_APP = "flora-convert"  # modal_app/convert_app.py
 MERGE_EXPECTED_S, MERGE_MAX_S = 300, 1200  # v2: FP64 merge, "a few minutes" (tempseg-merge.md)
 EQUIV_EXPECTED_S, EQUIV_MAX_S = 240, 600  # v1: 142 s + image start on one L40S
@@ -277,6 +304,31 @@ def exact_job_seconds(video_s: float, table: Any = None) -> tuple[float, float]:
     return nominal, upper
 
 
+def cold_startup_s(st: Any, compile_factor: float = COLD_COMPILE_FACTOR) -> tuple[float, str]:
+    """A cold-compile startup from a ``planner.rates.StartupEntry``, and what it rests on. A
+    startup **measured** with a cold compile cache (``compile_cache: cold``) already includes
+    the compile: taken as is. A projection, a placeholder or a warm measurement is scaled by
+    ``compile_factor`` (:data:`COLD_COMPILE_FACTOR`), once."""
+    cache = getattr(st, "compile_cache", None)
+    if st.status == "measured" and cache == "cold":
+        return float(st.startup_s), "measured cold"
+    basis = f"measured {cache}" if st.status == "measured" and cache else st.status
+    return float(st.startup_s) * compile_factor, f"{basis} x {compile_factor:.2f}"
+
+
+def startup_basis(table: Any = None) -> dict[str, str]:
+    """Per balanced pool: what (d)'s startup is priced on (for the dry run)."""
+    from flora_deploy.planner.rates import RateTable
+
+    t = table or RateTable.load()
+    out = {}
+    for kind in ("segment", "caption"):
+        st = t.startup_for("balanced", kind)
+        sec, basis = cold_startup_s(st)
+        out[kind] = f"{sec:.0f} s ({basis}, rates.json {st.startup_s:g} s)"
+    return out
+
+
 def balanced_job_seconds(video_s: float, table: Any = None, *,
                          compile_factor: float = COLD_COMPILE_FACTOR
                          ) -> dict[str, tuple[float, float]]:
@@ -294,7 +346,8 @@ def balanced_job_seconds(video_s: float, table: Any = None, *,
     for kind in ("segment", "caption"):
         e = t.rate("balanced", kind, 1, 1)
         st = t.startup_for("balanced", kind)
-        work[kind] = (st.startup_s * compile_factor, video_s * e.container_s_per_video_s,
+        start, _basis = cold_startup_s(st, compile_factor)
+        work[kind] = (start, video_s * e.container_s_per_video_s,
                       max(e.uncertainty, st.uncertainty))
     cap_nominal = work["caption"][0] + work["caption"][1]
     for kind, (start, w, unc) in work.items():
@@ -333,11 +386,12 @@ def project(step: str, manifest: Mapping[str, Any]) -> Projection:
               secs["segment"][0], upper_s=secs["segment"][1])
         p.add(f"balanced caption {JOB} ({len(eps)} ep, {v:.1f} s, cold compile)", cap,
               secs["caption"][0], upper_s=secs["caption"][1])
+        p.peak_usd_per_s = seg.usd_per_s() + cap.usd_per_s()
+    elif step == "lab":
         for kind in ("tempseg", "captioner"):
-            p.add(f"balanced lab {kind} (L0 + Gate A; only after the job is done)", LAB[kind],
-                  LAB_EXPECTED_S[kind], upper_s=LAB_MAX_S + LAB_SLACK_S)
-        p.peak_usd_per_s = max(seg.usd_per_s() + cap.usd_per_s(),
-                               max(c.usd_per_s() for c in LAB.values()))
+            p.add(f"balanced lab {kind} (L0 + Gate A, 2 cold compiles; after (d)'s job)",
+                  LAB[kind], LAB_EXPECTED_S[kind], upper_s=LAB_DEADLINE_S[kind] + LAB_SLACK_S)
+        p.peak_usd_per_s = max(c.usd_per_s() for c in LAB.values())  # one after the other
     elif step == "noise":
         nv = sum(dur[i] for i in NOISE_EPISODES if i in dur)
         nominal, upper = exact_job_seconds(nv)
@@ -377,11 +431,12 @@ def honest_caps(projections: Mapping[str, Projection]) -> dict[str, float]:
 # State and stop rules
 
 
-STEPS = ("tempseg", "preflight", "exact_e2e", "balanced", "certify", "noise")
+STEPS = ("tempseg", "preflight", "exact_e2e", "balanced", "lab", "certify", "noise")
 TITLES = {"tempseg": "0. TempSeg merger v2 build + equivalence (CPU + L40S), then pin",
           "preflight": "a. balanced preflight (CPU)",
           "exact_e2e": "b. exact oracle, 6 human episodes, default mode, H200",
-          "balanced": "d. balanced via flora deploy/run (L40S + H100) + lab L0 / Gate A",
+          "balanced": "d. balanced via flora deploy/run (L40S + H100)",
+          "lab": "d2. balanced lab L0 / Gate A on (d)'s job (L40S, then H100)",
           "certify": "e. offline provisional certification",
           "noise": "f. noise: oracle job repeated, default mode, H200"}
 
@@ -1154,13 +1209,10 @@ def balanced_episodes(manifest: Mapping[str, Any]) -> tuple[str, ...]:
 
 def run_balanced(ctx: Ctx) -> dict[str, Any]:
     """(d): balanced through the real ``flora deploy`` / ``flora run`` on the 6 golden episodes
-    (:func:`balanced_episodes`; independent of (b)), then the lab's L0 + Gate A on 6 captured
-    requests, only when that job is ``done`` (L2)."""
-    import modal
-
+    (:func:`balanced_episodes`; independent of (b)). The lab's L0 + Gate A on that job is its
+    own step (:func:`run_lab`, ``--only lab``), so a lab retry never redoes this job."""
     from flora_deploy.config.receipts import derived_content as content_of
     from flora_deploy.config.schema import load_config
-    from flora_deploy.modal_app import balanced_lab as lab
 
     require_tempseg_pin(ctx)
     episodes = balanced_episodes(ctx.manifest)
@@ -1173,52 +1225,209 @@ def run_balanced(ctx: Ctx) -> dict[str, Any]:
     r = _run_job(ctx, "balanced", cfg, job_id, determinism=ORACLE_DETERMINISM, usd_per_s=rate,
                  spent_in_step=0.0, side="balanced")
     jobs = {JOB: r}
-    spent = float(r.get("spend") or 0.0)
     e2e = _jobs_result(jobs, 1)
-    out: dict[str, Any] = {"episodes": list(episodes), "kinds": {},
+    out: dict[str, Any] = {"episodes": list(episodes),
                            "derived_content": content_of(load_config(cfg))}
-    if not e2e["ok"]:  # L2: the lab does not depend on the job, but a failed job stops here
-        why = (f"deployed balanced job ended {r.get('state')!r}"
-               + (f" ({r['error']})" if r.get("error") else ""))
-        out["lab"] = f"skipped: {why}; fix it and re-run the step"
-        return {"ok": False, **out, "jobs": jobs, "tracked_usd": spent,
-                "report_error": e2e["report_error"], "apps": e2e["apps"]}
-    seg_rel = ""
-    rdir = ROOT / "reports" / "wave-h"
+    if not e2e["ok"]:  # L2: the lab step refuses a job that did not finish
+        out["lab"] = (f"not run: deployed balanced job ended {r.get('state')!r}"
+                      + (f" ({r['error']})" if r.get("error") else ""))
+    return {**e2e, **out}
+
+
+def balanced_job_done(st: State) -> bool:
+    """(d)'s deployed job finished (``done``), whatever its step's status says: a state from
+    before the lab became its own step marks (d) ``failed`` when only the lab failed."""
+    job = ((st.steps.get("balanced") or StepState()).result.get("jobs") or {}).get(JOB) or {}
+    return job.get("state") == "done" and bool(job.get("job_id"))
+
+
+def adopt_balanced_job(st: State) -> bool:
+    """Mark (d) ``done`` when its deployed job finished but the step failed on the lab it
+    used to run inline (the 2026-10-22 state). Returns whether it changed anything."""
+    s = st.steps.get("balanced")
+    if s is None or s.status == "done" or not balanced_job_done(st):
+        return False
+    s.status = "done"
+    s.notes.append("deployed job done; its lab part moved to step lab (d2), re-run there")
+    return True
+
+
+def _segment_records(ctx: Ctx, job: Mapping[str, Any]) -> list[Any]:
+    """(d)'s segment records: the exported JSONL (``wave_h_finalize.py --fetch``) if present,
+    else read from the job store (a Volume read; no container)."""
+    from flora_deploy.records import StageRecord
+
+    path = Path((job.get("records") or {}).get("segment") or record_paths("balanced")["segment"])
+    if path.is_file():
+        return [StageRecord.from_json(line) for line in path.read_text().splitlines()
+                if line.strip()]
+    from flora_deploy import sdk
+
+    return list(sdk.open_job(job["job_id"], store=store_uri(ctx.st)).results("segment"))
+
+
+def deployed_segments(records: Iterable[Any], episodes: Sequence[str]) -> dict[str, list[dict]]:
+    """Golden id -> NVIDIA segment rows (``stages.segment.rows_from_record``, what the deployed
+    caption worker feeds ``caption_*``) from (d)'s segment records, for ``episodes``."""
+    from flora_deploy.stages.segment import rows_from_record
+
+    by_eid = {h0.episode_id(g): g for g in episodes}
+    out: dict[str, list[dict]] = {}
+    for rec in records:
+        g = by_eid.get(rec.episode_id)
+        if g is not None and rec.stage == "segment":
+            out[g] = rows_from_record(rec)
+    return out
+
+
+def golden_missing(paths: Iterable[str]) -> list[str]:
+    """The ``flora-golden`` paths that do not exist (directory listings; no container)."""
+    import modal
+
+    vol = modal.Volume.from_name(h0.GOLDEN_VOLUME, version=2)
+    listed: dict[str, set[str]] = {}
+    out = []
+    for p in paths:
+        parent = p.rsplit("/", 1)[0]
+        if parent not in listed:
+            try:
+                listed[parent] = {e.path.rstrip("/").rsplit("/", 1)[-1]
+                                  for e in vol.listdir(parent)}
+            except Exception:  # noqa: BLE001 - a missing directory: everything under it
+                listed[parent] = set()
+        if p.rstrip("/").rsplit("/", 1)[-1] not in listed[parent]:
+            out.append(p)
+    return out
+
+
+def lab_preconditions(manifest: Mapping[str, Any], episodes: Sequence[str],
+                      segments: Mapping[str, Sequence[Mapping[str, Any]]], *,
+                      missing: Callable[[Iterable[str]], list[str]] = golden_missing
+                      ) -> list[str]:
+    """What must hold before a lab container starts (empty: all of it). The episodes are (d)'s
+    and staged; every camera file the lab child will open, at the path it will open it
+    (``balanced_lab.episode_inputs``), exists on ``flora-golden``; (d)'s segments cover every
+    episode (the Captioner lab captions them)."""
+    from flora_deploy.modal_app import balanced_lab as lab
+
+    out = []
+    if not episodes:
+        return ["no episodes: (d) recorded none"]
+    if tuple(episodes) != EPISODES:
+        out.append(f"episodes differ from (d)'s {len(EPISODES)}: {list(episodes)}")
+    try:
+        inputs = lab.episode_inputs(dict(manifest), list(episodes))
+        paths = lab.volume_paths(inputs)
+    except (KeyError, ValueError) as e:
+        return [*out, f"episode inputs: {e}"]
+    if not paths:
+        out.append("the episodes name no camera files")
+    if miss := missing(paths):
+        out.append(f"{len(miss)} of {len(paths)} camera files not on {h0.GOLDEN_VOLUME}: "
+                   f"{miss[:3]}")
+    if empty := [g for g in episodes if not segments.get(g)]:
+        out.append(f"(d)'s segment records cover {len(episodes) - len(empty)} of "
+                   f"{len(episodes)} episodes (missing: {empty})")
+    return out
+
+
+NO_EVIDENCE = "produced no L0 / Gate A evidence"
+
+
+def _lab_kind_summary(res: Mapping[str, Any], wall: float, usd: float) -> dict[str, Any]:
+    base = res.get("baseline", {}) if isinstance(res, Mapping) else {}
+    err = res.get("error") or base.get("error")
+    l0, gate = base.get("l0") or [], res.get("gate_a")
+    evidence = bool(l0) and bool(gate and gate.get("requests"))
+    return {"wall_s": round(wall, 1), "usd": round(usd, 4),
+            "lab_usd_estimate": res.get("usd_estimate"), "throughput": base.get("throughput"),
+            "l0": l0, "gate_a": gate, "evidence": evidence,
+            "episode_errors": len(base.get("episode_errors") or {}),
+            "compile_cache": res.get("compile_cache"),
+            "error": err or (None if evidence else NO_EVIDENCE)}
+
+
+def run_lab(ctx: Ctx, *, missing: Callable[[Iterable[str]], list[str]] | None = None,
+            records: Callable[[Ctx, Mapping[str, Any]], list[Any]] | None = None,
+            lab_module: Any = None) -> dict[str, Any]:
+    """(d2): the lab's L0 + Gate A against (d)'s finished deployed job: (d)'s episodes, and
+    (d)'s segment records for the Captioner (``--only lab`` retries it alone). Every
+    precondition is checked before any container (:func:`lab_preconditions`); a failed one
+    charges $0. TempSeg runs first; when it gets no request in, the Captioner is not started
+    (it reads the same inputs). Each call's deadline is :data:`LAB_DEADLINE_S` (two cold
+    compiles), shortened by the budget left; a call the budget cannot carry to its expected
+    length is not started. Spend is each started call's wall time x list $/s."""
+    if lab_module is None:
+        from flora_deploy.modal_app import balanced_lab as lab_module
+    lab = lab_module
+    bal = ctx.st.step("balanced").result
+    if not balanced_job_done(ctx.st):
+        raise RuntimeError("the lab runs against (d)'s finished deployed job; (d) has none "
+                           "(run --only balanced first)")
+    job = bal["jobs"][JOB]
+    episodes = list(bal.get("episodes") or ())
+    try:
+        segments = deployed_segments((records or _segment_records)(ctx, job), episodes)
+    except Exception as e:  # noqa: BLE001 - before any container: a precondition
+        segments = {}
+        why = [f"reading (d)'s segment records: {e!r}"]
+    else:
+        why = []
+    why += lab_preconditions(ctx.manifest, episodes, segments,
+                             missing=missing or golden_missing)
+    out: dict[str, Any] = {"episodes": episodes, "job_id": job["job_id"], "kinds": {},
+                           "segments": {"source": "deployed job records",
+                                        "episodes": len(segments),
+                                        "rows": sum(len(v) for v in segments.values())}}
+    if why:
+        out["error"] = "preconditions: " + "; ".join(why)
+        out["note"] = f"no lab container started; charged $0; {NO_EVIDENCE}"
+        return {"ok": False, **out, "tracked_usd": 0.0, "apps": []}
+    import modal
+
+    spent = 0.0
+    rdir = LAB_OUT
     rdir.mkdir(parents=True, exist_ok=True)
-    ctx.note_app("flora-balanced-lab")
+    ctx.note_app("flora-balanced-lab")  # only now: a precondition failure above charged $0
     with modal.enable_output(), lab.app.run():
         for kind, fn in (("tempseg", lab.run_tempseg), ("captioner", lab.run_captioner)):
             c = LAB[kind]
-            limit = min(LAB_MAX_S, gpu_deadline_s(ctx.st, "balanced", c, spent_in_step=spent,
-                                                  slack_s=LAB_SLACK_S,
-                                                  global_cap=ctx.global_cap))
-            if limit < 120 or (kind == "captioner" and not seg_rel):
-                out["kinds"][kind] = {"skipped": f"budget left {limit:.0f} s"
-                                      if limit < 120 else "no TempSeg segments"}
-                break
+            limit = min(LAB_DEADLINE_S[kind],
+                        gpu_deadline_s(ctx.st, "lab", c, spent_in_step=spent,
+                                       slack_s=LAB_SLACK_S, global_cap=ctx.global_cap))
+            prev = out["kinds"].get("tempseg") or {}
+            if kind == "captioner" and prev.get("requests") == 0:
+                out["kinds"][kind] = {"skipped": "TempSeg sent zero requests on the same "
+                                      "inputs; not started", "usd": 0.0, "evidence": False,
+                                      "error": NO_EVIDENCE}
+                continue
+            if limit < LAB_EXPECTED_S[kind]:
+                out["kinds"][kind] = {"skipped": f"budget left {limit:.0f} s < the "
+                                      f"{LAB_EXPECTED_S[kind]:.0f} s it needs", "usd": 0.0,
+                                      "evidence": False, "error": NO_EVIDENCE}
+                continue
             t0 = time.time()
-            call = fn.spawn(f"wave-h-{ctx.st.run_id}", seg_rel, list(episodes), True)
+            call = fn.spawn(f"wave-h-{ctx.st.run_id}", "", episodes, True,
+                            segments if kind == "captioner" else None)
             try:
                 res = call.get(timeout=limit)
             except (TimeoutError, modal.exception.TimeoutError):
                 call.cancel()
                 res = {"error": f"client deadline {limit:.0f} s"}
             wall = time.time() - t0
-            spent += c.usd_per_s() * wall
+            usd = c.usd_per_s() * wall
+            spent += usd
             (rdir / f"balanced-{kind}.json").write_text(json.dumps(res, default=str))
-            base = res.get("baseline", {}) if isinstance(res, dict) else {}
-            out["kinds"][kind] = {"wall_s": round(wall, 1), "usd": round(c.usd_per_s() * wall, 4),
-                                  "lab_usd_estimate": res.get("usd_estimate"),
-                                  "throughput": base.get("throughput"), "l0": base.get("l0"),
-                                  "gate_a": res.get("gate_a"), "error": res.get("error")
-                                  or base.get("error")}
-            seg_rel = res.get("segments_rel", seg_rel) if kind == "tempseg" else seg_rel
-    lab_ok = all("error" not in v or not v["error"] for v in out["kinds"].values()) and \
-        len(out["kinds"]) == 2 and not any("skipped" in v for v in out["kinds"].values())
-    return {"ok": lab_ok and e2e["ok"], **out, "jobs": jobs, "tracked_usd": spent,
-            "report_error": e2e["report_error"],
-            "apps": [*e2e["apps"], "flora-balanced-lab"]}
+            out["kinds"][kind] = _lab_kind_summary(res, wall, usd)
+            stats = (res.get("baseline") or {}).get("batcher") or {}
+            out["kinds"][kind]["requests"] = stats.get("requests")
+    bad = {k: v["error"] for k, v in out["kinds"].items() if v.get("error")}
+    bad.update({k: f"{v['episode_errors']} episode(s) failed" for k, v in out["kinds"].items()
+                if v.get("episode_errors") and k not in bad})
+    if bad:
+        out["error"] = "; ".join(f"{k}: {v}" for k, v in bad.items())
+    return {"ok": not bad and len(out["kinds"]) == 2, **out, "tracked_usd": spent,
+            "apps": ["flora-balanced-lab"]}
 
 
 def _job_rows(ctx: Ctx, step: str) -> dict[str, dict[str, list[dict]]]:
@@ -1264,7 +1473,8 @@ def run_certify(ctx: Ctx, noise: Mapping[str, float] | None = None) -> dict[str,
         if not (b.get("caption") or eid in cap):
             m["caption_jaccard"] = 0.0
         per[eid] = m
-    bal = ctx.st.step("balanced").result.get("kinds", {})
+    bal = (ctx.st.step("lab").result.get("kinds")
+           or ctx.st.step("balanced").result.get("kinds", {}))  # pre-(d2) states: inline lab
     l0 = [r for k in ("tempseg", "captioner") for r in (bal.get(k, {}).get("l0") or [])]
     gate = max((bal.get(k, {}).get("gate_a") or {} for k in ("tempseg", "captioner")),
                key=lambda g: float(g.get("max_abs_dlogit") or 0.0), default={})
@@ -1308,7 +1518,7 @@ def run_noise(ctx: Ctx) -> dict[str, Any]:
 
 RUNNERS: dict[str, Callable[[Ctx], dict[str, Any]]] = {
     "tempseg": run_tempseg, "preflight": run_preflight, "exact_e2e": run_exact,
-    "balanced": run_balanced, "certify": run_certify, "noise": run_noise}
+    "balanced": run_balanced, "lab": run_lab, "certify": run_certify, "noise": run_noise}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1368,8 +1578,9 @@ def _numbers_only(d: Any) -> Any:
 
 
 def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
-               manifest: Mapping[str, Any] | None = None, plan: str = DEFAULT_PLAN) -> None:
-    steps = PLANS[plan]
+               manifest: Mapping[str, Any] | None = None, plan: str = DEFAULT_PLAN,
+               only: str | None = None) -> None:
+    steps = (only,) if only else PLANS[plan]
     gcap = plan_global_cap(plan, projections)
     out(f"Wave H-lite run {st.run_id} ({EMBODIMENT} only), plan {plan} "
         f"({' -> '.join(TITLES[s].split('.')[0] for s in steps)}): spent ${st.spent:.2f} of "
@@ -1395,15 +1606,22 @@ def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
             out(f"      {i['what']:60s} {i['gpu']:>5s} {i['seconds']:6.0f} s / "
                 f"{i['upper_seconds']:6.0f} s x ${i['usd_per_h']:.2f}/h = ${i['usd']:.3f} "
                 f"(upper ${i['usd_upper']:.3f})")
-    for name in deferred_steps(plan):
+    for name in () if only else deferred_steps(plan):
         out(f"  {TITLES[name]:66s} [{DEFERRED_NOTE}; never runs in plan {plan}]")
     if "balanced" in steps:
-        out(f"  assumption: no warm flora-cache compile cache for balanced/tempseg or "
-            f"balanced/captioner, so each balanced pool's startup is the rates.json placeholder "
-            f"x {COLD_COMPILE_FACTOR:.2f} (Rewarder cold/warm @enter, 318 s / 229 s, "
-            "docs/cold-start.md); the lab calls are bounded by their "
-            f"{LAB_MAX_S} s timeout either way. The deployed workers mount flora-cache read-only "
-            "(no write-back); the lab writes flora-cache:/balanced/<engine> and commits it")
+        basis = startup_basis()
+        out("  assumption: (d) is priced with a cold compile: startup segment "
+            f"{basis['segment']}, caption {basis['caption']} (a startup measured cold is taken "
+            f"as is; any other is scaled by {COLD_COMPILE_FACTOR:.2f}, the Rewarder's cold/warm "
+            "@enter 318 s / 229 s, docs/cold-start.md). The deployed workers copy "
+            "flora-cache:/balanced/<engine> to local disk and never write it back")
+    if "lab" in steps:
+        out("  assumption: each lab call compiles two engines cold (baseline + dt_bias "
+            "plugin): deadline " + ", ".join(f"{k} {LAB_DEADLINE_S[k]:.0f} s"
+                                             for k in LAB_DEADLINE_S)
+            + f" (expected x {1 + LAB_UNCERTAINTY:.2f}, <= the {LAB_TIMEOUT_S} s container "
+            "timeout); the lab commits flora-cache:/balanced/<engine>[-dtbias] after each "
+            "engine, so a warm cache only makes it cheaper")
     nominal = sum(projections[s].usd for s in steps)
     upper = sum(projections[s].usd_upper for s in steps)
     how = ("the sum of the plan's upper projections, rounded up to $0.10" if plan != "full"
@@ -1448,6 +1666,8 @@ def main(argv: list[str] | None = None) -> int:
                  "full)")
 
     st = load_state(args.state)
+    if adopt_balanced_job(st):
+        print("note: (d)'s deployed job is done; (d) counts as done and its lab is step lab")
     killed_apps = st.mark_killed() if args.yes_spend else []
     manifest = load_manifest(args.offline)
     miss = missing_episodes(manifest)
@@ -1456,7 +1676,7 @@ def main(argv: list[str] | None = None) -> int:
               f"episodes are staged; using those (missing: {', '.join(miss)})")
     projections = {s: project(s, manifest) for s in STEPS}
     gcap = plan_global_cap(args.plan, projections)
-    print_plan(st, projections, manifest=manifest, plan=args.plan)
+    print_plan(st, projections, manifest=manifest, plan=args.plan, only=args.only)
     if args.report:
         REPORT.parent.mkdir(parents=True, exist_ok=True)
         REPORT.write_text(render_report(st, projections, plan=args.plan))

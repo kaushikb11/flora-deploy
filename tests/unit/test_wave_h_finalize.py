@@ -120,7 +120,7 @@ def build(tmp: Path, *, jobs=("human", "yam"), labs=("tempseg", "captioner"),
         cfgs[job].write_text(yaml.safe_dump(d))
     st = wh.State(run_id="r1", created=T0, billing_since="2026-10-13")
     t = T0
-    for name in wh.STEPS:
+    for name in (n for n in wh.STEPS if n != "lab"):  # the 2026-10-22 shape: lab inside (d)
         s = st.step(name)
         s.status = "done"
         if name == "exact_e2e":
@@ -578,17 +578,21 @@ def test_global_cap_is_the_state_plans_cap_not_the_full_plans(tmp_path, capsys):
     for name, up in (("tempseg", 0.7189), ("preflight", 0.0053), ("balanced", 3.6646)):
         st.step(name).status = "done"
         st.step(name).projected_upper_usd = up
-    assert fin.run_plan(st) == "balanced-only"
+    st.step("balanced").result = {"kinds": {}}  # pre-(d2): the lab ran inside (d)
+    assert fin.run_plan(st) == "balanced-only" and fin.inline_lab(st)
     assert fin.global_cap(st) == 4.40 != wh.GLOBAL_CAP_USD
     # the same relationship as the runbook: cap = upper sum rounded up to $0.10
     ps = {n: SimpleNamespace(usd_upper=st.steps[n].projected_upper_usd)
-          for n in wh.PLANS["balanced-only"]}
+          for n in wh.PLANS["balanced-only"] if n != "lab"}
+    ps["lab"] = SimpleNamespace(usd_upper=0.0)
     assert fin.global_cap(st) == wh.plan_global_cap("balanced-only", ps)
+    st.step("lab").projected_upper_usd = 2.3  # a (d2) state: the lab step counts
+    assert not fin.inline_lab(st) and fin.global_cap(st) == 6.70
     # a step the run never reached is priced as the runbook prices it
     st2 = wh.State(run_id="r", created=T0, billing_since="2026-10-13")
     st2.step("tempseg").projected_upper_usd = 0.7189
     up = 0.7189 + sum(wh.project(n, wh.offline_manifest(wh.DURATION_HEADROOM)).usd_upper
-                      for n in ("preflight", "balanced"))
+                      for n in ("preflight", "balanced", "lab"))
     assert up <= fin.global_cap(st2) < up + 0.1 + 1e-9
     # a started full-plan step: the full plan's cap
     st.step("exact_e2e").attempts.append(_attempt(T0, 0.1, []))

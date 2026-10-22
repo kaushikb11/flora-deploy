@@ -18,6 +18,10 @@ engine-core with the plugin env, and GPU memory is released between them. Child 
 Gate A requests go through ``/tmp`` in the container; the TempSeg run also writes its segment
 rows to ``flora-golden:balanced-lab/<run>/segments.json`` (private Volume) for the caption run.
 
+A baseline run that sends zero requests (no episode ran) returns ``error`` and
+``no_evidence`` and skips the plugin engine. The compile caches are committed after each child,
+and each result records whether its cache was warm (``compile_cache``).
+
 Run (each call is one GPU container, hard timeout 20 min)::
 
     uv run modal run src/flora_deploy/modal_app/balanced_lab.py::preflight          # CPU, cents
@@ -81,6 +85,38 @@ def cache_env(kind: str, plugin: bool) -> dict[str, str]:
             "CUDA_CACHE_PATH": str(base / "cuda"), "XDG_CACHE_HOME": str(base / "xdg")}
 
 
+def episode_inputs(manifest: dict, ids, mount: PurePosixPath | str = GOLDEN_MOUNT) -> list[dict]:
+    """``golden_episode_inputs`` for ``ids`` with camera files under the golden mount.
+
+    The manifest's ``path`` is Volume-relative (``golden/v1/<pool>/<dataset>/<slug>``,
+    ``validate.golden.episode_relpath``), so the root is the mount itself. The 2026-10-22 lab
+    joined ``<mount>/golden/v1`` + ``golden/v1/...``: every episode raised FileNotFoundError,
+    the stage sent zero requests and the call still returned without an error."""
+    from flora_deploy.stages.reference import golden_episode_inputs
+
+    return golden_episode_inputs(manifest, ids, PurePosixPath(mount))
+
+
+def volume_paths(inputs: list[dict], mount: PurePosixPath | str = GOLDEN_MOUNT) -> list[str]:
+    """The Volume-relative path of every camera file the child will open (for a check before
+    any container starts); raises if one is not under ``mount``."""
+    out = []
+    for e in inputs:
+        for path in e["videos"].values():
+            out.append(str(PurePosixPath(path).relative_to(PurePosixPath(mount))))
+    return out
+
+
+def evidence_problems(ids: list[str], episodes: list[dict], requests: int) -> list[str]:
+    """Why a baseline run produced no L0 / Gate A evidence (empty: it did)."""
+    out = []
+    if not episodes:
+        out.append(f"no episode ran (of {len(ids)} requested)")
+    if requests == 0:
+        out.append("the stage sent zero requests to the engine")
+    return out
+
+
 def pick_episodes(manifest: dict, pools=POOLS) -> list[str]:
     """The shortest oracle-eligible episode of each pool (manifest order breaks ties)."""
     out = []
@@ -137,7 +173,6 @@ def child(args: dict) -> None:
     from flora_deploy.nv.linker import load_family
     from flora_deploy.stages import caption as C
     from flora_deploy.stages import segment as S
-    from flora_deploy.stages.reference import golden_episode_inputs
 
     kind, plugin = args["kind"], args["plugin"]
     out: dict[str, Any] = {"kind": kind, "plugin": plugin, "gpu": _gpu_name(),
@@ -157,7 +192,14 @@ def child(args: dict) -> None:
     if not args.get("gate_only"):
         manifest = json.loads((Path(GOLDEN_MOUNT) / "golden/v1/manifest.json").read_text())
         ids = args.get("episodes") or pick_episodes(manifest)
-        inputs = golden_episode_inputs(manifest, ids, PurePosixPath(GOLDEN_MOUNT) / "golden/v1")
+        inputs = episode_inputs(manifest, ids)  # raises on an id the manifest lacks
+        out["episodes_requested"] = list(ids)
+        segments_in = args.get("segments") or {}
+        if kind == "captioner" and (miss := [i for i in ids if not segments_in.get(i)]):
+            out["error"] = f"no segments for {len(miss)} of {len(ids)} episodes: {miss}"
+            out["no_evidence"] = True
+            Path(args["out"]).write_text(json.dumps(out, default=str))
+            return
         seen: list = []
 
         def observer(reqs, comps, info):
@@ -165,7 +207,6 @@ def child(args: dict) -> None:
                 if len(seen) < max(L0_REQUESTS, GATE_A_REQUESTS):
                     seen.append((r, c))
 
-        segments_in = args.get("segments") or {}
         stage = S.SegmentStage(nv, proc) if kind == "tempseg" else C.CaptionStage(nv, proc)
 
         async def one(mb, e):
@@ -204,6 +245,18 @@ def child(args: dict) -> None:
             "video_s_per_gpu_s": round(video_s / wall, 4) if wall else None,
             "usd_per_video_h": round(usd_per_h(kind) * wall / video_s, 2) if video_s else None,
             "generate_s": round(engine.stats["generate_s"], 2)}
+        failed = [e for e in eps if not e["ok"]]
+        if failed:  # evidence from the rest is kept; wave_h does not count this kind as ok
+            out["episode_errors"] = {e["id"]: e["error"] for e in failed}
+        problems = evidence_problems(list(ids), [e for e in eps if e["ok"]],
+                                     int(bstats.get("requests") or 0))
+        if problems:  # fail loudly: no L0, no Gate A requests, no plugin engine after this
+            out["error"] = "; ".join(problems) + (
+                f" (first episode error: {failed[0]['error']})" if failed else "")
+            out["no_evidence"] = True
+            out["l0"] = []
+            Path(args["out"]).write_text(json.dumps(out, default=str))
+            return
         out["l0"] = _l0(engine.llm, proc, [r for r, _ in seen[:L0_REQUESTS]],
                         [c for _, c in seen[:L0_REQUESTS]])
         with open(args["gate_requests"], "wb") as f:
@@ -211,6 +264,10 @@ def child(args: dict) -> None:
 
     with open(args["gate_requests"], "rb") as f:
         gate_reqs = pickle.load(f)
+    if not gate_reqs:
+        out["error"], out["no_evidence"] = "no Gate A requests captured", True
+        Path(args["out"]).write_text(json.dumps(out, default=str))
+        return
     budget = 1024 if kind == "tempseg" else 512
     sp = S.nvidia_sampling(budget, eos, logprobs=20)
     comps = engine.generate_batch(gate_reqs, [sp] * len(gate_reqs))
@@ -283,15 +340,30 @@ def preflight() -> dict:
     return out
 
 
+def compile_cache_state(kind: str, plugin: bool, root: Path | str = CACHE_MOUNT) -> dict:
+    """The vLLM compile-cache entries under this engine's ``cache_env`` root: hash dirs, and
+    which hold a finished ``vllm_compile_cache.py`` (an engine with that config hash loads
+    instead of compiling). Taken before each child, so the result says warm or cold."""
+    base = Path(root) / "balanced" / f"{kind}{'-dtbias' if plugin else ''}" / "vllm" \
+        / "torch_compile_cache"
+    hashes = sorted(p.name for p in base.iterdir() if p.is_dir()
+                    and p.name != "torch_aot_compile") if base.is_dir() else []
+    done = [h for h in hashes if any((base / h).glob("rank_*/*/vllm_compile_cache.py"))]
+    return {"hashes": hashes, "complete": done, "warm": bool(done)}
+
+
 def run_kind(kind: str, run_id: str, segments_rel: str = "",
-             episodes: list[str] | None = None, gate_a: bool = True) -> dict:
+             episodes: list[str] | None = None, gate_a: bool = True,
+             segments: dict | None = None) -> dict:
+    """One lab call. ``segments`` (golden id -> NVIDIA segment rows, e.g. the deployed job's
+    records) takes precedence over ``segments_rel`` (a file on ``flora-golden``)."""
     from flora_deploy.engines.patches import dt_bias_fp32
     from flora_deploy.modal_app import warm
 
     t0 = time.time()
     prefetch = warm.start_prefetch(str(MODEL_DIRS[kind]), threads=16)
-    segments = {}
-    if segments_rel:
+    segments = dict(segments or {})
+    if segments_rel and not segments:
         golden.reload()
         segments = json.loads((Path(GOLDEN_MOUNT) / segments_rel).read_text())
     tmp = Path("/tmp/balanced-lab")
@@ -300,29 +372,38 @@ def run_kind(kind: str, run_id: str, segments_rel: str = "",
             "gate_requests": str(tmp / "gate.pkl")}
     for e in cache_env(kind, False).values():
         Path(e).mkdir(parents=True, exist_ok=True)
+    caches = {"baseline": compile_cache_state(kind, False)}
     a = _run_child({**base, "plugin": False, "out": str(tmp / "a.json")},
                    cache_env(kind, False))
+    cache.commit()  # keep the baseline compile even if the plugin child hits a deadline
     result: dict[str, Any] = {"run": run_id, "kind": kind, "baseline": a,
+                              "compile_cache": caches,
                               "prefetch": (s.as_json() if (s := prefetch.wait(0)) else None)}
+    if "error" in a:
+        result["error"] = f"baseline: {a['error']}"
+        result["no_evidence"] = True
     if gate_a and "error" not in a:
         env = {**cache_env(kind, True), **dt_bias_fp32.install_entry_point(tmp / "plugin")}
         for e in cache_env(kind, True).values():
             Path(e).mkdir(parents=True, exist_ok=True)
+        caches["plugin"] = compile_cache_state(kind, True)
         b = _run_child({**base, "plugin": True, "gate_only": True,
                         "out": str(tmp / "b.json")}, env)
+        cache.commit()
         result["dtbias"] = {k: v for k, v in b.items() if k != "gate_a"}
-        if "error" not in b:
+        if "error" in b:
+            result["error"] = f"plugin: {b['error']}"
+        else:
             result["gate_a"] = gate_a_compare(a["gate_a"], b["gate_a"])
-    if kind == "tempseg" and "episodes" in a:
+    ok_rows = {e["id"]: e["rows"] for e in a.get("episodes") or [] if e["ok"]}
+    if kind == "tempseg" and ok_rows:  # never hand an empty segments file on
         rel = f"balanced-lab/{run_id}/segments.json"
         p = Path(GOLDEN_MOUNT) / rel
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps({e["id"]: e["rows"] for e in a["episodes"] if e["ok"]}))
+        p.write_text(json.dumps(ok_rows))
         golden.commit()
         result["segments_rel"] = rel
-    for side in ("baseline",):
-        result[side].pop("gate_a", None)
-    cache.commit()
+    result["baseline"].pop("gate_a", None)
     result["container_s"] = round(time.time() - t0, 1)
     result["usd_estimate"] = round(usd_per_h(kind) * result["container_s"] / 3600, 3)
     return result
@@ -334,16 +415,16 @@ _GPU_VOLUMES = {str(WEIGHTS_MOUNT): weights, str(GOLDEN_MOUNT): golden, str(CACH
 @app.function(image=vllm_image(), gpu=GPUS["tempseg"], cpu=CPU,
               memory=MEM_GIB["tempseg"] * 1024, timeout=TIMEOUT_S, volumes=_GPU_VOLUMES, env=ENV)
 def run_tempseg(run_id: str, segments_rel: str = "", episodes: list[str] | None = None,
-                gate_a: bool = True) -> dict:
-    return run_kind("tempseg", run_id, segments_rel, episodes, gate_a)
+                gate_a: bool = True, segments: dict | None = None) -> dict:
+    return run_kind("tempseg", run_id, segments_rel, episodes, gate_a, segments)
 
 
 @app.function(image=vllm_image(), gpu=GPUS["captioner"], cpu=CPU,
               memory=MEM_GIB["captioner"] * 1024, timeout=TIMEOUT_S, volumes=_GPU_VOLUMES,
               env=ENV)
 def run_captioner(run_id: str, segments_rel: str = "", episodes: list[str] | None = None,
-                  gate_a: bool = True) -> dict:
-    return run_kind("captioner", run_id, segments_rel, episodes, gate_a)
+                  gate_a: bool = True, segments: dict | None = None) -> dict:
+    return run_kind("captioner", run_id, segments_rel, episodes, gate_a, segments)
 
 
 @app.local_entrypoint()
@@ -357,5 +438,5 @@ def main(kind: str = "tempseg", run: str = "r1", gate_a: bool = True) -> None:
     summary = {k: result.get(k) for k in ("gate_a", "container_s", "usd_estimate")}
     base = result.get("baseline", {})
     summary.update(throughput=base.get("throughput"), l0=base.get("l0"),
-                   error=base.get("error"))
+                   error=result.get("error") or base.get("error"))
     print(json.dumps(summary, indent=1, default=str))

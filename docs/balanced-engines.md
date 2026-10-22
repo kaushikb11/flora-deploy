@@ -252,6 +252,13 @@ uv run python scripts/spend.py --app flora-balanced-lab
 - the episodes the GPU runs would pick: the shortest oracle-eligible episode of `human`, `yam`,
   `single_view_robot` and `dex`.
 
+**Golden paths.** Manifest `path`s are Volume-relative (`golden/v1/...`), so the lab opens
+camera files under the mount itself (`balanced_lab.episode_inputs`). On 2026-10-22 the lab
+joined `<mount>/golden/v1` to them. Every episode raised `FileNotFoundError` and the stage sent
+zero requests. A baseline that sends zero requests now returns `error` / `no_evidence` and skips
+the plugin engine. Wave H's lab step (d2, `scripts/wave_h.py --only lab`) checks the files, the
+episodes and (d)'s segments before it starts a container.
+
 **Each GPU call** runs one container with a 20 min hard timeout and two child processes:
 1. **Baseline engine.**
    - The stage runs end to end on the picked episodes.
@@ -267,8 +274,11 @@ uv run python scripts/spend.py --app flora-balanced-lab
 The TempSeg run writes its segment rows to `flora-golden:balanced-lab/<run>/segments.json` for
 the caption run. The full JSON lands in `reports/balanced-lab/` (git-ignored).
 
-**Expected cost** (estimate): about 12–15 min of container time per kind, two engine starts each.
-That is ≈ $0.6 for L40S and ≈ $1.2 for H100, ≈ $1.8–2.4 in total, within the $3 cap.
+**Expected cost** (estimate): two cold engine builds per call, then the work. TempSeg: 270 s +
+190 s builds, ≈ 615 s (deadline 769 s), ≈ $0.46 (upper $0.62). Captioner: 2 × 325 s builds,
+≈ 905 s (deadline 1131 s), ≈ $1.28 (upper $1.69). In total ≈ $1.74, upper $2.31
+(`wave_h.lab_seconds`). A warm `flora-cache` entry makes a build cheaper. Each result says
+whether its cache was warm.
 
 ## Results
 

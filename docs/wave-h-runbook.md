@@ -117,11 +117,12 @@ the `balanced-only` dry run:
 |---|---|---|---|---|---|
 | 0 | TempSeg merger v2 build + equivalence, then stop for the pin | CPU + L40S | $0.75 | $0.23 | $0.72 |
 | a | balanced preflight: derived dirs, receipts, EOS ids | CPU | $0.05 | $0.00 | $0.01 |
-| d | `preset: balanced` (`allow_uncertified: true`) via `flora deploy`/`flora run`, one app, cold compile; then, only if that job is `done`, the lab's L0 + Gate A on 6 captured requests | L40S + H100, lab L40S + H100 | $3.70 | $2.01 | $3.70 |
+| d | `preset: balanced` (`allow_uncertified: true`) via `flora deploy`/`flora run`, one app, cold compile | L40S + H100 | $2.30 | $1.27 | $2.28 |
+| d2 | `lab`: only against (d)'s finished job, the lab's L0 + Gate A on 6 captured requests (two cold compiles per call) | L40S, then H100 | $2.35 | $1.74 | $2.31 |
 | b | exact oracle | deferred to the certified run | | | |
 | e | offline provisional certification | deferred to the certified run | | | |
 | f | noise run | deferred to the certified run | | | |
-| | **total** | | global **$4.50** | **$2.25** | **$4.42** |
+| | **total** | | global **$5.40** | **$3.25** | **$5.31** |
 
 The global cap of `balanced-only` is not a fixed number: it is the sum of its steps' upper
 projections, rounded up to $0.10 (`plan_global_cap`), and the dry run prints it. Each step's cap
@@ -135,23 +136,60 @@ fixed cap of $6.50. Its dry run says "NOT HONEST AT $6.50" and names the minimum
 measured rate. One job per stage gives one of each, so finalize **refuses the rate update** after
 this session (it still writes the report).
 
+### The lab step (d2) and `--only lab`
+
+Until 2026-10-22 the lab ran inside (d). That run's deployed job finished (6 episodes, 72
+segments, all captioned), but the lab gave no evidence:
+- **TempSeg lab: zero requests.** The child opened camera files under
+  `/golden/golden/v1/golden/v1/...`: the manifest's `path` is already Volume-relative
+  (`golden/v1/<pool>/...`) and the lab joined it to `<mount>/golden/v1`. All 6 episodes raised
+  `FileNotFoundError`, which was recorded per episode, and the call still returned without an
+  error (`l0: []`, Gate A over 0 requests). The episode selection was right: (d)'s 6 ids.
+- **Captioner lab: cut off.** Its 600 s client deadline could not hold two cold engine builds
+  (about 325 s each on H100) plus the work. It was cancelled after about $0.85.
+
+Now:
+- The lab is its own step, `lab` (d2). `wave_h.py --yes-spend --only lab` retries it against
+  (d)'s finished job without redoing the job. A state where (d) failed only because of its
+  inline lab counts (d) as done.
+- The lab runs (d)'s episodes. The Captioner captions **(d)'s segment records**: the exported
+  JSONL, or the job store. It no longer uses the TempSeg lab's output.
+- **Preconditions before any container** (`lab_preconditions`):
+  - the episodes are (d)'s and staged;
+  - every camera file exists on `flora-golden` at the path the lab child will open;
+  - (d)'s segments cover every episode.
+
+  If one fails, no container starts and the step is charged $0.
+- **Fail loudly.** A baseline that runs no episode or sends zero requests returns `error` and
+  `no_evidence`, and the plugin engine is not built. Wave H then skips the Captioner (it reads
+  the same inputs). A kind with no L0 rows or no Gate A requests is reported as "produced no
+  L0 / Gate A evidence". The step is charged only the wall time of the calls it started.
+- **Deadlines** cover two cold compiles: overhead + baseline build + plugin build + work, × 1.25.
+  That is TempSeg 769 s and Captioner 1131 s, under the 1200 s container timeout. A call the
+  budget left cannot carry to its expected length is not started.
+
 ### Cold compile
 
 The image smoke found that `flora-cache` holds **no compile cache** for `balanced/tempseg` or
 `balanced/captioner` at the current image key. The first L40S and H100 engine starts in (d)
 therefore compile from scratch (torch.compile, Triton, CUDA graphs). The balanced startup row of
-`planner/rates.json` (130 s, projected for a warm cache) is scaled by the Rewarder's measured
-cold/warm `@modal.enter` ratio, 318 s / 229 s ≈ 1.39 (`docs/rewarder-smoke.md`,
-`docs/cold-start.md`): about 181 s per pool, in both the nominal and the upper figure. The dry
-run states this assumption. The lab calls are bounded by their 10-minute timeout either way;
-their cold compiles make that timeout likelier to bite.
+`planner/rates.json` are now **measured** with a cold cache (segment 300.5 s, caption 325 s,
+`compile_cache: cold`). They are taken as they are. Only a startup that is not a cold
+measurement (a projection, a placeholder or a warm measurement) is scaled by the Rewarder's
+cold/warm `@modal.enter` ratio, 318 s / 229 s ≈ 1.39 (`cold_startup_s`; `docs/rewarder-smoke.md`,
+`docs/cold-start.md`). The dry run says which applies.
 
 **Write-back.** The deployed balanced workers mount `flora-cache` **read-only**
 (`FLORA_CACHE_MODE=ro`; a local copy, never committed), so the deployed job leaves no cache
-behind. The lab calls in (d) are the writers: each writes `flora-cache:/balanced/<engine>`
-(and `<engine>-dtbias` for Gate A's plugin side) and commits it at the end of the call. Later
-runs can start from that cache, but whether it hits for the deployed workers (which also apply
-the OPT-1 accel patches) has not been measured.
+behind, and nothing can flow from a deployed run to the lab. The lab calls (d2) are the
+writers: each writes `flora-cache:/balanced/<engine>` (and `<engine>-dtbias` for Gate A's plugin
+side) and commits it after each engine. Each result records whether its cache was warm
+(`compile_cache`). The deployed workers seed from the same `balanced/<engine>` directory. Whether
+their vLLM config hash matches the lab's has not been measured: the lab's engine adds
+`logprobs_mode: raw_logits` and `max_logprobs: 20`. Triton and CUDA kernel caches are
+content-addressed either way. After 2026-10-22, `flora-cache` holds finished torch.compile
+entries for `balanced/tempseg`, `balanced/captioner` and `balanced/tempseg-dtbias`.
+`balanced/captioner-dtbias` was cut off mid-compile.
 
 Projections are container-seconds × list $/h (GPU + cores + memory, as pinned in `jobs.budget`).
 Container-seconds come from `planner/rates.json`: startup + video-s × container-s per video-s, plus
@@ -160,7 +198,7 @@ Container-seconds come from `planner/rates.json`: startup + video-s × container
 - **240 s client slack per app** (the `flora run` timeout margin, then cancel + `modal app stop`);
 - every cold start (for (d), a cold compile);
 - the segment pool's scale-down tail while captions run;
-- the lab's 10-minute limit plus 60 s, and step 0's deadlines plus 60 s.
+- each lab call's two-cold-compile deadline plus 60 s, and step 0's deadlines plus 60 s.
 
 ## Stop rules
 
@@ -175,8 +213,9 @@ Container-seconds come from `planner/rates.json`: startup + video-s × container
   Every app is stopped (`modal app stop`) once its job ends.
 - **After a step:** the step's spend is checked against its cap, and the cumulative figure
   against the global cap.
-- **(d)'s lab runs only after its deployed job is `done`.** If the job failed or was cut short,
-  the step ends `failed` with `lab: skipped: ...` and the lab spends nothing (review 10 L2).
+- **The lab (d2) runs only against (d)'s `done` job.** If the job failed or was cut short,
+  (d) ends `failed` with `lab: not run: ...`, and the lab step refuses to run before any app
+  starts, so it spends nothing (review 10 L2).
 - **Step 0** ends with exit 4 (`needs_pin`) until the pin is set; see above.
 
 ## Spend accounting

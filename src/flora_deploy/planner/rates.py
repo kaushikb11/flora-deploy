@@ -75,6 +75,10 @@ class StartupEntry:
     date: str
     source: str | None = None
     n: int | None = None  # containers behind a measured cold start
+    # The compile cache (torch.compile / Triton / CUDA graphs) a measured startup was timed
+    # with: "cold" (compiled from scratch) or "warm" (loaded a seeded cache); None when not
+    # recorded (projections, placeholders).
+    compile_cache: str | None = None
 
 
 # Rows a later measurement wave flips from ``placeholder`` to ``measured`` by editing rates.json
@@ -82,6 +86,7 @@ class StartupEntry:
 # ``placeholder`` or ``measured``, and a ``measured`` one must name its ``source`` and ``date``.
 MEASURED_SLOTS: tuple[tuple[str, str], ...] = (("balanced", "segment"), ("balanced", "caption"))
 SLOT_STATUSES: tuple[str, ...] = ("placeholder", "measured")
+COMPILE_CACHE_STATES: tuple[str | None, ...] = ("cold", "warm", None)
 
 
 class RatesFileError(ValueError):
@@ -134,6 +139,9 @@ class RateTable:
             except TypeError as exc:
                 raise RatesFileError(f"{source}: startup[{i}]: {exc}") from None
             _check(e2.startup_s >= 0, f"{source}: startup[{i}] must be >= 0")
+            _check(e2.compile_cache in COMPILE_CACHE_STATES,
+                   f"{source}: startup[{i}].compile_cache {e2.compile_cache!r}; use cold | "
+                   "warm or leave it out")
             startup.append(e2)
         _check_slots(rates, source)
         return cls(tuple(rates), tuple(startup), source=source, updated=data.get("updated", ""))

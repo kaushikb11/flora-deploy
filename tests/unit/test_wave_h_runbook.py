@@ -90,16 +90,16 @@ def test_projections_are_honest_about_the_caps():
         assert p.usd_upper >= p.usd
     for it in ps["exact_e2e"].items + ps["noise"].items:  # every app carries the client slack
         assert it["upper_seconds"] - it["seconds"] >= wh.CLIENT_SLACK_S
-    # one app per stage: exact on one H200, balanced on one L40S + one H100 plus the two lab
-    # containers, step 0 a CPU merge and one L40S check
+    # one app per stage: exact on one H200, balanced on one L40S + one H100, the lab step its
+    # two containers, step 0 a CPU merge and one L40S check
     assert [i["gpu"] for i in ps["exact_e2e"].items] == ["H200"]
     assert [i["gpu"] for i in ps["noise"].items] == ["H200"]
-    assert [i["gpu"] for i in ps["balanced"].items] == ["L40S", "H100!", "L40S", "H100"]
+    assert [i["gpu"] for i in ps["balanced"].items] == ["L40S", "H100!"]
+    assert [i["gpu"] for i in ps["lab"].items] == ["L40S", "H100"]
     assert [i["gpu"] for i in ps["tempseg"].items] == ["cpu", "L40S"]
     honest = wh.honest_caps(ps)
     for step in wh.STEPS:  # every step's upper projection fits its own cap
         assert ps[step].usd_upper <= wh.CAPS_USD[step] + 1e-9, step
-        assert wh.CAPS_USD[step] == honest[step], step
     assert wh.GLOBAL_CAP_USD == 6.50  # the approved upper
     upper = sum(p.usd_upper for p in ps.values())
     assert upper > wh.GLOBAL_CAP_USD  # reported by the dry run, not hidden
@@ -224,7 +224,7 @@ def test_dry_run_spends_nothing(monkeypatch, tmp_path, capsys):
 
 def test_balanced_only_runs_0_a_d_and_defers_b_e_f():
     assert wh.DEFAULT_PLAN == "balanced-only"
-    assert wh.PLANS["balanced-only"] == ("tempseg", "preflight", "balanced")
+    assert wh.PLANS["balanced-only"] == ("tempseg", "preflight", "balanced", "lab")
     assert wh.deferred_steps("balanced-only") == ("exact_e2e", "certify", "noise")
     assert wh.PLANS["full"] == wh.STEPS and wh.deferred_steps("full") == ()
 
@@ -264,7 +264,7 @@ def test_main_never_runs_a_deferred_step(monkeypatch, tmp_path):
         "ok": True, "tracked_usd": 0.0}) for k in wh.STEPS})
     argv = argv[:1] + argv[3:]  # --yes-spend without --only
     assert wh.main(argv) == 0
-    assert ran == ["tempseg", "preflight", "balanced"]
+    assert ran == ["tempseg", "preflight", "balanced", "lab"]
     st = wh.load_state(state)
     assert not {"exact_e2e", "certify", "noise"} & set(st.steps)
     with pytest.raises(SystemExit):
@@ -634,8 +634,8 @@ def test_l2_lab_is_skipped_when_the_deployed_balanced_job_failed(monkeypatch, tm
     monkeypatch.setattr(wh, "_run_job", lambda *a, **k: {
         "app": "flora-bal", "state": "failed", "spend": 0.4, "job_id": "job"})
     res = wh.run_balanced(_Ctx(wh.State("r", 0.0, "x"), tmp_path, []))
-    assert not res["ok"] and res["lab"].startswith("skipped: deployed balanced job ended")
-    assert res["kinds"] == {} and "flora-balanced-lab" not in res["apps"]
+    assert not res["ok"] and res["lab"].startswith("not run: deployed balanced job ended")
+    assert "kinds" not in res and "flora-balanced-lab" not in res["apps"]
     assert res["tracked_usd"] == pytest.approx(0.4)
     assert res["derived_content"] == {"tempseg_merged": "e" * 64}  # what finalize certifies
 

@@ -424,7 +424,8 @@ def lab_result(paths: Paths, st: wh.State, kind: str) -> dict[str, Any] | None:
     if p.exists():
         d = json.loads(p.read_text(encoding="utf-8"))
         return d if isinstance(d, dict) else None
-    k = (st.steps.get("balanced") and st.steps["balanced"].result.get("kinds", {}).get(kind))
+    k = next((st.steps[n].result.get("kinds", {}).get(kind) for n in ("lab", "balanced")
+              if n in st.steps and st.steps[n].result.get("kinds", {}).get(kind)), None)
     if not k or not (k.get("l0") or k.get("gate_a")):
         return None
     return {"kind": kind, "baseline": {"l0": k.get("l0") or []}, "gate_a": k.get("gate_a")}
@@ -708,6 +709,13 @@ def run_plan(st: wh.State) -> str:
     return wh.DEFAULT_PLAN
 
 
+def inline_lab(st: wh.State) -> bool:
+    """A state from before the lab became step ``lab`` (d2): (d) ran it inline (its result
+    has ``kinds``) and no ``lab`` step exists."""
+    bal = st.steps.get("balanced")
+    return "lab" not in st.steps and bal is not None and "kinds" in bal.result
+
+
 def global_cap(st: wh.State) -> float:
     """The global cap the run was gated on: ``wave_h.plan_global_cap`` for the state's plan,
     from the upper projection the runbook stored on each step before it ran it. A step it never
@@ -715,6 +723,9 @@ def global_cap(st: wh.State) -> float:
     plan = run_plan(st)
     projections: dict[str, Any] = {}
     for name in wh.PLANS[plan]:
+        if name == "lab" and inline_lab(st):  # gated before (d2) existed: (d)'s stored
+            projections[name] = SimpleNamespace(usd_upper=0.0)  # projection covers its lab
+            continue
         s = st.steps.get(name)
         if s is not None and s.projected_upper_usd is not None:
             projections[name] = SimpleNamespace(usd_upper=s.projected_upper_usd)
