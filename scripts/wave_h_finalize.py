@@ -190,8 +190,15 @@ class Measurement:
 
     @property
     def rate(self) -> float | None:
+        """Busy container-s per video-s, rounded to 3 places (``planner/rates.json``)."""
+        r = self.rate_exact
+        return None if r is None else round(r, 3)
+
+    @property
+    def rate_exact(self) -> float | None:
+        """:attr:`rate` unrounded: what costs are computed from (review 12 F9)."""
         v = sum(v for _, _, v in self.samples)
-        return round(sum(b for _, b, _ in self.samples) / v, 3) if v > 0 else None
+        return sum(b for _, b, _ in self.samples) / v if v > 0 else None
 
     @staticmethod
     def band(xs: Sequence[float]) -> float | None:
@@ -380,6 +387,14 @@ def updated_rates(data: Mapping[str, Any], ms: Mapping[tuple[str, str], Measurem
                 "date": date, "source": source}
         existing = [r for r in new["startup"] if r["preset"] == preset and r["kind"] == kind]
         if existing:
+            # the compile-cache state the startup was measured with is not in the state; keep
+            # the one recorded beside the row (``wave_h.startup_basis`` reads it), so --write
+            # stays idempotent
+            if "compile_cache" in existing[0]:
+                srow = {k: v for k, v in srow.items() if k != "n"} | {
+                    "compile_cache": existing[0]["compile_cache"], "n": k}
+                srow = {**{x: srow[x] for x in ("preset", "kind", "startup_s", "uncertainty",
+                                                "status", "compile_cache", "n")}, **srow}
             existing[0].clear()
             existing[0].update(srow)
         else:
@@ -613,26 +628,46 @@ def table(head: Sequence[str], rows: Sequence[Sequence[str]]) -> list[str]:
 
 def usd_per_video_h(ms: Mapping[tuple[str, str], Measurement], preset: str
                     ) -> dict[str, Any] | None:
-    """3600 x sum over the preset's kinds of (container-s per video-s x pool $/s)."""
-    terms, unc_num = [], 0.0
+    """3600 x sum over the preset's kinds of (container-s per video-s x pool $/s), from the
+    unrounded rates and prices, rounded once (review 12 F9: summing per-term cents gave $5.62
+    for $5.613)."""
+    terms, unc_num, total = [], 0.0, 0.0
     for kind in PRESET_KINDS[preset]:
         m = ms[(preset, kind)]
         if m.rate is None or m.refusals:
             return None
         c = wh.pool_container(kind, preset)
-        t = 3600.0 * m.rate * c.usd_per_s()
+        t = 3600.0 * m.rate_exact * c.usd_per_s()
         terms.append({"kind": kind, "gpu": m.gpu, "rate": m.rate,
                       "usd_per_h": round(c.usd_per_h(), 3), "usd_per_video_h": round(t, 2)})
         unc_num += t * (m.uncertainty or 0.0)
-    total = sum(t["usd_per_video_h"] for t in terms)
+        total += t
     return {"terms": terms, "usd_per_video_h": round(total, 2),
             "uncertainty": round(unc_num / total, 2) if total else None}
 
 
 def run_usd_per_video_h(st: wh.State, step: str) -> float | None:
+    """All in: the step's jobs' whole spend (cold starts, idle until scale-down, slack) per
+    video-hour."""
     jobs = [r for r in jobs_of(st, step).values() if r.get("spend") is not None]
     video = sum(job_video_s(r) or 0.0 for r in jobs)
     return round(sum(float(r["spend"]) for r in jobs) / video * 3600, 2) if video else None
+
+
+def run_usd_per_video_h_after_startup(st: wh.State, step: str) -> float | None:
+    """The step's containers' cost without each one's cold start (spawn to first attempt):
+    each container's $ x (seconds - startup) / seconds, per video-hour. What a warm job of the
+    same size would pay, idle time until scale-down included."""
+    jobs = list(jobs_of(st, step).values())
+    video = sum(job_video_s(r) or 0.0 for r in jobs)
+    usd_ = 0.0
+    for r in jobs:
+        for c in r.get("containers") or []:
+            sec, up = float(c.get("seconds") or 0.0), float(c.get("startup_s") or 0.0)
+            if sec <= 0 or c.get("usd") is None:
+                return None
+            usd_ += float(c["usd"]) * max(0.0, sec - up) / sec
+    return round(usd_ / video * 3600, 2) if video and usd_ else None
 
 
 def l0_rows(labs: Mapping[str, Mapping[str, Any] | None]) -> list[dict[str, Any]]:
@@ -662,6 +697,8 @@ def gate_a(labs: Mapping[str, Mapping[str, Any] | None]) -> dict[str, Any]:
     from flora_deploy.validate.certify import gate_a_summary
 
     kinds = {k: gate_a_summary(labs.get(k)) for k in ("tempseg", "captioner")}
+    # a Gate A with no request is not a measurement ("0/0", review 12 F8): not measured
+    kinds = {k: g if g and g.get("requests") else None for k, g in kinds.items()}
     ref = wh.GATE_A_MAX_DLOGIT
     measured = {k: g for k, g in kinds.items() if g and g.get("max_abs_dlogit") is not None}
     over = sorted(k for k, g in measured.items() if float(g["max_abs_dlogit"]) > ref)
@@ -731,10 +768,22 @@ def inline_lab(st: wh.State) -> bool:
 
 
 def global_cap(st: wh.State) -> float:
-    """The global cap the run was gated on: ``wave_h.plan_global_cap`` for the state's plan,
-    from the upper projection the runbook stored on each step before it ran it. A step it never
-    reached is priced as the runbook prices it (offline manifest, today's rates)."""
+    """The global cap in force (review 12 F6): the one the last ``--yes-spend`` run gated on
+    (``State.gate_cap``) when the state has it for the state's plan. Otherwise it is
+    reconstructed: ``wave_h.plan_global_cap`` for the state's plan, from the upper projection
+    the runbook stored on each step before it ran it (a step it never reached is priced as the
+    runbook prices it: offline manifest, today's rates). With a user-approved override for that
+    plan (``--global-cap``), the runbook gates on the larger of the override and the cap derived
+    from today's projections, so that is reported."""
     plan = run_plan(st)
+    if st.gate_cap is not None and st.gate_cap_plan == plan:
+        return st.gate_cap
+    override = st.override_for(plan)
+    if override is not None:
+        man = wh.offline_manifest(wh.DURATION_HEADROOM)
+        reuse = wh.lab_reuse(st)
+        today = {s: wh.project(s, man, reuse=reuse if s == "lab" else ()) for s in wh.PLANS[plan]}
+        return wh.plan_global_cap(plan, today, override)
     projections: dict[str, Any] = {}
     for name in wh.PLANS[plan]:
         if name == "lab" and inline_lab(st):  # gated before (d2) existed: (d)'s stored
@@ -777,8 +826,17 @@ def render_report(f: Findings) -> str:
          "step used (`scripts/spend.py`).", ""]
     L += table(["step", "status", "attempts", "cap", "tracked", "charged", "billed", "billing"],
                f.billing)
-    L += ["", f"Total: **{usd(st.spent)}** of the {usd(global_cap(st))} global cap "
-          f"(billed total {usd(st.billed_total)}, billing read {utc(st.billed_at)})."]
+    tracked = sum(s.tracked_usd for s in st.steps.values())
+    charged = sum(s.charged(st.billed_at) for s in st.steps.values())
+    L += ["", f"Total: **{usd(st.spent)}** of the {usd(global_cap(st))} global cap: the "
+          "larger of charged and billed, the figure the runbook gates on.", "",
+          f"- tracked {usd(tracked)}: container-seconds x list $/h of every attempt;",
+          f"- charged {usd(charged)}: tracked, with a killed or unreported attempt at its budget "
+          f"until billing is read {wh.BILLING_LAG_S} s after it"
+          + (f" ({usd(charged - tracked)} over tracked)" if charged - tracked > 0.005 else "")
+          + ";",
+          f"- billed {usd(st.billed_total)}: Modal's billed delta of every app (read "
+          f"{utc(st.billed_at)})."]
     if f.warnings:
         L += ["", "Warnings:", *[f"- {w}" for w in f.warnings]]
 
@@ -825,7 +883,16 @@ def render_report(f: Findings) -> str:
                            f"({t['kind']}, {t['gpu']})" for t in c["terms"])
         rows.append([preset, terms, f"**{usd(c['usd_per_video_h'])}** ±{c['uncertainty']:.0%}",
                      usd(run)])
-    L += table(["preset", "terms", "$/video-h", "this run (cold starts, idle, slack)"], rows)
+    L += table(["preset", "terms", "$/video-h (busy)", "this run (cold starts, idle, slack)"],
+               rows)
+    warm = run_usd_per_video_h_after_startup(st, "balanced")
+    L += ["", "$/video-h (busy) counts busy container-seconds only: steady state at scale, "
+          "without cold starts or idle time until scale-down. This run's figure is everything "
+          "its jobs spent"
+          + (f"; without the cold starts, `balanced` was {usd(warm)}/video-h (idle kept)"
+             if warm is not None else "")
+          + ". One small job (n=1): the band is a nominal convention, not a statistical "
+          "interval."]
     ex, bal = f.cost.get("exact"), f.cost.get("balanced")
     if ex and bal and bal["usd_per_video_h"]:
         L += ["", f"`exact` / `balanced`: {ex['usd_per_video_h'] / bal['usd_per_video_h']:.1f}x "
@@ -948,6 +1015,9 @@ def fetch_records(paths: Paths, st: wh.State, run: Callable[..., Any] = subproce
                 out.parent.mkdir(parents=True, exist_ok=True)
                 run([h0.flora_bin(), "results", "--job", r["job_id"], "--stage", stage,
                      "--store", store, "--format", "jsonl", "--out", str(out)], check=True)
+                # which job these records are: the lab reads (d)'s only when this matches
+                wh.records_source_path(out).write_text(json.dumps(
+                    {"job_id": r["job_id"], "store": store, "stage": stage}) + "\n")
 
 
 def analyze(paths: Paths, *, derived: Mapping[str, str] | None = None, cert_tmp: Path,

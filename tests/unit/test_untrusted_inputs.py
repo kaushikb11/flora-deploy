@@ -276,3 +276,50 @@ def test_gitignore_covers_license_guard_examples():
                          input="\n".join(samples), capture_output=True, text=True)
     ignored = set(out.stdout.split())
     assert sorted(set(samples) - ignored) == []
+
+
+def _encode(path, fmt=None, codec="libx264"):
+    import av
+    import numpy as np
+
+    with av.open(str(path), "w", format=fmt) as o:
+        s = o.add_stream(codec, rate=10)
+        s.width, s.height, s.pix_fmt = 64, 48, "yuv420p"
+        for i in range(5):
+            f = av.VideoFrame.from_ndarray(np.full((48, 64, 3), i * 8, np.uint8), format="rgb24")
+            for p in s.encode(f):
+                o.mux(p)
+        for p in s.encode():
+            o.mux(p)
+    return path
+
+
+@pytest.mark.parametrize("name,fmt,codec", [("a.mkv", "matroska", "libx264"),
+                                            ("a.webm", "webm", "libvpx-vp9"),
+                                            ("renamed.mp4", "matroska", "libx264")])
+def test_non_mp4_containers_are_refused_with_a_clear_message(tmp_path, name, fmt, codec):
+    """Review 12 F12: not FFmpeg's ``[Errno 22] Invalid argument``."""
+    from flora_deploy.media.avsafe import UnsupportedContainer, open_input
+    from flora_deploy.media.index import scan_stream
+
+    try:
+        p = _encode(tmp_path / name, fmt, codec)
+    except Exception as e:  # noqa: BLE001 - an encoder this PyAV build lacks
+        pytest.skip(f"cannot encode {fmt}/{codec}: {e}")
+    for call in (open_input, scan_stream):
+        with pytest.raises(UnsupportedContainer, match=r"unsupported container \(only MP4/MOV\)"):
+            r = call(p)
+            if hasattr(r, "close"):
+                r.close()
+    assert issubclass(UnsupportedContainer, ValueError)  # a per-episode data error, as before
+
+
+def test_a_corrupt_mp4_keeps_ffmpeg_s_error(tmp_path):
+    from flora_deploy.media.avsafe import UnsupportedContainer, open_input
+
+    p = tmp_path / "bad.mp4"
+    p.write_bytes(b"\x00\x00\x00\x18ftypisom" + b"\x00" * 16)
+    with pytest.raises(Exception) as ei:
+        with open_input(p):
+            pass
+    assert not isinstance(ei.value, UnsupportedContainer)

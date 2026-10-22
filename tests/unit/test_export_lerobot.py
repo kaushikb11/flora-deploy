@@ -621,3 +621,83 @@ def test_export_cli(tmp_path):
     r = runner.invoke(app, ["export", "--job", job, "--store", uri, "--out",
                             str(tmp_path / "o3"), "--allow-uncertified"], env=env)
     assert r.exit_code == 2 and "--source" in r.output  # no index summary names the dataset
+
+
+# ---------------------------------------------------------------------------------------------
+# Review 12 F1 / F4: the source dataset's metadata and symlinks never reach outside it
+
+
+@pytest.mark.parametrize("data_path", [
+    "../../home/victim/data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+    "../x/episode_{episode_index:06d}.parquet",
+    "/abs/episode_{episode_index:06d}.parquet",
+    "data/{episode_index.__class__}.parquet",
+    "data/{0}.parquet",
+])
+def test_hostile_data_path_is_refused_and_writes_nothing_outside(tmp_path, data_path):
+    victim = make_v21(tmp_path / "home" / "victim", LENGTHS)
+    before = tree_digest(victim)
+    src = make_v21(tmp_path / "downloads" / "evil", LENGTHS)
+    info = json.loads((src / "meta/info.json").read_text())
+    info["data_path"] = data_path
+    (src / "meta/info.json").write_text(json.dumps(info))
+    with pytest.raises(ExportError, match="data_path|path"):
+        export_lerobot(src, tmp_path / "downloads" / "out", records(LENGTHS))
+    assert tree_digest(victim) == before
+    assert not (tmp_path / "downloads" / "out").exists()
+
+
+def test_data_file_symlinked_outside_is_refused(tmp_path):
+    victim = make_v21(tmp_path / "victim", LENGTHS)
+    before = tree_digest(victim)
+    src = make_v21(tmp_path / "ds", LENGTHS)
+    f = src / "data/chunk-000/episode_000000.parquet"
+    f.unlink()
+    f.symlink_to(victim / "data/chunk-000/episode_000000.parquet")
+    with pytest.raises(ExportError, match="outside"):
+        export_lerobot(src, tmp_path / "out", records(LENGTHS))
+    assert tree_digest(victim) == before
+
+
+def test_v3_data_file_symlinked_outside_is_refused(tmp_path):
+    other = make_v3(tmp_path / "other", LENGTHS)
+    src = make_v3(tmp_path / "ds", LENGTHS)
+    f = sorted((src / "data").glob("chunk-*/file-*.parquet"))[0]
+    rel = f.relative_to(src)
+    f.unlink()
+    f.symlink_to(other / rel)
+    with pytest.raises(ExportError, match="outside"):
+        export_lerobot(src, tmp_path / "out", records(LENGTHS))
+
+
+@pytest.mark.parametrize("make", [make_v21, make_v3])
+def test_symlink_out_of_the_dataset_is_not_copied(tmp_path, make):
+    secret = tmp_path / "home" / ".ssh" / "id_ed25519"
+    secret.parent.mkdir(parents=True)
+    secret.write_text("PRIVATE KEY")
+    src = make(tmp_path / "ds", LENGTHS)
+    (src / "meta" / "notes.md").symlink_to(secret)
+    with pytest.raises(ExportError, match="symlink"):
+        export_lerobot(src, tmp_path / "out", records(LENGTHS))
+    leaked = [p for p in tmp_path.rglob("*") if p.is_file() and not p.is_symlink()
+              and p != secret and "PRIVATE KEY" in p.read_text(errors="ignore")]
+    assert leaked == []
+
+
+def test_symlinked_directory_out_of_the_dataset_is_refused(tmp_path):
+    outside = tmp_path / "home" / ".ssh"
+    outside.mkdir(parents=True)
+    (outside / "id_ed25519").write_text("PRIVATE KEY")
+    src = make_v21(tmp_path / "ds", LENGTHS)
+    (src / "extra").symlink_to(outside)
+    with pytest.raises(ExportError, match="symlink"):
+        export_lerobot(src, tmp_path / "out", records(LENGTHS))
+
+
+def test_symlink_inside_the_dataset_is_copied_as_a_file(tmp_path):
+    src = make_v21(tmp_path / "ds", LENGTHS)
+    (src / "NOTES.md").write_text("notes")
+    (src / "meta" / "notes.md").symlink_to(src / "NOTES.md")
+    export_lerobot(src, tmp_path / "out", records(LENGTHS))
+    p = tmp_path / "out" / "meta" / "notes.md"
+    assert not p.is_symlink() and p.read_text() == "notes"

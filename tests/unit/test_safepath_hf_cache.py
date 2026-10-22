@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import pytest
 
-from flora_deploy.media.safepath import UnsafePath, contain, is_within
+from flora_deploy.media.safepath import UnsafePath, _allowed_roots, contain, is_within
 
 
 def _cache(tmp_path, repo="datasets--org--data"):
@@ -51,3 +51,49 @@ def test_a_plain_directory_gets_no_extra_root(tmp_path):
     (root / "videos" / "ep.mp4").symlink_to(outside)
     with pytest.raises(UnsafePath):
         contain(root, "videos/ep.mp4")
+
+
+# --- review 12 F3: a shipped ``blobs`` symlink must not widen the allowed roots ---------------
+
+
+def _fake_repo(tmp_path, blobs_target):
+    secret = tmp_path / "secret" / "creds.txt"
+    secret.parent.mkdir(parents=True)
+    secret.write_text("TOP SECRET")
+    repo = tmp_path / "dl" / "datasets--evil"
+    snap = repo / "snapshots" / "r"
+    (snap / "videos").mkdir(parents=True)
+    (repo / "blobs").symlink_to(blobs_target(secret))
+    return snap, secret
+
+
+@pytest.mark.parametrize("target", [lambda s: "/", lambda s: s.parent],
+                         ids=["blobs->/", "blobs->secret-dir"])
+def test_symlinked_blobs_dir_is_not_an_allowed_root(tmp_path, target):
+    snap, secret = _fake_repo(tmp_path, target)
+    (snap / "videos" / "a.mp4").symlink_to(secret)
+    assert _allowed_roots(snap) == [snap.resolve()]
+    with pytest.raises(UnsafePath):
+        contain(snap, "videos/a.mp4")
+    assert not is_within(snap, secret)
+
+
+def test_blob_symlink_pointing_outside_is_refused(tmp_path):
+    snap, blob = _cache(tmp_path)
+    secret = tmp_path / "secret.txt"
+    secret.write_text("x")
+    link = blob.parent / "deadbeef"
+    link.symlink_to(secret)
+    (snap / "videos" / "ep3.mp4").symlink_to(link)
+    with pytest.raises(UnsafePath):
+        contain(snap, "videos/ep3.mp4")
+
+
+def test_only_flat_blob_files_count(tmp_path):
+    snap, blob = _cache(tmp_path)
+    nested = blob.parent / "sub" / "x"
+    nested.parent.mkdir()
+    nested.write_bytes(b"v")
+    (snap / "videos" / "ep4.mp4").symlink_to(nested)
+    with pytest.raises(UnsafePath):
+        contain(snap, "videos/ep4.mp4")

@@ -365,11 +365,29 @@ def compile_cache_state(kind: str, plugin: bool, root: Path | str = CACHE_MOUNT)
     return {"hashes": hashes, "complete": done, "warm": bool(done)}
 
 
+def check_segments_from(segments: dict | None, segments_from: dict | None) -> str | None:
+    """Why inline ``segments`` cannot be captioned (None: they can). Inline segments are a
+    deployed job's records; the caller must say which job and segment stage hash they came from
+    (``{"job_id", "segment_hash"}``, checked against the records by ``scripts/wave_h.py``), so a
+    result is never captioned from another job's segments without saying so (review 12 F5)."""
+    if not segments:
+        return None
+    sf = segments_from or {}
+    if not (isinstance(sf, dict) and sf.get("job_id") and sf.get("segment_hash")):
+        return ("inline segments without their provenance (segments_from: job_id and "
+                "segment_hash); refusing to caption segments of an unknown job")
+    return None
+
+
 def run_kind(kind: str, run_id: str, segments_rel: str = "",
              episodes: list[str] | None = None, gate_a: bool = True,
-             segments: dict | None = None) -> dict:
+             segments: dict | None = None, segments_from: dict | None = None) -> dict:
     """One lab call. ``segments`` (golden id -> NVIDIA segment rows, e.g. the deployed job's
-    records) takes precedence over ``segments_rel`` (a file on ``flora-golden``)."""
+    records) takes precedence over ``segments_rel`` (a file on ``flora-golden``); inline
+    segments need ``segments_from`` (:func:`check_segments_from`), echoed in the result."""
+    if why := check_segments_from(segments, segments_from):
+        return {"run": run_id, "kind": kind, "error": why, "no_evidence": True,
+                "segments_from": segments_from}
     from flora_deploy.engines.patches import dt_bias_fp32
     from flora_deploy.modal_app import warm
 
@@ -390,6 +408,7 @@ def run_kind(kind: str, run_id: str, segments_rel: str = "",
                    cache_env(kind, False))
     cache.commit()  # keep the baseline compile even if the plugin child hits a deadline
     result: dict[str, Any] = {"run": run_id, "kind": kind, "baseline": a,
+                              "segments_from": dict(segments_from) if segments else None,
                               "compile_cache": caches,
                               "prefetch": (s.as_json() if (s := prefetch.wait(0)) else None)}
     if "error" in a:
@@ -428,16 +447,19 @@ _GPU_VOLUMES = {str(WEIGHTS_MOUNT): weights, str(GOLDEN_MOUNT): golden, str(CACH
 @app.function(image=vllm_image(), gpu=GPUS["tempseg"], cpu=CPU,
               memory=MEM_GIB["tempseg"] * 1024, timeout=TIMEOUT_S, volumes=_GPU_VOLUMES, env=ENV)
 def run_tempseg(run_id: str, segments_rel: str = "", episodes: list[str] | None = None,
-                gate_a: bool = True, segments: dict | None = None) -> dict:
-    return run_kind("tempseg", run_id, segments_rel, episodes, gate_a, segments)
+                gate_a: bool = True, segments: dict | None = None,
+                segments_from: dict | None = None) -> dict:
+    return run_kind("tempseg", run_id, segments_rel, episodes, gate_a, segments, segments_from)
 
 
 @app.function(image=vllm_image(), gpu=GPUS["captioner"], cpu=CPU,
               memory=MEM_GIB["captioner"] * 1024, timeout=TIMEOUT_S, volumes=_GPU_VOLUMES,
               env=ENV)
 def run_captioner(run_id: str, segments_rel: str = "", episodes: list[str] | None = None,
-                  gate_a: bool = True, segments: dict | None = None) -> dict:
-    return run_kind("captioner", run_id, segments_rel, episodes, gate_a, segments)
+                  gate_a: bool = True, segments: dict | None = None,
+                  segments_from: dict | None = None) -> dict:
+    return run_kind("captioner", run_id, segments_rel, episodes, gate_a, segments,
+                    segments_from)
 
 
 @app.local_entrypoint()

@@ -127,7 +127,9 @@ def test_run_kind_passes_inline_segments_and_commits_after_each_engine(fake_lab,
                        "gate_a": gate, "l0": [{"ids_equal": True}]}
     box["plugin"] = {"gate_a": gate}
     seg = _segments()
-    res = lab.run_kind("captioner", "r", episodes=list(wh.EPISODES), segments=seg)
+    res = lab.run_kind("captioner", "r", episodes=list(wh.EPISODES), segments=seg,
+                       segments_from=BOUND)
+    assert res["segments_from"] == BOUND
     assert [c["plugin"] for c in calls] == [False, True]
     assert all(c["segments"] == seg for c in calls)
     assert res["gate_a"]["requests"] == 1 and "error" not in res
@@ -185,12 +187,17 @@ def test_deployed_segment_records_map_back_to_golden_ids():
 # --- run_lab ------------------------------------------------------------------------------------
 
 
+SEG_HASH = "a" * 64
+BOUND = {"job_id": "job-d", "segment_hash": SEG_HASH}
+
+
 def _done_state() -> wh.State:
     st = wh.State("r", 0.0, "x")
     b = st.step("balanced")
     b.status = "failed"  # the 2026-10-22 state: the job finished, the inline lab failed
     b.result = {"episodes": list(wh.EPISODES), "kinds": {},
-                "jobs": {wh.JOB: {"state": "done", "job_id": "job-d", "records": {}}}}
+                "jobs": {wh.JOB: {"state": "done", "job_id": "job-d", "records": {},
+                                  "stage_hashes": {"segment": SEG_HASH, "caption": "c"}}}}
     st.step("lab").attempts.append(wh.Attempt(0.0))
     return st
 
@@ -235,6 +242,7 @@ def lab_ctx(monkeypatch, tmp_path):
                  global_cap=10.0)
     recs = lambda ctx, job: [SimpleNamespace(  # noqa: E731
         episode_id=h0.episode_id(g), stage="segment",
+        provenance=SimpleNamespace(config_hash=SEG_HASH),
         segments=(SimpleNamespace(start_s=0.0, end_s=1.0, nv_metadata={}),))
         for g in wh.EPISODES]
     return ctx, recs
@@ -369,7 +377,8 @@ def test_lab_reuses_a_good_saved_kind_and_runs_only_the_rest(lab_ctx):
     assert res["kinds"]["tempseg"]["reused"] and res["kinds"]["tempseg"]["usd"] == 0.0
     assert res["kinds"]["tempseg"]["l0"]  # its evidence is carried into the step result
     # everything saved: nothing starts, no app is noted
-    wh.lab_result_path("captioner").write_text(json.dumps(_saved("captioner")))
+    wh.lab_result_path("captioner").write_text(json.dumps(_saved("captioner",
+                                                                segments_from=BOUND)))
     ctx.st.step("lab").attempts.append(wh.Attempt(1.0))
     fake2 = _Lab({})
     again = wh.run_lab(ctx, missing=lambda p: [], records=recs, lab_module=fake2)
@@ -508,3 +517,99 @@ def test_shipped_balanced_startups_are_recorded_cold_and_priced_as_measured():
         RateTable.from_dict({"schema": 1, "startup": [{
             "preset": "x", "kind": "*", "startup_s": 1, "uncertainty": 0, "status": "measured",
             "provenance": "p", "date": "d", "compile_cache": "lukewarm"}]}, source="t")
+
+
+# --- review 12 F5: the Captioner captions (d)'s segments, bound by job id and stage hash -------
+
+
+def test_lab_refuses_inline_segments_without_their_provenance(fake_lab):
+    box, calls, _vols = fake_lab
+    for sf in (None, {}, {"job_id": "job-d"}, {"segment_hash": SEG_HASH}):
+        res = lab.run_kind("captioner", "r", episodes=list(wh.EPISODES), segments=_segments(),
+                           segments_from=sf)
+        assert "provenance" in res["error"] and res["no_evidence"]
+    assert calls == []  # no engine was built
+
+
+def test_lab_refuses_segment_records_of_another_job_or_stage_hash(lab_ctx):
+    ctx, recs = lab_ctx
+
+    def other(c, j):
+        out = recs(c, j)
+        out[2] = SimpleNamespace(**{**vars(out[2]),
+                                    "provenance": SimpleNamespace(config_hash="b" * 64)})
+        return out
+
+    fake = _Lab({})
+    res = wh.run_lab(ctx, missing=lambda p: [], records=other, lab_module=fake)
+    assert not res["ok"] and fake.spawned == [] and res["tracked_usd"] == 0.0
+    assert "not from (d)'s job job-d" in res["error"] and "bbbbbbbbbbbb" in res["error"]
+
+    def unknown(c, j):  # the stage hash (d) ran with is unknown: refused, before any container
+        raise RuntimeError("(d)'s job job-d has no segment stage hash")
+
+    res = wh.run_lab(ctx, missing=lambda p: [], records=recs, binding=unknown, lab_module=fake)
+    assert not res["ok"] and fake.spawned == [] and "no segment stage hash" in res["error"]
+
+
+def test_lab_passes_the_binding_to_the_captioner_only(lab_ctx):
+    ctx, recs = lab_ctx
+    fake = _Lab({"tempseg": _good("tempseg"), "captioner": _good("captioner")})
+    res = wh.run_lab(ctx, missing=lambda p: [], records=recs, lab_module=fake)
+    (_k1, a1), (_k2, a2) = fake.spawned
+    assert a1[5] is None and a2[5] == BOUND and res["segments_from"] == BOUND
+
+
+def test_a_saved_captioner_result_of_another_job_is_not_reused(tmp_path):
+    p = tmp_path / "balanced-captioner.json"
+    p.write_text(json.dumps(_saved("captioner", segments_from=BOUND)))
+    assert wh.reusable_lab_result("captioner", "r", wh.EPISODES, path=p, segments_from=BOUND)
+    other = {**BOUND, "job_id": "job-x"}
+    assert wh.reusable_lab_result("captioner", "r", wh.EPISODES, path=p,
+                                  segments_from=other) is None
+    assert wh.reusable_lab_result("captioner", "r", wh.EPISODES, path=p) is None
+    p.write_text(json.dumps(_saved("captioner")))  # no binding saved (a pre-fix result)
+    assert wh.reusable_lab_result("captioner", "r", wh.EPISODES, path=p,
+                                  segments_from=BOUND) is None
+
+
+def test_segment_records_use_the_jsonl_only_when_it_names_d_s_job(lab_ctx, tmp_path,
+                                                                   monkeypatch):
+    from flora_deploy import sdk
+    from flora_deploy.records import Provenance, Segment, StageRecord
+
+    ctx, _ = lab_ctx
+    prov = Provenance(models={}, engine="e", preset="balanced", config_hash=SEG_HASH,
+                      logic_version="0", framework="f")
+    rec = StageRecord(uid="u", dataset="d", episode_id="e0", stage="segment", provenance=prov,
+                      certified=False, uncertified_reason="fake_models",
+                      segments=(Segment("s0", 0.0, 1.0),))
+    jsonl = tmp_path / "segment.jsonl"
+    jsonl.write_text(rec.to_json() + "\n")
+    job = {"job_id": "job-d", "records": {"segment": str(jsonl)}}
+    reads = []
+    monkeypatch.setattr(sdk, "open_job", lambda jid, store: reads.append(jid) or
+                        SimpleNamespace(results=lambda stage: ["from-store"]))
+    assert wh._segment_records(ctx, job) == ["from-store"]  # no sidecar: the store
+    side = wh.records_source_path(jsonl)
+    side.write_text(json.dumps({"job_id": "job-other"}))
+    assert wh._segment_records(ctx, job) == ["from-store"]  # another job's export
+    side.write_text(json.dumps({"job_id": "job-d"}))
+    assert [r.episode_id for r in wh._segment_records(ctx, job)] == ["e0"]
+    assert reads == ["job-d", "job-d"]
+
+
+def test_segment_binding_from_the_state_else_the_store(lab_ctx, monkeypatch):
+    from flora_deploy import sdk
+
+    ctx, _ = lab_ctx
+    job = ctx.st.step("balanced").result["jobs"][wh.JOB]
+    assert wh.segment_binding(ctx, job) == BOUND
+    monkeypatch.setattr(sdk, "open_job", lambda jid, store: SimpleNamespace(
+        settings=SimpleNamespace(stage_hashes={"segment": "c" * 64})))
+    old = {"job_id": "job-d"}  # a state from before _run_job recorded the hashes
+    assert wh.segment_binding(ctx, old) == {"job_id": "job-d", "segment_hash": "c" * 64}
+    monkeypatch.setattr(sdk, "open_job", lambda jid, store: SimpleNamespace(
+        settings=SimpleNamespace(stage_hashes={})))
+    with pytest.raises(RuntimeError, match="no segment stage hash"):
+        wh.segment_binding(ctx, old)

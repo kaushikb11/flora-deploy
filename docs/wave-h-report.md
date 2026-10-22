@@ -12,16 +12,19 @@ Tracked: container-seconds x list $/h from `flora report` (the lab: its wall tim
 
 | step | status | attempts | cap | tracked | charged | billed | billing |
 |---|---|---|---|---|---|---|---|
-| 0. TempSeg merger v2 build + equivalence (CPU + L40S), then pin | done | 4 | $0.75 | $0.34 | $0.34 | $0.29 | partial: read 2157 s after the step; final after 2026-10-22T03:04:42Z |
-| a. balanced preflight (CPU) | done | 1 | $0.05 | $0.00 | $0.00 | $0.00 | partial: read 2138 s after the step; final after 2026-10-22T03:05:01Z |
-| d. balanced via flora deploy/run (L40S + H100) + lab L0 / Gate A | failed | 1 | $3.70 | $2.86 | $2.86 | $0.00 | partial: read 2 s after the step; final after 2026-10-22T03:40:37Z |
+| 0. TempSeg merger v2 build + equivalence (CPU + L40S), then pin | done | 4 | $0.75 | $0.34 | $0.34 | $0.31 | reconciled |
+| a. balanced preflight (CPU) | done | 1 | $0.05 | $0.00 | $0.00 | $0.00 | reconciled |
+| d. balanced via flora deploy/run (L40S + H100) | done | 1 | $2.30 | $2.86 | $2.86 | $1.31 | MISMATCH: billed -1.55 vs tracked |
+| d2. balanced lab L0 / Gate A on (d)'s job (L40S, then H100) | failed | 1 | $2.35 | $0.72 | $2.35 | - | shared app: global total only |
 
-Total: **$3.20** of the $4.40 global cap (billed total $0.29, billing read 2026-10-22T02:40:39Z).
+Total: **$5.55** of the $5.70 global cap: the larger of charged and billed, the figure the runbook gates on.
+
+- tracked $3.92: container-seconds x list $/h of every attempt;
+- charged $5.55: tracked, with a killed or unreported attempt at its budget until billing is read 3600 s after it ($1.63 over tracked);
+- billed $2.88: Modal's billed delta of every app (read 2026-10-22T05:23:32Z).
 
 Warnings:
-- tempseg: billing was read 2157 s after the step (< 3600 s lag): billed $0.29 vs tracked $0.34 is partial; re-run the runbook's billing read after 2026-10-22T03:04:42Z, then this script
-- preflight: billing was read 2138 s after the step (< 3600 s lag): billed $0.00 vs tracked $0.00 is partial; re-run the runbook's billing read after 2026-10-22T03:05:01Z, then this script
-- balanced: billing was read 2 s after the step (< 3600 s lag): billed $0.00 vs tracked $2.86 is partial; re-run the runbook's billing read after 2026-10-22T03:40:37Z, then this script
+- balanced: billed $1.31 vs tracked $2.86 after the billing lag (-1.55); the list prices or the receipts are off
 
 ## Measured rates
 
@@ -42,28 +45,30 @@ $/video-h = 3600 x sum over the preset's kinds of (container-s per video-s x poo
 pool $/s  = (GPU $/h + cores x core $/h + memory GiB x GiB $/h) / 3600   (jobs.budget pinned list prices)
 ```
 
-| preset | terms | $/video-h | this run (cold starts, idle, slack) |
+| preset | terms | $/video-h (busy) | this run (cold starts, idle, slack) |
 |---|---|---|---|
 | exact | not measured | - | - |
-| balanced | 3600 x 0.367 x $2.712/h / 3600 (segment, L40S) + 3600 x 0.906 x $5.096/h / 3600 (caption, H100) | **$5.62** ±50% | $33.37 |
+| balanced | 3600 x 0.367 x $2.712/h / 3600 (segment, L40S) + 3600 x 0.906 x $5.096/h / 3600 (caption, H100) | **$5.61** ±50% | $33.37 |
+
+$/video-h (busy) counts busy container-seconds only: steady state at scale, without cold starts or idle time until scale-down. This run's figure is everything its jobs spent; without the cold starts, `balanced` was $11.72/video-h (idle kept). One small job (n=1): the band is a nominal convention, not a statistical interval.
 
 ## L0 (input parity: vLLM vs NVIDIA's HF processor)
 
 | kind | status | requests | ids equal | render ids equal | grid equal |
 |---|---|---|---|---|---|
-| tempseg | missing | - | - | - | - |
+| tempseg | pass | 6 | 6 | 6 | 6 |
 | captioner | missing | - | - | - | - |
 
 ## Gate A (FP32 `dt_bias` plugin vs BF16)
 
 | kind | requests | greedy identical | positions | max |Δlogit| | mean |Δlogit| |
 |---|---|---|---|---|---|
-| tempseg | 0 | 0 | 0 | None | None |
+| tempseg | 6 | 5 | 422 | 0.375 | 0.033765 |
 | captioner | not measured | - | - | - | - |
 
 Rule (`docs/balanced-engines.md`): turn the plugin on only if its drift exceeds the oracle's noise. H-lite does not measure the oracle's logit noise, so the reference is the runbook's Gate A bound, max |Δlogit| <= 0.5.
 
-**Recommendation: plugin off** (Gate A was not measured; keep the default (off)).
+**Recommendation: plugin off** (max |Δlogit| 0.375 is within the reference 0.5 for tempseg (captioner not measured)).
 
 ## Certificate
 
