@@ -47,6 +47,7 @@ import pyarrow.parquet as pq
 
 import flora_deploy
 from flora_deploy.jobs.types import episode_uid
+from flora_deploy.media.safepath import UnsafePath, contain, format_template, is_within
 from flora_deploy.records import StageRecord
 
 EXPORT_SCHEMA = "flora_lerobot_export_v1"
@@ -247,6 +248,30 @@ def _rel(path: Path, root: Path) -> str:
     return path.relative_to(root).as_posix()
 
 
+def _src(root: Path, rel: str) -> Path:
+    """A source dataset file ``root / rel``, refused (ExportError) when it resolves outside the
+    dataset (a symlink out of it; review 12 F1/F4). The dataset's metadata is untrusted."""
+    try:
+        return contain(root, rel)
+    except UnsafePath as e:
+        raise ExportError(f"{root}: {e}") from None
+
+
+def _within(root: Path, f: Path) -> Path:
+    """``f`` (found under ``root`` by a glob), refused when it resolves outside the dataset."""
+    if not is_within(root, f):
+        raise ExportError(f"{root}: {_rel(f, root)} resolves outside the dataset")
+    return f
+
+
+def _dst(tmp: Path, rel: str) -> Path:
+    """The export file ``tmp / rel``; ``rel`` must stay inside the export directory."""
+    try:
+        return contain(tmp, rel)
+    except UnsafePath as e:
+        raise ExportError(f"refusing to write outside the export: {e}") from None
+
+
 class _Layout:
     """What differs between v2.1 and v3.0: where episode rows and data files are."""
 
@@ -289,10 +314,11 @@ class _V21(_Layout):
         path = self.root / "meta" / "episodes.jsonl"
         if not path.is_file():
             raise ExportError(f"{self.root}: missing meta/episodes.jsonl")
+        path = _src(self.root, "meta/episodes.jsonl")
         return [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines() if x.strip()]
 
     def episode_files(self) -> list[Path]:
-        return [self.root / "meta" / "episodes.jsonl"]
+        return [_src(self.root, "meta/episodes.jsonl")]
 
     def data_files(self) -> list[Path]:
         tpl = self.info.get("data_path")
@@ -302,11 +328,16 @@ class _V21(_Layout):
         out = []
         for row in self.episode_rows():
             e = int(row["episode_index"])
-            p = self.root / tpl.format(episode_chunk=e // size, episode_index=e)
+            try:
+                rel = format_template(tpl, what="data_path", episode_chunk=e // size,
+                                      episode_index=e)
+            except UnsafePath as err:
+                raise ExportError(f"{self.root}: {err}") from None
+            p = self.root / rel
             if not p.is_file():
                 raise ExportError(f"{self.root}: episode {e}: missing data file "
                                   f"{_rel(p, self.root)}")
-            out.append(p)
+            out.append(_src(self.root, rel))
         return out
 
     def write_episodes(self, out_root, labels, fields):
@@ -314,7 +345,7 @@ class _V21(_Layout):
         for row in self.episode_rows():
             row.update(_episode_values(labels.get(int(row["episode_index"])), fields))
             lines.append(json.dumps(row, ensure_ascii=False, allow_nan=False))
-        (out_root / "meta" / "episodes.jsonl").write_text("\n".join(lines) + "\n",
+        _dst(out_root, "meta/episodes.jsonl").write_text("\n".join(lines) + "\n",
                                                           encoding="utf-8")
 
 
@@ -328,7 +359,7 @@ class _V3(_Layout):
         files = sorted({*d.glob("chunk-*/file-*.parquet"), *d.glob("chunk-*/file_*.parquet")})
         if not files:
             raise ExportError(f"{self.root}: no meta/episodes/chunk-*/file-*.parquet")
-        return files
+        return [_within(self.root, f) for f in files]
 
     def episode_rows(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -344,7 +375,7 @@ class _V3(_Layout):
         files = sorted({*d.glob("chunk-*/file-*.parquet"), *d.glob("chunk-*/file_*.parquet")})
         if not files:
             raise ExportError(f"{self.root}: no data/chunk-*/file-*.parquet")
-        return files
+        return [_within(self.root, f) for f in files]
 
     def write_episodes(self, out_root, labels, fields):
         for f in self.episode_files():
@@ -357,7 +388,7 @@ class _V3(_Layout):
                 vals = [_episode_values(labels.get(int(e)), fields)[name] for e in idx]
                 table = table.append_column(pa.field(name, EPISODE_FIELDS[name][0]),
                                             pa.array(vals, type=EPISODE_FIELDS[name][0]))
-            dst = out_root / _rel(f, self.root)
+            dst = _dst(out_root, _rel(f, self.root))
             dst.parent.mkdir(parents=True, exist_ok=True)
             pq.write_table(table, dst, compression=_compression(pq.ParquetFile(f)))
 
@@ -366,7 +397,7 @@ def open_layout(root: Path) -> _Layout:
     info_path = root / "meta" / "info.json"
     if not info_path.is_file():
         raise ExportError(f"{root}: not a LeRobot dataset (no meta/info.json)")
-    info = _load_json(info_path)
+    info = _load_json(_src(root, "meta/info.json"))
     version = str(info.get("codebase_version", ""))
     if version.startswith("v3."):
         return _V3(root, info)
@@ -489,8 +520,14 @@ def _check_out(source: Path, out: Path) -> None:
 
 def _ignore(source: Path, skip: set[str], include_videos: bool) -> Callable[[str, list[str]],
                                                                             set[str]]:
+    """``copytree``'s ``ignore``: drops ``skip`` (files the export rewrites), caches and (unless
+    ``include_videos``) ``videos/``, and refuses (ExportError) any symlink that resolves outside
+    the source dataset (review 12 F4: a ``meta/notes.md -> ~/.ssh/id_ed25519`` would otherwise be
+    copied into the export and pushed). Links into the dataset itself, or into its own HF cache
+    ``blobs/`` (``media.safepath``), are copied as the file they name."""
     def ignore(d: str, names: list[str]) -> set[str]:
-        rel = Path(d).resolve().relative_to(source.resolve())
+        rel = Path(d).relative_to(source) if Path(d).is_relative_to(source) else \
+            Path(d).resolve().relative_to(source.resolve())
         out = set()
         for n in names:
             r = (rel / n).as_posix()
@@ -498,6 +535,9 @@ def _ignore(source: Path, skip: set[str], include_videos: bool) -> Callable[[str
                 out.add(n)
             elif r == "videos" and not include_videos:
                 out.add(n)
+            elif (Path(d) / n).is_symlink() and not is_within(source, Path(d) / n):
+                raise ExportError(f"{source}: {r} is a symlink that resolves outside the "
+                                  "dataset; refusing to copy it into the export")
         return out
     return ignore
 
@@ -569,7 +609,7 @@ def export_lerobot(
         shutil.copytree(source, tmp, ignore=_ignore(source, rewritten, include_videos))
         stats = _FrameStats()
         for f in data_files:
-            _rewrite_data(f, tmp / _rel(f, source), labels, columns, stats)
+            _rewrite_data(f, _dst(tmp, _rel(f, source)), labels, columns, stats)
         layout.write_episodes(tmp, labels, fields)
 
         # Report: episodes with a missing label, and frames dense alignment left NaN.

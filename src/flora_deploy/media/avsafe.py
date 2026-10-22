@@ -12,6 +12,9 @@ container (format-context) options only, so codec options and decode semantics a
 * ``enable_drefs=0``: the mov demuxer's external data references stay off (FFmpeg's default,
   pinned here).
 
+Anything else (Matroska ``.mkv``, WebM ``.webm``, a playlist named ``.mp4``) is refused with
+:class:`UnsupportedContainer` (``docs/media-notes.md``, "Containers").
+
 Verified against the locked PyAV 16.0.1 / FFmpeg 8.0 (``tests/unit/test_untrusted_inputs.py``):
 an ``ffconcat`` or HLS playlist named ``.mp4`` and the ``concat:`` / ``http:`` protocols are
 refused. NVIDIA's own code (``batch_utils``) opens the videos we hand it with its own
@@ -34,9 +37,39 @@ INPUT_CONTAINER_OPTIONS: dict[str, str] = {
 }
 
 
+# ISO base media (MP4/MOV) top-level box types: bytes 4..8 of a file the mov demuxer reads
+_ISO_BOXES = frozenset({b"ftyp", b"moov", b"mdat", b"free", b"skip", b"wide", b"pnot", b"styp",
+                        b"sidx", b"moof", b"uuid"})
+
+
+class UnsupportedContainer(ValueError):
+    """The input is not an MP4/MOV file (e.g. Matroska ``.mkv``, WebM ``.webm``): the decoder only
+    opens the ``mov`` demuxer's containers (``format_whitelist``)."""
+
+
 def open_input(path: str | os.PathLike[str], *, options: dict[str, str] | None = None,
                **kwargs: Any) -> Any:
     """``av.open(path, "r", options=options, container_options=INPUT_CONTAINER_OPTIONS)``.
-    ``options`` (e.g. NVIDIA's ``err_detect``) apply to the container and codecs as before."""
-    return av.open(str(path), "r", options=options,
-                   container_options=dict(INPUT_CONTAINER_OPTIONS), **kwargs)
+    ``options`` (e.g. NVIDIA's ``err_detect``) apply to the container and codecs as before.
+
+    A local file that is not MP4/MOV raises :class:`UnsupportedContainer` ("unsupported
+    container (only MP4/MOV): <path>") instead of FFmpeg's ``[Errno 22] Invalid argument``
+    (review 12 F12); any other failure is FFmpeg's own error."""
+    try:
+        return av.open(str(path), "r", options=options,
+                       container_options=dict(INPUT_CONTAINER_OPTIONS), **kwargs)
+    except av.error.FFmpegError as e:
+        if not _looks_iso_bmff(path):
+            raise UnsupportedContainer(f"unsupported container (only MP4/MOV): {path}") from e
+        raise
+
+
+def _looks_iso_bmff(path: str | os.PathLike[str]) -> bool:
+    """Whether ``path`` is a readable local file whose first box is an MP4/MOV box. ``True`` when
+    it cannot be read (a URL, a missing file): FFmpeg's own error explains those."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8)
+    except (OSError, TypeError, ValueError):
+        return True
+    return len(head) == 8 and head[4:8] in _ISO_BOXES

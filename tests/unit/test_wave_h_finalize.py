@@ -240,7 +240,9 @@ def test_happy_path_updates_everything_consistently_and_is_idempotent(tmp_path, 
         assert head in rep
     seg_h = wh.pool_container("segment", "balanced").usd_per_h()
     cap_h = wh.pool_container("caption", "balanced").usd_per_h()
-    bal_cost = round(round(want_seg * seg_h, 2) + round(want_cap * cap_h, 2), 2)
+    # from the unrounded rates, rounded once (review 12 F9: not a sum of per-term cents)
+    exact_seg, exact_cap = (0.5 * 30.7 + 0.6 * 45.8) / 76.5, (1.4 * 30.7 + 1.0 * 45.8) / 76.5
+    bal_cost = round(exact_seg * seg_h + exact_cap * cap_h, 2)
     assert f"**${bal_cost:,.2f}**" in rep
     assert "3600 x sum over the preset's kinds" in rep
     assert "**Recommendation: plugin off**" in rep and "0.31 is within the reference 0.5" in rep
@@ -612,3 +614,63 @@ def test_global_cap_is_the_state_plans_cap_not_the_full_plans(tmp_path, capsys):
     assert "(plan balanced-only)" in out and "of $4.40" in out and "$6.50" not in out
     rep = (root / "docs/wave-h-report.md").read_text()
     assert "of the $4.40 global cap" in rep and "$6.50" not in rep
+
+
+# --- review 12 F8 / F9: rounding, Gate A without requests, the spend figures ------------------
+
+
+def test_usd_per_video_h_rounds_once_from_unrounded_rates():
+    # the 2026-10-22 run: 65.4 / 161.5 busy s over 178.2 video s gave $5.62 by summing cents
+    def m(kind, busy):
+        real = fin.Measurement("balanced", kind, "GPU", [("human", busy, 178.2)])
+        return SimpleNamespace(rate=real.rate, rate_exact=real.rate_exact, refusals=[],
+                               uncertainty=0.5, gpu="GPU")
+
+    ms = {("balanced", "segment"): m("segment", 65.4), ("balanced", "caption"): m("caption", 161.5)}
+    assert ms[("balanced", "segment")].rate == 0.367  # the rounded rate rates.json keeps
+    c = fin.usd_per_video_h(ms, "balanced")
+    seg_s = wh.pool_container("segment", "balanced").usd_per_s()
+    cap_s = wh.pool_container("caption", "balanced").usd_per_s()
+    want = 3600 * (65.4 / 178.2 * seg_s + 161.5 / 178.2 * cap_s)
+    assert c["usd_per_video_h"] == round(want, 2)
+    double = round(sum(round(3600 * r * p, 2) for r, p in ((0.367, seg_s), (0.906, cap_s))), 2)
+    if round(want, 2) != double:  # with today's prices: $5.61, not $5.62
+        assert c["usd_per_video_h"] != double
+
+
+def test_gate_a_without_requests_is_not_measured():
+    zero = {"gate_a": {"requests": 0, "greedy_identical": 0, "max_abs_dlogit": None,
+                       "mean_abs_dlogit": None}}
+    g = fin.gate_a({"tempseg": zero, "captioner": None})
+    assert g["kinds"] == {"tempseg": None, "captioner": None}
+    assert g["why"].startswith("Gate A was not measured")
+
+
+def test_run_cost_without_cold_starts():
+    st = wh.State("r", 0.0, "x")
+    st.step("balanced").result = {"jobs": {"human": {
+        "spend": 1.6516, "video_s": 178.2,
+        "containers": [{"seconds": 665.9, "startup_s": 300.5, "usd": 0.5016},
+                       {"seconds": 540.4, "startup_s": 325.0, "usd": 0.7649}]}}}
+    assert fin.run_usd_per_video_h(st, "balanced") == 33.37
+    assert fin.run_usd_per_video_h_after_startup(st, "balanced") == 11.72
+
+
+def test_report_spend_shows_tracked_charged_and_billed(tmp_path, capsys):
+    root = build(tmp_path)
+    st_path = root / "reports/wave-h/state.json"
+    st = wh.State.from_json(json.loads(st_path.read_text()))
+    lab = st.step("lab")
+    lab.status = "failed"  # a crashed attempt: charged at its budget until billing reads it
+    end = st.billed_at - 60  # billing has not caught up with it yet
+    lab.attempts.append(wh.Attempt(started=end - 600, finished=end, tracked_usd=0.72,
+                                   status="failed", budget_usd=2.35, report_error=True))
+    st_path.write_text(json.dumps(st.to_json()))
+    rc, out = run(root, "--write", capsys=capsys)
+    assert rc == 0, out
+    rep = (root / "docs/wave-h-report.md").read_text()
+    tracked = sum(s.tracked_usd for s in st.steps.values())
+    charged = sum(s.charged(st.billed_at) for s in st.steps.values())
+    assert f"Total: **${st.spent:,.2f}**" in rep
+    assert f"- tracked ${tracked:,.2f}" in rep and f"- charged ${charged:,.2f}" in rep
+    assert "over tracked" in rep and f"- billed ${st.billed_total:,.2f}" in rep

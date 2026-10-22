@@ -154,6 +154,9 @@ DURATION_HEADROOM = 0.10
 CAPS_USD = {"tempseg": 0.75, "preflight": 0.05, "exact_e2e": 3.30, "balanced": 2.30,
             "lab": 2.35, "certify": 0.0, "noise": 3.30}
 GLOBAL_CAP_USD = 6.50  # --plan full; balanced-only derives its own (plan_global_cap)
+# The most --global-cap may approve: the project's whole GPU budget (review 12 F7: ``inf`` once
+# turned every global check into a no-op).
+MAX_GLOBAL_CAP_USD = 50.0
 # Cold compile (image smoke, 2026-10-22): ``flora-cache`` holds no compile cache for
 # balanced/tempseg or balanced/captioner at the current image key, so (d)'s first L40S and H100
 # engine starts compile from scratch (torch.compile, Triton, CUDA graphs). The balanced startup
@@ -443,6 +446,33 @@ def plan_global_cap(plan: str, projections: Mapping[str, Projection],
     return max(derived, override) if override is not None else derived
 
 
+def check_global_cap(value: float, *, spent: float, derived: float) -> str | None:
+    """Why ``--global-cap value`` is refused (None: it is accepted). A finite amount, at most
+    :data:`MAX_GLOBAL_CAP_USD`, not below what was spent, and above the plan's derived cap (an
+    override only raises the cap; a lower one would have no effect)."""
+    if not math.isfinite(value) or value <= 0:
+        return f"--global-cap {value!r} is not a positive finite amount"
+    if value > MAX_GLOBAL_CAP_USD + 1e-9:
+        return (f"--global-cap ${value:.2f} is over the ${MAX_GLOBAL_CAP_USD:.2f} ceiling (the "
+                "project budget)")
+    if value < spent - 1e-9:
+        return f"--global-cap ${value:.2f} is below the ${spent:.2f} already spent"
+    if value < derived - 1e-9:
+        return (f"--global-cap ${value:.2f} is below the plan's derived cap ${derived:.2f}; an "
+                "override can only raise it")
+    return None
+
+
+def global_cap_label(st: State, plan: str, projections: Mapping[str, Projection]) -> str:
+    """How the plan's global cap in force (:func:`plan_global_cap`) came about."""
+    derived = plan_global_cap(plan, projections)
+    ov = st.override_for(plan)
+    if ov is not None and ov > derived + 1e-9:
+        return f"user-approved override for plan {plan}; derived ${derived:.2f}"
+    return ("the sum of the plan's upper projections, rounded up to $0.10" if plan != "full"
+            else "GLOBAL_CAP_USD")
+
+
 def honest_caps(projections: Mapping[str, Projection]) -> dict[str, float]:
     """Per step, the smallest cap (rounded up to 5 cents) its upper projection fits, and the
     global total of those (``"global"``)."""
@@ -538,6 +568,13 @@ class State:
     billed_total: float | None = None  # billed delta over every app seen so far
     billed_at: float | None = None  # when billing was last read
     cap_override: float | None = None  # a global cap the user approved (--global-cap)
+    # the plan that cap was approved for: it never carries over to another plan. ``None`` in a
+    # state from before the scope was saved: the default plan, the only one it was set on
+    cap_override_plan: str | None = None
+    # the global cap the last --yes-spend run gated its steps on, and its plan (what
+    # wave_h_finalize.py reports; review 12 F6)
+    gate_cap: float | None = None
+    gate_cap_plan: str | None = None
 
     def step(self, name: str) -> StepState:
         return self.steps.setdefault(name, StepState())
@@ -552,6 +589,12 @@ class State:
         tracked = sum(s.spent_at(self.billed_at) for s in self.steps.values())
         return round(max(tracked, self.billed_total or 0.0), 4)
 
+    def override_for(self, plan: str) -> float | None:
+        """The approved global cap override, if it was approved for ``plan``."""
+        if self.cap_override is None or (self.cap_override_plan or DEFAULT_PLAN) != plan:
+            return None
+        return self.cap_override
+
     def spent_outside(self, step: str) -> float:
         """Cumulative spend minus ``step``'s running attempt (in-step deadlines add their own)."""
         cur = self.step(step).current
@@ -562,7 +605,8 @@ class State:
         return {"run_id": self.run_id, "created": self.created,
                 "billing_since": self.billing_since, "billing_baseline": self.billing_baseline,
                 "billed_total": self.billed_total, "billed_at": self.billed_at,
-                "cap_override": self.cap_override,
+                "cap_override": self.cap_override, "cap_override_plan": self.cap_override_plan,
+                "gate_cap": self.gate_cap, "gate_cap_plan": self.gate_cap_plan,
                 "steps": {k: asdict(v) for k, v in self.steps.items()}}
 
     @classmethod
@@ -579,7 +623,8 @@ class State:
             steps[k] = StepState(**{**v, "attempts": atts})
         return cls(d["run_id"], d["created"], d["billing_since"],
                    dict(d.get("billing_baseline", {})), steps, d.get("billed_total"),
-                   d.get("billed_at"), d.get("cap_override"))
+                   d.get("billed_at"), d.get("cap_override"), d.get("cap_override_plan"),
+                   d.get("gate_cap"), d.get("gate_cap_plan"))
 
     def mark_killed(self) -> list[str]:
         """Attempts left ``running`` by a killed process: ``killed`` (charged their budget
@@ -1170,6 +1215,9 @@ def _run_job(ctx: Ctx, step: str, cfg: Path, job_id: str, *, determinism: str,
                                    global_cap=ctx.global_cap))
     out: dict[str, Any] = {"app": plan.app_name, "job_id": job_id, "deadline_s": round(deadline),
                            "budget_usd": round(budget, 4), "cfg": str(cfg),
+                           # what its records' provenance.config_hash must be (review 12 F5)
+                           "config_hash": plan.config_hash,
+                           "stage_hashes": dict(plan.stage_hashes),
                            "preset": c.preset, "records": record_paths(side)}
     if deadline < 60:
         out["state"] = "skipped"
@@ -1278,18 +1326,62 @@ def adopt_balanced_job(st: State) -> bool:
     return True
 
 
+def records_source_path(jsonl: Path | str) -> Path:
+    """The sidecar ``wave_h_finalize.py --fetch`` writes beside an exported record JSONL: which
+    job (and store) the records were exported from."""
+    return Path(f"{jsonl}.source.json")
+
+
+def segment_binding(ctx: Ctx, job: Mapping[str, Any]) -> dict[str, str]:
+    """``{"job_id", "segment_hash"}`` of (d)'s deployed job: the segment stage hash its segment
+    records carry as ``provenance.config_hash``. From the state (``_run_job`` records the plan's
+    ``stage_hashes``), else from the job's run spec in the store (a Volume read; no container).
+    Raises when neither has it: the lab never captions segments it cannot bind to (d)."""
+    sh = (job.get("stage_hashes") or {}).get("segment")
+    if not sh:
+        from flora_deploy import sdk
+
+        j = sdk.open_job(job["job_id"], store=store_uri(ctx.st))
+        sh = (j.settings.stage_hashes or {}).get("segment")
+    if not sh:
+        raise RuntimeError(f"(d)'s job {job['job_id']} has no segment stage hash")
+    return {"job_id": str(job["job_id"]), "segment_hash": str(sh)}
+
+
 def _segment_records(ctx: Ctx, job: Mapping[str, Any]) -> list[Any]:
-    """(d)'s segment records: the exported JSONL (``wave_h_finalize.py --fetch``) if present,
-    else read from the job store (a Volume read; no container)."""
+    """(d)'s segment records: the exported JSONL (``wave_h_finalize.py --fetch``) when its
+    sidecar (:func:`records_source_path`) names (d)'s job id, else read from the job store (a
+    Volume read; no container). The JSONL's fixed path names no job, so without the sidecar
+    match it may hold another job's records (review 12 F5)."""
     from flora_deploy.records import StageRecord
 
     path = Path((job.get("records") or {}).get("segment") or record_paths("balanced")["segment"])
-    if path.is_file():
+    try:
+        src = json.loads(records_source_path(path).read_text())
+    except (OSError, ValueError):
+        src = {}
+    if path.is_file() and isinstance(src, dict) and src.get("job_id") == job["job_id"]:
         return [StageRecord.from_json(line) for line in path.read_text().splitlines()
                 if line.strip()]
     from flora_deploy import sdk
 
     return list(sdk.open_job(job["job_id"], store=store_uri(ctx.st)).results("segment"))
+
+
+def segment_provenance_problems(records: Iterable[Any], episodes: Sequence[str],
+                                binding: Mapping[str, str]) -> list[str]:
+    """Why (d)'s segment records for ``episodes`` are not (d)'s: any segment record of those
+    episodes whose ``provenance.config_hash`` is not the job's segment stage hash (empty: all
+    of them are)."""
+    want = binding["segment_hash"]
+    eids = {h0.episode_id(g) for g in episodes}
+    bad = sorted({str(getattr(getattr(r, "provenance", None), "config_hash", None))
+                  for r in records if r.episode_id in eids and r.stage == "segment"
+                  and getattr(getattr(r, "provenance", None), "config_hash", None) != want})
+    if bad:
+        return [f"segment records are not from (d)'s job {binding['job_id']}: config_hash "
+                f"{[b[:12] for b in bad]} != its segment stage hash {want[:12]}"]
+    return []
 
 
 def deployed_segments(records: Iterable[Any], episodes: Sequence[str]) -> dict[str, list[dict]]:
@@ -1365,9 +1457,13 @@ def lab_result_path(kind: str) -> Path:
 
 
 def reusable_lab_result(kind: str, run_id: str, episodes: Sequence[str],
-                        path: Path | None = None) -> dict[str, Any] | None:
+                        path: Path | None = None, *,
+                        segments_from: Mapping[str, str] | None = None
+                        ) -> dict[str, Any] | None:
     """A saved lab result for ``kind`` a re-run can keep instead of paying for it again: same
-    run id and kind, (d)'s episodes, no error anywhere, L0 rows and Gate A requests."""
+    run id and kind, (d)'s episodes, no error anywhere, L0 rows and Gate A requests. A
+    Captioner result must also have captioned ``segments_from`` ((d)'s job id and segment stage
+    hash, :func:`segment_binding`); without a known binding it is never reused."""
     p = path or lab_result_path(kind)
     try:
         res = json.loads(p.read_text())
@@ -1382,15 +1478,22 @@ def reusable_lab_result(kind: str, run_id: str, episodes: Sequence[str],
           and bool(base.get("l0")) and int(gate.get("requests") or 0) > 0
           and list(base.get("episodes_requested") or ()) == list(episodes)
           and not (res.get("dtbias") or {}).get("error"))
+    if kind == "captioner":
+        ok = ok and segments_from is not None and res.get("segments_from") == dict(segments_from)
     return res if ok else None
 
 
 def lab_reuse(st: State) -> tuple[str, ...]:
     """The lab kinds whose saved result (d2) reuses (:func:`reusable_lab_result`)."""
-    eps = (st.steps.get("balanced") or StepState()).result.get("episodes") or ()
+    bal = (st.steps.get("balanced") or StepState()).result
+    eps = bal.get("episodes") or ()
     if not eps:
         return ()
-    return tuple(k for k in LAB if reusable_lab_result(k, st.run_id, eps) is not None)
+    job = (bal.get("jobs") or {}).get(JOB) or {}
+    sh = (job.get("stage_hashes") or {}).get("segment")
+    sf = {"job_id": str(job["job_id"]), "segment_hash": sh} if sh and job.get("job_id") else None
+    return tuple(k for k in LAB
+                 if reusable_lab_result(k, st.run_id, eps, segments_from=sf) is not None)
 
 
 def _lab_kind_summary(res: Mapping[str, Any], wall: float, usd: float) -> dict[str, Any]:
@@ -1408,6 +1511,7 @@ def _lab_kind_summary(res: Mapping[str, Any], wall: float, usd: float) -> dict[s
 
 def run_lab(ctx: Ctx, *, missing: Callable[[Iterable[str]], list[str]] | None = None,
             records: Callable[[Ctx, Mapping[str, Any]], list[Any]] | None = None,
+            binding: Callable[[Ctx, Mapping[str, Any]], dict[str, str]] | None = None,
             lab_module: Any = None) -> dict[str, Any]:
     """(d2): the lab's L0 + Gate A against (d)'s finished deployed job: (d)'s episodes, and
     (d)'s segment records for the Captioner (``--only lab`` retries it alone). Every
@@ -1425,16 +1529,19 @@ def run_lab(ctx: Ctx, *, missing: Callable[[Iterable[str]], list[str]] | None = 
                            "(run --only balanced first)")
     job = bal["jobs"][JOB]
     episodes = list(bal.get("episodes") or ())
+    bound: dict[str, str] | None = None
     try:
-        segments = deployed_segments((records or _segment_records)(ctx, job), episodes)
+        bound = (binding or segment_binding)(ctx, job)
+        recs = list((records or _segment_records)(ctx, job))
+        why = segment_provenance_problems(recs, episodes, bound)
+        segments = {} if why else deployed_segments(recs, episodes)
     except Exception as e:  # noqa: BLE001 - before any container: a precondition
         segments = {}
         why = [f"reading (d)'s segment records: {e!r}"]
-    else:
-        why = []
     why += lab_preconditions(ctx.manifest, episodes, segments,
                              missing=missing or golden_missing)
     out: dict[str, Any] = {"episodes": episodes, "job_id": job["job_id"], "kinds": {},
+                           "segments_from": bound,
                            "segments": {"source": "deployed job records",
                                         "episodes": len(segments),
                                         "rows": sum(len(v) for v in segments.values())}}
@@ -1450,7 +1557,7 @@ def run_lab(ctx: Ctx, *, missing: Callable[[Iterable[str]], list[str]] | None = 
         save_state(ctx.st, ctx.state_path)
 
     for kind in LAB:
-        saved = reusable_lab_result(kind, ctx.st.run_id, episodes)
+        saved = reusable_lab_result(kind, ctx.st.run_id, episodes, segments_from=bound)
         if saved is not None:
             out["kinds"][kind] = {**_lab_kind_summary(saved, 0.0, 0.0), "reused": True,
                                   "requests": ((saved.get("baseline") or {}).get("batcher")
@@ -1484,8 +1591,9 @@ def run_lab(ctx: Ctx, *, missing: Callable[[Iterable[str]], list[str]] | None = 
                                       "evidence": False, "error": NO_EVIDENCE}
                 continue
             t0 = time.time()
+            cap = kind == "captioner"
             call = fn.spawn(f"wave-h-{ctx.st.run_id}", "", episodes, True,
-                            segments if kind == "captioner" else None)
+                            segments if cap else None, bound if cap else None)
             try:
                 res = call.get(timeout=limit)
             except (TimeoutError, modal.exception.TimeoutError):
@@ -1607,7 +1715,7 @@ RUNNERS: dict[str, Callable[[Ctx], dict[str, Any]]] = {
 
 def render_report(st: State, projections: Mapping[str, Projection], *,
                   plan: str = DEFAULT_PLAN) -> str:
-    gcap = plan_global_cap(plan, projections, st.cap_override)
+    gcap = plan_global_cap(plan, projections, st.override_for(plan))
     lines = ["# Wave H-lite runbook summary", "",
              "Generated by `scripts/wave_h.py` (runbook: `docs/wave-h-runbook.md`). Numbers only;",
              "`docs/wave-h-report.md` is written by `scripts/wave_h_finalize.py`.", "",
@@ -1661,7 +1769,7 @@ def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
                manifest: Mapping[str, Any] | None = None, plan: str = DEFAULT_PLAN,
                only: str | None = None) -> None:
     steps = (only,) if only else PLANS[plan]
-    gcap = plan_global_cap(plan, projections, st.cap_override)
+    gcap = plan_global_cap(plan, projections, st.override_for(plan))
     out(f"Wave H-lite run {st.run_id} ({EMBODIMENT} only), plan {plan} "
         f"({' -> '.join(TITLES[s].split('.')[0] for s in steps)}): spent ${st.spent:.2f} of "
         f"${gcap:.2f} (billing read "
@@ -1704,8 +1812,7 @@ def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
             "engine, so a warm cache only makes it cheaper")
     nominal = sum(projections[s].usd for s in steps)
     upper = sum(projections[s].usd_upper for s in steps)
-    how = ("the sum of the plan's upper projections, rounded up to $0.10" if plan != "full"
-           else "GLOBAL_CAP_USD")
+    how = global_cap_label(st, plan, projections)
     out(f"  total: nominal ${nominal:.2f}, upper ${upper:.2f} (incl. {CLIENT_SLACK_S} s client "
         f"slack per app); global cap ${gcap:.2f} ({how})")
     honest = honest_caps({s: projections[s] for s in steps})
@@ -1734,8 +1841,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="balanced-only (default): steps 0, a, d; full: every step")
     ap.add_argument("--only", choices=STEPS, help="run just this step (if not done)")
     ap.add_argument("--global-cap", type=float, default=None, metavar="USD",
-                    help="raise the global cap to this (a cap the user approved; saved in the "
-                         "state; never below the plan's derived cap or what was spent)")
+                    help="raise this plan's global cap to this (a cap the user approved; "
+                         "saved in the state only with --yes-spend, for this --plan only; "
+                         f"finite, at most ${MAX_GLOBAL_CAP_USD:.0f}, never below the plan's "
+                         "derived cap or what was spent)")
     ap.add_argument("--offline", action="store_true",
                     help="dry run / report: price the golden selection's expected durations "
                          "instead of reading the manifest from the Volume")
@@ -1764,14 +1873,23 @@ def main(argv: list[str] | None = None) -> int:
         print(f"note: lab reuses the saved {', '.join(reuse)} result(s) (evidence, run "
               f"{st.run_id}, (d)'s episodes); only the rest runs")
     if args.global_cap is not None:
-        if args.global_cap < st.spent:
-            print(f"refused: --global-cap ${args.global_cap:.2f} is below the ${st.spent:.2f} "
-                  "already spent")
+        why = check_global_cap(args.global_cap, spent=st.spent,
+                               derived=plan_global_cap(args.plan, projections))
+        if why:
+            print(f"refused: {why}")
             return 2
-        st.cap_override = round(args.global_cap, 2)
-        save_state(st, args.state)
-        print(f"global cap raised to ${st.cap_override:.2f} (user-approved; saved in the state)")
-    gcap = plan_global_cap(args.plan, projections, st.cap_override)
+        if args.report:
+            print("note: --global-cap ignored by --report (the report shows the cap in force)")
+        else:
+            st.cap_override, st.cap_override_plan = round(args.global_cap, 2), args.plan
+            if args.yes_spend:  # only a run approves it; a dry run only shows its effect
+                save_state(st, args.state)
+                print(f"global cap for plan {args.plan} raised to ${st.cap_override:.2f} "
+                      "(user-approved; saved in the state)")
+            else:
+                print(f"dry run: would raise the global cap for plan {args.plan} to "
+                      f"${st.cap_override:.2f}; not saved (pass --yes-spend to approve it)")
+    gcap = plan_global_cap(args.plan, projections, st.override_for(args.plan))
     print_plan(st, projections, manifest=manifest, plan=args.plan, only=args.only)
     if args.report:
         REPORT.parent.mkdir(parents=True, exist_ok=True)
@@ -1793,6 +1911,7 @@ def main(argv: list[str] | None = None) -> int:
     for app in killed_apps:  # a killed run may have left them up
         subprocess.run(["modal", "app", "stop", "--yes", app], capture_output=True, text=True)
         print(f"stopped {app} (left by a killed run)")
+    st.gate_cap, st.gate_cap_plan = gcap, args.plan  # the cap this run gates on
     save_state(st, args.state)
     os.chdir(args.work)  # relative input.path is hashed against the cwd: plan where flora runs
     ctx = Ctx(st, manifest, args.work, state_path=args.state, global_cap=gcap)

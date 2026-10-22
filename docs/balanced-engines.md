@@ -285,10 +285,10 @@ whether its cache was warm.
 <!-- wave-h:results (owned by scripts/wave_h_finalize.py) -->
 | Item | Result (Wave H-lite, 2026-10-22; `docs/wave-h-report.md`) |
 |---|---|
-| L0 in-engine (ids, grid vs HF) | tempseg: missing; captioner: missing |
+| L0 in-engine (ids, grid vs HF) | tempseg: pass (6/6 ids, 6/6 grid); captioner: missing |
 | Segments / captions end to end on golden episodes | 1 `balanced` job(s) through `flora deploy` / `flora run` (run `102207184317`); certificate **deferred** |
-| Throughput, $/video-h vs `exact` | **$5.62/video-h** ±50%, list prices |
-| Gate A (dt_bias FP32 vs bf16) | tempseg: max None, mean None, greedy 0/0; recommendation: plugin **off** |
+| Throughput, $/video-h vs `exact` | **$5.61/video-h** ±50%, list prices |
+| Gate A (dt_bias FP32 vs bf16) | tempseg: max 0.375, mean 0.033765, greedy 5/6; recommendation: plugin **off** |
 <!-- /wave-h:results -->
 
 **Recommendation for Gate A until it is measured:** ship with the plugin **off**, the default.

@@ -35,29 +35,30 @@ _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}")
 
 
-def format_template(template: object, **fields: str | int) -> str:
+def format_template(template: object, /, *, what: str = "video_path", **fields: str | int) -> str:
     """``template.format(**fields)`` restricted to plain ``{name}`` / ``{name:03d}`` fields, then
-    :func:`check_relative`. Raises :class:`UnsafePath`."""
+    :func:`check_relative`. ``what`` names the template in errors (``video_path``,
+    ``data_path``). Raises :class:`UnsafePath`."""
     if not isinstance(template, str):
-        raise UnsafePath(f"video_path template {template!r} is not a string")
+        raise UnsafePath(f"{what} template {template!r} is not a string")
     try:
         parts = list(string.Formatter().parse(template))
     except ValueError as e:
-        raise UnsafePath(f"video_path template {template!r}: {e}") from None
+        raise UnsafePath(f"{what} template {template!r}: {e}") from None
     out = []
     for literal, name, spec, conversion in parts:
         out.append(literal)
         if name is None:
             continue
         if name not in fields:
-            raise UnsafePath(f"video_path template {template!r}: field {{{name}}} is not one of "
+            raise UnsafePath(f"{what} template {template!r}: field {{{name}}} is not one of "
                              f"{sorted(fields)}")
         if conversion is not None:
-            raise UnsafePath(f"video_path template {template!r}: conversion !{conversion}")
+            raise UnsafePath(f"{what} template {template!r}: conversion !{conversion}")
         value = fields[name]
         if spec:
             if not isinstance(value, int) or not _INT_SPEC.fullmatch(spec):
-                raise UnsafePath(f"video_path template {template!r}: format spec {spec!r} for "
+                raise UnsafePath(f"{what} template {template!r}: format spec {spec!r} for "
                                  f"{{{name}}}")
             out.append(format(value, spec))
         else:
@@ -80,35 +81,56 @@ def contain(root: str | os.PathLike[str], rel: str) -> Path:
     Raises UnsafePath."""
     root = Path(root)
     path = root / check_relative(rel)
-    if not _under_any(path.resolve(), _allowed_roots(root)):
+    if not _permitted(path.resolve(), root):
         raise UnsafePath(f"path {rel!r} resolves outside {root}")
     return path
 
 
 def is_within(root: str | os.PathLike[str], path: str | os.PathLike[str]) -> bool:
     """``path`` (absolute or relative to the cwd), symlinks resolved, is under ``root``."""
-    return _under_any(Path(path).resolve(), _allowed_roots(Path(root)))
+    return _permitted(Path(path).resolve(), Path(root))
+
+
+def _permitted(path: Path, root: Path) -> bool:
+    """``path`` (resolved) is under ``root`` resolved, or is a blob file directly in the HF cache
+    ``blobs/`` directory of the repo ``root`` is a snapshot of (:func:`_hf_blobs`)."""
+    if path.is_relative_to(root.resolve()):
+        return True
+    blobs = _hf_blobs(root)
+    return blobs is not None and path.parent == blobs
 
 
 def _allowed_roots(root: Path) -> list[Path]:
-    """``root`` resolved, plus, when ``root`` is (inside) a Hugging Face cache snapshot
+    """The directories :func:`contain` accepts files under: ``root`` resolved, plus its HF cache
+    repo's ``blobs/`` when :func:`_hf_blobs` finds one (only flat blob files in it count)."""
+    blobs = _hf_blobs(root)
+    return [root.resolve(), *([blobs] if blobs is not None else [])]
+
+
+def _hf_blobs(root: Path) -> Path | None:
+    """When ``root`` resolved is (inside) a Hugging Face cache snapshot
     (``<cache>/datasets--o--n/snapshots/<rev>/...``), that repo's own ``blobs/`` directory:
     snapshot files are symlinks into it, so a dataset fetched with ``huggingface-cli download``
-    (no ``--local-dir``) must still resolve. Only the same repo's blobs, never the wider cache."""
-    real = root.resolve()
-    roots = [real]
-    for base in (root.absolute(), real):
-        parts = base.parts
-        if "snapshots" in parts:
-            i = len(parts) - 1 - parts[::-1].index("snapshots")
-            repo = Path(*parts[:i])
-            if repo.name.startswith(("datasets--", "models--")) and (repo / "blobs").is_dir():
-                roots.append((repo / "blobs").resolve())
-    return roots
+    (no ``--local-dir``) must still resolve. Only the same repo's blobs, never the wider cache.
 
-
-def _under_any(path: Path, roots: list[Path]) -> bool:
-    return any(path.is_relative_to(r) for r in roots)
+    A dataset delivered as an archive can ship any tree, including ``blobs -> /`` (review 12 F3),
+    so ``blobs`` counts only when it is a real directory (not a symlink) physically inside the
+    repo directory, beside a real ``snapshots/`` directory. Both sides are resolved before they
+    are compared, and only the resolved path is examined (a lexical ``root`` that merely *looks*
+    like a snapshot adds nothing)."""
+    parts = root.resolve().parts
+    if "snapshots" not in parts:
+        return None
+    i = len(parts) - 1 - parts[::-1].index("snapshots")
+    repo = Path(*parts[:i])  # a prefix of a resolved path: no symlinks in it
+    if not repo.name.startswith(("datasets--", "models--")):
+        return None
+    blobs, snaps = repo / "blobs", repo / "snapshots"
+    if blobs.is_symlink() or not blobs.is_dir() or snaps.is_symlink() or not snaps.is_dir():
+        return None
+    if blobs.resolve() != blobs or blobs.parent != repo:
+        return None
+    return blobs
 
 
 def check_key(key: object) -> str:
