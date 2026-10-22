@@ -258,7 +258,7 @@ def max_gpus() -> int:
 
 
 STORE_VOLUME = {"real": "flora-scale", "fake-modal": "flora-scale-fake"}
-MEDIA_VOLUME = {"real": "flora-scale-media", "fake-modal": "flora-scale-fake-media"}
+MEDIA_VOLUME = {"fake-modal": "flora-scale-fake-media"}  # real stages on its store Volume
 
 # ---------------------------------------------------------------------------------------------
 # Timing constants (seconds)
@@ -919,7 +919,9 @@ def config_text(mode: str, *, project: str, run_id: str, budget_usd: float,
         d = DATASET
         inp = (f"  format: {d['format']}\n  repo: {d['repo']}\n  revision: {d['revision']}\n"
                f"  path: {d['path']}\n"
-               f"  stage_to: volume://{MEDIA_VOLUME[mode]}/{run_id}/wash\n")
+               # on the store Volume: Modal-side `flora index` mounts one Volume (the
+               # store's), and workers then share that mount for the media
+               f"  stage_to: volume://{STORE_VOLUME[mode]}/{run_id}/wash\n")
     elif mode == "fake-modal":
         inp = ("  format: mp4_dir\n  path: ./synthetic\n"
                f"  stage_to: volume://{MEDIA_VOLUME[mode]}-{run_id}/{run_id}/synthetic\n")

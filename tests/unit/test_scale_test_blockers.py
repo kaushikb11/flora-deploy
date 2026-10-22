@@ -152,3 +152,12 @@ def test_a_resumable_run_keeps_its_volumes(offline, deletes, tmp_path, monkeypat
     sc.main(["--mode", "fake-modal", "--yes-spend", "--state", str(tmp_path / "s.json"),
              "--work", str(tmp_path / "w")])
     assert _vol_deletes(deletes) == []
+
+
+def test_real_media_is_staged_on_the_store_volume():
+    """Modal-side `flora index` mounts only the store's Volume, so real media must be on it."""
+    import yaml
+
+    cfg = yaml.safe_load(sc.config_text("real", project="p", run_id="r1", budget_usd=1.0))
+    stage, sink = cfg["input"]["stage_to"], cfg["output"]["sink"]
+    assert stage.split("/")[2] == sink.split("/")[2] == sc.STORE_VOLUME["real"]
