@@ -281,7 +281,7 @@ def planned_changes(real: fin.Paths, staged: fin.Paths, docs: Mapping[Path, str]
 def leakage(changes: Sequence[Change], inp: cc.Inputs, root: Path) -> None:
     """Step 5: NVIDIA text and record strings in every file that changes."""
     run = cc.load_run(inp)
-    forbidden = cc.record_strings(run)
+    forbidden, ids = cc.record_strings(run), cc.record_ids(run)  # ids: before the hex allowance
     allowed = set().union(*(cc.our_strings(run, s, c) for s, (_, c) in run.certs.items())) \
         if run.certs else set()
     ref = cc.nv_reference(inp.nv_root)
@@ -296,7 +296,7 @@ def leakage(changes: Sequence[Change], inp: cc.Inputs, root: Path) -> None:
         name = c.rel(root)
         if ref is not None and (hit := ref.check(name, text)) is not None:
             hits.append(f"{name}: NVIDIA text (shingle ratio {hit.ratio:.2f})")
-        if n := cc._leaks(text, forbidden, allowed):
+        if n := cc._leaks(text, forbidden, allowed, ids):
             hits.append(f"{name}: {n} record string(s) (captions, ids, metadata)")
     if hits:
         raise Refused("leakage", hits)

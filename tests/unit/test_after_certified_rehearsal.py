@@ -247,6 +247,43 @@ def test_a_planted_leak_is_refused(human, capsys, monkeypatch, leak, why, where)
     assert leak not in out  # the report names the file, never the leaked text
 
 
+# Episode ids made only of hex digits (one only digits): the hash allowance must not let them
+# through, and the run's own hashes (sha256 of the uids, cert keys) must not trip the scan.
+HEX_IDS = (*(f"{i:x}" * 16 for i in range(10, 16)), *(f"{i}{i}9f3c0a7e4b2d1" for i in range(5)),
+           "202610229876")
+HEX_RUN = R.Options(episodes=HEX_IDS, noise=HEX_IDS[:6])
+
+
+def test_a_hex_id_run_flips_cleanly(tmp_path, capsys):
+    f = A.build(tmp_path, HEX_RUN)
+    assert all(ac.cc._SAFE.match(e) for e in HEX_IDS)
+    assert run(f, "--write") == ac.OK, capsys.readouterr().out
+    assert "leakage scan clean" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("leak", [HEX_IDS[7], HEX_IDS[-1], R.uid(HEX_IDS[0])])
+@pytest.mark.parametrize("where", ["limitations", "certificate"])
+def test_a_planted_hex_id_is_refused(tmp_path, capsys, monkeypatch, leak, where):
+    f = A.build(tmp_path, HEX_RUN)
+    if where == "limitations":
+        real = limitations_status.block_certification
+        monkeypatch.setattr(limitations_status, "block_certification",
+                            lambda d: real(d) + f"\nSlowest episode: {leak}.\n")
+        name = "docs/limitations.md"
+    else:
+        real_leakage = ac.leakage
+        name = f"{A.CERT_REL.as_posix()}/notes.json"
+        extra = ac.Change(f.root / name, None, f'{{"slowest": "{leak}"}}\n'.encode())
+        monkeypatch.setattr(ac, "leakage", lambda changes, inp, root: real_leakage(
+            [*changes, extra], inp, root))
+    before = snapshot(f)
+    assert run(f, "--write") == ac.FAILED
+    out = capsys.readouterr().out
+    assert snapshot(f) == before
+    assert "Failed at **leakage**" in out and f"{name}: " in out and "record string" in out
+    assert leak not in out
+
+
 # ---------------------------------------------------------------------------------------------
 # Nothing is written outside the fake repository and the temp directory
 
