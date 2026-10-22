@@ -499,8 +499,14 @@ def check_apps(env: Env) -> Check:
         apps = json.loads(r.out) if r.rc == 0 else None
     except ValueError:
         apps = None
-    if apps is None:
+    if not isinstance(apps, list) or not all(isinstance(a, dict) for a in apps):
         return Check(name, FAIL, f"modal app list failed: {_tail(r)}", "check `modal token`")
+    # modal prints the table's column titles ("App ID", "Description", "State"): snake-case them
+    apps = [{re.sub(r"[^a-z0-9]+", "_", str(k).strip().lower()).strip("_"): v
+             for k, v in a.items()} for a in apps]
+    if any(not a.get("app_id") for a in apps):
+        return Check(name, FAIL, f"modal app list --json: unreadable rows: {_tail(r)}",
+                     "the output format changed: update check_apps")
     live = [a for a in apps if str(a.get("description") or a.get("name") or "")
             .startswith("flora") and str(a.get("state", "")).lower() in LIVE_STATES]
     d = {"live": live}

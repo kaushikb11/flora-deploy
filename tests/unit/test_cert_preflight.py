@@ -375,6 +375,16 @@ def test_apps_stray_flora_app_only(tmp_path):
     assert cp.check_apps(env).status == cp.PASS
 
 
+def test_apps_reads_modals_real_column_keys(tmp_path):
+    apps = [{"App ID": "ap-x", "Description": "flora-st-run", "State": "deployed", "Tasks": "1",
+             "Created at": "2026-10-22 10:00:00+00:00", "Stopped at": None}]
+    env, _ = make_env(tmp_path, **{"modal app list": ok(json.dumps(apps))})
+    c = cp.check_apps(env)
+    assert c.status == cp.FAIL and "ap-x" in c.message and "flora-st-run" in c.message
+    env, _ = make_env(tmp_path, **{"modal app list": ok(json.dumps([{"Name": "flora-x"}]))})
+    assert cp.check_apps(env).status == cp.FAIL  # unreadable rows: never a silent pass
+
+
 # 7. lab ----------------------------------------------------------------------------------------
 
 def _lab_files(tmp_path, hashes):

@@ -13,7 +13,7 @@ Rules every implementation must honor:
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from typing import Protocol
 
 from flora_deploy.jobs.types import safe_key
@@ -24,6 +24,26 @@ class Store(Protocol):
     def get_bytes(self, path: str) -> bytes: ...
     def exists(self, path: str) -> bool: ...
     def list(self, prefix: str) -> Iterator[str]: ...
+
+
+def prefetch(store: Store, paths: Iterable[str]) -> int:
+    """Let ``store`` read ``paths`` ahead, in parallel, when it can (a ``ClientVolumeStore``: one
+    network round trip per file otherwise); a no-op for every other store. Returns the number
+    of files read ahead."""
+    fn = getattr(store, "prefetch", None)
+    return int(fn(paths)) if callable(fn) else 0
+
+
+def prefetch_areas(store: Store, root: str, hashes: Iterable[str], areas: Iterable[str]) -> int:
+    """:func:`prefetch` every file under ``<root>/<hash>/<area>/`` (a job's per-config and
+    per-stage areas: ``calls``, ``receipts``, ``attempts``, ``parts``, ...)."""
+    if not callable(getattr(store, "prefetch", None)):
+        return 0
+    paths: list[str] = []
+    for h in dict.fromkeys(hashes):
+        for area in areas:
+            paths += store.list(f"{root}/{safe_key(h)}/{area}/")
+    return prefetch(store, paths)
 
 
 def _fan(key: str) -> str:

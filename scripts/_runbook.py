@@ -15,6 +15,7 @@ import io
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -635,27 +636,60 @@ def utc(t: float | None) -> str:
 
 def _run(args: list[str], run: Callable[..., Any] | None) -> Any:
     try:
-        return (run or subprocess.run)(args, capture_output=True, text=True, timeout=120)
+        return (run or subprocess.run)(args, capture_output=True, text=True, timeout=120,
+                                       stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return None
 
 
+class AppListError(RuntimeError):
+    """``modal app list --json`` printed something this module cannot read as an app list."""
+
+
+def _app_key(k: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(k).strip().lower()).strip("_")
+
+
+def app_row(r: Mapping[str, Any]) -> dict[str, Any]:
+    """One ``modal app list --json`` row with snake-case keys: modal 1.x prints the table's
+    column titles (``"App ID"``, ``"Description"``, ``"State"``, ``"Tasks"``, ``"Created at"``,
+    ``"Stopped at"``) -> ``app_id``, ``description``, ``state``, ...; already snake-case keys
+    are kept."""
+    return {_app_key(k): v for k, v in r.items()}
+
+
+def parse_app_list(text: str) -> list[dict[str, Any]]:
+    """``modal app list --json`` output -> rows (:func:`app_row`). Raises :class:`AppListError`
+    unless it is a JSON list of objects that each carry an app id: an app list read as empty
+    would stop nothing and still report success."""
+    try:
+        rows = json.loads(text)
+    except (TypeError, ValueError) as e:
+        raise AppListError(f"modal app list --json: not JSON ({e}): {str(text)[:200]!r}") from e
+    if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+        raise AppListError(f"modal app list --json: not a list of objects: {str(text)[:200]!r}")
+    out = [app_row(r) for r in rows]
+    for raw, r in zip(rows, out, strict=True):
+        if not r.get("app_id"):
+            raise AppListError(f"modal app list --json: a row without an app id (keys "
+                               f"{sorted(raw)}): did the output format change?")
+    return out
+
+
 def list_apps(run: Callable[..., Any] | None = None) -> list[dict[str, Any]] | None:
-    """``modal app list --json`` (``app_id``, ``description``, ``state``, ...); None when it
-    cannot be read."""
+    """``modal app list --json`` as :func:`app_row` rows (``app_id``, ``description``,
+    ``state``, ...); None when the command fails. Raises :class:`AppListError` when it succeeds
+    but its output cannot be read (:func:`parse_app_list`)."""
     p = _run(["modal", "app", "list", "--json"], run)
     if getattr(p, "returncode", 1) != 0:
         return None
-    try:
-        rows = json.loads(p.stdout)
-    except (TypeError, ValueError):
-        return None
-    return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else None
+    return parse_app_list(p.stdout)
 
 
 def app_ids_named(name: str, apps: Iterable[Mapping[str, Any]]) -> list[str]:
-    """The ids of the listed apps whose description is ``name``."""
-    return [str(r["app_id"]) for r in apps if r.get("description") == name and r.get("app_id")]
+    """The ids of the listed apps whose description is ``name`` (either key spelling)."""
+    rows = [app_row(r) for r in apps]
+    return [str(r["app_id"]) for r in rows if r.get("description") == name and r.get("app_id")]
 
 
 def _live(r: Mapping[str, Any]) -> bool:
@@ -674,7 +708,12 @@ def stop_apps(names: Iterable[str], ids: Iterable[str] = (),
     stopped (listed as stopped, or stopped with exit code 0). When the app list cannot be read,
     each id and each name (a deployed app's) is stopped anyway, unconfirmed."""
     names, ids = list(dict.fromkeys(names)), list(dict.fromkeys(ids))
-    listed = list_apps(run)
+    try:
+        listed = list_apps(run)
+    except AppListError as e:  # loud, and never a confirmed stop
+        print(f"warning: {e}; stopping {', '.join([*ids, *names])} unconfirmed",
+              file=sys.stderr)
+        listed = None
     if listed is None:
         for ident in [*ids, *names]:
             stop_app(ident, run)

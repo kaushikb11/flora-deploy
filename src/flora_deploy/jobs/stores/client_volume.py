@@ -16,6 +16,16 @@ for everything below it from that listing; and it keeps what it read (files up t
 status is fetched once. Both caches are dropped by :meth:`refresh` and by every write through
 this store. Writes by *other* processes are seen after the next :meth:`refresh`; ``sdk.Job``
 refreshes at the start of every ``status()`` (so every ``wait`` poll).
+
+**Reads in parallel** (:meth:`prefetch`, scale-test rehearsal: ``flora run --detach`` took
+5.5 min, ``flora status`` 20-29 s, ``flora report`` 69 s, ``flora compose`` 321 s). The bounded
+listings left one ``read_file`` round trip per shard file, one after another: ``submit``'s plan
+reads every index receipt (one per episode), ``status`` a call ledger and a receipt per shard,
+``report`` also an attempt marker per shard, ``compose`` a receipt and the parts per shard.
+Callers that are about to read a whole area (``jobs.store.prefetch_areas``) hand its files to
+:meth:`prefetch`, which reads them :data:`PREFETCH_WORKERS` at a time into the read cache, so
+the loop that follows is served from memory: the same number of reads, in about
+1/:data:`PREFETCH_WORKERS` of the wall time.
 """
 
 from __future__ import annotations
@@ -23,7 +33,8 @@ from __future__ import annotations
 import io
 import posixpath
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from flora_deploy.jobs.stores.local import check_list_prefix, check_rel_path
@@ -32,6 +43,7 @@ _FILE = 1  # modal.volume.FileEntryType.FILE
 LIST_DEPTH = 5  # flora/<job>/<hash>/<area>/<kind>
 MAX_CACHED_FILE = 1 << 20
 MAX_CACHED_BYTES = 64 << 20
+PREFETCH_WORKERS = 16  # concurrent read_file calls in prefetch()
 
 
 def _not_found(e: BaseException) -> bool:
@@ -112,6 +124,33 @@ class ClientVolumeStore:
                     self._reads[path] = data
                     self._read_bytes += len(data)
         return data
+
+    def prefetch(self, paths: Iterable[str], *, workers: int = PREFETCH_WORKERS) -> int:
+        """Read ``paths`` (store-relative) into the read cache, ``workers`` at a time (module
+        docstring). Paths already cached are skipped; a missing or unreadable file is left for
+        the caller's own read to report; reading stops once the cache is full. Returns the
+        number of files read."""
+        with self._lock:
+            todo = [p for p in dict.fromkeys(paths) if p not in self._reads]
+        if not todo:
+            return 0
+
+        def one(path: str) -> int:
+            with self._lock:
+                full = self._read_bytes >= MAX_CACHED_BYTES
+            if full:
+                return 0
+            try:
+                self.get_bytes(path)
+            except Exception:  # noqa: BLE001 - the caller's own read raises it
+                return 0
+            return 1
+
+        if len(todo) == 1 or workers <= 1:
+            return sum(one(p) for p in todo)
+        with ThreadPoolExecutor(max_workers=min(workers, len(todo)),
+                                thread_name_prefix="flora-prefetch") as pool:
+            return sum(pool.map(one, todo))
 
     def _files_under(self, d: str) -> frozenset[str]:
         """Store-relative paths of every file under directory ``d``."""

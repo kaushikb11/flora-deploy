@@ -43,3 +43,30 @@ def test_settings_round_trip_keeps_the_flag():
     assert s.fake_models
     assert not sdk.settings_from_dict({k: v for k, v in sdk.settings_to_dict(settings()).items()
                                        if k != "fake_models"}).fake_models
+
+
+def test_report_containers_of_a_fake_job_are_priced_as_cpu(monkeypatch):
+    """``flora report``'s per-container rows (``jobs.containers``) price a fake job's workers at
+    the CPU rate ``pool_rate`` charges, not the pool's GPU list price."""
+    from flora_deploy.jobs import containers as C
+    from tests.fakes.jobs import make_manifest
+    from tests.fakes.modal import FakeStore
+
+    seen = {}
+
+    def capture(markers, receipts, spawned, **kw):
+        seen.update(kw)
+        return []
+
+    monkeypatch.setattr(C, "container_rows", capture)
+    rates = B.pinned_rates()
+    fake = settings(fake_models=True)
+    C.job_container_rows(FakeStore(), "j", "c", make_manifest({}), pools=fake.pools,
+                         scaledown_s=2.0, rates=rates, settings=fake)
+    assert seen["usd_per_s"]("segcap") == B.pool_rate(rates, fake, "segcap")
+    assert seen["pool_gpus"]["segcap"] in ("", None)  # no GPU on a fake worker
+    real = settings()
+    C.job_container_rows(FakeStore(), "j", "c", make_manifest({}), pools=real.pools,
+                         scaledown_s=2.0, rates=rates, settings=real)
+    assert seen["usd_per_s"]("segcap") == rates.pool_per_second(real.pools["segcap"])
+    assert seen["pool_gpus"]["segcap"] == "H200"

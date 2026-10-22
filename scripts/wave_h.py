@@ -1385,7 +1385,11 @@ def _modal_run(ctx: Ctx, target: str, args: list[str], *, limit: float, out: Pat
         err = str(e)
     finally:
         run = _sh_runner(ctx)
-        ids = rb.app_ids_named(name, rb.list_apps(run) or [])
+        try:
+            ids = rb.app_ids_named(name, rb.list_apps(run) or [])
+        except rb.AppListError as e:  # stop_apps below says so too and stops by name
+            print(f"warning: {e}", file=sys.stderr)
+            ids = []
         for i in ids:
             ctx.note_app_id(i)
         if rb.stop_apps([name], ids, run=run):
@@ -1630,7 +1634,8 @@ def _run_job(ctx: Ctx, step: str, cfg: Path, job_id: str, *, determinism: str,
             out["rc"] = p.returncode
         except subprocess.TimeoutExpired:
             out["rc"] = "deadline"
-            ctx.sh([fl, "cancel", job_id, "--config", str(cfg)], check=False, timeout=120)
+            ctx.sh([fl, "cancel", job_id, "--yes", "--config", str(cfg)], check=False,
+                   timeout=120)
     finally:
         p = ctx.sh(["modal", "app", "stop", "--yes", plan.app_name], check=False, timeout=120)
         out["stopped_at"] = time.time()

@@ -76,7 +76,7 @@ from flora_deploy.jobs.attempts import JobFiles
 from flora_deploy.jobs.manifest import load_manifest, stages_of
 from flora_deploy.jobs.progress import Progress, compose_input, derive, read_errors
 from flora_deploy.jobs.settings import MAX_EPISODE_ERROR_RATE
-from flora_deploy.jobs.store import Store
+from flora_deploy.jobs.store import JobPaths, Store, prefetch_areas
 from flora_deploy.jobs.types import MAX_STARTS_BEFORE_QUARANTINE, EpisodeRef
 from flora_deploy.records import SCHEMA, Stage, StageRecord
 
@@ -344,6 +344,11 @@ def compose(store: Store, job_id: str, *, config_hash: str | None = None,
             raise
         raise ComposeError(str(e)) from None
     cfg = manifest.config_hash
+
+    # every receipt and part is read below, one Volume round trip each through the client:
+    # read them ahead in parallel (a no-op on a mounted or local store)
+    prefetch_areas(store, JobPaths(job_id).root, [cfg, *dict(manifest.stage_hashes).values()],
+                   ("receipts", "parts"))
     dstore = _DigestingStore(store)
     jf = JobFiles(dstore, job_id, cfg)  # type: ignore[arg-type]
     try:

@@ -109,13 +109,22 @@ def container_rows(markers: Iterable[Mapping[str, Any]], receipts: Iterable[Mapp
 def job_container_rows(store: Any, job_id: str, config_hash: str, manifest: Any, *,
                        pools: Mapping[str, Any], scaledown_s: float,
                        stopped_at: float | None = None, now: float | None = None,
-                       rates: Any = None) -> list[dict[str, Any]]:
-    """:func:`container_rows` read from a job's store. ``pools``: kind -> ``PoolSettings``."""
+                       rates: Any = None, settings: Any = None) -> list[dict[str, Any]]:
+    """:func:`container_rows` read from a job's store. ``pools``: kind -> ``PoolSettings``.
+
+    ``settings`` (the job's ``RunSettings``): price and label each kind's containers as they are
+    billed (``jobs.settings.billed_pool``: a ``fake_models`` job runs every kind on a CPU
+    container, never the pool's GPU), the price ``jobs.budget.pool_rate`` charges."""
     from flora_deploy.jobs import attempts as A
     from flora_deploy.jobs import progress as P
     from flora_deploy.jobs.orchestrator import ShardLedger
     from flora_deploy.jobs.store import JobPaths
 
+    if settings is not None:
+        from flora_deploy.jobs.settings import billed_pool
+
+        pools = {k: billed_pool(settings, k) if k in settings.pools else p
+                 for k, p in pools.items()}
     sh = dict(getattr(manifest, "stage_hashes", None) or {})
     jf = A.JobFiles(store, job_id, config_hash, stage_hashes=sh)
     shards = P.effective_shards(manifest, P.quarantine_records(jf), jf)
