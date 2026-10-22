@@ -31,6 +31,11 @@ flora results caption
 
 ## Label your own data
 
+<!-- wave-h:certified -->
+Accuracy certificates: none yet, so `balanced` segmentation and captioning records say `certified: false`.
+Rewards run NVIDIA's own engine, as `exact` does, and need none.
+<!-- /wave-h:certified -->
+
 **You need:**
 - A [Modal](https://modal.com) account. Run `modal setup` once.
 - Nothing to request on [Hugging Face](https://huggingface.co): the `nvidia/Flora-*` model
@@ -65,7 +70,7 @@ or interrupted job left off. GPUs start when the job starts and shut down when i
 project: my-labels
 license_ack: research-only        # the Flora models are licensed for research use only
 preset: balanced
-allow_uncertified: true           # required until balanced's accuracy certificates are published
+allow_uncertified: true           # for stages without an accuracy certificate (see below)
 
 modal:
   budget_usd: 25                  # hard spending cap for the job
@@ -84,6 +89,11 @@ pipeline:
 output:
   sink: volume://flora-results/my-labels
 ```
+
+<!-- wave-h:allow-uncertified -->
+`allow_uncertified: true` lets `balanced` run segmentation and captioning without accuracy certificates.
+None exist yet, so it is required for them.
+<!-- /wave-h:allow-uncertified -->
 
 **Cameras.** Flora reads one camera view, or three (`main`, `left_wrist`, `right_wrist`). If your
 dataset has several cameras, map them under `input.cameras`; the template shows how.

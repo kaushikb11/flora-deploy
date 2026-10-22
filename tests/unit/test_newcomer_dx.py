@@ -100,7 +100,7 @@ def test_plan_readable_at_80_columns(balanced_cfg):
     r = _plan(balanced_cfg, columns="80")
     assert r.exit_code == 0, r.output
     assert "…" not in r.output and "┃" not in r.output
-    assert "1. balanced x1 (recommended): ok, uncertified" in r.output
+    assert "1. balanced x1 (recommended): ok, partly certified" in r.output  # rewards: reference
     assert "cost $" in r.output and "wall-clock" in r.output
     wide = _plan(balanced_cfg, columns="200").output
     assert "…" not in wide and "┃" in wide
@@ -160,7 +160,7 @@ def test_results_caption_shows_spans_and_captions(demo):
     assert "(task: " in out  # the stand-in captioner's text, not a segment count
     assert "segments" not in out.split("\n", 2)[-1]
     assert all(len(line) <= 80 for line in out.splitlines() if "│" in line), out
-    assert "certified: no (fake_models) for every record" in out
+    assert "certified: no (fake models) for every record" in out
 
 
 def test_results_segment_terminal_dense_show_their_labels(demo):
@@ -251,8 +251,9 @@ def test_doctor_says_each_certificate_problem_once(tmp_path):
 
     p = _write(tmp_path, template_text("balanced_lerobot"))
     c = by_name(d.check_certificates(FakeProbes(), load_config(p)))
-    fixes = [x.fix for x in c.values()]
-    assert len(c) == 1 and len(fixes) == len(set(fixes)), c
+    fixes = [x.fix for x in c.values() if x.fix]
+    problems = [x for x in c.values() if "reference" not in x.message]  # rewards: reference
+    assert len(problems) == 1 and len(fixes) == len(set(fixes)), c
     assert_no_jargon(" ".join(x.message + x.fix for x in c.values()), "doctor certificates")
 
 

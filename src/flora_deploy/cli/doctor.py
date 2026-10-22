@@ -14,7 +14,9 @@ Every check reports ``pass``, ``warn`` or ``fail`` with a one-line fix:
   ``volume://`` sinks;
 * **weights**: the pinned snapshots (and their prep receipts) are on the ``flora-weights``
   Volume, and the derived-weight receipts are in ``flora.yaml`` (``weights.derived``);
-* **certificates**: Gate certificate status of each shard kind;
+* **certificates**: each stage's certificate status in plain words ("certified (human, L40S)",
+  "not certified", "certified for human, not for yam"), and whether ``allow_uncertified`` is
+  still needed;
 * **budget**: ``modal.budget_usd`` and the Environment-budget backstop to set by hand;
 * **input**: the dataset revision resolves, or the local files exist.
 
@@ -204,14 +206,14 @@ class RealProbes:
         return sum(1 for _ in p.rglob(pattern))
 
     def certificate_status(self, cfg: Any) -> dict[str, str] | None:
-        """Kind -> ``certified``, or the status and why (``cli._certs``)."""
+        """Kind -> its status in plain words (``cli._certs`` ``label``): ``certified (human,
+        L40S)``, ``not certified``, ``certified for human, not for yam``, ..."""
         from flora_deploy.cli._certs import certificate_report
         from flora_deploy.config.receipts import derived_content
 
         rep = certificate_report(cfg, {k: p.gpu for k, p in cfg.pools().items()},
                                  derived_content=derived_content(cfg))
-        return {k: r["status"] if r["status"] == "certified" else f"{r['status']}: {r['why']}"
-                for k, r in rep.items()}
+        return {k: r["label"] for k, r in rep.items()}
 
 
 def _probe_local(root: Path, key: str, data: bytes) -> str:
@@ -271,8 +273,9 @@ def check_config(path: Path) -> tuple[Check, Any]:
         first = next((ln.strip(" -") for ln in text.splitlines()[1:]), text)
         if "license_ack" in text:
             fix = "add `license_ack: research-only` (NVIDIA's models are research-only)"
-        elif "accuracy certificate" in text:
-            fix = "set `allow_uncertified: true` (balanced has no certificates yet)"
+        elif "accuracy certificate" in text or "not certified for every stage" in text:
+            fix = ("set `allow_uncertified: true` to run the stages named above without a "
+                   "certificate (their records say certified: false), or use preset exact")
         else:
             fix = f"edit {path}; see src/flora_deploy/config/templates/ for every key"
         return Check("config", "fail", f"{path} is invalid: {first}", fix), None
@@ -481,7 +484,16 @@ def check_weights(p: Probes, cfg: Any) -> list[Check]:
 _CERT_OK = {"certified", "reference", "ok", "valid", "pass", "true"}
 
 
+def _cert_ok(s: str) -> bool:
+    """A probe's per-stage status that needs no opt-in: ``certified (human, L40S)``,
+    ``reference (...)`` or a bare ``certified`` / ``reference``."""
+    return s.lower() in _CERT_OK or s.startswith(("certified (", "reference ("))
+
+
 def check_certificates(p: Probes, cfg: Any) -> list[Check]:
+    """One line per certified stage, one per distinct reason a stage is not certified, in
+    plain words. With ``allow_uncertified: true`` the uncertified stages are expected (pass);
+    once every stage is certified, the opt-in is said to be no longer needed."""
     from flora_deploy.config.presets import find_certificates, needs_certificate
 
     if not needs_certificate(cfg.preset):
@@ -490,19 +502,23 @@ def check_certificates(p: Probes, cfg: Any) -> list[Check]:
     status = p.certificate_status(cfg)
     if status is None:
         certs = find_certificates(cfg.preset, cfg.pools())
-        status = {k: ("certified" if k in certs else "none") for k in cfg.pools()}
+        status = {k: ("not certified" if k not in certs else
+                      "reference (NVIDIA's own engine, no certificate needed)"
+                      if certs[k].verdict == "reference" else "certified")
+                  for k in cfg.pools()}
+    gpus = {k: pool.gpu for k, pool in cfg.pools().items()} if hasattr(cfg, "pools") else {}
     out = []
     lacking: dict[str, list[str]] = {}  # status -> kinds: one line per distinct problem
     for kind, s in sorted(status.items()):
-        if s.lower() in _CERT_OK:
-            out.append(Check(f"certificates.{kind}", "pass", f"{kind}: {s}"))
+        if _cert_ok(s):
+            where = f" on {gpus[kind]}" if kind in gpus and gpus[kind] not in s else ""
+            out.append(Check(f"certificates.{kind}", "pass", f"{kind}{where}: {s}"))
         else:
             lacking.setdefault(s, []).append(kind)
     allowed = bool(getattr(cfg, "allow_uncertified", False))
     for s, kinds in lacking.items():
         name = "certificates." + (kinds[0] if len(kinds) == 1 else ",".join(kinds))
-        what = (f"{cfg.preset} has no accuracy certificate for {', '.join(kinds)} "
-                f"({_CERT_WHY.get(s, s)})")
+        what = f"{', '.join(kinds)}: {_CERT_WHY.get(s, s)}"
         if allowed:  # expected for the README's config: say it once, not as a problem
             out.append(Check(name, "pass", what + "; runs uncertified (allow_uncertified: "
                              "true), its records say certified: false",
@@ -510,12 +526,21 @@ def check_certificates(p: Probes, cfg: Any) -> list[Check]:
         else:
             out.append(Check(name, "warn", what, "set allow_uncertified: true to run it "
                              "uncertified, or use preset exact"))
+    if allowed and status and not lacking:
+        emb = getattr(getattr(cfg, "pipeline", None), "embodiment", None)
+        out.append(Check("allow_uncertified", "warn",
+                         f"every stage is certified{f' for {emb}' if emb else ''}: "
+                         "`allow_uncertified: true` is no longer needed",
+                         "remove it, so a later change that is not certified is refused "
+                         "instead of running uncertified"))
     return out
 
 
-_CERT_WHY = {"none": "none published yet",
-             "unverified_weights": "needs the derived weights `flora prepare` builds",
-             "provisional": "only a provisional one", "fail": "its certificate failed"}
+# raw statuses (probes that report them) in plain words; labels pass through unchanged
+_CERT_WHY = {"none": "not certified", "missing": "not certified",
+             "unverified_weights": "not checked: run `flora prepare` first",
+             "provisional": "not certified (only a provisional certificate)",
+             "fail": "not certified (its certificate failed)"}
 
 
 def check_budget(cfg: Any) -> Check:

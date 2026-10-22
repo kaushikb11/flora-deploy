@@ -182,7 +182,7 @@ def results(
         return
 
     rows = [{"uid": r.uid, "certified": r.certified, "reason": r.uncertified_reason,
-             "segments": len(r.segments),
+             "certificate": r.provenance.certificate, "segments": len(r.segments),
              "score": (r.terminal.score if r.terminal else
                        r.rubric.total if r.rubric else None)} for r in recs]
     if out is not None:
@@ -217,6 +217,10 @@ def results(
     console.print(t, width=width)
     if len(same) == 1:
         console.print(f"certified: {escape(same.pop())} for every record", soft_wrap=True)
+    ids = sorted({r.provenance.certificate for r in recs
+                  if r.certified and r.provenance.certificate})
+    if ids:
+        console.print("certificate: " + ", ".join(ids), soft_wrap=True)
     if len(label_rows) > limit:
         console.print(f"... {len(label_rows) - limit} more rows (raise --limit or use "
                       "--format jsonl)", soft_wrap=True)
@@ -230,8 +234,27 @@ def _span(s) -> str:
     return f"{s.start_s:.1f}–{s.end_s:.1f} s"
 
 
+# ``uncertified_reason`` in plain words (the JSONL / Parquet keep the code).
+_REASON_WORDS = {
+    "uncertified_stack": "no certificate for this stage",
+    "outside_reference_envelope": "outside NVIDIA's tested conditions",
+    "oracle_ineligible_source": "video cannot be compared with the reference",
+    "fake_models": "fake models",
+}
+
+
 def _certified(r) -> str:
-    return "yes" if r.certified else f"no ({r.uncertified_reason or '-'})"
+    """``yes (certificate cert_1a2b3c4d)`` (the id shortened; ``flora results`` prints it in
+    full below the table), ``yes (reference)`` or ``no (<why, in plain words>)``."""
+    p = r.provenance
+    if r.certified:
+        return f"yes (certificate {p.certificate[:13]})" if p.certificate else "yes (reference)"
+    reason = r.uncertified_reason
+    if reason == "uncovered_pool":
+        why = f"not certified for {p.embodiment}" if p.embodiment else "embodiment not covered"
+    else:
+        why = _REASON_WORDS.get(str(reason), str(reason or "-"))
+    return f"no ({why})"
 
 
 def dense_summary(per_step, width: int = 24) -> str:

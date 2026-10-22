@@ -930,6 +930,54 @@ def cost_block(f: Findings) -> str | None:
             "for your dataset.")
 
 
+def certification_blocks(readme: str, cert_dirs: Sequence[Path]) -> str:
+    """``readme`` with its ``wave-h:certified`` (one status line under "Label your own data")
+    and ``wave-h:allow-uncertified`` (under the Configuration example) blocks written from the
+    ``balanced`` certificates in ``cert_dirs`` that unlock (the newest for its key decides, as
+    in ``certkey.matching``; verdict ``certified``, within policy): which stages, for which
+    embodiments, on which GPUs. Plain words, no ids."""
+    from flora_deploy.validate import certkey
+
+    words = {"segment": "segmentation", "caption": "captioning",
+             "reward.terminal": "terminal rewards", "reward.dense": "dense rewards",
+             "reward.rubric": "rubric rewards"}
+    newest: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for c in sorted((c for d in cert_dirs for c in certkey.load_certificates(d)
+                     if c.get("preset") == "balanced"),
+                    key=lambda c: (c["generated_at"], certkey.VERDICTS.index(c["verdict"]))):
+        newest[cert_key(c)] = c  # the last one wins: newest, then fail over certified
+    kinds: dict[str, tuple[set[str], set[str]]] = {}  # kind -> (embodiments, GPUs)
+    for c in newest.values():
+        if c["verdict"] != "certified" or certkey.policy_problems(c):
+            continue
+        embs, gpus = kinds.setdefault(c["kind"], (set(), set()))
+        embs.update(c.get("covered_pools") or ())
+        gpus.add(c["gpu"])
+    groups: dict[tuple[str, ...], list[str]] = {}  # embodiments -> kinds, in stage order
+    for k in sorted(kinds, key=lambda k: list(words).index(k) if k in words else 99):
+        groups.setdefault(tuple(sorted(kinds[k][0])), []).append(k)
+    parts = []
+    for embs, ks in groups.items():
+        gpus = list(dict.fromkeys(g for k in ks for g in sorted(kinds[k][1])))  # stage order
+        parts.append(f"{' and '.join(words.get(k, k) for k in ks)} for "
+                     f"{', '.join(f'`{e}`' for e in embs)} data ({' / '.join(gpus)})")
+    if not parts:
+        status = ("Accuracy certificates: none yet, so `balanced` segmentation and captioning "
+                  "records say `certified: false`.\nRewards run NVIDIA's own engine, as "
+                  "`exact` does, and need none.")
+        config = ("`allow_uncertified: true` lets `balanced` run segmentation and captioning "
+                  "without accuracy certificates.\nNone exist yet, so it is required for them.")
+    else:
+        status = (f"Accuracy certificates: {'; '.join(parts)}.\nRewards run NVIDIA's own "
+                  "engine, as `exact` does, and need none. Everything else runs uncertified.")
+        config = ("`allow_uncertified: true` runs the stages that have no accuracy certificate "
+                  "for your embodiment and GPU;\ntheir records say `certified: false`. Certified "
+                  f"today: {'; '.join(parts)}.\nA config whose every stage is certified does "
+                  "not need it; `flora doctor` tells you.")
+    readme = replace_block(readme, "certified", status)
+    return replace_block(readme, "allow-uncertified", config)
+
+
 # ---------------------------------------------------------------------------------------------
 # Driver
 
@@ -988,6 +1036,8 @@ def analyze(paths: Paths, *, derived: Mapping[str, str] | None = None, cert_tmp:
         outputs[paths.readme] = replace_block(readme, BLOCK_COST, body)
     certs = [cert_tmp / f"{o['cert']['id']}.json" for o in outcomes
              if o.get("cert") and o["cert"]["verdict"] != "fail"]
+    readme = outputs.get(paths.readme) or paths.readme.read_text(encoding="utf-8")
+    outputs[paths.readme] = certification_blocks(readme, [paths.certs, cert_tmp])
     return f, outputs, certs
 
 

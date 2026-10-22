@@ -181,7 +181,10 @@ def test_balanced_needs_certificates_or_explicit_opt_in(monkeypatch):
     assert parse_config(d).preset == "balanced"
     monkeypatch.setattr(schema, "find_certificates",
                         lambda preset, pools, **kw: {"segment": certs["segment"]})
-    assert "for caption on H100!, reward.terminal on H100!" in err(d)
+    msg = err(d)  # partly covered: each stage that is not, and why, in plain words
+    assert "not certified for every stage of this config (certified: segment" in msg
+    assert "caption on H100!: no certificate" in msg
+    assert "allow_uncertified: true" in msg and "segment on L40S" not in msg
 
 
 def test_exact_needs_no_certificate():

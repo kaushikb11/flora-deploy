@@ -16,7 +16,7 @@ modal:
   budget_usd: 15                    # hard cap; also set the Environment budget `flora doctor` prints
 
 preset: balanced
-allow_uncertified: true             # balanced has no Gate certificates yet, so records are
+allow_uncertified: true             # no stage is certified for yam, so records are
                                     # certified=false with uncertified_reason uncertified_stack
 
 input:

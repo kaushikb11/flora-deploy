@@ -304,6 +304,10 @@ def test_h7_config_validation_and_plan_app_agree_on_reward_certificates(tmp_path
         balanced=terminal_set("balanced", 10, score=1, es=1.0, modes=modes, **gpu_kw),
         noise=terminal_set("exact", 5, **gpu_kw), gpu=gpu, generated_at="2026-10-23T00:00:00Z",
         engine_spec=key("balanced", "reward.terminal", gpu, fp=None, modes=modes)), cdir)
+    # the rewards are the reference by identity (exact's own engine): a fail does not apply
+    assert plan_app(cfg, store="s3://b/x")
+    # ... until the stack diverges from exact's: then the newer fail decides
+    monkeypatch.setattr(certkey, "reference_identical", lambda *a, **k: False)
     with pytest.raises(DeployError, match="Gate certificate"):
         plan_app(cfg, store="s3://b/x")
 

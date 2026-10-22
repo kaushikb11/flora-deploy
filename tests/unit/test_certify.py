@@ -294,10 +294,12 @@ def test_schema_gate_reads_the_registry(tmp_path, monkeypatch):
     _write_stage(tmp_path, cfg, "caption", stamp="2026-10-23T00:00:00Z")  # newer: decides
     assert parse_config(d, derived_content=CONTENT).preset == "balanced"
     # fail closed: without the derived weights' content digests nothing with weights matches
-    with pytest.raises(ConfigError, match="segment on L40S, caption on H100!"):
+    with pytest.raises(ConfigError, match="segment on L40S: certificate not checked without "
+                       "the prepared weights"):
         parse_config(d)
     # another embodiment is not covered (D16)
-    with pytest.raises(ConfigError, match="no accuracy certificate"):
+    with pytest.raises(ConfigError, match="embodiment human: segment/caption certified for "
+                       "yam only"):
         parse_config({**d, "pipeline": {**d["pipeline"], "embodiment": "human"}},
                      derived_content=CONTENT)
 

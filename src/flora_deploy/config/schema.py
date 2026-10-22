@@ -9,7 +9,7 @@ Layout (see ``config/templates/*.yaml`` for commented templates)::
     license_ack: research-only          # required (NVIDIA's models are non-commercial)
     modal: {environment, max_gpus, budget_usd, region, tags}
     preset: exact | balanced             # budget / interactive: not available yet
-    allow_uncertified: false             # required for balanced until its certificates exist
+    allow_uncertified: false             # needed when a stage has no certificate for the config
     input: {format, repo, revision, path, cameras, stage_to}
     pipeline: {stages, embodiment, episode_instruction, envelope, shard_target_gpu_minutes,
                determinism, terminal_rationale, exact_scheduling,
@@ -50,6 +50,7 @@ from flora_deploy.config.presets import (
     get_preset,
     gpu_problem,
     needs_certificate,
+    refusal_message,
     shard_kinds_for,
 )
 from flora_deploy.jobs.settings import (
@@ -526,16 +527,12 @@ class FloraConfig(_Model):
 
             # Fail closed: without derived-weight content digests (context
             # ``derived_content``), a kind that needs derived weights matches no certificate.
-            certs = find_certificates(self.preset, pools, **lookup_context(
-                self, pools, derived_content=(info.context or {}).get("derived_content")))
-            missing = [f"{k} on {p.gpu}" for k, p in pools.items() if k not in certs]
-            if missing:
-                raise ValueError(
-                    f"preset {self.preset!r} has no accuracy certificate for {', '.join(missing)} "
-                    "(a provisional certificate does not count; config/certificates/), so its "
-                    "outputs are not certified faithful to NVIDIA's. "
-                    "Use preset 'exact', or set `allow_uncertified: true` (or pass "
-                    "--allow-uncertified) to run it as an uncertified stack")
+            ctx = lookup_context(self, pools,
+                                 derived_content=(info.context or {}).get("derived_content"))
+            certs = find_certificates(self.preset, pools, **ctx)
+            if any(k not in certs for k in pools):
+                # names each stage that is not covered and why (presets.refusal_message)
+                raise ValueError(refusal_message(self.preset, pools, certs, **ctx))
         need = sum(p.gpu_count * p.max_containers for p in pools.values())
         if need > self.modal.max_gpus:
             raise ValueError(

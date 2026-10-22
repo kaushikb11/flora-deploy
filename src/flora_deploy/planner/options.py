@@ -50,10 +50,10 @@ DEFAULT_EPISODE_S = 60.0  # assumed mean episode length when only total hours ar
 Certification = Literal["reference", "certified", "needs certificates"]
 # The ``unavailable`` reason (and flag) of a preset without certificates; :func:`with_certificates`
 # removes both from an option whose every pool is certified.
-UNCERTIFIED = "uncertified ({preset} has no certificates)"
+UNCERTIFIED = "uncertified (not every stage of {preset} is certified for this config)"
 # Every "uncertified" flag starts with this (``with_certificates`` drops it).
 _UNCERTIFIED_FLAG = "{preset}: uncertified"
-_UNCERTIFIED_BLOCKED = ("{preset}: uncertified until its certificates exist; set "
+_UNCERTIFIED_BLOCKED = ("{preset}: uncertified until every stage is certified; set "
                         "`allow_uncertified: true` in flora.yaml to run it anyway")
 _UNCERTIFIED_ALLOWED = "{preset}: uncertified, allowed by `allow_uncertified: true`"
 Status = Literal["ok", "at risk", "infeasible"]
