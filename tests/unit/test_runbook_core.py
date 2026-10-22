@@ -284,6 +284,46 @@ def test_stop_apps_stops_ephemeral_apps_by_id():
     assert [c[-1] for c in unlisted.calls[1:]] == ["ap-2", "dep-app"]
 
 
+#: ``modal app list --json`` as modal 1.x prints it: the table's column titles as keys
+REAL_APP_LIST = [
+    {"App ID": "ap-x", "Description": "flora-st-r-run", "State": "deployed", "Tasks": "1",
+     "Created at": "2026-10-22 10:00:00+00:00", "Stopped at": None},
+    {"App ID": "ap-old", "Description": "flora-st-r-run", "State": "stopped", "Tasks": "0",
+     "Created at": "2026-10-21 10:00:00+00:00", "Stopped at": "2026-10-21 11:00:00+00:00"},
+    {"App ID": "ap-9", "Description": "other", "State": "ephemeral", "Tasks": "1",
+     "Created at": "2026-10-22 10:00:00+00:00", "Stopped at": None},
+]
+
+
+def test_stop_apps_reads_modals_real_app_list_keys():
+    fake = _Modal(REAL_APP_LIST)
+    rows = rb.list_apps(fake)
+    assert rows[0]["app_id"] == "ap-x" and rows[0]["description"] == "flora-st-r-run"
+    assert rows[0]["state"] == "deployed" and rows[0]["stopped_at"] is None
+    assert rb.app_ids_named("flora-st-r-run", REAL_APP_LIST) == ["ap-x", "ap-old"]
+    assert rb.stop_apps(["flora-st-r-run"], run=fake)
+    stops = [c for c in fake.calls if c[:3] == ["modal", "app", "stop"]]
+    assert stops == [["modal", "app", "stop", "--yes", "ap-x"]]  # live one only, by id
+
+
+@pytest.mark.parametrize("out", ["not json", json.dumps({"apps": []}),
+                                 json.dumps([{"Name": "flora-x", "Status": "deployed"}])])
+def test_an_unreadable_app_list_fails_loudly_never_a_confirmed_stop(out, capsys):
+    class Garbled(_Modal):
+        def __call__(self, args, **kw):
+            p = super().__call__(args, **kw)
+            if args[:3] == ["modal", "app", "list"]:
+                p.stdout = out
+            return p
+
+    with pytest.raises(rb.AppListError):
+        rb.list_apps(Garbled([]))
+    fake = Garbled([])
+    assert not rb.stop_apps(["flora-st-r-run"], ["ap-1"], run=fake)  # stopped, unconfirmed
+    assert [c[-1] for c in fake.calls[1:]] == ["ap-1", "flora-st-r-run"]
+    assert "modal app list --json" in capsys.readouterr().err
+
+
 def test_the_next_run_stops_a_killed_attempts_apps_and_bounds_it():
     st = rb.State("r", T0, "x")
     a = rb.Attempt(started=T0, status="killed", heartbeat=T0 + 100, tracked_usd=0.1,
