@@ -111,8 +111,7 @@ def good_table(**over) -> dict[str, cp.Result]:
         "wave_h.py --status": cp.Result(2, "", "unrecognized: --status"),
         "load_selection": ok(json.dumps(EPS) + "\n"),
         "flora prepare --show-receipt": ok(json.dumps(RECEIPTS)),
-        "lock_images.py --help": ok("usage: lock_images.py [--upgrade]"),
-        "lock_images as L": ok("\n"),
+        "lock_images.py --check": ok("locks current: img_cpu, img_hfref, img_vllm\n"),
         "modal app list": ok(json.dumps([
             {"app_id": "ap-1", "description": "flora-balanced-lab", "state": "stopped"},
             {"app_id": "ap-2", "description": "plumbline-llm", "state": "deployed"}])),
@@ -141,7 +140,7 @@ def test_all_good_is_go(tmp_path, capsys):
     assert cp.main([], env=env) == 0
     out = capsys.readouterr().out
     assert out.strip().splitlines()[-1] == "GO"
-    assert "[WARN] images" in out  # no --check mode yet: a warning, not a fail
+    assert "[PASS] images" in out
 
 
 def test_json_output_and_nogo_exit(tmp_path, capsys):
@@ -340,16 +339,28 @@ def test_weights_unpinned_or_missing(tmp_path):
 
 # 5. images -------------------------------------------------------------------------------------
 
-def test_images_check_mode_used_when_present(tmp_path):
-    env, _ = make_env(tmp_path, **{"lock_images.py --help": ok("[--check]"),
-                                   "lock_images.py --check": cp.Result(1, "", "img_vllm stale")})
+def test_images_current_passes(tmp_path):
+    env, fake = make_env(tmp_path)
     c = cp.check_images(env)
-    assert c.status == cp.FAIL and "img_vllm" in c.message
+    assert c.status == cp.PASS and "current" in c.message
+    assert [ln for ln in fake.calls if "lock_images" in ln] == [
+        "uv run python scripts/lock_images.py --check"]
 
 
-def test_images_inputs_drift(tmp_path):
-    env, _ = make_env(tmp_path, **{"lock_images as L": ok("img_cpu\n")})
-    assert cp.check_images(env).status == cp.FAIL
+def test_images_stale_fails(tmp_path):
+    env, _ = make_env(tmp_path, **{"lock_images.py --check": cp.Result(
+        1, "", "stale lock(s): img_vllm; run uv run python scripts/lock_images.py")})
+    c = cp.check_images(env)
+    assert c.status == cp.FAIL and "stale" in c.message and "img_vllm" in c.message
+    assert "commit the locks" in c.fix
+
+
+@pytest.mark.parametrize("rc", [2, 124, 127])
+def test_images_unresolvable_fails(tmp_path, rc):
+    """A compile error, timeout or missing uv is a FAIL (never a silent pass or a warning)."""
+    env, _ = make_env(tmp_path, **{"lock_images.py --check": cp.Result(rc, "", "boom")})
+    c = cp.check_images(env)
+    assert c.status == cp.FAIL and f"exit {rc}" in c.message and "network" in c.fix
 
 
 # 6. apps ---------------------------------------------------------------------------------------

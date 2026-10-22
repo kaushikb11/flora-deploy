@@ -366,7 +366,7 @@ uv run python scripts/cert_preflight.py --json     # the same, as JSON
 | plan | the certified plan's next step **runs** under the runbook's own decision (`--status --json`, else `--status` / `--dry-run`); it prints the caps, the upper total vs the global cap, and any held attempt |
 | episodes | every golden/v2 `human` episode (`--embodiment yam`: golden/v3-yam) is on `flora-golden` with the manifest's file sizes |
 | weights | `DERIVED_PINS` match the receipts on `flora-weights` (`flora prepare --show-receipt`) |
-| images | the image locks are current (`lock_images.py --check`; until that mode exists, only the `.in` inputs are compared, as a warning) |
+| images | a re-lock would change no committed lock file: `lock_images.py --check` re-resolves every lock (network, no Modal) without writing |
 | apps | no `flora*` Modal app is running (other apps are ignored, never touched) |
 | lab | the lab runs, or its saved result's engine-settings hash equals the current one (no hash yet: a warning, "will re-run") |
 | freeze | `cert_freeze.py --check` and `tests/unit/test_certificate_drift.py` pass |
