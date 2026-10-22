@@ -13,7 +13,8 @@ for every episode:
 | `reward.terminal` | did the episode succeed? A 1–5 score with probabilities | `5` (expected score `4.6`) |
 | `reward.dense` | a 1–3 label (failure / suboptimal / normal) for every 0.5 s of the episode | `3, 3, 2, 3, …` |
 
-Labels come back as Parquet and JSONL, keyed by episode, ready for pandas or 🤗 `datasets`.
+Labels come back as Parquet and/or JSONL (`output.formats`), keyed by episode, ready for pandas
+or 🤗 `datasets`.
 
 ## Try it in two minutes
 
@@ -98,6 +99,7 @@ pipeline:
 
 output:
   sink: volume://flora-results/my-labels
+  formats: [parquet, jsonl]       # default: [parquet]
 ```
 
 <!-- wave-h:allow-uncertified -->
@@ -139,28 +141,33 @@ GPU produced it. Field reference: [`docs/output-format.md`](docs/output-format.m
 ## Cost
 
 `flora plan` estimates the cost of your dataset before anything runs, and `flora report` shows what
-a finished job actually spent. Segmentation runs on an L40S, captioning and rewards on H100s.
+a finished job actually spent. With `balanced`, segmentation runs on an L40S, captioning and
+rewards on H100s (`exact` runs segmentation + captioning on an H200).
 
 <!-- wave-h:cost -->
-`balanced` costs about **$5.28 per video-hour** of GPU work (±50%) for segmentation + captioning (`exact`: $25.35),
-measured 2026-10-22 at Modal list prices. Startup (a few minutes per container), idle time and
-rewards are extra and dominate small jobs: `flora plan` shows the all-in estimate for your dataset.
+`balanced` costs about **$5.28 per video-hour** of GPU work (±50%) for segmentation + captioning (`exact`: $36.39),
+at Modal list prices; a projection from rates measured on one 3.9-min job (2026-10-22, n=1), not yet confirmed at scale.
+Startup, idle time and rewards are extra and dominate small jobs: `flora plan` shows the all-in estimate for your dataset.
 <!-- /wave-h:cost -->
 
 Three numbers, three definitions:
 - **GPU work** (above): only the seconds the GPUs spend labelling. A large job's segmentation +
-  captioning approaches it.
+  captioning should approach it; no job at scale has measured that yet
+  ([`docs/scale-test.md`](docs/scale-test.md)).
 - **`flora plan`**: the all-in estimate for your dataset: GPU work for every stage you chose,
   plus each container's startup, a short idle tail after its stage's last episode (about 17 s),
   and the orchestrator. It also says whether `balanced` is certified for your embodiment (rewards
-  need no certificate; segmentation and captioning do).
+  need no certificate; segmentation and captioning do). Before `flora prepare` it can't check
+  the certificate against the prepared weights, so it reports segmentation as not certified;
+  run it again after `flora prepare`.
 - **`flora report`**: what the job actually spent: everything above plus idle time. On a job of
   a few minutes of video, startup and idle can make this several times the GPU-work rate.
 
 `flora index` runs on Modal CPU containers (no GPU, about $0.06 per container-hour), so it costs a
 few cents for most datasets; `flora index --local` runs it on your machine for free. `flora
 doctor` and `flora plan` cost nothing. A `balanced` stage's first container publishes its compiled
-engine, so later containers and jobs start warm; after an image or engine change the first starts
+engine, so later containers and jobs start warm (the time saved is not measured yet); after an
+image or engine change the first starts
 cold (`flora plan --check-cache`). The measurement behind these rates:
 [measurement report](docs/wave-h-report.md).
 

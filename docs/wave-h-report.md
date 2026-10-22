@@ -12,20 +12,19 @@ Tracked: container-seconds x list $/h from `flora report` (the lab: its wall tim
 
 | step | status | attempts | cap | tracked | charged | billed | billing |
 |---|---|---|---|---|---|---|---|
-| b. exact oracle, 6 human episodes, default mode, H200 | done | 1 | $3.30 | $2.62 | $2.62 | $0.00 | MISMATCH: billed -2.62 vs tracked |
-| d. balanced via flora deploy/run (L40S + H100) | done | 2 | $2.30 | $3.13 | $3.13 | $2.66 | reconciled |
+| b. exact oracle, 6 human episodes, default mode, H200 | done | 1 | $3.30 | $2.62 | $2.62 | $0.00 | other workspace: not in this billing read |
+| d. balanced via flora deploy/run (L40S + H100) | done | 2 | $2.35 | $3.13 | $3.13 | $2.66 | reconciled |
 | d2. balanced lab L0 / Gate A on (d)'s job (L40S, then H100) | done | 1 | $2.35 | $2.07 | $2.07 | $0.19 | partial: read 126 s after the step, billed through 2026-10-22T12:00:00Z; final after 2026-10-22T13:15:00Z |
-| e. offline provisional certification | failed | 2 | $0.00 | $0.00 | $0.00 | - | no app |
-| f. noise: oracle job repeated, default mode, H200 | done | 1 | $3.30 | $1.58 | $1.58 | - | shared app: global total only |
+| e. offline provisional certification | finalize: segment (human) certified, caption (human) fail | 2 | $0.00 | $0.00 | $0.00 | - | no app |
+| f. noise: oracle job repeated, default mode, H200 | done | 1 | $3.30 | $1.58 | $1.58 | - | other workspace: not in this billing read |
 
 Total: **$9.39** of the $10.60 global cap: the larger of charged and billed, the figure the runbook gates on.
 
 - tracked $9.39: container-seconds x list $/h of every attempt;
 - charged $9.39: tracked, with a killed or unreported attempt at its bound or budget until billing covers it;
-- billed $2.85: Modal's billed delta of every app (read 2026-10-22T12:28:34Z).
+- billed $2.85: Modal's billed delta of every app (read 2026-10-22T12:28:34Z); steps b and f ran on another Modal workspace, so their billing is not in this read and their tracked figure stands.
 
 Warnings:
-- exact_e2e: billed $0.00 vs tracked $2.62 after the billing lag (-2.62); the list prices or the receipts are off
 - lab: billing covers up to 2026-10-22T12:00:00Z, before the step's last activity 2026-10-22T12:26:28Z: billed $0.19 vs tracked $2.07 is partial; re-run the runbook's billing read after 2026-10-22T13:15:00Z, then this script
 
 ## Measured rates
@@ -47,14 +46,23 @@ $/video-h = 3600 x sum over the preset's kinds of (container-s per video-s x poo
 pool $/s  = (GPU $/h + cores x core $/h + memory GiB x GiB $/h) / 3600   (jobs.budget pinned list prices)
 ```
 
-| preset | terms | $/video-h (busy) | this run (cold starts, idle, slack) |
+| preset | terms | $/video-h (busy, this run's rate) | this run (cold starts, idle, slack) |
 |---|---|---|---|
 | exact | 3600 x 4.458 x $5.686/h / 3600 (segcap, H200) | **$25.35** ±41% | $39.93 |
 | balanced | 3600 x 0.342 x $2.712/h / 3600 (segment, L40S) + 3600 x 0.854 x $5.096/h / 3600 (caption, H100) | **$5.28** ±50% | $27.10 |
 
-$/video-h (busy) counts busy container-seconds only: steady state at scale, without cold starts or idle time until scale-down. This run's figure is everything its jobs spent; without the cold starts, `balanced` was $9.90/video-h (idle kept). One small job (n=1): the band is a nominal convention, not a statistical interval.
+$/video-h (busy) counts busy container-seconds only, without cold starts or idle time until scale-down: what a large job approaches if the per-video-second rate holds at scale, a projection until a scale run measures it (`docs/scale-test.md`). This run's figure is everything its jobs spent; without the cold starts, `balanced` was $9.90/video-h (idle kept). One small job (n=1): the band is a nominal convention, not a statistical interval.
 
-`exact` / `balanced`: 4.8x (segment + caption only; rewards are the same on both presets).
+What `flora plan` prices (`planner/rates.json`, busy seconds only). These are the figures the README and `docs/costs.md` quote. Only the `balanced` slots are written from this run; an `exact` rate measured above is reported, not folded in, so `exact` stays at its committed row.
+
+| preset | rate x pool $/h | $/video-h (busy) |
+|---|---|---|
+| exact | 6.4 (measured) x $5.686/h (segcap, H200) | **$36.39** ±35% |
+| balanced | 0.342 (measured) x $2.712/h (segment, L40S) + 0.854 (measured) x $5.096/h (caption, H100) | **$5.28** ±50% |
+
+`exact` measured here ($25.35) and as priced ($36.39) differ. This run's `exact` jobs are the oracle and its noise repeat, on one app; the committed row is its own measurement (see its `provenance` in `planner/rates.json`). Folding this run's `exact` rate into `rates.json` is a maintainer decision; until then the docs quote the priced figure.
+
+`exact` / `balanced` as priced: 6.9x (segment + caption only; rewards are the same on both presets).
 
 ## L0 (input parity: vLLM vs NVIDIA's HF processor)
 
@@ -76,7 +84,7 @@ Rule (`docs/balanced-engines.md`): turn the plugin on only if its drift exceeds 
 
 ## Certificate
 
-Overall: **fail**. Reference: `exact` in NVIDIA's default mode; certificates in `src/flora_deploy/config/certificates/` (metrics only).
+Per stage: segment (human) **certified**, caption (human) **fail**. Each stage's certificate unlocks that stage on its own. Reference: `exact` in NVIDIA's default mode; certificates in `src/flora_deploy/config/certificates/` (metrics only; a `fail` is never committed).
 
 | stage | pool | GPU | verdict | episodes | noise episodes | id |
 |---|---|---|---|---|---|---|

@@ -86,6 +86,24 @@ def test_what_certified_promises_matches_the_policy():
     assert metric_threshold("count_mismatch", 0.1, tol, 0.0) > count  # "more when ... disagree"
 
 
+def test_quoted_human_segment_limit_is_the_committed_certificates():
+    """The applied count-flip limit quoted for the human segment certificate is the one it
+    records (noise raised it above the floor), not the floor."""
+    from flora_deploy.validate.certkey import count_flips_allowed
+
+    cert_dir = L.DOC.resolve().parents[1] / "src/flora_deploy/config/certificates"
+    certs = [json.loads(p.read_text()) for p in cert_dir.glob("cert_*.json")]
+    seg = [c for c in certs if c["stage"] == "segment" and "human" in c["covered_pools"]
+           and c["verdict"] == "certified"]
+    if not seg:
+        assert "human`\nsegmentation certificate" not in TEXT
+        return
+    u = seg[0]["metrics"]["count_flips"]["union"]
+    assert count_flips_allowed(u["threshold"], u["n"]) == u["allowed"]
+    assert f"limit is {u['threshold']:.0%} ({u['allowed']} of {u['n']})" in TEXT
+    assert f"`balanced` split {u['flips']} of {u['n']}" in TEXT
+
+
 def test_rubric_has_not_run_on_a_gpu_while_its_rate_is_unmeasured():
     if "`reward.rubric` has only run in CPU tests" in TEXT:
         assert RateTable.load().rate("balanced", "reward.rubric", 1).status != "measured"

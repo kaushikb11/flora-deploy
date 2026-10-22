@@ -56,7 +56,8 @@ Start with the repository [`README.md`](../README.md) (users) or [`PLAN.md`](PLA
 | [`golden-candidates.md`](golden-candidates.md) | Public datasets that stand in for each embodiment in flora's test set | maintainer |
 | [`golden-manifest-v1.md`](golden-manifest-v1.md) | What is staged in flora's test set ("golden set") v1: counts, media, licenses, coverage | maintainer |
 | [`golden-manifest-v2.md`](golden-manifest-v2.md) | The 12-episode `human` certification set for the certified run (staged, verified) | maintainer |
-| [`wave-h-report.md`](wave-h-report.md) | The first measured `balanced` run: $/video-hour, startup, the rates in `planner/rates.json` | maintainer |
+| [`golden-manifest-v3-yam.md`](golden-manifest-v3-yam.md) | The `yam` (3-view) certification set for the yam certified run (staged) | maintainer |
+| [`wave-h-report.md`](wave-h-report.md) | The certified run (generated): spend per step, the measured `balanced` rates in `planner/rates.json`, $/video-hour, L0, Gate A, and the certificate verdict per stage (segment certified, caption failed) | maintainer |
 | [`scale-test.md`](scale-test.md) | The `balanced` scale test: a quarter-hour lite profile (the default) and a one-video-hour full one, prepared, not yet run on Modal | maintainer |
 
 ## Upstream

@@ -21,7 +21,7 @@ of startup however much video it labels. These are the planner's estimates (the 
 | 10 | 600 | **$5.37** ($3.58-$8.04) | $53.65 | 8.6 h | **$6.53** ($4.17-$10.33) | $65.25 |
 | 100 | 6,000 | **$5.29** ($3.53-$7.94) | $529 | 85.5 h | **$6.39** ($4.08-$10.14) | $639 |
 
-One container per stage, cold starts, Modal list prices. Bold: the estimate; in brackets: its range from the error bands below. Rewards are terminal + dense (`reward.rubric` is not measured yet). What each rate rests on:
+One container per stage, cold starts, Modal list prices. Bold: the estimate; in brackets: its range from the error bands below. Rewards are terminal + dense (`reward.rubric` is not measured yet). The 10 and 100 video-hour rows are projected from rates measured on one small job; not yet confirmed at scale ([scale test](scale-test.md)). What each rate rests on:
 
 - `segment`: GPU work 0.342 container-s per video-s, measured (n=1, ±50%); startup 295 s, measured (n=1, ±50%)
 - `caption`: GPU work 0.854 container-s per video-s, measured (n=1, ±50%); startup 373 s, measured (n=1, ±50%)
@@ -51,19 +51,20 @@ Segment + caption, one container per stage, cold starts. 3-view GPU work is the 
 ### Why you may have seen other numbers
 
 The README quotes the cost of GPU work alone, with no startup or idle time. A very large job
-tends towards it:
+should tend towards it:
 
 <!-- cost-table:busy -->
-**$5.28 per video-hour** (segment + caption; $6.37 with rewards)
+**$5.28 per video-hour** (segment + caption; $6.37 with rewards), projected from rates measured on one small job; not yet confirmed at scale ([scale test](scale-test.md))
 <!-- /cost-table:busy -->
 
 `flora plan` gives the all-in estimate for your dataset: the rows above, worked out for your
 episodes, stages and pool sizes.
 
-The first test job, three minutes of video, cost $33 per video-hour. Back then each container
-also sat idle for five minutes after its work. Pools are now told to shut down as soon as their
-work is done, so the same job is priced at the 0.05 row above, and most of what is left is
-startup.
+The first test job (run `102207184317`, three minutes of video) cost $33.36 per video-hour all
+in. Back then each container also sat idle for five minutes after its work. Pools are now told
+to shut down as soon as their work is done, so the same job is priced at the 0.05 row above, and
+most of what is left is startup. The certified run's job (3.9 minutes) cost $27.10 per
+video-hour all in, $9.90 without its cold starts ([measurement report](wave-h-report.md)).
 
 ## Where the money goes
 
@@ -91,7 +92,7 @@ Segment + caption, one container per stage, per video-hour:
 | 1 | $0.75 (12%) | $5.28 (87%) | $0.04 (1%) | $0.00 (0%) | **$6.07** |
 | 100 | $0.01 (0%) | $5.28 (100%) | $0.00 (0%) | $0.01 (0%) | **$5.29** |
 
-Idle at the end is an estimate (17 s per container), not yet confirmed on a live job. Everything else comes from the measured rates above.
+Idle at the end is an estimate (17 s per container), not yet confirmed on a live job. Everything else comes from the measured rates above; for segment and caption that is one small job, so the large rows are an extrapolation.
 <!-- /cost-table:breakdown -->
 
 On a three-minute job, startup is most of the bill. From about one video-hour up, GPU work is
@@ -139,7 +140,7 @@ Each cell: cost per video-hour, wall-clock and the containers `flora plan` picks
 <!-- /cost-table:gpus -->
 
 - If time doesn't matter, run one container per stage (`max_containers: 1`, as in
-  `balanced_lerobot.yaml`; `balanced_mp4_dir.yaml` ships 2 per stage). That is the cheapest way
+  `flora init --template balanced_lerobot`; `--template balanced_mp4_dir` ships 2 per stage). That is the cheapest way
   to run. `flora plan` recommends a layout that fills `modal.max_gpus`, so set
   `modal.max_gpus: 2` if you want it to pick one container per stage.
 - If you have a deadline, pass `flora plan --deadline 12h`. The planner adds containers only
@@ -165,20 +166,22 @@ estimate is early the H100 waits, at about $0.09 per minute; on a small job it s
 minutes of wall-clock. It is skipped when `flora deploy --min-containers` already keeps the
 pool warm.
 
-Batch fill is the other new change: it feeds the GPU bigger batches, so it does the same work in
-fewer seconds. It matters on big jobs, where GPU work is the whole bill. Neither warm starts nor
-batch fill has been measured yet, so the columns below are estimates:
+Batch fill (`engines/batch_policy.py`) is on by default: it feeds the GPU bigger batches, so it
+does the same work in fewer seconds. It matters on big jobs, where GPU work is the whole bill.
+It was on when the measured rates were taken, but that job (12 episodes) was too small to fill a
+batch, so its gain is not in them. Neither warm starts nor full batches have been measured yet,
+so those columns below are estimates:
 
 <!-- cost-table:levers -->
-| Video-hours | Today (cold) | Warm start | Batch fill | Both |
+| Video-hours | Measured rates (cold) | Warm start | Full batches | Both |
 |---|---|---|---|---|
 | 0.05 | **$21.00** ($14.20-$31.20) | **$13.40** ($8.80-$20.40) | no gain (too few episodes to fill a batch) | no gain (too few episodes to fill a batch) |
 | 1 | **$6.07** ($4.06-$9.09) | **$5.69** ($3.79-$8.55) | **$4.14** ($2.77-$6.19) | **$3.75** ($2.50-$5.65) |
 | 100 | **$5.29** ($3.53-$7.94) | **$5.29** ($3.53-$7.93) | **$3.36** ($2.24-$5.04) | **$3.35** ($2.24-$5.03) |
 
-- Today: the measured rates and cold startups above.
+- Measured rates: the rates and cold startups above. Batch fill is on by default and was on when they were measured, but the measuring job was too small to fill a batch.
 - Warm start: segment startup 150 s, estimate (placeholder, ±60%); caption startup 180 s, estimate (placeholder, ±60%). Not measured yet.
-- Batch fill: an estimate, not measured (segment 0.2 container-s per video-s, caption 0.55 container-s per video-s, ±50%, for jobs of at least 16 episodes; it can be smaller when preparing frames is the bottleneck rather than the GPU).
+- Full batches: what batch fill should reach on a job big enough to fill its batches; an estimate, not measured (segment 0.2 container-s per video-s, caption 0.55 container-s per video-s, ±50%, for jobs of at least 16 episodes; the gain can be smaller when preparing frames is the bottleneck rather than the GPU).
 <!-- /cost-table:levers -->
 
 `flora plan` prices startups cold unless you ask:
@@ -232,7 +235,8 @@ Team and Enterprise plans; otherwise the usage page of the Modal dashboard).
 - **Preparing the data.** `flora index` runs on CPU containers and costs a few cents for most
   datasets (or nothing with `--local`); downloading a Hugging Face dataset is not priced.
 - **Region pinning.** Setting `modal.region` multiplies every price by 1.15 to 1.75.
-  `flora plan` includes this; the tables here don't.
+  `flora plan` applies 1.15 (a broad region), so a narrow region can cost up to 1.75x its
+  estimate; the tables here apply neither.
 - **Retries and preemptions.** A preempted or crashed container redoes at most one shard of
   work (about 10 GPU-minutes by default), which these tables don't count.
 - **`reward.rubric`.** Its rate is not measured yet, so `flora plan` marks an option that

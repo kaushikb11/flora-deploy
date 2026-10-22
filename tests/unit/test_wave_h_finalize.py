@@ -256,8 +256,16 @@ def test_happy_path_updates_everything_consistently_and_is_idempotent(tmp_path, 
     assert f"**${bal_cost:,.2f}**" in rep
     assert "3600 x sum over the preset's kinds" in rep
     assert "**Recommendation: plugin off**" in rep and "0.31 is within the reference 0.5" in rep
-    assert "Overall: **provisional**" in rep and "reconciled" in rep
+    assert "Per stage: segment (human) **provisional**" in rep and "reconciled" in rep
+    assert "Overall:" not in rep  # one verdict per stage, never a single overall one
     assert "| tempseg | pass | 6 | 6 | 6 | 6 |" in rep
+    # `exact` as `flora plan` prices it (planner/rates.json), whatever this run measured
+    t = RateTable.load(root / "src/flora_deploy/planner/rates.json")
+    planned = fin.planned_usd_per_video_h(t, "exact")
+    ex_rate = t.rate("exact", "segcap", 1, 4).container_s_per_video_s
+    want_ex = round(ex_rate * wh.pool_container("segcap", "exact").usd_per_h(), 2)
+    assert planned["usd_per_video_h"] == want_ex
+    assert f"**${want_ex:,.2f}** ±" in rep and "as priced:" in rep
 
     # 4. docs blocks
     doc = (root / "docs/balanced-engines.md").read_text()
@@ -268,6 +276,9 @@ def test_happy_path_updates_everything_consistently_and_is_idempotent(tmp_path, 
     readme = (root / "README.md").read_text()
     cost = readme.split("<!-- wave-h:cost -->")[1].split("<!-- /wave-h:cost -->")[0]
     assert f"${bal_cost:.2f} per video-hour" in cost and "#" not in cost
+    assert f"(`exact`: ${want_ex:.2f})" in cost  # the planner's figure, not this run's
+    assert "projection" in cost and "not yet confirmed at scale" in cost
+    assert "measured 20" not in cost  # never presented as an at-scale measurement
     assert 2 <= len(cost.strip().splitlines()) <= 3
     readme0 = before["README.md"].decode()  # as built: no certificates in this root
     outside = readme0.split("<!-- wave-h:cost -->")

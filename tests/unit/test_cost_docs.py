@@ -54,7 +54,7 @@ def test_a_rate_change_changes_the_doc():
             r["container_s_per_video_s"] = C.BATCH_FILL_ESTIMATE[r["kind"]]
     measured = RateTable.from_dict(data, source="x")
     assert C.batch_fill_table(measured) is None
-    assert "Batch fill" not in C.block_levers(measured)
+    assert "Full batches" not in C.block_levers(measured)
 
 
 def test_every_number_is_labelled():

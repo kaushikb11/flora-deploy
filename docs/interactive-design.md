@@ -57,8 +57,8 @@ JobRequest{stages, episode: {id, videos: {main, left_wrist?, right_wrist?} -> al
    - It writes that receipt to `flora/online/<deployment>/<req>/`.
    - It then calls `segment → caption` and `reward.*` **in parallel**, since rewards don't need segments. Wall time ≈ max(seg + cap, reward).
 3. **GPU services** (`@modal.cls`, async methods, async `@modal.enter`, one engine per container):
-   - **SegmentService** on L40S. `@modal.concurrent(max_inputs=8)`, under `max_num_seqs=32` (`engines/offline_llm.py:96`).
-   - **CaptionService** on H100!. `max_inputs=4` (`max_num_seqs=16`, `offline_llm.py:100`).
+   - **SegmentService** on L40S. `@modal.concurrent(max_inputs=8)`, under `max_num_seqs=48` (`engines/offline_llm.py` `GPU_LIMITS`).
+   - **CaptionService** on H100!. `max_inputs=4` (`max_num_seqs=16`, same table).
    - **RewardService** on H100!. `max_inputs=4`; generation is serialized under a lock, and only the Collage decode overlaps.
 
    These are new classes. The batch factory's refusal of `max_inputs>1` (`factory.py:646`) does not apply to them.
@@ -192,8 +192,8 @@ Conditions:
 7. Should online results be composable into batch outputs or LeRobot write-back?
 
 ### Critical files for implementation
-- /Users/kaushikbokka/apps/robotics/flora-deploy/src/flora_deploy/modal_app/balanced_app.py
-- /Users/kaushikbokka/apps/robotics/flora-deploy/src/flora_deploy/engines/microbatch.py
-- /Users/kaushikbokka/apps/robotics/flora-deploy/src/flora_deploy/validate/certkey.py
-- /Users/kaushikbokka/apps/robotics/flora-deploy/src/flora_deploy/stages/reward.py
-- /Users/kaushikbokka/apps/robotics/flora-deploy/src/flora_deploy/jobs/budget.py
+- `src/flora_deploy/modal_app/balanced_app.py`
+- `src/flora_deploy/engines/microbatch.py`
+- `src/flora_deploy/validate/certkey.py`
+- `src/flora_deploy/stages/reward.py`
+- `src/flora_deploy/jobs/budget.py`

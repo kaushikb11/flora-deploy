@@ -168,8 +168,11 @@ normalize.
 
 ## Safety
 
-* **Uncertified records are refused** unless you pass `--allow-uncertified`: `balanced` segment
-  and caption records, out-of-envelope episodes, uncovered pools. The flag is not read from
+* **Uncertified records are refused** unless you pass `--allow-uncertified`: every record that
+  says `certified: false`, such as `balanced` caption records (no caption certificate yet),
+  `balanced` segment records outside the certified `human` / L40S pool, out-of-envelope
+  episodes and uncovered pools. `balanced` segment records from the certified stack export
+  without the flag. The flag is not read from
   `flora.yaml`'s `allow_uncertified`.
 * **Fake-model records are refused** unless you pass `--allow-fake`. These are
   `--fake-models` runs and `*.fake` job ids; they are counted as `fake`, not `uncertified`, and
