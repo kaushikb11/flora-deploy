@@ -670,6 +670,9 @@ def main(argv: list[str] | None = None) -> int:
             with _LOCK:
                 app_names.append(r.plan.app_name)
                 watch.append(r.plan.watch_dict)
+                from flora_deploy.jobs.pools import pool_dict_name
+
+                watch.append(pool_dict_name(r.plan.watch_dict))  # jobs.pools: same prefix
             r.check("deployed app == the client's plan", f"deployed {r.plan.app_name}" in
                     " ".join((dep.stdout + dep.stderr).split()), r.plan.app_name)
             if r.spec.preempt or r.spec.poison_at:

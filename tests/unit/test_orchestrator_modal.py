@@ -223,7 +223,7 @@ def test_orchestrator_app_definitions_are_module_scope():
     for fn in (oa.run, oa.reconcile, oa.reconcile_watched):
         raw = fn._raw_f_  # private, but the only offline handle on the decorated function
         assert raw.__qualname__ == raw.__name__  # module scope, not nested/serialized
-    assert "nonpreemptible: true" in str(oa.run._spec_.scheduler_placement)
+    assert "nonpreemptible: true" not in str(oa.run._spec_.scheduler_placement)  # jobs.pools
     assert oa.run._spec_.gpus is None and oa.run._spec_.cpu == oa.CPU_CORES
     with pytest.raises(ValueError, match="module:function"):
         oa.load_factory("nocolon")

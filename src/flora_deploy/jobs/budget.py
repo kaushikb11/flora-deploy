@@ -42,6 +42,7 @@ from datetime import datetime
 from typing import Any, Protocol
 
 from flora_deploy.jobs.orchestrator import BudgetDecision
+from flora_deploy.jobs.pools import DRAINED_SCALEDOWN_S, ORCHESTRATOR_PREEMPTIBLE, idle_tail_s
 from flora_deploy.jobs.settings import PoolSettings, RunSettings
 from flora_deploy.jobs.store import JobPaths, Store
 from flora_deploy.jobs.types import ContainerReceipt, Shard
@@ -286,13 +287,20 @@ class BudgetState:
 
     now: float
     calls: tuple[CallRecord, ...] = ()
+    # kind -> intervals ``(start, end | None)`` its worker class was drained (``jobs.pools``)
+    drains: Mapping[str, tuple[tuple[float, float | None], ...]] = field(default_factory=dict)
+    # kind -> ``(start, end | None)`` of a pre-warm container waiting for its first call
+    prewarms: Mapping[str, tuple[float, float | None]] = field(default_factory=dict)
 
     def live(self) -> list[CallRecord]:
         return [c for c in self.calls if c.live]
 
 
 def calls_cost(calls: Iterable[CallRecord], settings: RunSettings, rates: Rates, now: float, *,
-               scaledown_s: float = 60.0, warm: int = 0) -> float:
+               scaledown_s: float = 60.0, warm: int = 0,
+               drains: Mapping[str, Iterable[tuple[float, float | None]]] | None = None,
+               drained_s: float = DRAINED_SCALEDOWN_S,
+               prewarms: Mapping[str, tuple[float, float | None]] | None = None) -> float:
     """Spawn-time spend estimate, independent of container receipts.
 
     Per kind, a sweep over call intervals ``[spawned_at, ended_at or now]``: at every instant the
@@ -303,7 +311,14 @@ def calls_cost(calls: Iterable[CallRecord], settings: RunSettings, rates: Rates,
     containers of the calls it knows (it cannot see orphan calls; receipts and billing can).
 
     ``warm``: ``min_containers`` warm containers per kind, billed from the kind's first call on
-    (kinds sharing one worker class are each charged their own: an over-count)."""
+    (kinds sharing one worker class are each charged their own: an over-count).
+
+    ``drains``: per kind, when the orchestrator drained its worker class (``jobs.pools``): a
+    container going idle then is charged only until ``drain start + drained_s``
+    (:func:`~flora_deploy.jobs.pools.idle_tail_s`), not the whole ``scaledown_s``.
+
+    ``prewarms``: per kind, a pre-warm container (``jobs.pools``) billed from its start until its
+    first call was spawned (``end``) or up to now, on top of the calls."""
     by_kind: dict[str, list[tuple[float, int]]] = {}
     for c in calls:
         start = min(c.spawned_at, now)
@@ -320,14 +335,21 @@ def calls_cost(calls: Iterable[CallRecord], settings: RunSettings, rates: Rates,
         ev.append((now, 0))
         n = 0
         last = ev[0][0]
+        kind_drains = tuple((drains or {}).get(kind, ()))
         for t, d in ev:
             containers = max(math.ceil(n / mi), warm)
             total += (t - last) * containers * per_s
             n += d
             after = max(math.ceil(n / mi), warm)
             if after < containers:
-                total += (containers - after) * scaledown_s * per_s
+                tail = (idle_tail_s(t, scaledown_s, kind_drains, drained_s) if kind_drains
+                        else scaledown_s)
+                total += (containers - after) * tail * per_s
             last = t
+    for kind, (t0, t1) in (prewarms or {}).items():
+        if kind in settings.pools:
+            end = now if t1 is None else min(t1, now)
+            total += max(end - t0, 0.0) * pool_rate(rates, settings, kind)
     return total
 
 
@@ -616,9 +638,11 @@ class ProjectionBudgetGate:
     tick_reserve_s: float = 30.0  # burn charged ahead in overspend(): poll interval + cancel lag
     # kind -> stage hash (or a callable): where each kind's shard receipts live (``JobPaths``)
     stage_hashes: Mapping[str, str] | Callable[[], Mapping[str, str]] | None = None
-    # the orchestrator's own container (non-preemptible CPU), billed from the first call on
+    # the orchestrator's own container (``jobs.pools``: preemptible CPU since the lean-ops
+    # change), billed from the first call on
     orchestrator_cores: float = 0.0
     orchestrator_memory_gib: float = 0.0
+    orchestrator_preemptible: bool = ORCHESTRATOR_PREEMPTIBLE
     learn_calibration: bool = True
     billing_error: str | None = field(default=None, init=False)
     last_overspend: dict[str, Any] = field(default_factory=dict, init=False)
@@ -784,13 +808,14 @@ class ProjectionBudgetGate:
         live = 0
         if self._state is not None:
             calls = calls_cost(self._state.calls, self.settings, self.rates, now,
-                               scaledown_s=self.scaledown_s, warm=self.settings.min_containers)
+                               scaledown_s=self.scaledown_s, warm=self.settings.min_containers,
+                               drains=self._state.drains, prewarms=self._state.prewarms)
             live = len(self._state.live())
             if self._state.calls and (self.orchestrator_cores or self.orchestrator_memory_gib):
                 t0 = min(c.spawned_at for c in self._state.calls)
                 calls += max(now - t0, 0.0) * self.rates.per_second(
                     None, 0, self.orchestrator_cores, self.orchestrator_memory_gib,
-                    preemptible=False)
+                    preemptible=self.orchestrator_preemptible)
         return SpendReport(receipts, calls, self._billing_now(now), len(self._known), live)
 
     def projection(self, in_flight: Mapping[str, int]) -> Projection:

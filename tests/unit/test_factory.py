@@ -83,7 +83,10 @@ def test_exact_plan_and_app():
     assert w.env["FLORA_SHARD_KINDS"] == "segcap" and "CUBLAS_WORKSPACE_CONFIG" not in w.env
     assert w.secrets == ()
     orch = plan.object("orchestrator_run")
-    assert orch.nonpreemptible and orch.gpu is None and orch.cpu <= 0.5
+    # jobs.pools: small, preemptible, 2 s idle; memory (request, limit)
+    assert not orch.nonpreemptible and orch.gpu is None and orch.cpu <= 0.125
+    assert orch.memory == (256, 1024) and orch.scaledown_window == 2
+    assert orch.env["FLORA_POOL_DICT"] == plan.watch_dict + "-pools"
     assert orch.timeout == 24 * 3600 and orch.retries == f.ORCH_RETRIES
     assert orch.env["FLORA_WATCH_DICT"] == plan.watch_dict
     assert set(plan.image_fingerprints) == {"img_hfref", "img_cpu"}
@@ -98,7 +101,7 @@ def test_exact_plan_and_app():
     assert spec.gpus == "H200" and spec.cpu == 8.0 and spec.memory == w.memory
     assert set(spec.volumes) == {str(WEIGHTS_MOUNT), "/vol/flora-results"}
     ospec = fns["orchestrator_run"]._spec
-    assert "nonpreemptible: true" in str(ospec.scheduler_placement) and ospec.gpus is None
+    assert "nonpreemptible: true" not in str(ospec.scheduler_placement) and ospec.gpus is None
     for name in ("orchestrator_run", "reconcile"):
         raw = fns[name]._raw_f
         assert raw.__module__ == f.__name__ and raw.__qualname__ == name  # module scope
@@ -394,7 +397,8 @@ def test_orchestrator_wrappers_spawn_in_their_own_app(monkeypatch):
     monkeypatch.setattr(f, "_watch_kv", lambda: store)
     calls = {}
 
-    def run_generation(job_id, factory, generation, watch, *, spawn_successor, watch_kv):
+    def run_generation(job_id, factory, generation, watch, *, spawn_successor, watch_kv,
+                       pool_kv=None):
         calls["run"] = (job_id, factory, generation, watch, spawn_successor, watch_kv)
         return {"ok": True}
 

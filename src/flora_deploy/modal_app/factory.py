@@ -31,9 +31,11 @@ Objects, by stable Modal name (``ModalSpawner`` looks classes up by ``AppPlan.wo
   embodiment, which the workers verify and stamp). Kinds that
   share a class share its containers: their pools must agree on GPU and ``max_inputs``; cpu and
   memory take the larger, ``max_containers`` the sum (the orchestrator caps each kind itself);
-- ``orchestrator_run`` (CPU, nonpreemptible, 24 h, ``modal.Retries``) and ``reconcile``; with
-  ``reconcile_cron`` also ``reconcile_watched`` on a ``modal.Cron``. Their continuation/revive
-  spawns go to this app (``FLORA_APP_NAME``), and the watch list is per app;
+- ``orchestrator_run`` (small preemptible CPU, 2 s idle, 24 h, ``modal.Retries``; sizes in
+  ``jobs.pools``) and ``reconcile``; with ``reconcile_cron`` also ``reconcile_watched`` on a
+  ``modal.Cron``. Their continuation/revive spawns go to this app (``FLORA_APP_NAME``), and the
+  watch list is per app, as is the pool Dict (``FLORA_POOL_DICT``, ``<watch dict>-pools``)
+  through which the app's jobs agree when a worker class may be drained (``jobs.pools``);
 - ``index_run_shard`` when ``INDEX_FUNCTION`` resolves to an undecorated function (P1a-6b);
   otherwise it is listed in ``AppPlan.skipped``.
 
@@ -697,17 +699,23 @@ def plan_app(
                 secrets=secrets, region=cfg.modal.region,
                 env=dict(sorted({**env, **_recipe_env(ref.recipe, determinism, "rw")}.items()))))
 
+    from flora_deploy.jobs import pools as jp
+
     orch_env = dict(sorted({**base_env, WATCH_ENV: watch_dict,
+                            jp.POOL_DICT_ENV: jp.pool_dict_name(watch_dict),
                             "FLORA_SCALEDOWN_S": str(scaledown),
                             "FLORA_MIN_CONTAINERS": str(min_containers),
                             **({"FLORA_REGION": cfg.modal.region} if cfg.modal.region else {}),
                             }.items()))
     here = __name__
-    common = {"module": here, "image": "img_cpu", "cpu": float(oa.CPU_CORES),
-              "memory": int(oa.MEMORY_MIB), "volumes": dict(store_volumes), "secrets": secrets,
+    common = {"module": here, "image": "img_cpu", "cpu": float(jp.ORCHESTRATOR_CPU),
+              "memory": (int(jp.ORCHESTRATOR_MEMORY_MIB), int(jp.ORCHESTRATOR_MEMORY_LIMIT_MIB)),
+              "scaledown_window": int(jp.ORCHESTRATOR_SCALEDOWN_S),
+              "volumes": dict(store_volumes), "secrets": secrets,
               "env": orch_env, "region": cfg.modal.region}
     objects.append(ObjectSpec(kind="function", name="orchestrator_run", attr="orchestrator_run",
-                              timeout=int(oa.TIMEOUT_S), nonpreemptible=True,
+                              timeout=int(oa.TIMEOUT_S),
+                              nonpreemptible=not jp.ORCHESTRATOR_PREEMPTIBLE,
                               retries=dict(ORCH_RETRIES), **common))
     objects.append(ObjectSpec(kind="function", name="reconcile", attr="reconcile",
                               timeout=15 * 60, **common))
@@ -877,11 +885,16 @@ def _watch_kv() -> Any:
 def orchestrator_run(job_id: str, factory: str, generation: int = 0,
                      watch: bool = False) -> dict[str, Any]:
     """One orchestrator generation (``orchestrator_app.run_generation``) in this app."""
+    import modal
+
+    from flora_deploy.jobs.pools import POOL_DICT_ENV
     from flora_deploy.modal_app import orchestrator_app as oa
 
+    pool_kv = (modal.Dict.from_name(os.environ[POOL_DICT_ENV], create_if_missing=True)
+               if os.environ.get(POOL_DICT_ENV) else None)
     return oa.run_generation(job_id, factory, generation, watch,
                              spawn_successor=_own("orchestrator_run").spawn,
-                             watch_kv=_watch_kv())
+                             watch_kv=_watch_kv(), pool_kv=pool_kv)
 
 
 def reconcile(job_id: str, factory: str, revive: bool = True) -> dict[str, Any]:

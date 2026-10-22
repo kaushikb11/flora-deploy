@@ -549,16 +549,18 @@ def test_pool_sizing_recommends_two_segment_three_caption():
 
 
 def test_observed_spend_prices_each_container_at_its_own_class():
-    """M2: the orchestrator and reconcilers at the non-preemptible CPU rate, L40S workers at
-    L40S, H100 at H100 (``jobs.budget`` pinned prices); not everything at H100."""
+    """M2: the orchestrator and reconcilers at their CPU rate (preemptible since ``jobs.pools``:
+    no 3x), L40S workers at L40S, H100 at H100 (``jobs.budget`` pinned prices); not everything
+    at H100."""
     from flora_deploy.jobs.budget import pinned_rates
     from flora_deploy.modal_app import orchestrator_app as oa
 
     r = pinned_rates()
     rates = sc.container_rates("real")
-    cpu = r.per_second(None, 0, oa.CPU_CORES, oa.MEMORY_MIB / 1024, preemptible=False)
+    cpu = r.per_second(None, 0, oa.CPU_CORES, oa.MEMORY_MIB / 1024, preemptible=True)
     assert rates[sc.CPU_CLASS] == pytest.approx(cpu)
-    assert cpu == pytest.approx(3 * r.per_second(None, 0, oa.CPU_CORES, oa.MEMORY_MIB / 1024))
+    assert cpu == pytest.approx(
+        r.per_second(None, 0, oa.CPU_CORES, oa.MEMORY_MIB / 1024, preemptible=False) / 3)
     from flora_deploy.config.presets import get_preset
 
     seg = get_preset("balanced").pools["segment"]

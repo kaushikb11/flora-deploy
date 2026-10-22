@@ -14,6 +14,7 @@ from flora_deploy.jobs.budget import pinned_rates
 from flora_deploy.planner.options import (
     ORCHESTRATOR_CORES,
     ORCHESTRATOR_GIB,
+    POOL_END_TAIL_S,
     PlanRequest,
     WorkloadGroup,
     WorkloadSummary,
@@ -25,7 +26,7 @@ from flora_deploy.planner.options import (
 from flora_deploy.planner.rates import RateTable
 
 H200_PER_S = (4.54 + 8 * 0.0472 + 96 * 0.008) / 3600
-ORCH_PER_S = 3 * (ORCHESTRATOR_CORES * 0.0472 + ORCHESTRATOR_GIB * 0.008) / 3600
+ORCH_PER_S = (ORCHESTRATOR_CORES * 0.0472 + ORCHESTRATOR_GIB * 0.008) / 3600  # preemptible
 
 
 def one_rate_table(rate=4.0, startup=100.0, u=0.0) -> RateTable:
@@ -73,7 +74,9 @@ def test_hand_calc_single_kind():
     k = o.kinds[0]
     assert (k.containers, k.max_inputs, k.gpu) == (4, 4, "H200")
     assert o.wall_s == pytest.approx(100 + 144_000 / 4)
-    expect = H200_PER_S * (144_000 + 4 * 100) + ORCH_PER_S * (100 + 36_000)
+    # each container's pool-end tail: one poll + the drained 2 s window (jobs.pools)
+    expect = (H200_PER_S * (144_000 + 4 * (100 + POOL_END_TAIL_S))
+              + ORCH_PER_S * (100 + 36_000))
     assert o.cost_usd == pytest.approx(expect, abs=0.01)
     assert o.peak_gpus == 4 and o.certification == "reference" and o.status == "ok"
 

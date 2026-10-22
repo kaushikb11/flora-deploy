@@ -77,7 +77,7 @@ user machine:  flora CLI / SDK  (init · doctor · prepare · index · plan · d
    index ──► plan ──► deploy ──► run ───────────────────────────────────► compose ──► results
      │        │         │         │                                          │
      ▼        ▼         ▼         ▼                                          ▼
-  index     shards    one Modal  orchestrator (CPU, non-preemptible,     deduped JSONL /
+  index     shards    one Modal  orchestrator (CPU, preemptible,         deduped JSONL /
   receipts  + rate    app per    Dict lease, 23 h continuation)          Parquet / summary.json
   per       estimate  config     ├─ spawns shard calls per kind, chained per episode
   episode             (factory)  ├─ attempts → quarantine → bisection → errors/

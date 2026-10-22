@@ -190,6 +190,86 @@ Expect ≈ 100–130 s per fresh container. Also consider pinning GPU workers to
 (US): the one `ap-northeast` container read 3× slower. Regional pinning has a price multiplier
 (≥ 1.15×), so weigh it against that.
 
+## Ending idle
+
+`scaledown_window` is flora's own `WORKER_SCALEDOWN_S` (300 s); Modal's default is 60 s. On the
+first real balanced job (6 episodes) the segment L40S sat idle for the full 300 s after its last
+shard ($0.23 of its $0.50), and caption did the same at job end. `jobs/pools.py` removes both
+tails.
+
+**What modal 1.6.2 offers** (read from the installed client):
+- `Cls.from_name(app, cls)().update_autoscaler(scaledown_window=, min_containers=,
+  max_containers=, buffer_containers=)` overrides one class until the next deploy.
+  `scaledown_window` must be in [2, 3600]. `Function.autoscaler.update()` is the newer spelling
+  (`update_autoscaler` warns as deprecated since 2026-10-16), but a `Cls` instance doesn't
+  expose it yet.
+- `max_containers` can't be set to 0.
+- There's no per-class "stop idle containers" call. `modal container stop` takes one container
+  id, and `modal app stop` stops every class.
+- `modal.experimental.stop_fetching_inputs()` exists, but it runs inside a worker. A worker
+  can't tell its pool is finished, so a respawned shard would then need a cold container, and
+  those files belong to the worker owners.
+
+**What flora does.** When a class has no shard left that is queued, retrying, live or waiting on
+a dependency, the orchestrator drops that class's window to 2 s. It does this on the tick where
+it sees the last receipt, so at most one 15 s poll after the container went idle. It puts the
+window back to 300 s before that class gets work again. Jobs on one app agree through the app's
+pool Dict (`<watch dict>-pools`): a class is drained only when no other live job needs it.
+Caption is never drained while segment still produces.
+
+`calls_cost` charges a container that goes idle only up to *drain + 2 s*. Each drain is saved in
+`<job>/<cfg>/pools/drains.json`. The planner charges each container a 17 s tail (one poll plus
+2 s) in place of nothing.
+
+**Not verified live:** whether Modal applies a lowered window to a container that is *already*
+idle, or only to containers that go idle afterwards. One CPU fake-models run settles it: deploy,
+run one shard, watch `modal container list` after the `pool_drained` event. If the window only
+applies to containers going idle later, the fallback is to drain one tick *before* the last
+shard ends. For that, the orchestrator would need the shard's ETA, which it already has from the
+pre-warm estimates.
+
+**Keep 300 s between shards.** With job-aware drain, the window only matters for gaps *inside* a
+busy pool. Gaps come in two kinds:
+- A pool with queued shards respawns within one poll (≤ 15 s), so any window above about 20 s
+  covers it.
+- The long gaps are a dependent pool waiting on its upstream mid-job, for example caption
+  waiting for the next segment output.
+
+For a gap of *g* seconds, keeping the container costs *g · r*, and letting it go costs one
+startup *S · r* plus *S* of wall-clock. This is the ski-rental problem, so the best fixed window
+is about *S*: segment 300 s, caption 325 s (`planner/rates.json`). A 60 s window would turn every
+60–325 s caption gap into a 325 s cold start, which costs more and is slower. So the default
+stays at 300 s. Changing it would also change every config hash, because `jobs/settings.py` is
+hashed.
+
+**Caption pre-warm.** Caption shards spawn only once their segment dependency is met
+(`orchestrator.deps_ready`, tested in `tests/unit/test_pools.py`). On a small job, that puts
+caption's 325 s cold start after segment's, one after the other. Here is how the orchestrator
+handles it:
+1. It estimates when the first caption shard becomes runnable: segment's spawn time, plus its
+   startup, plus its work, from the budget gate's rate-table estimator.
+2. At that time minus caption's startup, it sets caption's `min_containers` to 1.
+3. Once the first caption call is live, it sets `min_containers` back.
+4. It records the decision as a `pool_prewarm_plan` event, either `prewarm` with `saves_s`, or
+   `skip` with the reason.
+
+This saves up to about 5 min of wall-clock, and the cost is the estimate's error in idle H100
+time (about $0.09 per minute early). The budget charges the warm container from its start. At
+job end, `min_containers` is reset on every class a pre-warm may have raised.
+
+**Orchestrator.**
+- It now runs preemptible, at 0.125 cores, with 256 MiB requested (1 GiB limit) and a 2 s idle
+  window. Before, it ran non-preemptible at 0.25 cores and 1 GiB, with Modal's default 60 s
+  idle.
+- Its own cost is small, about $0.015 per small job before this change. Most of the "$0.38"
+  attributed to it was caption's idle tail.
+- Preemption is survivable. The lease belongs to the function call id, which a restarted input
+  keeps, and ledgers re-attach in-flight calls.
+- Reconciler cron: it stays at every 10 min. Each run is now a few CPU-seconds with a 2 s idle
+  window. A slower cron would make a dead orchestrator's gap longer, and a gap of caption idle
+  plus restart cost $2.65 in the scale-test model. A faster cron would buy nothing that
+  `modal.Retries` (30 s initial delay) doesn't already cover.
+
 ## Spend
 
 - CPU throughput: six fresh containers plus one reused container, ≈ 8 container-minutes. ≈ $0.10.

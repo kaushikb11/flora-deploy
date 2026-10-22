@@ -10,11 +10,14 @@ Model, per option (one preset at one episode concurrency per container):
   the kind that finishes last, until every kind meets the deadline (or, with no deadline, until
   the GPU cap or the per-kind episode cap stops it). Kinds run in parallel (reward shards do not
   wait for segment/caption), so wall-clock = max over kinds of startup + work / containers;
-* cost = Σ kinds (work + containers × startup) × the pool's $/s (GPU × count + cores + memory,
-  ``jobs.budget.Rates``) + the non-preemptible orchestrator for the wall-clock.
+* cost = Σ kinds (work + containers × (startup + :data:`POOL_END_TAIL_S`)) × the pool's $/s
+  (GPU × count + cores + memory, ``jobs.budget.Rates``) + the orchestrator (``jobs.pools``:
+  preemptible CPU) for the wall-clock. ``POOL_END_TAIL_S`` is each container's idle tail once
+  its pool has no work left: the orchestrator notices within one poll interval and drains the
+  class to a 2 s ``scaledown_window`` (``jobs.pools``) instead of waiting out the deployed 300 s.
 
-Not modelled: queueing for GPUs beyond the cap, a single long episode's critical path, idle
-``scaledown_window`` time and Volume/egress costs. ``flora estimate`` calibrates the rates.
+Not modelled: queueing for GPUs beyond the cap, a single long episode's critical path, idle time
+between shards of a busy pool and Volume/egress costs. ``flora estimate`` calibrates the rates.
 
 Rate status (review 4 M5, review 5 M-C): an option whose cost rests on rates that are not
 ``measured`` carries a ``warning:`` flag naming them. ``PlanRequest.features`` defaults to the
@@ -39,12 +42,19 @@ from typing import Any, Literal
 
 from flora_deploy.config.presets import AVAILABLE_PRESETS, get_preset, shard_kinds_for
 from flora_deploy.jobs.budget import Rates, pinned_rates
+from flora_deploy.jobs.orchestrator import POLL_INTERVAL_S
+from flora_deploy.jobs.pools import (
+    DRAINED_SCALEDOWN_S,
+    ORCHESTRATOR_CORES,
+    ORCHESTRATOR_PREEMPTIBLE,
+)
+from flora_deploy.jobs.pools import ORCHESTRATOR_MEMORY_GIB as ORCHESTRATOR_GIB
 from flora_deploy.jobs.settings import IN_WORKER_CONCURRENCY, PoolSettings
 from flora_deploy.planner.rates import DEPLOYED_FEATURES, STATUS_RANK, RateTable
 from flora_deploy.records import Stage
 
-ORCHESTRATOR_CORES = 0.25  # modal_app/orchestrator_app.py
-ORCHESTRATOR_GIB = 1.0
+# Idle per container after its pool's last shard: one orchestrator poll + the drained window.
+POOL_END_TAIL_S = POLL_INTERVAL_S + DRAINED_SCALEDOWN_S
 DEFAULT_EPISODE_S = 60.0  # assumed mean episode length when only total hours are known
 
 Certification = Literal["reference", "certified", "needs certificates"]
@@ -325,11 +335,12 @@ def build_option(req: PlanRequest, table: RateTable, rates: Rates, preset: str, 
     peak = sum(k.n * k.pool.gpu_count for k in kinds)
     wall = max(k.finish(1) for k in kinds)
     wall_hi = max(k.finish(2) for k in kinds)
-    orch_ps = rates.per_second(None, 0, ORCHESTRATOR_CORES, ORCHESTRATOR_GIB, preemptible=False)
+    orch_ps = rates.per_second(None, 0, ORCHESTRATOR_CORES, ORCHESTRATOR_GIB,
+                               preemptible=ORCHESTRATOR_PREEMPTIBLE)
 
     def cost(which: int, wall_s: float) -> float:
-        return sum(k.per_s * (k.work[which] + k.n * k.startup[which]) for k in kinds) + \
-            orch_ps * wall_s
+        return sum(k.per_s * (k.work[which] + k.n * (k.startup[which] + POOL_END_TAIL_S))
+                   for k in kinds) + orch_ps * wall_s
 
     c_lo, c_mid, c_hi = cost(0, max(k.finish(0) for k in kinds)), cost(1, wall), cost(2, wall_hi)
     flags: list[str] = []

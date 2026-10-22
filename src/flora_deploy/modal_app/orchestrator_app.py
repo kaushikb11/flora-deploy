@@ -1,4 +1,7 @@
-"""``flora-orchestrator`` Modal app: the job loop as a non-preemptible CPU function (PLAN.md §2).
+"""``flora-orchestrator`` Modal app: the job loop as a small preemptible CPU function (PLAN.md §2).
+
+Resources, preemptibility and the worker-pool drain / pre-warm: ``jobs.pools`` (module
+docstring), applied here through :class:`ModalAutoscaler`.
 
 - ``run(job_id, factory)``: acquires the per-job Dict lease, drives the
   :class:`~flora_deploy.jobs.orchestrator.Orchestrator` with :class:`ModalSpawner` through
@@ -55,9 +58,20 @@ from flora_deploy.jobs.orchestrator import (
     Orchestrator,
     OrchestratorDeps,
 )
+from flora_deploy.jobs.pools import (
+    ORCHESTRATOR_CPU,
+    ORCHESTRATOR_MEMORY_LIMIT_MIB,
+    ORCHESTRATOR_MEMORY_MIB,
+    ORCHESTRATOR_PREEMPTIBLE,
+    ORCHESTRATOR_SCALEDOWN_S,
+    POOL_DICT_ENV,
+    PoolScaler,
+    drains_path,
+)
 from flora_deploy.jobs.reconciler import reconcile as reconcile_status
 from flora_deploy.jobs.reconciler import revive_if_needed
 from flora_deploy.jobs.spawner import CallStatus
+from flora_deploy.jobs.store import JobPaths
 from flora_deploy.jobs.types import ShardReceipt, safe_key
 from flora_deploy.modal_app.images import cpu_image
 
@@ -65,8 +79,10 @@ APP_NAME = "flora-orchestrator"
 LEASE_DICT = "flora-orchestrator-leases"
 WATCH_DICT = "flora-orchestrator-watch"
 TIMEOUT_S = 24 * 3600  # Modal's per-attempt maximum; the loop stops at DEADLINE_S (23 h)
-CPU_CORES = 0.25
-MEMORY_MIB = 1024
+POOL_DICT = "flora-orchestrator-pools"  # this module's app; factory apps: ``<watch>-pools``
+CPU_CORES = ORCHESTRATOR_CPU
+MEMORY_MIB = ORCHESTRATOR_MEMORY_MIB  # request (billed at max(request, use))
+MEMORY = (ORCHESTRATOR_MEMORY_MIB, ORCHESTRATOR_MEMORY_LIMIT_MIB)  # (request, limit)
 RECONCILE_EVERY = "*/10 * * * *"
 
 app = modal.App(APP_NAME)
@@ -210,6 +226,48 @@ class ModalSpawner:
         self._call_api.from_id(call_id).cancel(terminate_containers=True)
 
 
+class ModalAutoscaler:
+    """``jobs.pools.Autoscaler`` over ``Cls.from_name(app, cls)().update_autoscaler`` (modal
+    1.6.2; it warns as deprecated in favour of ``Function.autoscaler.update``, which a ``Cls``
+    instance does not expose yet)."""
+
+    def __init__(self, app_name: str, *, cls_api: Any = None):
+        self.app_name = app_name
+        self._cls_api = cls_api or modal.Cls
+
+    def _update(self, cls_name: str, **kw: Any) -> None:
+        import warnings
+
+        obj = self._cls_api.from_name(self.app_name, cls_name)()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            obj.update_autoscaler(**kw)
+
+    def set_scaledown(self, cls_name: str, seconds: int) -> None:
+        self._update(cls_name, scaledown_window=int(seconds))
+
+    def set_min_containers(self, cls_name: str, n: int) -> None:
+        self._update(cls_name, min_containers=int(n))
+
+
+def build_pools(job_id: str, deps: OrchestratorDeps, *, kv: Any, autoscaler: Any,
+                events: Callable[[dict[str, Any]], None]) -> PoolScaler:
+    """The job's ``PoolScaler``: drains on the deployed classes, pre-warm timed by the budget
+    gate's estimator (when it has one)."""
+    est = getattr(deps.budget, "estimator", None)
+    pools = deps.settings.pools
+    startup = getattr(est, "startup_s", None)
+    work = None
+    if est is not None:
+        def work(shard: Any) -> float:
+            return float(est.container_seconds(shard, pools[shard.kind]))
+    return PoolScaler(
+        job_id=job_id, classes=deps.worker_classes, static_s=deps.settings.scaledown_s,
+        autoscaler=autoscaler, kv=kv, events=events, store=deps.store,
+        path=drains_path(JobPaths(job_id).root, deps.settings.config_hash),
+        startup_s=startup, work_s=work)
+
+
 # ----------------------------------------------------------------------------------------------
 # Functions
 # ----------------------------------------------------------------------------------------------
@@ -245,8 +303,10 @@ def _holder() -> str | None:
 
 def build_orchestrator(job_id: str, deps: OrchestratorDeps, *, lease_kv: Any,
                        events: Callable[[dict[str, Any]], None] = _print_event,
-                       deadline_s: float = DEADLINE_S, holder: str | None = None) -> Orchestrator:
+                       deadline_s: float = DEADLINE_S, holder: str | None = None,
+                       pools: PoolScaler | None = None) -> Orchestrator:
     return Orchestrator(
+        pools=pools,
         settings=deps.settings, store=deps.store,
         spawner=ModalSpawner(deps.worker_app, deps.worker_classes),
         lease=DictLease(lease_kv, f"orchestrator/{job_id}"),
@@ -269,8 +329,8 @@ def _retry(fn: Callable[[], Any], attempts: int = 3, delay_s: float = 5.0) -> An
     return None
 
 
-@app.function(image=cpu_image(), nonpreemptible=True, cpu=CPU_CORES, memory=MEMORY_MIB,
-              timeout=TIMEOUT_S,
+@app.function(image=cpu_image(), nonpreemptible=not ORCHESTRATOR_PREEMPTIBLE, cpu=CPU_CORES,
+              memory=MEMORY, timeout=TIMEOUT_S, scaledown_window=ORCHESTRATOR_SCALEDOWN_S,
               retries=modal.Retries(max_retries=3, initial_delay=30.0, backoff_coefficient=2.0))
 def run(job_id: str, factory: str, generation: int = 0, watch: bool = False) -> dict[str, Any]:
     """One orchestrator generation. Spawns its successor when the deadline is reached.
@@ -280,10 +340,13 @@ def run(job_id: str, factory: str, generation: int = 0, watch: bool = False) -> 
 
 
 def run_generation(job_id: str, factory: str, generation: int = 0, watch: bool = False, *,
-                   spawn_successor: Callable[..., Any], watch_kv: Any = None) -> dict[str, Any]:
+                   spawn_successor: Callable[..., Any], watch_kv: Any = None,
+                   pool_kv: Any = None, autoscaler: Any = None) -> dict[str, Any]:
     """``run``'s body. ``spawn_successor(job_id, factory, generation, watch)`` starts the next
     generation in the caller's own app; ``watch_kv`` (default ``watched``) is the reconciler's
-    watch list. The app factory (``modal_app.factory``) passes its own app's handles."""
+    watch list. The app factory (``modal_app.factory``) passes its own app's handles.
+    ``pool_kv`` / ``autoscaler`` (default: the app's pool Dict, ``ModalAutoscaler`` on
+    ``deps.worker_app``) drive ``jobs.pools``; with no worker classes there is nothing to drain."""
     watched_kv = watched if watch_kv is None else watch_kv
     deps = load_factory(factory)(job_id)
     if watch:
@@ -292,7 +355,13 @@ def run_generation(job_id: str, factory: str, generation: int = 0, watch: bool =
     backstop = apply_environment_budget(environment, deps.settings)
     if generation == 0:
         _print_event({"event": "environment_budget", "job_id": job_id, **asdict(backstop)})
-    orch = build_orchestrator(job_id, deps, lease_kv=leases, holder=_holder())
+    pools = None
+    if deps.worker_app and deps.worker_classes:
+        kv = pool_kv if pool_kv is not None else modal.Dict.from_name(
+            os.environ.get(POOL_DICT_ENV) or POOL_DICT, create_if_missing=True)
+        pools = build_pools(job_id, deps, kv=kv, events=_print_event,
+                            autoscaler=autoscaler or ModalAutoscaler(deps.worker_app))
+    orch = build_orchestrator(job_id, deps, lease_kv=leases, holder=_holder(), pools=pools)
     outcome = TickDriver(orch).run_until_idle(sleep=time.sleep)  # releases the lease
     if outcome.result == "continue":
         successor = _retry(lambda: spawn_successor(job_id, factory, generation + 1, watch))
@@ -325,7 +394,8 @@ def _reconcile_job(job_id: str, factory: str, revive: bool = True, *,
     return {**asdict(status), "revived": bool(revived)}
 
 
-@app.function(image=cpu_image(), cpu=CPU_CORES, memory=MEMORY_MIB, timeout=15 * 60)
+@app.function(image=cpu_image(), cpu=CPU_CORES, memory=MEMORY, timeout=15 * 60,
+              scaledown_window=ORCHESTRATOR_SCALEDOWN_S)
 def reconcile(job_id: str, factory: str, revive: bool = True) -> dict[str, Any]:
     """Rebuild status from files; restart the orchestrator if it is dead and work remains."""
     return _reconcile_job(job_id, factory, revive)
@@ -357,8 +427,8 @@ def reconcile_all(entries: Iterable[tuple[str, str]], reconcile_one: Callable[..
     return out
 
 
-@app.function(image=cpu_image(), cpu=CPU_CORES, memory=MEMORY_MIB, timeout=15 * 60,
-              schedule=reconcile_schedule())
+@app.function(image=cpu_image(), cpu=CPU_CORES, memory=MEMORY, timeout=15 * 60,
+              scaledown_window=ORCHESTRATOR_SCALEDOWN_S, schedule=reconcile_schedule())
 def reconcile_watched() -> dict[str, Any]:
     """Scheduled reconciler (opt-in, see the module docstring): revives dead orchestrators."""
     result = reconcile_all(list(watched.items()), _reconcile_job,

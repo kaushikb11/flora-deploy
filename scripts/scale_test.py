@@ -243,7 +243,7 @@ CPU_CLASS = "cpu"  # the app's CPU functions: orchestrator_run, reconcile, recon
 def container_rates(mode: str) -> dict[str, float]:
     """$/s of one container per class, at ``jobs.budget``'s pinned list prices: each pool's
     kind as deployed in ``mode``, and :data:`CPU_CLASS` for the orchestrator and reconciler
-    (``modal_app.orchestrator_app`` resources at the non-preemptible CPU / memory rate; any
+    (``modal_app.orchestrator_app`` resources, priced as ``jobs.pools`` deploys them; any
     container no attempt marker names is priced as one of these)."""
     from flora_deploy.jobs.budget import pinned_rates
     from flora_deploy.modal_app import orchestrator_app as oa
@@ -253,8 +253,10 @@ def container_rates(mode: str) -> dict[str, float]:
     r = pinned_rates()
     out = {k: r.per_second(c.gpu, 1 if c.gpu else 0, c.cpu, c.memory_gib)
            for k, (c, _) in pools_for(mode).items()}
+    from flora_deploy.jobs.pools import ORCHESTRATOR_PREEMPTIBLE
+
     out[CPU_CLASS] = r.per_second(None, 0, float(oa.CPU_CORES), oa.MEMORY_MIB / 1024,
-                                  preemptible=False)
+                                  preemptible=ORCHESTRATOR_PREEMPTIBLE)
     return out
 
 
@@ -502,8 +504,11 @@ def project(step: str, mode: str, video_s: float = VIDEO_S, table: Any = None, *
             p.add(f"caption: reconciler gap x{n[kind]} (idle {WORKER_SCALEDOWN_S} s + "
                   "restart)", c, n[kind] * (WORKER_SCALEDOWN_S + k.startup_s),
                   upper_s=n[kind] * (WORKER_SCALEDOWN_S + s_up))
-    orch = wh.Container(None, 0.25 * 3, 1.0 * 3)  # nonpreemptible: 3x CPU/memory
-    p.add("orchestrator (non-preemptible CPU) over the wall", orch,
+    from flora_deploy.jobs import pools as jp
+
+    mult = 1.0 if jp.ORCHESTRATOR_PREEMPTIBLE else 3.0  # non-preemptible: 3x CPU/memory
+    orch = wh.Container(None, jp.ORCHESTRATOR_CORES * mult, jp.ORCHESTRATOR_MEMORY_GIB * mult)
+    p.add("orchestrator (CPU) over the wall", orch,
           run_wall_s(mode, video_s, table=table, warm=warm, sizes=n),
           upper_s=run_wall_s(mode, video_s, upper=True, table=table, warm=warm, sizes=n)
           + CLIENT_SLACK_S)

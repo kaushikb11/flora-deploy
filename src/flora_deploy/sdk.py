@@ -667,12 +667,16 @@ class Job:
         rates = pinned_rates(region_multiplier=region_multiplier_for(settings.region))
         calls = budget_state_from_ledgers(
             _ledgers(self.store, self.job_id, self.config_hash, manifest), now).calls
+        from flora_deploy.jobs.pools import read_drains
+
+        drains, prewarms = read_drains(self.store, JobPaths(self.job_id).root, self.config_hash)
         by_kind = {}
         for kind in sorted({c.kind for c in calls}):
             mine = [c for c in calls if c.kind == kind]
             by_kind[kind] = {"calls": len(mine), "usd": round(calls_cost(
                 mine, settings, rates, now, scaledown_s=float(settings.scaledown_s),
-                warm=settings.min_containers), 4)}
+                warm=settings.min_containers, drains=drains,
+                prewarms={k: v for k, v in prewarms.items() if k == kind}), 4)}
         containers = [{"container_id": r.container_id, "gpu": r.gpu, "gpu_count": r.gpu_count,
                        "usd": round(container_cost(r, rates, now), 4),
                        "stopped": r.stopped_utc is not None, "source": "container_receipt"}
