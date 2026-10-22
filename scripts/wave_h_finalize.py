@@ -700,8 +700,10 @@ def overall_verdict(outcomes: Sequence[Mapping[str, Any]]) -> str:
 
 
 def run_plan(st: wh.State) -> str:
-    """The plan the state was run under (it is not stored): ``full`` when a step only that plan
-    runs was started, else the default ``balanced-only``."""
+    """The plan the state was run under: the one it stores (``certified`` does), else ``full``
+    when a step only that plan runs was started, else the default ``balanced-only``."""
+    if getattr(st, "plan", None) in wh.PLANS:
+        return st.plan
     for name in wh.deferred_steps(wh.DEFAULT_PLAN):
         s = st.steps.get(name)
         if s is not None and (s.attempts or s.status != "pending"):
@@ -721,6 +723,7 @@ def global_cap(st: wh.State) -> float:
     from the upper projection the runbook stored on each step before it ran it. A step it never
     reached is priced as the runbook prices it (offline manifest, today's rates)."""
     plan = run_plan(st)
+    spec = wh.SPECS[plan]
     projections: dict[str, Any] = {}
     for name in wh.PLANS[plan]:
         if name == "lab" and inline_lab(st):  # gated before (d2) existed: (d)'s stored
@@ -730,7 +733,8 @@ def global_cap(st: wh.State) -> float:
         if s is not None and s.projected_upper_usd is not None:
             projections[name] = SimpleNamespace(usd_upper=s.projected_upper_usd)
         else:
-            projections[name] = wh.project(name, wh.offline_manifest(wh.DURATION_HEADROOM))
+            projections[name] = wh.project(
+                name, wh.offline_manifest(wh.DURATION_HEADROOM, spec.golden), spec)
     return wh.plan_global_cap(plan, projections)
 
 

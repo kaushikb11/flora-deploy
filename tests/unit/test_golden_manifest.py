@@ -282,3 +282,19 @@ def test_cut_check_reports_fields():
     a = {k: 1 for k in golden.CUT_CHECK_FIELDS}
     assert cut_check(a, dict(a)) == []
     assert cut_check(a, {**a, "rate": "1/2", "frames": 3}) == ["rate", "frames"]
+
+
+def test_a_v2_selection_stages_under_its_own_prefix_and_leaves_v1_alone(tmp_path, repos):
+    v1 = stage_all(_selection(), hub=FakeHub(repos), root=tmp_path / "vol",
+                   work=tmp_path / "w", only=["wgo"], log=lambda _m: None)
+    before = (tmp_path / "vol" / GOLDEN_PREFIX / MANIFEST_NAME).read_bytes()
+    sel = _selection()
+    sel["version"] = "golden/v2"
+    m = stage_all(sel, hub=FakeHub(repos), root=tmp_path / "vol", work=tmp_path / "w2",
+                  only=["wgo"], log=lambda _m: None)
+    ep = next(e for e in m["episodes"] if e["dataset"] == "wgo")
+    assert m["version"] == "golden/v2" and ep["path"].startswith("golden/v2/")
+    assert (tmp_path / "vol" / "golden" / "v2" / MANIFEST_NAME).is_file()
+    assert (tmp_path / "vol" / GOLDEN_PREFIX / MANIFEST_NAME).read_bytes() == before
+    old = next(e for e in v1["episodes"] if e["dataset"] == "wgo")
+    assert ep["files"]["main"]["sha256"] == old["files"]["main"]["sha256"]  # same bytes

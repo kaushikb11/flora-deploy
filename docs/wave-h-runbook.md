@@ -9,7 +9,8 @@ session balanced only, now.** The default plan, `--plan balanced-only`, runs thr
   lab's L0 input parity and Gate A.
 
 The exact oracle (b), the provisional certification (e) and the noise run (f) are **deferred to
-the certified run**, a later session that uses `--plan full`. The approved scope is about $2.1
+the certified run**, a later session that uses `--plan certified` (see "The certified run"
+below; `--plan full` cannot certify). The approved scope is about $2.1
 nominal and $4.2 upper. With the cold-compile startup priced in (see "Cold compile" below), the
 dry run comes to **$2.25 nominal and $4.42 upper**, so its global cap is **$4.50**. The session
 runs only after review 10 is clean, CI is green and H0 passes.
@@ -22,7 +23,8 @@ uv run python scripts/wave_h.py --yes-spend         # step 0; exits 4 with the p
 #   pin the digest (one line in src/flora_deploy/config/pins.py), commit, then:
 uv run python scripts/wave_h.py --yes-spend         # step 0 done at $0, then (a), then (d)
 uv run python scripts/wave_h.py --report            # rewrite reports/wave-h/runbook.md
-uv run python scripts/wave_h.py --plan full --dry-run  # the later certified run: every step
+uv run python scripts/wave_h.py --plan full --dry-run  # every v1 step (cannot certify)
+uv run python scripts/wave_h.py --plan certified --dry-run  # the certified run (golden/v2)
 ```
 
 `--only <step>` runs one step of the chosen plan. Under `balanced-only`, `--only exact_e2e`,
@@ -128,9 +130,9 @@ The global cap of `balanced-only` is not a fixed number: it is the sum of its st
 projections, rounded up to $0.10 (`plan_global_cap`), and the dry run prints it. Each step's cap
 is its own upper projection rounded up to 5 cents, so no step is refused by its own cap.
 
-The certified run (`--plan full`) prices every step: $6.45 nominal and $11.02 upper, against its
-fixed cap of $6.50. Its dry run says "NOT HONEST AT $6.50" and names the minimum honest cap
-($11.10). The cap for that session is the user's decision.
+`--plan full` prices every v1 step: $7.44 nominal and $11.91 upper, against its fixed cap of
+$6.50. Its dry run says "NOT HONEST AT $6.50". It is superseded by `--plan certified` (below),
+which is the only plan that can make a certificate come out `certified`.
 
 `wave_h_finalize.py` needs at least 2 job samples and 2 cold starts per (preset, kind) to write a
 measured rate. One job per stage gives one of each, so finalize **refuses the rate update** after
@@ -255,7 +257,8 @@ Container-seconds come from `planner/rates.json`: startup + video-s × container
 - **Report:** `reports/wave-h/runbook.md` (`--report`, and after every run). Numbers only.
   `docs/wave-h-report.md` is `wave_h_finalize.py`'s. Captions, tasks and segment rows stay in
   `reports/wave-h/`.
-- **Provisional certificate** (certified run only; `balanced-only` writes none):
+- **Provisional certificate** (`--plan full` only; `balanced-only` writes none, and
+  `--plan certified` uses the real `flora certify` instead):
   `reports/wave-h/certificate-provisional.json`. Its checks:
   - L0 ids and grids are equal on every captured request;
   - Gate A max |Δlogit| ≤ 0.5;
@@ -265,6 +268,113 @@ Container-seconds come from `planner/rates.json`: startup + video-s × container
 
   With 6 noise episodes (at least 5) but 6 candidates (fewer than 10 per pool), H-lite is
   **provisional by design** (`docs/certification.md`).
+
+## The certified run (`--plan certified`)
+
+This run makes `balanced` **certified** for the `human` embodiment, so human data no longer
+needs `allow_uncertified: true`. It is prepared and priced, **not run**: it spends GPU money and
+waits for the user's go-ahead and cap.
+
+```
+uv run python scripts/golden_stage.py --version golden/v2 --verify-only  # golden/v2 is staged
+uv run python scripts/wave_h.py --plan certified --dry-run                # plan, prices, caps
+uv run python scripts/wave_h.py --plan certified --yes-spend              # b -> f -> d -> d2 -> e
+uv run python scripts/wave_h.py --plan certified --yes-spend --only noise # one step (resumes)
+```
+
+### What it needs, and how each need is met
+
+`flora certify` gives `certified` only when all of these hold (`docs/certification.md`, H4):
+
+| Requirement | How the plan meets it |
+|---|---|
+| at least 10 candidate episodes of the pool | 12 golden/v2 `human` episodes (`docs/golden-manifest-v2.md`): 10 plus 2 spares, all run. (b) and (d) refuse before any app when fewer than 10 are staged |
+| every oracle episode labelled (coverage 1.0) | (d) runs exactly (b)'s episodes |
+| oracle and candidate uids pair | **every job stages one data dir**, `cert-human`. Episode uids are `<data dir>--<episode id>`, and `--plan full` staged one dir per step, so its uids never paired and every certificate it could make had coverage 0 |
+| a noise run of at least 5 of the oracle's episodes, same stage hash, key, GPU and determinism | (f) re-indexes **(b)'s own config and data dir** with `flora index --limit 5`. The stage hash covers the config and the whole input dir, not the index, so it is (b)'s. The five noise episodes (`noise_subset` in the selection) are named `n-<id>` and the rest `x-<id>`, so they sort first. Before any app starts, (f) checks that the index holds exactly those five (count and video seconds). Same H200, `nvidia` mode, a new job id |
+| L0 passing for `segment` and `caption` | the lab's JSON (d2). It is **skipped when already done**: `balanced-<kind>.json` with L0 rows that all pass, Gate A requests, no error, and the pool's GPU (`lab_already_done`). L0 is per model kind, not per episode. Otherwise (d2) runs against (d)'s job on the golden/v1 six (its deadlines were measured on them) |
+| the candidate key equals this checkout's | (e) certifies with the derived content digests (d)'s workers verified, from the commit that ran (d) |
+
+### Steps, in order
+
+| Step | What | GPU | Stop rule (cap) | Nominal | Upper |
+|---|---|---|---|---|---|
+| b | exact oracle, 12 episodes, 235.9 s, `nvidia` mode, one app | H200 | $4.00 | $2.59 | $3.97 |
+| f | noise: 5 of (b)'s episodes, 84.4 s, (b)'s config and data dir, new job id | H200 | $1.95 | $1.06 | $1.90 |
+| d | `balanced` via the real `flora deploy` / `flora run`, the 12 episodes | L40S + H100 | $2.40 | $1.35 | $2.39 |
+| d2 | lab L0 + Gate A, **skipped at $0 when already done** | L40S, then H100 | $2.35 (or $0) | $1.74 (or $0) | $2.31 (or $0) |
+| e | `flora certify` per stage, then `scripts/wave_h_finalize.py --write` | CPU | $0 | $0 | $0 |
+| | **total, lab runs** | | global **$10.60** | **$6.75** | **$10.58** |
+| | **total, lab already done** | | global **$8.30** | **$5.00** | **$8.27** |
+
+The dry run on the staged manifest (`--plan certified --dry-run`) prints these numbers.
+
+- **Caps.** Each step's cap is its own upper projection rounded up to $0.05 (`plan_caps`), and
+  the global cap is the sum of the upper projections rounded up to $0.10 (`plan_global_cap`).
+  Both are derived from the measured rates and printed by the dry run. `--global-cap` can only
+  raise the global cap. The in-step stop rules are the same as for the other plans: a GPU
+  deadline from the step's cap left, `flora run --budget`, and `modal app stop`.
+- **Resumable.** The plan has its own state, `reports/wave-h/certified/state.json`, and its own
+  work dir and records. It never inherits a v1 job. A done step is skipped, and a failed or
+  killed step is retried. The state records `plan: certified`, and a v1 plan refuses to run on
+  it (and the other way round).
+- **(e)** exports the three jobs' records (`wave_h_finalize.fetch_records`, a Volume read). It
+  then runs `flora certify` per stage (`wave_h_finalize.certify_all`) with the oracle, the
+  noise run, the L0 JSON and the derived content digests. The step is `done` only when
+  **both** `segment` and `caption` come out `certified`. Only then does it run
+  `wave_h_finalize.py --state reports/wave-h/certified/state.json --records
+  reports/wave-h/certified/records --write`, which writes the rates, the certificates in
+  `config/certificates/`, the report and the docs blocks; the operator commits them. A
+  `provisional` or `fail` result writes nothing and names what is missing.
+
+### Assumptions in the prices
+
+- **Exact rate:** the measured 6.4 container-s per video-s ±35% (H200, default mode, c=4,
+  P1a-5s). It was measured on a 1-/3-view mix in a 160 GiB container. Here all 12 episodes are
+  single view, so it is probably pessimistic.
+- **Exact cold start: measured.** It is 103 s @enter ±100% per job (S1; P1a-5s measured 78 s).
+  (b) and (f) are each a cold start, because the oracle's app is stopped before (f) deploys it
+  again. Image pull and scheduling are not in the measured startup; the +100% and the 240 s of
+  client slack per app cover them.
+- **Balanced:** the measured n=1 rates (segment 0.367 on L40S, caption 0.906 on H100, ±50%) and
+  the measured cold startups (300 s and 325 s, `compile_cache: cold`). A warm compile cache
+  only makes (d) cheaper.
+- **Lab:** two cold compiles per call, priced as in "The lab step (d2)". It costs $0 when the
+  lab is already done.
+
+### Reusing step (d)'s balanced records: not possible
+
+On this commit, step (d)'s records still match the checkout: their `cert_key` equals
+`key_document(...)` and their stage hashes (`17bd065f…` segment, `d1e5c419…` caption) equal
+what the same config hashes to now. They still cannot be the certified run's candidate:
+- **Coverage.** They cover 6 episodes, and `flora certify` needs all of the oracle's ≥ 10.
+- **Uniformity.** The candidate set must share one stage hash, and the stage hash covers the
+  input dir's content. A second balanced job on only the 6 new episodes would therefore have
+  another stage hash, and certify refuses the mixed set.
+- **Uids.** They are `balanced-human--…`, while the certified oracle's are `cert-human--…`.
+- **Key.** `modal_app/balanced_app.py` is on the `segment` / `caption` certificate logic digest
+  (`certkey.cert_modules`), and it is being changed. Any code change there changes the key, and
+  certify (H1) then refuses records made before it.
+
+So **(d) is rerun on the 12 episodes.** It is about $1.35 nominal, and is priced above.
+
+### Tested offline
+
+`tests/unit/test_wave_h_certified.py` runs the certified plan's (e) on fake records shaped like
+the real ones:
+- the real uids (`cert-human--n-…` / `x-…`);
+- the H200 / L40S / H100 GPU names;
+- the `nvidia` determinism in the oracle's key;
+- a real-format balanced config and lab JSON.
+
+It drives them through `wave_h_finalize.certify_all` (the `flora certify` CLI). When the numbers
+agree, both stages come out **`certified`** (not provisional), with coverage 1.0 and 5 noise
+episodes, and `wave_h_finalize.py --write` is called. With 4 noise episodes they come out
+`provisional` (`too_few_noise_samples`), and a 0.6 s boundary shift is a `fail`; neither writes
+anything. The test also checks:
+- that the noise subset is exactly what `--limit 5` indexes;
+- that the oracle's and balanced's uids pair;
+- the caps and the "lab already done" skip.
 
 ## What H0 proves first
 

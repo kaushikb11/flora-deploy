@@ -136,3 +136,34 @@ def test_entry_digest_tracks_entry_and_dataset():
     assert entry_digest({**e, "episode": 1}, ds) != d0
     assert entry_digest(e, {**ds, "revision": "1" * 40}) != d0
     assert entry_id(e) == "yam/ds/episode_000000"
+
+
+def test_v2_is_the_human_certification_set_and_keeps_v1s_six():
+    from flora_deploy.validate.golden import SELECTIONS, prefix_for
+
+    v2 = validate_selection(load_selection(SELECTIONS["golden/v2"]))
+    v1 = load_selection()
+    assert v2["version"] == "golden/v2" and str(prefix_for("golden/v2")) == "golden/v2"
+    eps = v2["episodes"]
+    assert {e["pool"] for e in eps} == {"human"} and len(eps) >= 12  # 10 + spares
+    assert all(e["profile"] == "human" and list(e["cameras"]) == ["main"] for e in eps)
+    assert all(e["expected_s"] <= 60 for e in eps)
+    by1 = {entry_id(e): e for e in v1["episodes"]}
+    kept = [e for e in eps if entry_id(e) in by1]
+    assert len(kept) == 6
+    for e in kept:  # unchanged entries and datasets: the same staged bytes as v1
+        assert entry_digest(e, v2["datasets"][e["dataset"]]) == entry_digest(
+            by1[entry_id(e)], v1["datasets"][e["dataset"]])
+    new = [e for e in eps if entry_id(e) not in by1]
+    assert len({e["dataset"] for e in new}) == len(new)  # one per new task
+    egodex = {ds["revision"] for k, ds in v2["datasets"].items() if k.startswith("egodex_")}
+    assert egodex == {v1["datasets"]["egodex_make_sandwich"]["revision"]}
+    ids = {entry_id(e) for e in eps}
+    assert len(v2["noise_subset"]) == 5 and set(v2["noise_subset"]) <= ids
+
+
+def test_noise_subset_must_name_selected_episodes():
+    sel = _minimal()
+    sel["noise_subset"] = ["yam/ds/nope"]
+    with pytest.raises(SelectionError, match="noise_subset"):
+        validate_selection(sel)
