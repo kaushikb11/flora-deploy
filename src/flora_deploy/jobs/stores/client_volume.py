@@ -52,8 +52,11 @@ class ClientVolumeStore:
         self.calls = {"listdir": 0, "read_file": 0, "batch_upload": 0}
 
     @classmethod
-    def from_uri(cls, uri: str, *, environment: str | None = None) -> ClientVolumeStore:
-        """``modal-volume://name[/root]`` through ``modal.Volume.from_name`` (no container)."""
+    def from_uri(cls, uri: str, *, environment: str | None = None,
+                 create: bool = False) -> ClientVolumeStore:
+        """``modal-volume://name[/root]`` through ``modal.Volume.from_name`` (no container).
+        ``create``: make the Volume if it does not exist yet (writers such as ``flora index
+        --local``, which runs before ``flora deploy`` would create it)."""
         from urllib.parse import urlparse
 
         import modal
@@ -61,7 +64,8 @@ class ClientVolumeStore:
         u = urlparse(uri)
         if not u.netloc:
             raise ValueError(f"store {uri!r}: modal-volume://<name>[/path]")
-        vol = modal.Volume.from_name(u.netloc, environment_name=environment, version=2)
+        vol = modal.Volume.from_name(u.netloc, environment_name=environment, version=2,
+                                     create_if_missing=create)
         return cls(vol, u.path)
 
     # paths ---------------------------------------------------------------------------------

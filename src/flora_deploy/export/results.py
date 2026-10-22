@@ -43,7 +43,8 @@ class ResultsNotFound(FileNotFoundError):
 
 
 def store_from_uri(uri: str, *, endpoint_url: str | None = None,
-                   volume_mount: str | None = None, environment: str | None = None) -> Store:
+                   volume_mount: str | None = None, environment: str | None = None,
+                   create: bool = False) -> Store:
     from flora_deploy.config.schema import unsupported_sink_message
     from flora_deploy.jobs.stores import BucketStore, ClientVolumeStore, LocalStore, VolumeStore
 
@@ -71,7 +72,7 @@ def store_from_uri(uri: str, *, endpoint_url: str | None = None,
         if mount.is_dir():
             return VolumeStore(mount / sub if sub else mount)
         return ClientVolumeStore.from_uri(f"modal-volume://{u.netloc}/{sub}",
-                                          environment=environment)
+                                          environment=environment, create=create)
     raise ValueError(f"store {uri!r}: use file://, s3:// or modal-volume://")
 
 

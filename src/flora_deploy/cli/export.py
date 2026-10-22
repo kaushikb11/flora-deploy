@@ -74,8 +74,11 @@ def export_cmd(
                                 stages=chosen, allow_uncertified=allow_uncertified,
                                 allow_fake=allow_fake, include_videos=include_videos,
                                 push_to_hub=push_to_hub, private=not public)
-    except (ExportError, ResultsNotFound, FileNotFoundError, ValueError, sdk.FloraError) as e:
+    except (ExportError, ResultsNotFound, ValueError, sdk.FloraError) as e:
         raise _fail(str(e)) from None
+    except FileNotFoundError as e:  # a bare store path: the job is not in this store
+        raise _fail(f"no job {job!r} in {ref.store_uri} (missing {e}); check --job / --store, "
+                    "or run it first") from None
     console.print(f"Wrote {report.out} (LeRobot {report.codebase_version}): "
                   f"{report.labeled}/{report.episodes} episodes labeled, stages "
                   f"{', '.join(report.stages)}")
