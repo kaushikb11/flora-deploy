@@ -351,11 +351,13 @@ def plan(
 @app.command()
 def estimate(
     config: Annotated[Path, typer.Option("--config", "-c", help="flora.yaml")] = Path("flora.yaml"),
-    sample: Annotated[int, typer.Option(help="Episodes to run for calibration.")] = 20,
+    sample: Annotated[int, typer.Option(
+        help="Episodes to run for calibration (not wired yet: without --rates it exits 2).")] = 20,
     rates_file: Annotated[Path | None, typer.Option(
-        "--rates", help="A rates.json (e.g. from an earlier estimate) to show instead.")] = None,
+        "--rates", help="A rates.json to show, per stage of this config.")] = None,
 ) -> None:
-    """Measure per-stage rates on a sample of the dataset (needs a deployed app)."""
+    """Show the per-stage rates of a rates.json (--rates). Measuring them on a sample of your
+    dataset is not wired yet: without --rates it says so and exits 2."""
     from rich.markup import escape
     from rich.table import Table
 

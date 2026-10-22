@@ -379,7 +379,7 @@ flora certify [OPTIONS]
 
 ### `flora estimate`
 
-Measure per-stage rates on a sample of the dataset (needs a deployed app).
+Show the per-stage rates of a rates.json (--rates). Measuring them on a sample of your dataset is not wired yet: without --rates it says so and exits 2.
 
 ```
 flora estimate [OPTIONS]
@@ -388,8 +388,8 @@ flora estimate [OPTIONS]
 | Argument / option | Default | |
 |---|---|---|
 | `--config`, `-c` | `flora.yaml` | flora.yaml |
-| `--sample` | `20` | Episodes to run for calibration. |
-| `--rates` |  | A rates.json (e.g. from an earlier estimate) to show instead. |
+| `--sample` | `20` | Episodes to run for calibration (not wired yet: without --rates it exits 2). |
+| `--rates` |  | A rates.json to show, per stage of this config. |
 
 ### `flora compose`
 

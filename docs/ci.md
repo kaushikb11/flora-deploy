@@ -97,10 +97,10 @@ worker that needs them).
 
 - `concurrency: ci-<ref>` with `cancel-in-progress`: a newer push to the same branch or PR
   cancels the run it supersedes.
-- Timeouts: `test` and `order` 10 min (the local e2e step 2 min), `nvlink` 30 min (about 21 min
+- Timeouts: `test` and `order` 10 min (the local e2e step 2 min), `nvlink` 30 min (about 23 min
   serially before xdist; see "Test speed" below).
-- `permissions: contents: read`. Third-party actions are pinned: `setup-uv` by commit SHA, and
-  the `actions/*` actions by major version.
+- `permissions: contents: read`. Every action (`actions/checkout`, `actions/cache`,
+  `astral-sh/setup-uv`) is pinned by commit SHA, with its version in a comment.
 - `fail-fast: false` on the Python matrix, so a failure on 3.11 does not hide the 3.12 result.
 
 ## Failures fixed when the gates were added (G4)
@@ -121,11 +121,12 @@ worker that needs them).
 
 ```bash
 uv lock --check && uv sync --group dev
+uv run python scripts/cert_freeze.py --check && uv run pytest -q tests/unit/test_certificate_drift.py
 uv run ruff check .
 uv run pytest -q tests/unit/test_license_guard.py tests/unit/test_config_logic.py \
   tests/unit/test_pins.py tests/unit/test_modal_app_images.py tests/conformance
-uv run pytest -q -n auto --dist loadfile -m "not nvlink and not modal"    # fast, parallel
-FLORA_TEST_ORDER=reverse uv run pytest -q -p no:xdist -m "not nvlink and not modal"
+uv run pytest -q -n auto --dist loadfile -m "not nvlink and not modal and not torch"  # parallel
+FLORA_TEST_ORDER=reverse uv run pytest -q -p no:xdist -m "not nvlink and not modal and not torch"
 # nvlink + torch
 uv sync --group dev --group nvlink
 uv run python scripts/fetch_nv_code.py --with-processor
@@ -139,14 +140,14 @@ does not pay for starting workers.
 
 Profiled in October 2026 (`--durations=60`, 8-core laptop, load average 10-25 from other jobs):
 
-- **CPU suite** (1735 tests with torch installed, 1699 without): about 90-115 s serially, with no
-  single cause. The slowest tests are real-time concurrency smoke tests (SIGINT/preempt with
+- **CPU suite** (1735 tests with torch installed, 1699 without, at the time; about 3,100 now):
+  about 90-115 s serially then, with no single cause. The slowest tests are real-time concurrency smoke tests (SIGINT/preempt with
   episode sleeps, 1-3 s each), whole local jobs through the real orchestrator (0.5-2 s each),
   `uv build` / fresh-interpreter subprocess tests, and the 200+60-seed progress property tests
   (about 10 s in total). There is no hypothesis, no polling against real long timeouts (the local
   runner already polls every 20 ms) and no repeated expensive fixture. With torch installed,
   `test_convert_captioner.py` adds about 13 s of fixture setup. With xdist (`-n auto`) the suite
-  takes well under a minute.
+  took well under a minute then; today's ~3,100 tests take about 2.5 min on 8 cores (README).
 - **nvlink + torch** (222 tests): about 23 min serially. Nearly all of it is NVIDIA's own CPU
   work (synthetic videos through the real Flora processors, decode and parity comparisons); the
   heaviest files are `test_balanced_nvlink.py`, `test_accel_parity.py`, `test_accel_bench.py`
