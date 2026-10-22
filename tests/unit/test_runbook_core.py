@@ -114,3 +114,86 @@ def test_a_real_state_file_loads_from_a_copy(tmp_path):
     st = wh.load_state(copied)
     wh.save_state(st, copied)
     assert wh.load_state(copied).to_json() == st.to_json()
+
+
+# --- WP2: the billing watermark and per-attempt reconciliation ---------------------------------
+
+H = 3600.0
+T0 = 1792645200.0  # 2026-10-22 05:00 UTC, an hour start
+
+
+def _rows(*rows):
+    """``(object_id, description, hour index from T0, cost)`` -> spend.rows() rows."""
+    return [{"object_id": oid, "description": d, "interval_start": T0 + h * H, "cost": c}
+            for oid, d, h, c in rows]
+
+
+def test_spend_rows_parse_interval_start():
+    spend = sys.modules.get("spend") or _load("spend")
+    assert spend.interval_start("2026-10-22T05:00:00+00:00") == T0
+    assert spend.interval_start("2026-10-22T05:00:00Z") == T0
+    assert spend.interval_start("2026-10-22T05:00:00") == T0  # naive: UTC
+    assert spend.interval_start(None) is None and spend.interval_start("garbage") is None
+
+
+def test_watermark_is_the_latest_billed_hours_end():
+    b = rb.Billing.from_rows(_rows(("ap-1", "a", 0, 0.5), ("ap-2", "b", 2, 0.25),
+                                   ("ap-1", "a", 1, 0.5)))
+    assert b == {"a": 1.0, "b": 0.25} and b.through == T0 + 3 * H
+    assert rb.Billing.from_rows([]).through is None
+    st = rb.State("r", T0, "x")
+    assert st.watermark is None
+    st.billed_at = T0 + 5 * H  # an older state: no rows were kept, the lag rule applies
+    assert st.watermark == T0 + 4 * H
+    rb.refresh_billing(st, now=b, clock=lambda: T0 + 3.5 * H)
+    assert st.billed_through == T0 + 3 * H and st.watermark == T0 + 3 * H
+    rb.refresh_billing(st, now=rb.Billing.from_rows(_rows(("ap-1", "a", 0, 0.5))))
+    assert st.billed_through == T0 + 3 * H  # a later read never moves it back
+
+
+def _killed(started, last, *, apps=(), ids=(), budget=1.0, tracked=0.2):
+    return rb.Attempt(started=started, status="killed", heartbeat=last, budget_usd=budget,
+                      tracked_usd=tracked, apps=list(apps), app_ids=list(ids))
+
+
+def test_an_attempt_is_held_until_billing_covers_its_hours_then_billed():
+    st = rb.State("r", T0, "x")
+    a = _killed(T0 + 0.5 * H, T0 + 1.25 * H, apps=["flora-wh-r-lab-a1"], ids=["ap-lab1"])
+    st.step("lab").attempts.append(a)
+    st.step("lab").status = "failed"
+    # billing covers 05:00-06:00 only: the attempt ran into 06:15, so it is held at its budget
+    rb.refresh_billing(st, now=rb.Billing.from_rows(_rows(
+        ("ap-lab1", "flora-wh-r-lab-a1", 0, 0.30))))
+    assert not a.settled(st.watermark) and st.spent == pytest.approx(1.0)
+    # 06:00-07:00 lands: settled, charged its apps' billed cost across both hours
+    rb.refresh_billing(st, now=rb.Billing.from_rows(_rows(
+        ("ap-lab1", "flora-wh-r-lab-a1", 0, 0.30), ("ap-lab1", "flora-wh-r-lab-a1", 1, 0.15))))
+    assert a.settled(st.watermark) and a.billed_usd == pytest.approx(0.45)
+    assert a.charged(st.watermark) == pytest.approx(0.45) and st.spent == pytest.approx(0.45)
+
+
+def test_billing_rows_outside_an_attempts_hours_are_not_its():
+    st = rb.State("r", T0, "x")
+    a = rb.Attempt(started=T0 + 1.1 * H, status="done", finished=T0 + 1.2 * H,
+                   tracked_usd=0.10, app_ids=["ap-x"])
+    st.step("tempseg").attempts.append(a)
+    rb.refresh_billing(st, now=rb.Billing.from_rows(_rows(
+        ("ap-x", "flora-wh-r-tempseg-a1", 0, 9.0),  # an hour before it started
+        ("ap-x", "flora-wh-r-tempseg-a1", 1, 0.12), ("ap-y", "other", 2, 1.0))))
+    assert a.billed_usd == pytest.approx(0.12) and a.charged(st.watermark) == pytest.approx(0.12)
+
+
+def test_a_legacy_shared_name_is_not_attributed_to_one_attempt():
+    st = rb.State("r", T0, "x", {"flora-balanced-lab": 0.0})
+    pre = rb.Attempt(started=T0 + 0.1 * H, status="done", finished=T0 + 0.2 * H,
+                     tracked_usd=0.0003, apps=["flora-balanced-lab"])
+    lab = _killed(T0 + 0.3 * H, T0 + 0.5 * H, apps=["flora-balanced-lab"], tracked=0.72,
+                  budget=2.35)
+    st.step("preflight").attempts.append(pre)
+    st.step("lab").attempts.append(lab)
+    rb.refresh_billing(st, now=rb.Billing.from_rows(_rows(
+        ("ap-old", "flora-balanced-lab", 0, 0.80), ("ap-z", "z", 1, 0.0))))
+    assert pre.billed_usd is None and lab.billed_usd is None  # the same hour, the same name
+    assert lab.settled(st.watermark) and lab.charged(st.watermark) == pytest.approx(0.72)
+    assert st.step("lab").billed_usd is None  # shared with preflight: the global total only
+    assert st.billed_total == pytest.approx(0.80) and st.spent == pytest.approx(0.80)

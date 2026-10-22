@@ -1588,7 +1588,7 @@ def run_report(ctx: Ctx) -> dict[str, Any]:
                                                          "excused")}
                             for k, c in stages.items()}}
     proj = ctx.st.step("run")
-    actual = proj.spent_at(ctx.st.billed_at)  # tracked, or the billed delta once it lands
+    actual = proj.spent_at(ctx.st.watermark)  # tracked, or the billed delta once it lands
     pe: dict[str, Any] = {}
     if proj.projected_usd:
         pe = {"actual_usd": round(actual, 4), "billed": proj.billed_usd is not None,
@@ -1633,7 +1633,7 @@ def recheck(st: wh.State, mode: str) -> list[dict[str, Any]]:
     pe = dict(res.get("projection_error") or {})
     run = st.steps.get("run")
     if pe and run is not None and mode != "local":
-        actual = run.spent_at(st.billed_at)
+        actual = run.spent_at(st.watermark)
         pe.update(actual_usd=round(actual, 4), billed=run.billed_usd is not None)
         if pe.get("nominal_usd"):
             pe["vs_nominal"] = round(actual / pe["nominal_usd"] - 1, 3)

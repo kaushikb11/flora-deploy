@@ -619,7 +619,7 @@ def billing_rows(st: wh.State) -> tuple[list[list[str]], list[str]]:
                 billing = "reconciled"
         rows.append([wh.TITLES[name], step_status(st, name), str(len(s.attempts)),
                      usd(wh.CAPS_USD[name]),
-                     usd(s.tracked_usd), usd(s.charged(st.billed_at)), usd(s.billed_usd),
+                     usd(s.tracked_usd), usd(s.charged(st.watermark)), usd(s.billed_usd),
                      billing])
     return rows, warnings
 
@@ -835,7 +835,7 @@ def render_report(f: Findings) -> str:
     L += table(["step", "status", "attempts", "cap", "tracked", "charged", "billed", "billing"],
                f.billing)
     tracked = sum(s.tracked_usd for s in st.steps.values())
-    charged = sum(s.charged(st.billed_at) for s in st.steps.values())
+    charged = sum(s.charged(st.watermark) for s in st.steps.values())
     L += ["", f"Total: **{usd(st.spent)}** of the {usd(global_cap(st))} global cap: the "
           "larger of charged and billed, the figure the runbook gates on.", "",
           f"- tracked {usd(tracked)}: container-seconds x list $/h of every attempt;",

@@ -670,7 +670,7 @@ def test_report_spend_shows_tracked_charged_and_billed(tmp_path, capsys):
     assert rc == 0, out
     rep = (root / "docs/wave-h-report.md").read_text()
     tracked = sum(s.tracked_usd for s in st.steps.values())
-    charged = sum(s.charged(st.billed_at) for s in st.steps.values())
+    charged = sum(s.charged(st.watermark) for s in st.steps.values())
     assert f"Total: **${st.spent:,.2f}**" in rep
     assert f"- tracked ${tracked:,.2f}" in rep and f"- charged ${charged:,.2f}" in rep
     assert "over tracked" in rep and f"- billed ${st.billed_total:,.2f}" in rep

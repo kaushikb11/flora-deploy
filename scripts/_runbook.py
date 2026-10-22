@@ -19,7 +19,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-BILLING_LAG_S = 3600  # Modal billing covers complete hours only
+BILLING_LAG_S = 3600  # a state without a billing watermark: billing is this far behind its read
+HOUR_S = 3600.0  # Modal bills by the hour: a row's interval_start is the start of its hour
 HEARTBEAT_S = 30.0
 CLIENT_SLACK_S = 240  # per app: client timeout margin, then cancel + app stop
 # A state from before the cap override was scoped to a plan: the plan it was set on.
@@ -44,18 +45,30 @@ class Attempt:
     apps: list[str] = field(default_factory=list)
     report_error: bool = False
     notes: list[str] = field(default_factory=list)
+    app_ids: list[str] = field(default_factory=list)  # Modal app ids (``ap-...``) it started
+    billed_usd: float | None = None  # billed cost of its own apps (None: not attributable)
 
     @property
     def last_activity(self) -> float:
         return self.finished or self.heartbeat or self.started
 
-    def charged(self, billed_at: float | None) -> float:
-        """Tracked cost, or the attempt's budget while it cannot be known (killed, no report)
-        and billing has not caught up with it."""
+    @property
+    def settle_point(self) -> float:
+        """The latest time this attempt's apps can have been billed for."""
+        return self.last_activity
+
+    def settled(self, through: float | None) -> bool:
+        """Billing covers every hour this attempt could have spent in (``through``: the billing
+        watermark, :attr:`State.watermark`)."""
+        return through is not None and through >= self.settle_point
+
+    def charged(self, through: float | None) -> float:
+        """Settled: the larger of tracked and its own apps' billed cost. Until then: tracked,
+        or the attempt's budget while its spend cannot be known (killed, no report)."""
+        if self.settled(through):
+            return max(self.tracked_usd, self.billed_usd or 0.0)
         if self.status == "killed" or self.report_error:
-            reconciled = billed_at is not None and billed_at - self.last_activity >= BILLING_LAG_S
-            if not reconciled:
-                return max(self.tracked_usd, self.budget_usd)
+            return max(self.tracked_usd, self.budget_usd)
         return self.tracked_usd
 
 
@@ -111,6 +124,17 @@ class State:
     gate_cap: float | None = None
     gate_cap_plan: str | None = None
     plan: str | None = None  # the plan this state was run under (wave_h_finalize.py reads it)
+    # the billing watermark: billing covers every hour before this (the latest billed hour's
+    # end, from the rows' interval_start). None: never read with rows (an older state)
+    billed_through: float | None = None
+
+    @property
+    def watermark(self) -> float | None:
+        """Up to when billing is complete: :attr:`billed_through`, or for a state read before
+        it was kept, :data:`BILLING_LAG_S` before the last read."""
+        if self.billed_through is not None:
+            return self.billed_through
+        return None if self.billed_at is None else self.billed_at - BILLING_LAG_S
 
     def step(self, name: str) -> StepState:
         return self.steps.setdefault(name, StepState())
@@ -122,7 +146,7 @@ class State:
     @property
     def spent(self) -> float:
         """The cumulative figure the global cap is checked on (module docstring)."""
-        tracked = sum(s.spent_at(self.billed_at) for s in self.steps.values())
+        tracked = sum(s.spent_at(self.watermark) for s in self.steps.values())
         return round(max(tracked, self.billed_total or 0.0), 4)
 
     def override_for(self, plan: str) -> float | None:
@@ -134,7 +158,7 @@ class State:
     def spent_outside(self, step: str) -> float:
         """Cumulative spend minus ``step``'s running attempt (in-step deadlines add their own)."""
         cur = self.step(step).current
-        own = cur.charged(self.billed_at) if cur is not None else 0.0
+        own = cur.charged(self.watermark) if cur is not None else 0.0
         return round(max(0.0, self.spent - own), 4)
 
     def to_json(self) -> dict[str, Any]:
@@ -143,7 +167,7 @@ class State:
                 "billed_total": self.billed_total, "billed_at": self.billed_at,
                 "cap_override": self.cap_override, "cap_override_plan": self.cap_override_plan,
                 "gate_cap": self.gate_cap, "gate_cap_plan": self.gate_cap_plan,
-                "plan": self.plan,
+                "plan": self.plan, "billed_through": self.billed_through,
                 "steps": {k: asdict(v) for k, v in self.steps.items()}}
 
     @classmethod
@@ -161,7 +185,8 @@ class State:
         return cls(d["run_id"], d["created"], d["billing_since"],
                    dict(d.get("billing_baseline", {})), steps, d.get("billed_total"),
                    d.get("billed_at"), d.get("cap_override"), d.get("cap_override_plan"),
-                   d.get("gate_cap"), d.get("gate_cap_plan"), d.get("plan"))
+                   d.get("gate_cap"), d.get("gate_cap_plan"), d.get("plan"),
+                   billed_through=d.get("billed_through"))
 
     def mark_killed(self) -> list[str]:
         """Attempts left ``running`` by a killed process: ``killed`` (charged their budget
@@ -228,7 +253,7 @@ def check_before(st: State, step: str, proj: Any, *, caps: Mapping[str, float],
 
 def check_after(st: State, step: str, *, caps: Mapping[str, float], global_cap: float) -> None:
     s = st.step(step)
-    spent = s.spent_at(st.billed_at)
+    spent = s.spent_at(st.watermark)
     if spent > caps[step] + 1e-9:
         raise StopRule(f"{step}: spent ${spent:.2f} (tracked ${s.tracked_usd:.2f}, billed "
                        f"${s.billed_usd or 0:.2f}) is over its cap ${caps[step]:.2f}")
@@ -242,7 +267,7 @@ def step_budget(st: State, step: str, *, spent_in_step: float = 0.0, caps: Mappi
     left, minus what this attempt already spent."""
     s = st.step(step)
     cur = s.current
-    earlier = s.spent_at(st.billed_at) - (cur.charged(st.billed_at) if cur else 0.0)
+    earlier = s.spent_at(st.watermark) - (cur.charged(st.watermark) if cur else 0.0)
     return max(0.0, min(caps[step] - earlier, global_cap - st.spent_outside(step))
                - spent_in_step)
 
@@ -262,14 +287,68 @@ def gpu_deadline_s(st: State, step: str, c: Any, *, spent_in_step: float = 0.0,
 # Billing (scripts/spend.py)
 
 
-def billed_by_app(since: str) -> dict[str, float]:
+class Billing(dict):
+    """One billing read: billed cost per app description (a plain mapping, as it always was),
+    plus the hourly rows it came from (``(object_id, description, interval_start, cost)``) and
+    the watermark :attr:`through` (the latest billed hour's end: every hour before it is
+    complete; None without rows)."""
+
+    def __init__(self, by_name: Mapping[str, float] = (), rows: Iterable[tuple] = (),
+                 through: float | None = None):
+        super().__init__(by_name)
+        self.rows = list(rows)
+        self.through = through
+
+    @classmethod
+    def from_rows(cls, rows: Iterable[Mapping[str, Any]]) -> Billing:
+        by: dict[str, float] = {}
+        norm = []
+        for r in rows:
+            name = r.get("description") or "?"
+            cost = float(r.get("cost") or 0.0)
+            by[name] = by.get(name, 0.0) + cost
+            norm.append((r.get("object_id") or "", name, r.get("interval_start"), cost))
+        starts = [t for _, _, t, _ in norm if t is not None]
+        return cls(by, norm, max(starts) + HOUR_S if starts else None)
+
+
+def billed_by_app(since: str) -> Billing:
     import spend  # scripts/spend.py
 
-    out: dict[str, float] = {}
-    for row in spend.report(since):
-        name = row.get("description") or row.get("Description") or "?"
-        out[name] = out.get(name, 0.0) + float(row.get("cost") or row.get("Cost") or 0)
-    return out
+    return Billing.from_rows(spend.rows(since))
+
+
+def hour_floor(t: float) -> float:
+    return (t // HOUR_S) * HOUR_S
+
+
+def _attempt_keys(a: Attempt) -> set[str]:
+    return set(a.app_ids) | set(a.apps)
+
+
+def _attempt_hours(a: Attempt) -> tuple[float, float]:
+    """The billed hours [first, last] an attempt can have spent in (hour starts)."""
+    return hour_floor(a.started), hour_floor(a.settle_point)
+
+
+def attempt_billed(st: State, a: Attempt, rows: Iterable[tuple]) -> float | None:
+    """The billed cost of ``a``'s own apps over the hours it ran, from the hourly ``rows``. None
+    when it started no app, is still running, or shares an app with another attempt in an
+    overlapping hour (a legacy shared name: its step and the global total still count it)."""
+    keys = _attempt_keys(a)
+    if not keys or a.status == "running":
+        return None
+    lo, hi = _attempt_hours(a)
+    for s in st.steps.values():
+        for b in s.attempts:
+            if b is a or not (keys & _attempt_keys(b)):
+                continue
+            blo, bhi = _attempt_hours(b)
+            if blo <= hi and lo <= bhi:
+                return None
+    return round(sum(cost for oid, name, t, cost in rows
+                     if (oid in a.app_ids or name in a.apps) and t is not None and lo <= t <= hi),
+                 4)
 
 
 def billed_delta(st: State, apps: Iterable[str], now: Mapping[str, float]) -> float:
@@ -278,9 +357,11 @@ def billed_delta(st: State, apps: Iterable[str], now: Mapping[str, float]) -> fl
 
 def refresh_billing(st: State, *, now: Mapping[str, float],
                     clock: Callable[[], float] = time.time) -> bool:
-    """Apply a billing read (``now``: billed cost per app) to every app seen so far (H3): the
-    global billed total, and per step the billed delta of the apps only that step used (shared
-    apps count globally only)."""
+    """Apply a billing read (``now``: billed cost per app; a :class:`Billing` also carries its
+    rows and watermark) to every app seen so far (H3): the global billed total, per step the
+    billed delta of the apps only that step used (shared apps count globally only), and with
+    rows, per attempt the billed cost of its own apps (:func:`attempt_billed`) and the state's
+    watermark (:attr:`State.billed_through`)."""
     st.billed_total = billed_delta(st, st.apps_seen, now)
     owners: dict[str, set[str]] = {}
     for name, s in st.steps.items():
@@ -289,6 +370,12 @@ def refresh_billing(st: State, *, now: Mapping[str, float],
     for name, s in st.steps.items():
         mine = [a for a in s.apps if owners.get(a) == {name}]
         s.billed_usd = billed_delta(st, mine, now) if mine else s.billed_usd
+    if isinstance(now, Billing):
+        for s in st.steps.values():
+            for a in s.attempts:
+                a.billed_usd = attempt_billed(st, a, now.rows)
+        if now.through is not None:
+            st.billed_through = max(now.through, st.billed_through or now.through)
     st.billed_at = clock()
     return True
 

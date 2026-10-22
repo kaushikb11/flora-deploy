@@ -10,6 +10,7 @@ import argparse
 import json
 import subprocess
 from collections import defaultdict
+from datetime import UTC, datetime
 
 
 def report(since: str) -> list[dict]:
@@ -18,6 +19,35 @@ def report(since: str) -> list[dict]:
         capture_output=True, text=True, check=True,
     )
     return json.loads(out.stdout)
+
+
+def interval_start(value: object) -> float | None:
+    """A row's ``interval_start`` (ISO 8601, UTC when naive) as a POSIX time; None if absent."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, int | float):
+        return float(value)
+    try:
+        dt = value if isinstance(value, datetime) else datetime.fromisoformat(
+            str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.timestamp()
+
+
+def rows(since: str) -> list[dict]:
+    """The hourly report as ``{object_id, description, interval_start, cost}`` rows
+    (``interval_start``: POSIX seconds of the billed hour's start, or None)."""
+    out = []
+    for row in report(since):
+        out.append({"object_id": row.get("object_id") or row.get("Object ID") or "",
+                    "description": row.get("description") or row.get("Description") or "?",
+                    "interval_start": interval_start(row.get("interval_start")
+                                                     or row.get("Interval Start")),
+                    "cost": float(row.get("cost") or row.get("Cost") or 0)})
+    return out
 
 
 def main() -> None:
