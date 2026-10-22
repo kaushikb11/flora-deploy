@@ -48,7 +48,7 @@ def store_for_sink(sink: str) -> str:
     raise ValueError(f"sink {sink!r}: pass --store (file://, s3:// or modal-volume://)")
 
 
-def _require_volume(st, store_uri: str) -> None:
+def _require_volume(st, store_uri: str, environment: str | None = None) -> None:
     """``--local`` with a Modal Volume store: refuse before downloading anything when the Volume
     does not exist yet (the index would otherwise fail every episode's receipt write, then crash
     with a traceback). One metadata lookup, as ``flora doctor`` makes; nothing is created."""
@@ -63,11 +63,13 @@ def _require_volume(st, store_uri: str) -> None:
         from urllib.parse import urlparse
 
         name = urlparse(store_uri).netloc
+        env = f" --env {environment}" if environment else ""
+        where = f" in Modal environment {environment!r}" if environment else ""
         raise _fail(
-            f"Volume {name!r} (from {store_uri}) does not exist yet, and `flora index --local` "
-            "writes its receipts there. Create it: `modal volume create "
-            f"{name} --version 2` (free), or run `flora index` without --local once (it creates "
-            "the Volume).") from None
+            f"Volume {name!r} (from {store_uri}) does not exist yet{where}, and `flora index "
+            "--local` writes its receipts there. Create it: `modal volume create "
+            f"{name} --version 2{env}` (free), or run `flora index` without --local once (it "
+            "creates the Volume).") from None
 
 
 def _print_summary(s: dict) -> None:
@@ -148,10 +150,12 @@ def index(
         from flora_deploy.export.results import store_from_uri
 
         try:
-            st = store_from_uri(store_uri)
+            # the config's Modal Environment, not Modal's default one: a modal-volume:// store
+            # is looked up (and written) where `flora deploy` and `flora doctor` look
+            st = store_from_uri(store_uri, environment=cfg.modal.environment)
         except (ValueError, ImportError) as e:
             raise _fail(str(e)) from None
-        _require_volume(st, store_uri)
+        _require_volume(st, store_uri, cfg.modal.environment)
         local_root = None
         if cfg.input.repo is None:
             p = Path(str(cfg.input.path)).expanduser()
@@ -189,7 +193,7 @@ def index(
         from flora_deploy.modal_app import index_app
 
         index_app = importlib.reload(index_app)  # pick up FLORA_INDEX_VOLUME
-        with modal.enable_output(), index_app.app.run():
+        with modal.enable_output(), index_app.app.run(environment_name=cfg.modal.environment):
             summary = index_app.run_index_remote.remote(
                 ijob.to_dict(), store_uri, cfg.input.stage_to, limit, max_episodes, force)
 
