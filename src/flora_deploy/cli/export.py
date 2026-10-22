@@ -49,6 +49,9 @@ def export_cmd(
         "--public", help="With --push-to-hub: make the repo public (default private).")] = False,
     config_hash: Annotated[str | None, typer.Option(
         "--config-hash", help="Config hash (default: the job manifest's).")] = None,
+    keep_local_paths: Annotated[bool, typer.Option(
+        "--keep-local-paths", help="Record local source / output paths in the export (local "
+                                   "use only; not with --push-to-hub).")] = False,
 ) -> None:
     """Write a job's labels into a copy of its LeRobot dataset (the source is never modified)."""
     from flora_deploy import sdk
@@ -73,13 +76,14 @@ def export_cmd(
         report = sdk.export_job(st, job, out, config_hash=config_hash, source=source,
                                 stages=chosen, allow_uncertified=allow_uncertified,
                                 allow_fake=allow_fake, include_videos=include_videos,
-                                push_to_hub=push_to_hub, private=not public)
+                                push_to_hub=push_to_hub, private=not public,
+                                keep_local_paths=keep_local_paths)
     except (ExportError, ResultsNotFound, ValueError, sdk.FloraError) as e:
         raise _fail(str(e)) from None
     except FileNotFoundError as e:  # a bare store path: the job is not in this store
         raise _fail(f"no job {job!r} in {ref.store_uri} (missing {e}); check --job / --store, "
                     "or run it first") from None
-    console.print(f"Wrote {report.out} (LeRobot {report.codebase_version}): "
+    console.print(f"Wrote {out} (LeRobot {report.codebase_version}): "
                   f"{report.labeled}/{report.episodes} episodes labeled, stages "
                   f"{', '.join(report.stages)}")
     r = report.records

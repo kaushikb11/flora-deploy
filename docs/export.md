@@ -153,7 +153,7 @@ paths, `codebase_version`) is unchanged. A `flora` block records the export:
 | `job` | object | `job_id`, `config_hash`, `generation`, `status`, `stage_hashes` of the composed outputs |
 | `stages` | list of strings | the exported stages |
 | `subtasks_from` | string or null | `caption` or `segment` |
-| `source` | object | `path`, `name`, `repo`, `revision`, `subdir`, `format`, `codebase_version` of the source |
+| `source` | object | `path`, `name`, `repo`, `revision`, `subdir`, `format`, `codebase_version` of the source. `path` is the source URI (`hf://datasets/<repo>[/<subdir>]`, the job's `volume://...` URI) or a local dataset's directory name, never a local path (see Privacy) |
 | `videos` | object | `included`, and a `note` on how to fetch them when they are not |
 | `policy` | object | `allow_uncertified`, `allow_fake`, and `records`: counts of `certified`, `uncertified` and `fake` exported records |
 | `episode_fields` | object | episode field to Arrow type |
@@ -191,8 +191,8 @@ normalize.
 values. `flora_export_report.json` lists each one as `{episode_index, episode_id, uid,
 missing_stages, reason}` under `unlabeled`; `dense_uncovered` lists `{episode_index,
 nan_frames}`. The report also has `schema` (`flora_lerobot_export_report_v1`), `episodes`,
-`labeled`, `records`, the `allow_*` flags, `videos_included`, `job`, `source`, `pushed` and
-`stages`. `reason` is one of:
+`labeled`, `records`, the `allow_*` flags, `videos_included`, `job`, `source`, `pushed`,
+`stages` and `out` (the export directory's name). `reason` is one of:
 
 * `excluded`: planned, but the stage excluded it (`nv_failure` or a worker's `missing_task`;
   see `summary.json`), or planned with no record when the job has no manifest;
@@ -200,6 +200,38 @@ nan_frames}`. The report also has `schema` (`flora_lerobot_export_report_v1`), `
 * `unplanned: <why>`: the planner left it out, for example `unplanned: missing_task: ...` for an
   episode with no task text in a job with reward stages (all stages are then missing);
 * `not_in_job`: the job never included it (for example, `--limit`).
+
+## Privacy
+
+An export is meant to be shared, so **nothing the export writes names a path on your
+machine**. Each field that could carry one is written in a portable form:
+
+| Where | Field | Written as |
+|---|---|---|
+| `meta/info.json` | `flora.source.path` | `hf://datasets/<repo>[/<subdir>]` for a Hub dataset (never the directory it was fetched into); the job's dataset URI when it has one (`volume://...`); otherwise the local dataset directory's name |
+| `meta/info.json` | `flora.source.name` | the job's dataset name; a local path becomes its last component |
+| `meta/info.json` | `flora.videos.note` | names the source by `flora.source.path` |
+| `README.md` | title, Source line | from `flora.source` |
+| `flora_export_report.json` | `out` | the export directory's name |
+| `flora_export_report.json` | `source` | as `flora.source` |
+| `flora_export_report.json` | `unlabeled[].uid` | for a local dataset, built from the directory's name (`<name>--episode_000001`), not the slugged path the job uses |
+| `flora_export_report.json` | `unlabeled[].reason` | each local path (an index error naming a file, for example) replaced by `<local path>` |
+
+`--keep-local-paths` (SDK `keep_local_paths=True`) writes the local paths instead (the
+directory the export read, `--out`, the job's uids and the reasons unchanged). Use it for an
+export that stays on your machine. It cannot be combined with `--push-to-hub`.
+
+Everything else in an export is either computed (labels, hashes, ids) or copied from the source
+dataset. **Before `--push-to-hub` sends anything, it scans every file it would upload** and
+refuses (exit 2, nothing uploaded, no Hub call made) when a string names an absolute local path
+(`/Users/...`, `/home/...`, `/tmp/...`, `/vol/...` and other local or Modal mount roots, `~/...`,
+`file://...`, `C:\...`), your home directory (also in its slugged uid form) or the host name. The
+error names each file and field (`meta/info.json: flora.source.path`,
+`meta/tasks.jsonl: line 1.recorded_at`, `data/chunk-000/file-000.parquet: parquet metadata
+'origin'`), never the value. The scan reads JSON and JSONL by field, other text files by line,
+the key-value metadata of every parquet file and the rows of `meta/` parquet files. It does not
+read the rows of data parquet files or binary files such as videos. If the source dataset's own
+files hold a path, remove it there and export again.
 
 ## `--push-to-hub`
 
@@ -210,6 +242,8 @@ nan_frames}`. The report also has `schema` (`flora_lerobot_export_report_v1`), `
 * A new repo is **private** by default. Pass `--public` for a public one. `--public` does not
   make an existing private repo public.
 * A private push into an existing **public** repo is refused.
+* An export that names a local path, your home directory or the host name is refused before
+  any upload (see Privacy).
 * `.cache/**` and `.git/**` are not uploaded.
 * After the upload, the commit is tagged with the `codebase_version` (`v3.0` / `v2.1`). LeRobot
   resolves a Hub dataset by that tag.

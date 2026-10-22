@@ -15,6 +15,12 @@ source's ``meta/`` and ``data/`` with the labels added (``docs/export.md`` is th
   certification policy used, the alignment rule);
 * ``flora_export_report.json`` (at the root) lists the episodes that got no label, and why.
 
+**Portable by default.** Nothing the export writes names a local filesystem path: the source is
+recorded as ``hf://datasets/<repo>[/<subdir>]``, the URI the job was given (``volume://...``),
+or a local dataset's directory name; the report records ``--out`` by its name; episode uids of
+a local dataset use that name; reasons have local paths replaced by ``<local path>``.
+``keep_local_paths`` (``--keep-local-paths``, never with a push) keeps them instead.
+
 Videos are not copied unless ``include_videos``: their paths are unchanged, so downloading the
 source revision's ``videos/`` into the export directory completes it.
 
@@ -35,10 +41,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 import numpy as np
@@ -102,6 +109,76 @@ class ExportError(ValueError):
 
 class ExportRefused(ExportError):
     """The records include labels the policy refuses (uncertified or fake-model records)."""
+
+
+# ---------------------------------------------------------------------------------------------
+# Portability: what the export writes never names a local path (docs/export.md "Privacy")
+
+# Absolute paths under these roots are local (laptops, CI, Modal mounts). A path only matches
+# where it starts a token, so ``https://host/home/x`` and ``data/chunk-000`` do not.
+_LOCAL_ROOTS = ("Users", "home", "root", "tmp", "private", "var", "mnt", "media", "Volumes",
+                "opt", "srv", "scratch", "workspace", "vol", "volumes", "weights", "cache",
+                "golden", "canary", "snapshots", "data", "nfs", "lustre", "net", "run", "etc")
+_STOP = r"""[^\s"'`<>|,;:)\]}]"""
+LOCAL_PATH_RE = re.compile(
+    r"(?<![\w.:/~\\-])(?:"
+    r"/(?:" + "|".join(_LOCAL_ROOTS) + r")(?![\w.-])" + _STOP + "*"
+    r"|~[\w.-]*/" + _STOP + "*"
+    r"|file://" + _STOP + "+"
+    r"|[A-Za-z]:\\" + _STOP + "*)")
+_URI_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*)://")
+LOCAL_PATH_MARK = "<local path>"
+
+
+def is_local_path(name: str) -> bool:
+    """``name`` is a filesystem path on this machine: absolute, ``~``, ``./`` / ``../``, a
+    Windows drive or ``file://``. Hub repo ids, relative names and URIs (``hf://``,
+    ``volume://``, ``s3://``) are not."""
+    m = _URI_RE.match(name)
+    if m:
+        return m.group(1).lower() == "file"
+    return (name.startswith(("/", "~", "./", "../", "\\")) or name in (".", "..")
+            or bool(re.match(r"^[A-Za-z]:[\\/]", name)))
+
+
+def portable_name(name: str) -> str:
+    """``name`` without local paths: a local path becomes its last component (the dataset
+    directory's name); a URI loses any ``user:password@``; anything else is kept."""
+    m = _URI_RE.match(name)
+    if m and m.group(1).lower() != "file":
+        return re.sub(r"^([^:/]+://)[^/@]*@", r"\1", name)
+    if not is_local_path(name):
+        return name
+    raw = name[len("file://"):] if name.lower().startswith("file://") else name
+    windows = "\\" in raw or re.match(r"^[A-Za-z]:", raw)
+    pure = PureWindowsPath(raw) if windows else PurePosixPath(raw)
+    parts = [p for p in pure.parts if p.strip("/\\~.") and not p.endswith(":\\")]
+    return parts[-1] if parts else "dataset"
+
+
+def scrub_paths(text: str) -> str:
+    """``text`` with every local path (:data:`LOCAL_PATH_RE`) replaced by ``<local path>``."""
+    return LOCAL_PATH_RE.sub(LOCAL_PATH_MARK, text)
+
+
+def source_block(source: str | os.PathLike[str], source_info: Mapping[str, Any] | None,
+                 codebase_version: Any, *, keep_local_paths: bool = False) -> dict[str, Any]:
+    """``meta/info.json`` ``flora.source``. ``path`` is the source URI: ``hf://datasets/<repo>``
+    (``/<subdir>``) for a Hub dataset, the job's dataset URI when it has one (``volume://...``),
+    else the local dataset directory's name; never a local path. With ``keep_local_paths``,
+    ``path`` is the directory the export read and ``name`` is kept as the job recorded it."""
+    info = dict(source_info or {})
+    if keep_local_paths:
+        return {"path": str(source), **info, "codebase_version": codebase_version}
+    repo, name = info.get("repo"), info.get("name")
+    if repo:
+        sub = str(info.get("subdir") or "").strip("/")
+        path = f"hf://datasets/{repo}" + (f"/{sub}" if sub else "")
+    else:
+        path = portable_name(str(name) if name else str(Path(source).resolve()))
+    if name is not None:
+        info["name"] = portable_name(str(name))
+    return {"path": path, **info, "codebase_version": codebase_version}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -560,6 +637,7 @@ def export_lerobot(
     job_info: Mapping[str, Any] | None = None,
     episode_reasons: Mapping[str, str] | None = None,
     planned_uids: Iterable[str] | None = None,
+    keep_local_paths: bool = False,
 ) -> ExportReport:
     """Write a labeled copy of the LeRobot dataset at ``source`` to ``out`` (module docstring).
 
@@ -567,6 +645,7 @@ def export_lerobot(
     every supported stage present). ``source_info`` (repo, revision, subdir, name) is recorded as
     provenance and in the video note. ``episode_reasons`` (uid -> why it has no record) and
     ``planned_uids`` (the job's planned episodes) explain unlabeled episodes in the report.
+    Nothing written names a local path unless ``keep_local_paths`` (module docstring).
     """
     source, out = Path(source), Path(out)
     stages = list(stages) if stages is not None else [s for s in SUPPORTED_STAGES if records.get(s)]
@@ -630,13 +709,16 @@ def export_lerobot(
             uid = episode_uid(dataset, eid) if dataset else eid
             why = reasons.get(uid) or ("not_in_job" if planned is not None and uid not in planned
                                        else "excluded")
+            if not keep_local_paths:  # a local dataset's uid embeds its path (jobs.types)
+                uid = episode_uid(portable_name(dataset), eid) if dataset else eid
+                why = scrub_paths(why)
             unlabeled.append({"episode_index": e, "episode_id": eid, "uid": uid,
                               "missing_stages": missing, "reason": why})
         dense_uncovered = [{"episode_index": e, "frames": stats.frames.get(e, 0),
                             "nan_frames": n} for e, n in sorted(stats.dense_nan.items()) if n]
 
-        src = {"path": str(source), **dict(source_info or {}),
-               "codebase_version": layout.info.get("codebase_version")}
+        src = source_block(source, source_info, layout.info.get("codebase_version"),
+                           keep_local_paths=keep_local_paths)
         info = dict(layout.info)
         feats = dict(info.get("features", {}))
         for c in columns:
@@ -670,7 +752,9 @@ def export_lerobot(
         (tmp / "meta" / "info.json").write_text(json.dumps(info, indent=4, allow_nan=False)
                                                 + "\n", encoding="utf-8")
         report = ExportReport(
-            out=str(out), codebase_version=str(layout.info.get("codebase_version")),
+            # the export directory's name, not where it is on this machine
+            out=str(out) if keep_local_paths else out.name,
+            codebase_version=str(layout.info.get("codebase_version")),
             stages=stages, episodes=len(by_index),
             labeled=len(by_index) - len(unlabeled), unlabeled=unlabeled, records=counts,
             allow_uncertified=allow_uncertified, allow_fake=allow_fake,
@@ -700,8 +784,8 @@ def video_note(src: Mapping[str, Any]) -> str:
                 f"them into this directory with: hf download {repo} --repo-type dataset "
                 f"--revision {rev} --include '{inc}' --local-dir <dir>"
                 + (f" (then move {sub}/videos here)" if sub else ""))
-    return (f"videos are not copied; copy {src.get('path')}/videos into this directory (paths "
-            "are unchanged)")
+    return (f"videos are not copied; copy the videos/ directory of the source dataset "
+            f"({src.get('path')}) into this directory (paths are unchanged)")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -730,6 +814,7 @@ def export_job(
     include_videos: bool = False,
     work_dir: str | os.PathLike[str] | None = None,
     download: Callable[..., str] | None = None,
+    keep_local_paths: bool = False,
 ) -> ExportReport:
     """Export a composed job's labels into a copy of its LeRobot dataset.
 
@@ -780,4 +865,4 @@ def export_job(
                           allow_uncertified=allow_uncertified, allow_fake=allow_fake,
                           fake_job=is_fake_job_id(job_id), include_videos=include_videos,
                           source_info=src_info, job_info=job, episode_reasons=reasons,
-                          planned_uids=planned)
+                          planned_uids=planned, keep_local_paths=keep_local_paths)

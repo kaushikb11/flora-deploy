@@ -348,6 +348,7 @@ Job and store default from `flora.yaml` ([above](#where-the-job-and-the-store-co
 | `--push-to-hub` |  | Upload the export to this dataset repo (user/repo). |
 | `--public` | off | With --push-to-hub: make the repo public (default private). |
 | `--config-hash` |  | Config hash (default: the job manifest's). |
+| `--keep-local-paths` | off | Record local source / output paths in the export (local use only; not with --push-to-hub). |
 
 ### `flora certify`
 
