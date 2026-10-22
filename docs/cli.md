@@ -50,6 +50,16 @@ it from there when you give no `--index` or `--video-hours`.
 
 ## Commands
 
+As grouped in `flora --help`:
+
+| | |
+|---|---|
+| Get started | [`init`](#flora-init), [`doctor`](#flora-doctor), [`prepare`](#flora-prepare) |
+| Run | [`index`](#flora-index), [`plan`](#flora-plan), [`deploy`](#flora-deploy), [`run`](#flora-run), [`resume`](#flora-resume), [`cancel`](#flora-cancel) |
+| Inspect results | [`status`](#flora-status), [`report`](#flora-report), [`results`](#flora-results), [`logs`](#flora-logs), [`export`](#flora-export) |
+| Certification | [`certify`](#flora-certify) |
+| Advanced | [`estimate`](#flora-estimate), [`compose`](#flora-compose), [`version`](#flora-version) |
+
 ### `flora init`
 
 Write a commented flora.yaml to start from.
@@ -145,20 +155,6 @@ flora plan [OPTIONS]
 | `--check-cache` | off | Price balanced pools whose compile cache is published on flora-cache (needs Modal credentials) with the warm startup row. |
 | `--assume-warm` | off | Projection: price every pool's startup warm, as if a compile cache were published. |
 
-### `flora estimate`
-
-Measure per-stage rates on a sample of the dataset (needs a deployed app).
-
-```
-flora estimate [OPTIONS]
-```
-
-| Argument / option | Default | |
-|---|---|---|
-| `--config`, `-c` | `flora.yaml` | flora.yaml |
-| `--sample` | `20` | Episodes to run for calibration. |
-| `--rates` |  | A rates.json (e.g. from an earlier estimate) to show instead. |
-
 ### `flora deploy`
 
 Deploy the config's Modal app (one app per config; workers scale from zero).
@@ -210,30 +206,12 @@ flora run [OPTIONS]
 | `--json` | off | Print the result as JSON. |
 | `--verbose`, `-v` | off | Local: every event. |
 
-### `flora status`
+### `flora resume`
 
-Show a job's state, progress, errors, spend vs budget and ETA.
-
-```
-flora status [JOB] [OPTIONS]
-```
-
-Job and store default from `flora.yaml` ([above](#where-the-job-and-the-store-come-from)).
-
-| Argument / option | Default | |
-|---|---|---|
-| `JOB` |  | Job id (default: the config's project; its fake-models run &lt;project&gt;.fake when there is no real one). |
-| `--store` (env `FLORA_STORE`) |  | Job store: modal-volume://name[/path], s3://bucket[/prefix], file:///dir or a directory (default: the config's output.sink, then &lt;config dir&gt;/flora-local-store). |
-| `--config`, `-c` | `flora.yaml` | flora.yaml (finds the store and Modal environment). |
-| `--env` (env `MODAL_ENVIRONMENT`) |  | Modal environment of a modal-volume store. |
-| `--json` | off | Print JSON. |
-
-### `flora logs`
-
-Show a job's Modal logs.
+Resume a budget-stopped job or restart a dead orchestrator.
 
 ```
-flora logs [JOB] [OPTIONS]
+flora resume [JOB] [OPTIONS]
 ```
 
 Job and store default from `flora.yaml` ([above](#where-the-job-and-the-store-come-from)).
@@ -241,9 +219,7 @@ Job and store default from `flora.yaml` ([above](#where-the-job-and-the-store-co
 | Argument / option | Default | |
 |---|---|---|
 | `JOB` |  | Job id (default: the config's project; its fake-models run &lt;project&gt;.fake when there is no real one). |
-| `--kind` |  | orchestrator, or a worker kind (segment, caption, segcap, reward.terminal, ...). |
-| `--follow`, `-f` | off | Stream new lines. |
-| `--tail`, `-n` | `100` | Lines per call (not with -f). |
+| `--budget-usd` |  | New job budget in USD (not below the spend so far). |
 | `--store` (env `FLORA_STORE`) |  | Job store: modal-volume://name[/path], s3://bucket[/prefix], file:///dir or a directory (default: the config's output.sink, then &lt;config dir&gt;/flora-local-store). |
 | `--config`, `-c` | `flora.yaml` | flora.yaml (finds the store and Modal environment). |
 | `--env` (env `MODAL_ENVIRONMENT`) |  | Modal environment of a modal-volume store. |
@@ -267,12 +243,12 @@ Job and store default from `flora.yaml` ([above](#where-the-job-and-the-store-co
 | `--config`, `-c` | `flora.yaml` | flora.yaml (finds the store and Modal environment). |
 | `--env` (env `MODAL_ENVIRONMENT`) |  | Modal environment of a modal-volume store. |
 
-### `flora resume`
+### `flora status`
 
-Resume a budget-stopped job or restart a dead orchestrator.
+Show a job's state, progress, errors, spend vs budget and ETA.
 
 ```
-flora resume [JOB] [OPTIONS]
+flora status [JOB] [OPTIONS]
 ```
 
 Job and store default from `flora.yaml` ([above](#where-the-job-and-the-store-come-from)).
@@ -280,10 +256,10 @@ Job and store default from `flora.yaml` ([above](#where-the-job-and-the-store-co
 | Argument / option | Default | |
 |---|---|---|
 | `JOB` |  | Job id (default: the config's project; its fake-models run &lt;project&gt;.fake when there is no real one). |
-| `--budget-usd` |  | New job budget in USD (not below the spend so far). |
 | `--store` (env `FLORA_STORE`) |  | Job store: modal-volume://name[/path], s3://bucket[/prefix], file:///dir or a directory (default: the config's output.sink, then &lt;config dir&gt;/flora-local-store). |
 | `--config`, `-c` | `flora.yaml` | flora.yaml (finds the store and Modal environment). |
 | `--env` (env `MODAL_ENVIRONMENT`) |  | Modal environment of a modal-volume store. |
+| `--json` | off | Print JSON. |
 
 ### `flora report`
 
@@ -325,21 +301,52 @@ Job and store default from `flora.yaml` ([above](#where-the-job-and-the-store-co
 | `--config`, `-c` | `flora.yaml` | flora.yaml (finds the store and Modal environment). |
 | `--env` (env `MODAL_ENVIRONMENT`) |  | Modal environment of a modal-volume store. |
 
-### `flora compose`
+### `flora logs`
 
-Compose a job's parts into per-stage JSONL + Parquet and a summary.json.
+Show a job's Modal logs.
 
 ```
-flora compose [OPTIONS]
+flora logs [JOB] [OPTIONS]
 ```
+
+Job and store default from `flora.yaml` ([above](#where-the-job-and-the-store-come-from)).
 
 | Argument / option | Default | |
 |---|---|---|
-| `--job` | required | Job id. |
-| `--store` (env `FLORA_STORE`) | required | State-of-record store: file:///dir (or a path), s3://bucket[/prefix], modal-volume://name. |
+| `JOB` |  | Job id (default: the config's project; its fake-models run &lt;project&gt;.fake when there is no real one). |
+| `--kind` |  | orchestrator, or a worker kind (segment, caption, segcap, reward.terminal, ...). |
+| `--follow`, `-f` | off | Stream new lines. |
+| `--tail`, `-n` | `100` | Lines per call (not with -f). |
+| `--store` (env `FLORA_STORE`) |  | Job store: modal-volume://name[/path], s3://bucket[/prefix], file:///dir or a directory (default: the config's output.sink, then &lt;config dir&gt;/flora-local-store). |
+| `--config`, `-c` | `flora.yaml` | flora.yaml (finds the store and Modal environment). |
+| `--env` (env `MODAL_ENVIRONMENT`) |  | Modal environment of a modal-volume store. |
+
+### `flora export`
+
+Write a job's labels into a copy of its LeRobot dataset (the source is never modified).
+
+```
+flora export [OPTIONS]
+```
+
+Job and store default from `flora.yaml` ([above](#where-the-job-and-the-store-come-from)).
+
+| Argument / option | Default | |
+|---|---|---|
+| `--out` | required | New directory for the labeled copy. |
+| `--job` |  | Job id (default: the config's project; its fake-models run when there is no real one). |
+| `--store` (env `FLORA_STORE`) |  | Job store: file:///dir (or a path), s3://bucket[/prefix], modal-volume://name (default: the config's output.sink, then &lt;config dir&gt;/flora-local-store). |
+| `--config`, `-c` | `flora.yaml` | flora.yaml (finds the store and Modal environment). |
+| `--env` (env `MODAL_ENVIRONMENT`) |  | Modal environment of a modal-volume store. |
+| `--to` | `lerobot` | Target format (lerobot). |
+| `--stages` |  | Stages to export (repeat or comma-separate): segment, caption, reward.terminal, reward.dense. Default: every composed one. |
+| `--source` |  | Local copy of the source dataset (default: the job's dataset; a Hub dataset is fetched at its pinned revision, meta/ and data/ only). |
+| `--include-videos` | off | Copy the videos too (default: reference the source). |
+| `--allow-uncertified` | off | Export uncertified records (recorded in the metadata). |
+| `--allow-fake` | off | Export fake-model records (recorded in the metadata). |
+| `--push-to-hub` |  | Upload the export to this dataset repo (user/repo). |
+| `--public` | off | With --push-to-hub: make the repo public (default private). |
 | `--config-hash` |  | Config hash (default: the job manifest's). |
-| `--partial` | off | Compose what exists even if the job is not complete. |
-| `--max-error-rate` | `0.1` | Excluded share of a stage above which the job is completed_with_errors. |
 
 ### `flora certify`
 
@@ -369,6 +376,36 @@ flora certify [OPTIONS]
 | `--json` | off | Print the certificates as JSON. |
 | `--generated-at` |  | Certificate time YYYY-MM-DDTHH:MM:SSZ (default: now). Pass the run's own time to make re-certifying the same records reproduce the same certificate id. |
 
+### `flora estimate`
+
+Measure per-stage rates on a sample of the dataset (needs a deployed app).
+
+```
+flora estimate [OPTIONS]
+```
+
+| Argument / option | Default | |
+|---|---|---|
+| `--config`, `-c` | `flora.yaml` | flora.yaml |
+| `--sample` | `20` | Episodes to run for calibration. |
+| `--rates` |  | A rates.json (e.g. from an earlier estimate) to show instead. |
+
+### `flora compose`
+
+Compose a job's parts into per-stage JSONL + Parquet and a summary.json.
+
+```
+flora compose [OPTIONS]
+```
+
+| Argument / option | Default | |
+|---|---|---|
+| `--job` | required | Job id. |
+| `--store` (env `FLORA_STORE`) | required | State-of-record store: file:///dir (or a path), s3://bucket[/prefix], modal-volume://name. |
+| `--config-hash` |  | Config hash (default: the job manifest's). |
+| `--partial` | off | Compose what exists even if the job is not complete. |
+| `--max-error-rate` | `0.1` | Excluded share of a stage above which the job is completed_with_errors. |
+
 ### `flora version`
 
 Print the framework version.
@@ -376,30 +413,3 @@ Print the framework version.
 ```
 flora version
 ```
-
-### `flora export`
-
-Write a job's labels into a copy of its LeRobot dataset (the source is never modified).
-
-```
-flora export [OPTIONS]
-```
-
-Job and store default from `flora.yaml` ([above](#where-the-job-and-the-store-come-from)).
-
-| Argument / option | Default | |
-|---|---|---|
-| `--out` | required | New directory for the labeled copy. |
-| `--job` |  | Job id (default: the config's project; its fake-models run when there is no real one). |
-| `--store` (env `FLORA_STORE`) |  | Job store: file:///dir (or a path), s3://bucket[/prefix], modal-volume://name (default: the config's output.sink, then &lt;config dir&gt;/flora-local-store). |
-| `--config`, `-c` | `flora.yaml` | flora.yaml (finds the store and Modal environment). |
-| `--env` (env `MODAL_ENVIRONMENT`) |  | Modal environment of a modal-volume store. |
-| `--to` | `lerobot` | Target format (lerobot). |
-| `--stages` |  | Stages to export (repeat or comma-separate): segment, caption, reward.terminal, reward.dense. Default: every composed one. |
-| `--source` |  | Local copy of the source dataset (default: the job's dataset; a Hub dataset is fetched at its pinned revision, meta/ and data/ only). |
-| `--include-videos` | off | Copy the videos too (default: reference the source). |
-| `--allow-uncertified` | off | Export uncertified records (recorded in the metadata). |
-| `--allow-fake` | off | Export fake-model records (recorded in the metadata). |
-| `--push-to-hub` |  | Upload the export to this dataset repo (user/repo). |
-| `--public` | off | With --push-to-hub: make the repo public (default private). |
-| `--config-hash` |  | Config hash (default: the job manifest's). |

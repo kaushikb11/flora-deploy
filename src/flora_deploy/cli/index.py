@@ -126,7 +126,9 @@ def index(
         from flora_deploy.export.results import store_from_uri
 
         try:
-            # a missing Volume is created, as `flora deploy` would (index runs before deploy)
+            # the config's Modal Environment, not Modal's default one, as `flora deploy` and
+            # `flora doctor` use; a missing Volume is created, as `flora deploy` would
+            # (index runs before deploy)
             st = store_from_uri(store_uri, environment=cfg.modal.environment, create=True)
         except (ValueError, ImportError) as e:
             raise _fail(str(e)) from None
@@ -167,7 +169,7 @@ def index(
         from flora_deploy.modal_app import index_app
 
         index_app = importlib.reload(index_app)  # pick up FLORA_INDEX_VOLUME
-        with modal.enable_output(), index_app.app.run():
+        with modal.enable_output(), index_app.app.run(environment_name=cfg.modal.environment):
             summary = index_app.run_index_remote.remote(
                 ijob.to_dict(), store_uri, cfg.input.stage_to, limit, max_episodes, force)
 

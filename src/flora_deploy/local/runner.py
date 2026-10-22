@@ -368,7 +368,7 @@ class LocalRunner:
             return
         if self.verbose or name in NOTABLE:
             detail = {k: v for k, v in e.items() if k not in ("event", "job_id", "t", "holder")}
-            self.log(f"  [{name}] " + " ".join(f"{k}={v}" for k, v in sorted(detail.items())))
+            self.log(f"  [{name}] {event_text(detail)}".rstrip())
 
     def _shard(self, shard_id: Any) -> Any:
         return next((s for s in (self.manifest.shards if self.manifest else ())
@@ -810,6 +810,22 @@ def _gaps(c: Mapping[str, Any]) -> str:
     if c.get("excused"):
         out += f", {c['excused']} skipped (rejected by the model, or not planned)"
     return out
+
+
+def event_text(detail: Mapping[str, Any]) -> str:
+    """An orchestrator event's fields as ``key=value`` text: empty lists / maps and ``None``
+    left out (``[done] shards=5``, not ``dead=[] problems=[] shards=5``), lists joined with
+    commas, maps as ``key:value``."""
+    parts = []
+    for k, v in sorted(detail.items()):
+        if v is None or (isinstance(v, (list, tuple, set, dict)) and not v):
+            continue
+        if isinstance(v, dict):
+            v = ",".join(f"{a}:{b}" for a, b in v.items())
+        elif isinstance(v, (list, tuple, set)):
+            v = ",".join(str(x) for x in v)
+        parts.append(f"{k}={v}")
+    return " ".join(parts)
 
 
 def summary_lines(res: LocalRunResult, *, results_cmd: str | None = None) -> list[str]:

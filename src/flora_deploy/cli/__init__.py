@@ -37,7 +37,9 @@ from flora_deploy.cli import (  # noqa: F401  (registers commands)
     run_local,
     status,
 )
-from flora_deploy.cli._app import app
+from flora_deploy.cli._app import app, arrange_help
+
+arrange_help(app)  # `flora --help` panels (Get started / Run / Inspect results / ...)
 
 __all__ = ["app", "main"]
 

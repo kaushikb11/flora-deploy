@@ -17,7 +17,7 @@ from pathlib import Path
 
 import typer
 
-from flora_deploy.cli._app import app, console
+from flora_deploy.cli._app import app, console, hours_text
 from flora_deploy.cli.run import (
     ConfigOpt,
     EnvOpt,
@@ -64,7 +64,7 @@ def report(job: JobArg = None, store: StoreOpt = None,
             done = all(c["stopped"] for c in sp["containers"])
             _p(f"  containers: {len(sp['containers'])} local stand-ins, "
                + ("all finished" if done else "some still running"))
-        _p(f"video-hours: {vh['done']:.3f} done of {vh['planned']:.3f} planned")
+        _p(f"video-hours: {hours_text(vh['done'])} done of {hours_text(vh['planned'])} planned")
     else:
         _spend(sp, vh, per)
     _rest(r, job)
@@ -84,7 +84,7 @@ def _spend(sp: dict, vh: dict, per: float | None) -> None:
         for c in sp["containers"][:20]:
             _p(f"    {escape(c['container_id'])} {c['gpu'] or 'cpu'}x{c['gpu_count']} "
                f"${c['usd']:,.2f}{'' if c['stopped'] else ' (running)'}")
-    _p(f"video-hours: {vh['done']:.3f} done of {vh['planned']:.3f} planned; "
+    _p(f"video-hours: {hours_text(vh['done'])} done of {hours_text(vh['planned'])} planned; "
        + (f"${per:,.2f} per video-hour all-in" if per is not None else "$/video-hour: n/a yet"))
     if per is not None:
         _p("  all-in: GPU work plus each container's startup and idle time (`flora plan` "

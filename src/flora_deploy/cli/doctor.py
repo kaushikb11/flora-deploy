@@ -1,6 +1,7 @@
 """`flora doctor`: fast preflight checks before `flora prepare` / `flora deploy` / `flora run`.
 
-Every check reports ``pass``, ``warn`` or ``fail`` with a one-line fix:
+Every check reports ``pass``, ``warn`` or ``fail`` with a one-line fix (``info``: a note, never
+a problem):
 
 * **config**: ``flora.yaml`` validates and carries ``license_ack``;
 * **modal**: client installed at the pinned version, a token configured and accepted, the
@@ -19,6 +20,11 @@ Every check reports ``pass``, ``warn`` or ``fail`` with a one-line fix:
   still needed;
 * **budget**: ``modal.budget_usd`` and the Environment-budget backstop to set by hand;
 * **input**: the dataset revision resolves, or the local files exist.
+
+A **local-only** config (a local ``input.path`` not staged anywhere Modal can read, as in the
+``local_demo`` template) can only run ``flora run --local --fake-models``: the Modal, Hugging Face,
+store, weights and certificate checks are skipped with one ``info`` line saying how to move the
+config to Modal, and a missing ``mp4_dir`` folder is a note (``--sample-data`` writes it).
 
 **Zero Modal spend.** Only control-plane and metadata calls are made (object lookups, a Volume
 listing, Hub ``*_info`` calls, a probe write); never ``modal run`` and never a container.
@@ -43,7 +49,7 @@ import typer
 
 from flora_deploy.cli._app import app, console
 
-Status = Literal["pass", "warn", "fail"]
+Status = Literal["pass", "warn", "fail", "info"]
 BUCKET_SECRET = "flora-bucket"
 PROBE_PREFIX = "flora/.doctor"
 
@@ -577,10 +583,51 @@ def check_input(p: Probes, cfg: Any, token: str | None) -> Check:
     return Check("input", "pass", f"{n} {pattern} file(s) under {inp.path}")
 
 
+def local_only(cfg: Any) -> bool:
+    """A config that can only run on this machine (``flora run --local --fake-models``): a local
+    ``input.path`` that is not staged anywhere Modal can read (``input.stage_to`` unset or a
+    local directory), as in the ``local_demo`` template. Modal workers cannot read it."""
+    inp = cfg.input
+    return inp.repo is None and not (inp.stage_to and "://" in inp.stage_to)
+
+
+def check_local_only(cfg: Any) -> list[Check]:
+    """The checks a local-only config gets instead of the Modal-side ones."""
+    out = [Check("modal", "info", "local-only config (a local input.path, not staged for "
+                 "Modal): Modal, Hugging Face, store, weights and certificate checks skipped; "
+                 "`flora run --local --fake-models` needs none of them",
+                 "to run on Modal, upload input.path to a Volume and set input.stage_to, or "
+                 "set input.repo (`flora init --template balanced_mp4_dir modal.yaml` shows "
+                 "how), then rerun `flora doctor`")]
+    out.append(Check("budget", "info", f"budget_usd ${cfg.modal.budget_usd:,.2f}: a local run "
+                     "prices its work as if on Modal and stops at it; nothing is charged"))
+    return out
+
+
+def _local_input(p: Probes, cfg: Any) -> Check:
+    """``check_input`` for a local-only config: a missing ``mp4_dir`` folder is a note (the
+    local demo writes it with ``--sample-data``), not a failure."""
+    c = check_input(p, cfg, None)
+    if c.status == "fail" and cfg.input.format == "mp4_dir" and "not a directory" in c.message:
+        return Check("input", "info", f"{cfg.input.path} does not exist yet",
+                     "`flora run --local --fake-models --sample-data` writes sample videos "
+                     "there; or point input.path at a folder of MP4s")
+    return c
+
+
 def run_checks(config: Path, probes: Probes) -> list[Check]:
-    """Every check, in order. A config that does not load skips the checks that need it."""
+    """Every check, in order. A config that does not load skips the checks that need it; a
+    local-only config (:func:`local_only`) skips the Modal-side ones."""
     cfg_check, cfg = check_config(config)
     out = [cfg_check]
+    if cfg is not None and local_only(cfg):
+        out += check_local_only(cfg)
+        try:
+            out.append(_local_input(probes, cfg))
+        except Exception as e:  # a probe blew up: report it
+            out.append(Check("doctor", "warn", f"a check crashed: {_err(e)[6:]}",
+                             "rerun; report a bug"))
+        return out
     out += check_modal(probes, cfg.modal.environment if cfg is not None else None)
     hf, token = check_hf(probes)
     out += hf
@@ -606,7 +653,7 @@ def run_checks(config: Path, probes: Probes) -> list[Check]:
 
 ConfigOpt = Annotated[Path, typer.Option("--config", "-c", help="flora.yaml to check.")]
 JsonOpt = Annotated[bool, typer.Option("--json", help="Print JSON.")]
-_COLOR = {"pass": "green", "warn": "yellow", "fail": "red"}
+_COLOR = {"pass": "green", "warn": "yellow", "fail": "red", "info": "cyan"}
 
 
 @app.command()
@@ -625,10 +672,11 @@ def doctor(config: ConfigOpt = Path("flora.yaml"), as_json: JsonOpt = False) -> 
             console.print(f"[{col}]{c.status.upper():4}[/{col}] {escape(c.name)}: "
                           f"{escape(c.message)}", soft_wrap=True)
             if c.fix:
-                label = "note" if c.status == "pass" else "fix"
+                label = "note" if c.status in ("pass", "info") else "fix"
                 console.print(f"     {label}: {escape(c.fix)}", soft_wrap=True)
-        n = {s: sum(c.status == s for c in checks) for s in ("pass", "warn", "fail")}
-        console.print(f"{n['pass']} passed, {n['warn']} warnings, {n['fail']} failed")
+        n = {s: sum(c.status == s for c in checks) for s in ("pass", "warn", "fail", "info")}
+        console.print(f"{n['pass']} passed, {n['warn']} warnings, {n['fail']} failed"
+                      + (f", {n['info']} notes" if n["info"] else ""))
     raise typer.Exit(code=2 if failed else 0)
 
 
