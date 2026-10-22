@@ -74,9 +74,11 @@ def make_cert(doc, *, verdict="certified", gpu="L40S", pools=("human",), stamp=S
         "pins": {k: v["revision"] for k, v in sorted(doc["nvidia_pins"].items())},
         "derived_weights": dict(doc["derived_weights"]),
         "metrics": {"candidate": {p: {"n": 12, "means": zeros} for p in pools},
-                    "noise": {"n": 5, "means": zeros}, "coverage": 1.0},
+                    "noise": {"n": 5, "means": zeros}, "coverage": 1.0, "missing": 0},
         "thresholds": {"tolerance": tolerance, "min_samples": 10, "min_noise_samples": 5,
-                       "min_coverage": 1.0, "slack": {}},
+                       "max_missing": K.MAX_MISSING, "slack": {},
+                       "noise_floor": {m: K.NOISE_FLOOR[m] for m in SEG_METRICS},
+                       "absolute_floor": {"count_mismatch": K.ABSOLUTE_FLOOR["count_mismatch"]}},
     }
     body["id"] = K.certificate_id(body)
     return body

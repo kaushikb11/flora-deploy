@@ -20,6 +20,9 @@ BAL_GPU = {"segment": "L40S", "caption": "H100!", "reward.terminal": "H100!",
            "reward.dense": "H100!"}
 
 
+VLLM_STAGES = ("segment", "caption")
+
+
 def modes_for(preset: str, stage: str) -> dict:
     kind = get_preset(preset).stage_kinds[stage]
     if kind == "segcap":
@@ -46,6 +49,9 @@ def prov(preset: str, stage: str, *, gpu: str | None = None, embodiment: str | N
          engine: str | None = None, certificate: str | None = None, **kw) -> Provenance:
     g = gpu or default_gpu(preset, stage)
     doc = cert_key if cert_key is not None else key(preset, stage, g, fp=fp, modes=modes)
+    if preset != "exact" and stage in VLLM_STAGES:  # what a balanced vLLM worker stamps
+        kw.setdefault("compile_cache", "cold")
+        kw.setdefault("engine_preemptions", 0)
     vllm = doc.get("vllm_engine") if isinstance(doc, dict) else None
     models = {k: v["revision"] for k, v in (doc.get("nvidia_pins") or {}).items()}
     return Provenance(
@@ -104,7 +110,26 @@ def caption_set(preset: str, n: int, captions=("a", "b", "c"), **kw):
 STAGE_SETS = {"segment": segment_set, "caption": caption_set, "reward.terminal": terminal_set,
               "reward.dense": dense_set}
 
+def lab_hashes(kind: str, gpu: str) -> dict[str, str]:
+    """The engine-settings hashes a lab run on ``gpu`` records for the current limits."""
+    from flora_deploy.engines.offline_llm import EngineSpec
+
+    return {"baseline": certkey.engine_settings_hash(EngineSpec.for_gpu(kind, "", gpu).hashed()),
+            "plugin": certkey.engine_settings_hash(
+                EngineSpec.for_gpu(kind, "", gpu, dtbias_fp32=True).hashed())}
+
+
 L0_PASS = {"kind": "tempseg", "baseline": {"l0": [
     {"key": "k", "ids_equal": True, "render_ids_equal": True, "grid_equal": True}] * 6},
     "gate_a": {"requests": 6, "greedy_identical": 6, "positions": 10, "max_abs_dlogit": 0.1,
-               "mean_abs_dlogit": 0.01, "first_divergence": []}}
+               "mean_abs_dlogit": 0.01, "first_divergence": []},
+    "engine_hashes": lab_hashes("tempseg", "L40S")}
+
+
+def lab_for(stage: str) -> dict:
+    """A passing L0 / Gate A result for ``stage``'s model kind, under the current limits."""
+    from flora_deploy.validate.certify import L0_STAGES
+
+    kind = L0_STAGES.get(stage, "x")
+    hashes = lab_hashes(kind, BAL_GPU[stage]) if kind in ("tempseg", "captioner") else {}
+    return {**L0_PASS, "kind": kind, "engine_hashes": hashes}

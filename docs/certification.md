@@ -25,8 +25,9 @@ Anything that cannot be shown from the records refuses or downgrades the certifi
 |---|---|---|
 | `--exact` | `exact` records of the oracle run (JSONL, `flora_labels_v1`) | yes |
 | `--balanced` | the candidate stack's records on the same episodes | yes |
-| `--noise` | the oracle run **repeated** on a subset of its episodes: same stage hash, key, GPU and determinism mode. `exact` vs `noise` is the noise floor | no (without it: `provisional`) |
-| `--l0` | `modal_app/balanced_lab.py` result JSON (L0 rows and Gate A), one per model kind | no (without it, video stages are `provisional`) |
+| `--noise` | the oracle run **repeated** on some of its episodes: same stage hash, key, GPU and determinism mode. `exact` vs `noise` is the noise floor. Noise episodes the oracle did not label are dropped (`metrics.noise.unpaired`), so a spare fills in | no (without it: `provisional`) |
+| `--witness` | the **cold witness**: candidate records from one container forced cold (`FLORA_COMPILE_CACHE=off`), the same stack, on some of the oracle's episodes. Checked against the same thresholds as the candidate ("Warm and cold compiles") | no |
+| `--l0` | `modal_app/balanced_lab.py` result JSON (L0 rows, Gate A and `engine_hashes`, the `certkey.engine_settings_hash` of each engine it built), one per model kind. A lab whose baseline engine hash is not the candidate's engine settings is `stale` | no (without it, or stale, video stages are `provisional`) |
 | `--config` | the candidate run's `flora.yaml`: preset, pool GPUs, output-affecting modes, embodiment | yes |
 | `--derived-content NAME=SHA256` | content digest of each derived weight the kind needs (`tempseg_merged`, `captioner_bf16`): W1-Prepare's `content_digest(receipt)`, the value `DerivedPin.content_sha256` pins | yes for `segment`/`caption` |
 
@@ -44,6 +45,8 @@ Every record of every set (oracle, noise, candidate) must carry, in `provenance`
 | `cert_key` | `validate.certkey.key_document(preset, kind, pool_gpu, modes=kind_modes(cfg, kind), derived_content=..., dtbias_fp32=...)` of the stack that produced it | stamped by every real worker: exact segcap (`reference_app`), the balanced `SegmentWorker` / `CaptionWorker` (`balanced_app.build_stage`) and the Rewarder (`workers_app`); fake workers stamp none (refused as `fake_models`) |
 | `engine` | for `segment`/`caption`: the vLLM `EngineSpec.label` (must equal `cert_key.vllm_engine.label`) | set |
 | `models` | pin key -> revision; each must agree with `cert_key.nvidia_pins` | set |
+| `compile_cache` | `segment`/`caption`: the compile cache its container ran (`warm:<key>:<manifest sha256[:16]>`, `legacy:<key>`, `cold`, `cold:forced`); counted, not required | stamped by the balanced workers |
+| `engine_preemptions` | `segment`/`caption`: vLLM preemptions while the episode's requests were in flight (`vllm:num_preemptions`); `None` is unknown | stamped by the balanced workers; > 0 or `None` makes the certificate `provisional` |
 
 `flora certify` refuses records without them (`certified: false`, `missing_provenance`, naming
 the fields). Records made by fake engines (`provenance.certificate` in `{fake-models,
@@ -57,9 +60,12 @@ outright (`certified: false`, `fake_models`).
    `--config`, the pool GPU and `--derived-content`. The error names the differing key fields.
    The GPU must be the certified GPU.
 2. **Oracle (H2).** Uniform in the same fields: one oracle run. Same embodiment as the candidate.
-3. **Noise (H2).** Same stage hash, key, GPU and determinism mode as the oracle; its episodes a
-   subset of the oracle's; no record with the oracle's own `audit_ref` (a copy). The oracle's
-   stage hash, key, GPU and determinism mode are recorded in the certificate (`oracle`).
+3. **Noise (H2).** Same stage hash, key, GPU and determinism mode as the oracle; no record with
+   the oracle's own `audit_ref` (a copy). Only its episodes the oracle labelled are paired; the
+   rest are counted (`unpaired`), not an error. The oracle's stage hash, key, GPU and
+   determinism mode are recorded in the certificate (`oracle`).
+4. **Witness.** Same key, stage hash, GPU and embodiment as the candidate; paired with the
+   oracle like the noise run.
 
 Note for Wave H-lite: an oracle run in `deterministic` mode needs its noise run in
 `deterministic` mode too (they would otherwise differ in key and determinism).
@@ -99,7 +105,8 @@ The intervals of the two caption records are aligned as above. Captions are comp
 | `caption_similarity_divergence` | only with `--similarity module:function`: `(sum over P of 1 - sim(a, b) + unmatched) / slots`, with `sim` clipped to [0, 1]. **Off by default.** The hook is the caller's own code; nothing here touches the network |
 
 Caption records carry their own (balanced) segmentation, so caption metrics measure the
-end-to-end segment + caption result.
+end-to-end segment + caption result. Caption certificates also check `count_mismatch` (`1` if the
+two records have different numbers of intervals).
 
 ### Rewards
 
@@ -119,10 +126,23 @@ The noise floor is computed per stage: `noise_m = mean over noise episodes of m(
 For the stage's (single) embodiment pool and each metric:
 
 ```
-mean over episodes of m(exact, balanced)  <=  min(cap_m, tolerance x max(noise_m, floor_m) + slack_m)
+mean of m(exact, balanced)  <=  min(cap_m, max(absolute_floor_m, tolerance x max(noise_m, floor_m) + slack_m))
 ```
 
-(`certkey.metric_threshold`).
+(`certkey.metric_threshold`). **Which mean** (`per_metric.over`): `count_mismatch` is averaged
+over every paired episode; for `segment` and `caption` every other metric is averaged over the
+episodes whose subtask counts agree (`count_matched`). The same rule gives `noise_m`.
+
+**Why** (the user's decision on review 13 S3-2). With zero measured noise (H200 repeats give one
+distinct text) the floors decide, and `1.5 x 0.05 = 7.5%` made a single count flip in 12
+episodes (`1/12 = 8.3%`) a `fail` for a correct but different engine (vLLM BF16 on L40S/H100 vs
+HF on H200). A count flip also drags every interval and caption metric of that episode (an
+extra interval leaves slots unmatched, and its captions follow), so those were fatal in the same
+way. The rule now allows **up to about one episode in ten** to differ in subtask count
+(`absolute_floor` 0.10: 1 in 12 passes, 2 in 12 fail), bounds those episodes by that check
+alone, and keeps the **tight floors** below for the means over the episodes that agree. It stays
+fail-closed for real regressions: two count flips in 12, or a boundary error mean over 0.15 s
+with every count equal, fail.
 
 ### Policy (`certkey.POLICY`)
 
@@ -134,7 +154,7 @@ certificate that records them (H3).
 | `tolerance` | 1.5 (PLAN.md §4) | [1, 2] |
 | `min_samples` (candidate episodes per pool) | 10 | >= 10 |
 | `min_noise_samples` | 5 | >= 5 |
-| `min_coverage` | 1.0 | >= 1.0 |
+| `max_missing` (oracle episodes without a candidate record: the spares) | 2 | [0, 2] |
 | `slack_m` (`--slack`) | 0 | [0, `floor_m`] |
 
 **Absolute noise floors** `floor_m` (M4). A zero measured noise (two greedy runs that agree,
@@ -156,6 +176,19 @@ floor is below what a real regression costs:
 | `rank_divergence` | 0.05 | rho >= 0.925 |
 | `length_mismatch` | 0 | the step count is fixed by the video length |
 
+**Absolute floors** `absolute_floor_m` on the threshold itself: `count_mismatch` 0.10 (above).
+The certificate records `noise_floor` and `absolute_floor` (and each check's `floor`,
+`absolute_floor` and `over` in `per_metric`); matching refuses a certificate whose recorded
+floors are not the policy's (`certkey.floor_problems`).
+
+**Spares** (review 13 S3-3). The certificate evaluates **every** episode both sides labelled,
+never a chosen subset: the candidate paired with the oracle (`n`), the noise run paired with the
+oracle, the witness paired with the oracle. So a failed episode is replaced by whichever spare
+is present, deterministically. The golden/v2 certified plan runs 12 oracle episodes for the 10
+`min_samples` (2 spares, `max_missing`) and 6 noise episodes for the 5 `min_noise_samples` (1
+spare): one missing balanced, noise or oracle episode, including an oracle miss on a noise
+episode, still certifies while >= 10 candidate and >= 5 noise episodes pair.
+
 **Absolute caps** from archive/PLAN-v3.md §2: terminal `E[s]` MAE <= 0.05 (`expected_score_abs_delta`).
 PLAN's other bar, "boundary F1 at most 1 point below", is not enforced: no boundary-F1 metric
 is computed yet.
@@ -170,16 +203,47 @@ In this order:
    - no noise run (`no_noise_run`): checks have no threshold and cannot fail or pass;
    - noise episodes < `min_noise_samples` (`too_few_noise_samples`);
    - candidate episodes < `min_samples` (`too_few_samples`);
-   - coverage < `min_coverage` (`incomplete_coverage`): the candidate did not label every
-     `exact` episode;
+   - more than `max_missing` oracle episodes without a candidate record (`incomplete_coverage`);
    - no L0 for a video stage (`no_l0`). `segment` and `caption` need L0; rewards run the same
      NVIDIA vLLM engine as `exact`, so their L0 is `not_applicable`;
+   - an L0 measured under other engine settings (`stale_l0`: the lab's baseline
+     `engine_hashes` is not `certkey.engine_settings_hash` of the candidate's `vllm_engine`, or
+     the lab predates the hash);
+   - a candidate or witness record whose engine preempted while it ran (`engine_preempted`) or
+     that does not say (`preemptions_unknown`);
+   - a witness with fewer than `min_noise_samples` episodes (`too_few_witness_samples`) or with
+     a record that was not forced cold (`witness_not_forced_cold`);
    - a metric could not be evaluated (`metric_not_evaluable`).
 3. **`certified`** otherwise.
 
 **What `certified` needs** (H4), per stage and GPU: binding provenance on every record; at least
-10 candidate episodes of the pool, all oracle episodes labelled; a noise run of at least 5 of the
-oracle's episodes; L0 passing for `segment`/`caption`; every check within threshold. **Wave
+10 candidate episodes of the pool, at most 2 oracle episodes unlabelled; a noise run pairing at
+least 5 of the oracle's episodes; L0 passing for `segment`/`caption` under the candidate's engine
+settings; no preempted or unknown-preemption engine record; every check within threshold.
+
+**Preemptions** (review 13 B1). A preempted GDN sequence recomputes its generated tokens through
+the chunked-prefill kernel instead of the recurrent decode kernel, a numerics path the oracle and
+noise runs never used, and timing-dependent. Records whose engine preempted are therefore **not
+certified** rather than covered: covering them would vouch for a path that was measured only by
+accident, and excluding them would drop episodes silently. The engine limits fit a full batch of
+worst-case requests (`engines/offline_llm.py`, `KV_FIT`), and the build fails when vLLM's blocks
+do not (`check_mamba_blocks`), so a certified run should see none.
+
+### Warm and cold compiles
+
+A warm container replays the publisher's Inductor autotune picks (`.best_config`); a cold one
+benchmarks afresh and may pick other reduction kernels (`engines/compile_cache.py`,
+"Determinism"). The cache is **not** in the key (a key per publish would make every cold
+fallback an uncertified stack). Instead every `segment`/`caption` record carries
+`provenance.compile_cache`, and the certificate's `compile_cache` block counts the candidate's
+and the witness's caches and lists what its evidence `covers`. The certified plan
+(`scripts/wave_h.py --plan certified`) makes that cover both: (d)'s job runs with one container
+per kind, which compiles (cold, or from the lab's legacy cache) and publishes the cache every
+later warm container loads, so its records are exactly the kernels warm production replays;
+then the **cold witness** re-runs the same config on the 6 noise episodes with
+`FLORA_COMPILE_CACHE=off`, one container per kind forced cold. A certificate with a witness
+therefore covers warm containers loading that publish and independent cold compiles; one
+without covers only the caches it lists. **Wave
 H-lite (6 episodes, 2 noise episodes) is `provisional` by construction**, with or without
 anything else.
 
@@ -199,7 +263,7 @@ certificate is written only with an explicit `--out-dir`.
 | Field | Content |
 |---|---|
 | `id` | `cert_` + the first 32 hex characters of the sha256 of the canonical body without `id` (content address; a hand-edited file is ignored) |
-| `generator` | `{name: flora-certify, version: "2", framework}` |
+| `generator` | `{name: flora-certify, version: "3", framework}` (`certkey.GENERATOR_VERSIONS`: version 3 is the review 13 rule; earlier ones no longer match) |
 | `generated_at` | UTC `YYYY-MM-DDTHH:MM:SSZ`; orders certificates for one key (below) |
 | `verdict`, `reasons`, `unlocks` | `certified` / `provisional` / `fail`; machine reasons; whether it unlocks the preset |
 | `preset`, `stage`, `kind`, `gpu` | what it certifies; `gpu` is the Modal GPU type (`H100!` is not `H100`) |
@@ -209,8 +273,9 @@ certificate is written only with an explicit `--out-dir`.
 | `engine`, `modes`, `logic`, `pins`, `derived_weights` | from the key: engine name, versions, image and fingerprint, patches and vLLM spec; output-affecting modes; logic version and certificate logic digest; NVIDIA pin revisions; derived-weight content digests |
 | `oracle` | the oracle's `stage_hash`, `engine_spec_hash`, normalized `gpu` and `determinism` mode |
 | `episodes` | `{count, digest, uid_sha256: [...]}`: sha256 of each episode uid, never the uid |
-| `metrics` | per pool `{n, means}`; noise `{n, means, episodes: {count, digest}}`; `coverage`; the similarity hook's name |
-| `thresholds` | the knobs, and per metric `{slack, floor, cap, threshold}` |
+| `metrics` | per pool `{n, count_matched, means}`; noise and witness `{n, means, unpaired, episodes: {count, digest}}`; `coverage`; `missing`; the similarity hook's name |
+| `thresholds` | the knobs, `noise_floor`, `absolute_floor`, and per metric `{slack, floor, absolute_floor, cap, over, threshold}` |
+| `preemptions`, `compile_cache` | `segment`/`caption`: candidate and witness records whose engine preempted / could not say; the compile caches the candidate and the witness ran, and what the evidence `covers` |
 | `checks` | `[{class, metric, value, threshold, pass}]` (`class` is the pool) |
 | `l0`, `gate_a` | L0 status and counts; Gate A summary numbers |
 
@@ -291,11 +356,14 @@ A (preset, kind) runs exactly what `exact` runs when its live key document
 (`key_document(preset, kind, gpu, ...)`, with the config's modes and derived content) equals
 `exact`'s for the same kind once the `preset` field alone is removed, and the pool GPU is
 `exact`'s pool GPU for that kind. Then it is the **reference**, like `exact` itself: no
-certificate is needed and none applies (a measured `fail` does not revoke it, as it would not
-revoke `exact`). The rule is `certkey.reference_identical` / `reference_kinds`; the config gate
+certificate is needed, **unless** the deciding certificate that matches its live key (same
+preset, kind, GPU, embodiment pool and key) is a `fail` (review 13 S3-7): a failure measured
+under the very key overrides the identity argument, and the kind then needs a `certified`
+certificate like any other. The rule is `certkey.reference_identical` / `reference_kinds`; the config gate
 and the deploy factory get it through `config.presets.find_certificates` (a
-`reference:exact-identical` entry, no file) and `certkey.status` reports `reference`, so plan,
-doctor and deploy say `reference (NVIDIA's own engine, no certificate needed)`.
+`reference:exact-identical` entry, no file) and `certkey.status` reports `reference` (or `fail`
+when a matching fail overrides it), so plan, doctor and deploy say `reference (NVIDIA's own
+engine, no certificate needed)`.
 
 Today this holds for `balanced`'s `reward.terminal`, `reward.dense` and `reward.rubric` on
 `H100!`: same engine (`nvidia-vllm-offline`), image, pins, modes and logic. It is computed

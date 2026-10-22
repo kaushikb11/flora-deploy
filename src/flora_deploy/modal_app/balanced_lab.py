@@ -162,6 +162,16 @@ def _l0(llm, proc, requests, completions) -> list[dict]:
     return rows
 
 
+def engine_hash(spec: Any) -> str:
+    """``certkey.engine_settings_hash`` of the engine ``spec`` (an ``EngineSpec``): the hash a
+    certificate's L0 and ``scripts/wave_h.py``'s lab reuse compare with the current engine's
+    (review 13 S3-1). The Gate A logprob arguments only change what requests return, so the
+    lab's engines hash as the workers' do."""
+    from flora_deploy.validate.certkey import engine_settings_hash
+
+    return engine_settings_hash(spec.hashed())
+
+
 def child(args: dict) -> None:
     """One engine in this process (``args`` from ``run_kind``); writes ``args['out']``."""
     import asyncio
@@ -187,6 +197,7 @@ def child(args: dict) -> None:
     engine = OfflineEngine(spec, keep_prompt_ids=True)  # verifies the GDN dtypes (M6)
     out["engine_build_s"] = round(time.time() - t0, 1)
     out["spec"] = spec.as_json()
+    out["engine_hash"] = engine_hash(spec)
     out["gdn_dtypes"] = engine.gdn_dtypes or gdn_param_dtypes(engine.llm)
     eos = proc.tokenizer.eos_token_id
 
@@ -409,6 +420,8 @@ def run_kind(kind: str, run_id: str, segments_rel: str = "",
     cache.commit()  # keep the baseline compile even if the plugin child hits a deadline
     result: dict[str, Any] = {"run": run_id, "kind": kind, "baseline": a,
                               "segments_from": dict(segments_from) if segments else None,
+                              # the engine-settings hash of each engine built (S3-1)
+                              "engine_hashes": {"baseline": a.get("engine_hash")},
                               "compile_cache": caches,
                               "prefetch": (s.as_json() if (s := prefetch.wait(0)) else None)}
     if "error" in a:
@@ -423,6 +436,7 @@ def run_kind(kind: str, run_id: str, segments_rel: str = "",
                         "out": str(tmp / "b.json")}, env)
         cache.commit()
         result["dtbias"] = {k: v for k, v in b.items() if k != "gate_a"}
+        result["engine_hashes"]["plugin"] = b.get("engine_hash")
         if "error" in b:
             result["error"] = f"plugin: {b['error']}"
         else:

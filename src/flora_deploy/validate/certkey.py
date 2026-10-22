@@ -51,7 +51,9 @@ CERT_LOGIC_SCHEMA = "flora-cert-logic/v1"
 CERT_DIR = Path(__file__).resolve().parent.parent / "config" / "certificates"
 VERDICTS = ("certified", "provisional", "fail")
 GENERATOR = "flora-certify"
-GENERATOR_VERSIONS = ("2",)  # generator versions whose certificates matching() accepts
+# generator versions whose certificates matching() accepts; "3" (review 13): count-bounded
+# floors, spares, preemption and compile-cache evidence, the engine-hash-bound L0
+GENERATOR_VERSIONS = ("3",)
 
 # ``provenance.certificate`` values of records made by fake engines (``local/engines.py``).
 FAKE_CERTIFICATES = frozenset({"fake-models", "local-fake-models"})
@@ -73,7 +75,10 @@ _STAMP = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\Z")
 TOLERANCE_BOUNDS = (1.0, 2.0)  # PLAN.md §4 uses 1.5
 MIN_SAMPLES_FLOOR = 10  # candidate episodes per (stage, embodiment pool)
 MIN_NOISE_SAMPLES_FLOOR = 5  # noise-run episodes per stage
-MIN_COVERAGE = 1.0
+# Spares (review 13 S3-3): at most this many oracle episodes may lack a candidate record (the
+# golden/v2 plan runs 12 for the 10 a certificate needs). Every episode both sides labelled is
+# evaluated; a missing one is never chosen, it is whichever failed.
+MAX_MISSING = 2
 # Absolute noise floor per metric: the threshold is tolerance x max(noise, floor) + slack, so a
 # zero measured noise does not demand a bit-identical engine.
 NOISE_FLOOR: dict[str, float] = {
@@ -90,15 +95,25 @@ NOISE_FLOOR: dict[str, float] = {
     "rank_divergence": 0.05,
     "length_mismatch": 0.0,  # step count is fixed by the video length
 }
+# Absolute floors on the threshold itself (user decision on review 13 S3-2): with a zero noise
+# floor, 1.5 x 0.05 = 7.5% made one count flip in 12 episodes fatal. Up to about one episode in
+# ten may differ in subtask count; the other segment / caption metrics are averaged over the
+# episodes whose counts agree (``validate.certify.COUNT_CONDITIONED``), with their tight floors.
+ABSOLUTE_FLOOR: dict[str, float] = {"count_mismatch": 0.10}
 SLACK_MAX: dict[str, float] = dict(NOISE_FLOOR)  # --slack may at most add one floor
 # Absolute bars from PLAN-v3.md §2 ("terminal E[s] MAE <= 0.05"), on top of the noise rule.
 ABSOLUTE_CAPS: dict[str, float] = {"expected_score_abs_delta": 0.05}
 
 POLICY: dict[str, Any] = {
     "tolerance": list(TOLERANCE_BOUNDS), "min_samples": MIN_SAMPLES_FLOOR,
-    "min_noise_samples": MIN_NOISE_SAMPLES_FLOOR, "min_coverage": MIN_COVERAGE,
-    "noise_floor": NOISE_FLOOR, "slack_max": SLACK_MAX, "absolute_caps": ABSOLUTE_CAPS,
+    "min_noise_samples": MIN_NOISE_SAMPLES_FLOOR, "max_missing": MAX_MISSING,
+    "noise_floor": NOISE_FLOOR, "absolute_floor": ABSOLUTE_FLOOR, "slack_max": SLACK_MAX,
+    "absolute_caps": ABSOLUTE_CAPS,
 }
+# Engine kwargs that only change what a request *returns* (the lab's Gate A logprobs), left out
+# of the engine-settings hash so the lab's engines hash as the workers' (compile_cache drops
+# the same for its key).
+RETURN_ONLY_KWARGS = ("logprobs_mode", "max_logprobs")
 
 
 class CertKeyError(ValueError):
@@ -114,16 +129,28 @@ def sha256_hex(doc: Any) -> str:
     return hashlib.sha256(canonical(doc).encode("utf-8")).hexdigest()
 
 
+def engine_settings_hash(hashed: Mapping[str, Any]) -> str:
+    """sha256 of an ``EngineSpec.hashed()`` document as the key's ``vllm_engine`` hashes it,
+    without :data:`RETURN_ONLY_KWARGS` (review 13 S3-1: the lab records it per engine it built,
+    and lab evidence counts only for the engine settings the candidate ran)."""
+    doc = dict(hashed)
+    doc["engine_kwargs"] = {k: v for k, v in dict(doc.get("engine_kwargs") or {}).items()
+                            if k not in RETURN_ONLY_KWARGS}
+    return sha256_hex(doc)
+
+
 def metric_threshold(metric: str, noise: float, tolerance: float, slack: float) -> float:
-    """``min(cap, tolerance x max(noise, floor) + slack)`` (rounded as certificates are)."""
+    """``min(cap, max(absolute_floor, tolerance x max(noise, floor) + slack))`` (rounded as
+    certificates are)."""
     t = tolerance * max(float(noise), NOISE_FLOOR.get(metric, 0.0)) + float(slack)
+    t = max(t, ABSOLUTE_FLOOR.get(metric, 0.0))
     if metric in ABSOLUTE_CAPS:
         t = min(t, ABSOLUTE_CAPS[metric])
     return round(t, 6)
 
 
 def threshold_problems(tolerance: float, min_samples: int, min_noise_samples: int,
-                       min_coverage: float, slack: Mapping[str, float]) -> list[str]:
+                       max_missing: int, slack: Mapping[str, float]) -> list[str]:
     """Why these knobs are outside :data:`POLICY` (empty when they are within it)."""
     out = []
     lo, hi = TOLERANCE_BOUNDS
@@ -133,8 +160,8 @@ def threshold_problems(tolerance: float, min_samples: int, min_noise_samples: in
         out.append(f"min_samples {min_samples} < {MIN_SAMPLES_FLOOR}")
     if int(min_noise_samples) < MIN_NOISE_SAMPLES_FLOOR:
         out.append(f"min_noise_samples {min_noise_samples} < {MIN_NOISE_SAMPLES_FLOOR}")
-    if float(min_coverage) < MIN_COVERAGE:
-        out.append(f"min_coverage {min_coverage} < {MIN_COVERAGE}")
+    if not 0 <= int(max_missing) <= MAX_MISSING:
+        out.append(f"max_missing {max_missing} outside [0, {MAX_MISSING}]")
     for m, v in slack.items():
         if m not in SLACK_MAX:
             out.append(f"slack for unknown metric {m!r}")
@@ -359,8 +386,9 @@ def policy_problems(cert: Mapping[str, Any]) -> list[str]:
         tol = float(th["tolerance"])
         slack = {k: float(v) for k, v in (th.get("slack") or {}).items()}
         out += threshold_problems(tol, th["min_samples"], th["min_noise_samples"],
-                                  th["min_coverage"], slack)
-    except (KeyError, TypeError, ValueError):
+                                  th["max_missing"], slack)
+        out += floor_problems(th)
+    except (KeyError, TypeError, ValueError, AttributeError):
         return [*out, "thresholds missing or malformed"]
     if cert.get("verdict") != "certified":
         return out
@@ -368,7 +396,7 @@ def policy_problems(cert: Mapping[str, Any]) -> list[str]:
     noise = metrics.get("noise") or {}
     if int(noise.get("n") or 0) < int(th["min_noise_samples"]):
         out.append("too few noise samples")
-    if float(metrics.get("coverage") or 0) < float(th["min_coverage"]):
+    if int(metrics.get("missing") or 0) > int(th["max_missing"]):
         out.append("incomplete coverage")
     cand = metrics.get("candidate") or {}
     if not cand or any(int(b.get("n") or 0) < int(th["min_samples"]) for b in cand.values()):
@@ -376,7 +404,10 @@ def policy_problems(cert: Mapping[str, Any]) -> list[str]:
     if set(cand) != set(cert.get("covered_pools") or ()):
         out.append("covered_pools differ from the measured classes")
     means = noise.get("means") or {}
-    for pool, block in cand.items():
+    blocks = dict(cand)
+    if metrics.get("witness") is not None:
+        blocks["witness"] = metrics["witness"]
+    for pool, block in blocks.items():
         for m, v in (block.get("means") or {}).items():
             if v is None or means.get(m) is None:
                 out.append(f"{pool} {m}: not evaluable")
@@ -384,6 +415,25 @@ def policy_problems(cert: Mapping[str, Any]) -> list[str]:
             t = metric_threshold(m, means[m], tol, slack.get(m, 0.0))
             if float(v) > t + 1e-12:
                 out.append(f"{pool} {m}: {v} > {t}")
+    return out
+
+
+def floor_problems(th: Mapping[str, Any]) -> list[str]:
+    """Why a certificate's recorded floors are not :data:`POLICY`'s (its ``noise_floor``,
+    ``absolute_floor`` and each ``per_metric`` ``floor`` / ``absolute_floor``)."""
+    out = []
+    for m, v in dict(th["noise_floor"]).items():
+        if float(v) != NOISE_FLOOR.get(m):
+            out.append(f"noise floor {m}={v} is not the policy's {NOISE_FLOOR.get(m)}")
+    for m, v in dict(th["absolute_floor"]).items():
+        if float(v) != ABSOLUTE_FLOOR.get(m):
+            out.append(f"absolute floor {m}={v} is not the policy's {ABSOLUTE_FLOOR.get(m)}")
+    for m, pm in dict(th.get("per_metric") or {}).items():
+        if float(pm.get("floor") or 0.0) != NOISE_FLOOR.get(m, 0.0):
+            out.append(f"{m}: recorded floor {pm.get('floor')} is not the policy's")
+        if float(pm.get("absolute_floor") or 0.0) != ABSOLUTE_FLOOR.get(m, 0.0):
+            out.append(f"{m}: recorded absolute floor {pm.get('absolute_floor')} is not the "
+                       "policy's")
     return out
 
 
@@ -458,11 +508,22 @@ def reference_identical(preset: str, kind: str, gpu: str, **kwargs: Any) -> bool
             == {k: v for k, v in theirs.items() if k != "preset"})
 
 
+_MATCH_KWARGS = ("embodiment", "modes", "derived_content", "dtbias_fp32", "engines",
+                 "cert_dir", "image_fingerprint", "logic_root")
+
+
 def reference_kinds(preset: str, pools: Mapping[str, Any], **kwargs: Any) -> set[str]:
     """The kinds of ``pools`` that are :func:`reference_identical` (all of them for
-    ``exact``). The config gate (``config.presets.find_certificates``) and :func:`status` both
+    ``exact``), **unless** the deciding certificate that matches the kind's live key is a
+    ``fail`` (review 13 S3-7): a measured failure under the very key overrides the identity
+    argument. The config gate (``config.presets.find_certificates``) and :func:`status` both
     use this, so what may run without a certificate and what is shown as reference agree."""
-    return {k for k, p in pools.items() if reference_identical(preset, k, p.gpu, **kwargs)}
+    ident = {k for k, p in pools.items() if reference_identical(preset, k, p.gpu, **kwargs)}
+    if preset == REFERENCE_PRESET or not ident:
+        return ident
+    found = matching(preset, {k: pools[k] for k in ident},
+                     **{k: v for k, v in kwargs.items() if k in _MATCH_KWARGS})
+    return {k for k in ident if not (found.get(k) and found[k][0]["verdict"] == "fail")}
 
 
 def status(preset: str, pools: Mapping[str, Any], **kwargs: Any) -> dict[str, dict[str, Any]]:
@@ -474,7 +535,7 @@ def status(preset: str, pools: Mapping[str, Any], **kwargs: Any) -> dict[str, di
         return {k: {"gpu": p.gpu, "status": "reference", "certificate": None}
                 for k, p in pools.items()}
     found = matching(preset, pools, **kwargs)
-    ref = reference_kinds(preset, pools, **kwargs)
+    ref = reference_kinds(preset, pools, **kwargs)  # a matching fail is not the reference
     dc = kwargs.get("derived_content") or {}
     out = {}
     for k, p in pools.items():
