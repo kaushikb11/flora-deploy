@@ -674,3 +674,71 @@ def test_report_spend_shows_tracked_charged_and_billed(tmp_path, capsys):
     assert f"Total: **${st.spent:,.2f}**" in rep
     assert f"- tracked ${tracked:,.2f}" in rep and f"- charged ${charged:,.2f}" in rep
     assert "over tracked" in rep and f"- billed ${st.billed_total:,.2f}" in rep
+
+
+README_BLOCKS = ("certified", "allow-uncertified", "cost")
+
+
+def _strip_blocks(text: str) -> str:
+    """``text`` with every ``wave-h:*`` block body emptied (markers kept)."""
+    import re
+
+    return re.sub(r"(^<!-- wave-h:([\w-]+)(?: [^>]*)? -->\n).*?(^<!-- /wave-h:\2 -->)", r"\1\3",
+                  text, flags=re.M | re.S)
+
+
+def test_write_regenerates_every_readme_block_and_nothing_else(tmp_path, capsys):
+    import re
+
+    root = build(tmp_path)
+    readme = root / "README.md"
+    names = re.findall(r"^<!-- wave-h:([\w-]+)(?: [^>]*)? -->$", readme.read_text(), re.M)
+    assert sorted(names) == sorted(README_BLOCKS)  # a new block needs a regenerator here
+    stale = readme.read_text()
+    for n in README_BLOCKS:  # every block body stale: --write must rewrite each one
+        stale = re.sub(rf"(^<!-- wave-h:{n} -->\n).*?(^<!-- /wave-h:{n} -->)",
+                       r"\1STALE\n\2", stale, flags=re.M | re.S)
+    readme.write_text(stale)
+    rc, out = run(root, "--write", capsys=capsys)
+    assert rc == 0, out
+    new = readme.read_text()
+    assert "STALE" not in new
+    assert _strip_blocks(new) == _strip_blocks(stale)  # nothing outside the blocks changed
+    certs_dir = root / "src/flora_deploy/config/certificates"
+    blocks = fin.certification_blocks(stale, [certs_dir])
+    for n in ("certified", "allow-uncertified"):
+        want = blocks.split(f"<!-- wave-h:{n} -->\n")[1].split(f"<!-- /wave-h:{n} -->")[0]
+        assert new.split(f"<!-- wave-h:{n} -->\n")[1].split(f"<!-- /wave-h:{n} -->")[0] == want
+
+
+def test_write_locks_every_certificate_it_writes(tmp_path, capsys):
+    from flora_deploy.validate import certfreeze as F
+    from flora_deploy.validate import certkey as K
+
+    root = build(tmp_path)
+    rc, out = run(root, "--write", capsys=capsys)
+    assert rc == 0, out
+    d = root / "src/flora_deploy/config/certificates"
+    cs = certs(root)
+    assert cs and "lock " in out
+    for c in cs:
+        lock = F.read_freeze(d, c)
+        assert lock is not None, c["id"]  # the drift gate can name the changed modules
+        assert K.sha256_hex(lock["key_document"]) == c["engine_spec_hash"]
+    assert run(root, "--write", capsys=capsys)[1].count("would lock") == 0
+
+
+def test_write_refuses_a_certificate_this_tree_cannot_lock(tmp_path, capsys, monkeypatch):
+    from flora_deploy.validate import certfreeze as F
+    from flora_deploy.validate import certkey as K
+
+    root = build(tmp_path)
+    before = owned(root)
+
+    def drifted(cert, source_dir=None):
+        raise K.CertKeyError(f"{cert['id']}: this tree no longer computes its key")
+
+    monkeypatch.setattr(F, "lock_document", drifted)
+    rc, out = run(root, "--write", capsys=capsys)
+    assert rc == 1 and "REFUSED freeze lock" in out and "nothing written" in out
+    assert owned(root) == before

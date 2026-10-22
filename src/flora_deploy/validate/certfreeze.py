@@ -137,6 +137,23 @@ def current_key_document(cert: Mapping[str, Any], **kw: Any) -> dict[str, Any]:
         dtbias_fp32=bool(vllm.get("dtbias_fp32")), **kw)
 
 
+def lock_document(cert: Mapping[str, Any], source_dir: Path | None = None) -> dict[str, Any]:
+    """The key document to freeze ``cert`` with: the one in ``source_dir``'s freeze lock (what
+    ``flora certify`` keyed it on) when that lock is consistent, else the key this tree
+    computes. Raises ``CertKeyError`` when neither hashes to the certificate's
+    ``engine_spec_hash`` (the tree no longer computes its key: drift), or when the key cannot
+    be computed."""
+    if source_dir is not None:
+        lock = read_freeze(source_dir, cert)
+        if lock is not None:
+            return dict(lock["key_document"])
+    doc = current_key_document(cert)
+    if K.sha256_hex(doc) != cert.get("engine_spec_hash"):
+        raise K.CertKeyError(f"{cert.get('id')}: this tree no longer computes its key (drift; "
+                             "run scripts/cert_freeze.py --check)")
+    return doc
+
+
 def recorded_view(cert: Mapping[str, Any]) -> dict[str, Any]:
     """What a certificate body records of its key document (no freeze lock)."""
     eng = cert.get("engine") or {}

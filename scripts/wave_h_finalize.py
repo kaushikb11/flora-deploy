@@ -64,6 +64,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import wave_h as wh  # noqa: E402 - the runbook's state format, caps and constants
 
+from flora_deploy.validate import certfreeze as F  # noqa: E402
+
 MIN_RATE_SAMPLES = 1  # jobs (rate) and containers (cold start) per (preset, kind, GPU)
 MIN_VIDEO_S = 30.0  # video seconds behind a rate
 UNCERTAINTY_FLOOR = 0.25  # the error band never claims better than +/-25% from this few samples
@@ -1156,6 +1158,28 @@ def cert_key(c: Mapping[str, Any]) -> tuple[Any, ...]:
             tuple(c.get("covered_pools") or ()), c.get("engine_spec_hash"))
 
 
+def freeze_locks(certs: Sequence[Path], cert_dir: Path, new: Sequence[Path]
+                 ) -> tuple[list[tuple[dict[str, Any], dict[str, Any]]], list[str]]:
+    """The freeze locks (``validate/certfreeze.py``) ``--write`` writes beside the certificates
+    of this run, the equivalent of ``scripts/cert_freeze.py --lock`` for them, so the drift
+    gate can name the modules that change later: ``(certificate, key document)`` for each
+    certificate in ``new`` (rewritten) or whose committed lock is missing or inconsistent. The
+    document is the one ``flora certify`` locked it with, else the key this tree computes.
+    Second: why a certificate cannot be locked (its key no longer matches this tree)."""
+    out: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    errors: list[str] = []
+    fresh = {p.name for p in new}
+    for p in certs:
+        cert = json.loads(p.read_text(encoding="utf-8"))
+        if p.name not in fresh and F.read_freeze(cert_dir, cert) is not None:
+            continue
+        try:
+            out.append((cert, F.lock_document(cert, p.parent)))
+        except Exception as e:  # noqa: BLE001 - reported; --write refuses
+            errors.append(f"{cert.get('id')}: {e}")
+    return out, errors
+
+
 def superseded(cert_dir: Path, prev: Sequence[str], new: Sequence[Path]) -> list[Path]:
     """The certificates this script wrote before that a certificate of this run replaces:
     same :func:`cert_key`, another id. A certificate nothing new replaced (its inputs are
@@ -1217,10 +1241,21 @@ def main(argv: list[str] | None = None, *, cli: Callable[[list[str]], tuple[int,
             print(f"  {'update' if args.write else 'would update'} {p} (+{add} -{rem})")
         for c in new_certs:
             print(f"  {'write' if args.write else 'would write'} {paths.certs / c.name}")
+        locks, lock_errors = freeze_locks(certs, paths.certs, new_certs)
+        for cert, _doc in locks:
+            print(f"  {'lock' if args.write else 'would lock'} "
+                  f"{F.freeze_path(paths.certs, cert['id'])}")
         for s in stale:
             print(f"  {'remove' if args.write else 'would remove'} superseded {s}")
-        if not changed and not new_certs and not stale:
+        if not changed and not new_certs and not stale and not locks:
             print("  nothing to change")
+        if lock_errors:
+            for e in lock_errors:
+                print(f"  REFUSED freeze lock: {e}")
+            if args.write:  # fail closed: a certificate without its lock is not committed
+                print("refused: nothing written (a certificate this tree cannot lock would "
+                      "fail the drift gate; docs/certificate-freeze.md)")
+                return 1
         if args.write:
             for p, t in changed.items():
                 p.parent.mkdir(parents=True, exist_ok=True)
@@ -1228,8 +1263,11 @@ def main(argv: list[str] | None = None, *, cli: Callable[[list[str]], tuple[int,
             paths.certs.mkdir(parents=True, exist_ok=True)
             for c in new_certs:
                 shutil.copyfile(c, paths.certs / c.name)
+            for cert, doc in locks:  # scripts/cert_freeze.py --lock for what it wrote
+                F.write_freeze(cert, doc, paths.certs)
             for s in stale:
                 s.unlink()
+                F.freeze_path(paths.certs, s.stem).unlink(missing_ok=True)  # its orphan lock
             man = dump_json({"run_id": f.st.run_id, "certificates": owned_ids})
             if not paths.manifest.exists() or paths.manifest.read_text(encoding="utf-8") != man:
                 paths.manifest.parent.mkdir(parents=True, exist_ok=True)
