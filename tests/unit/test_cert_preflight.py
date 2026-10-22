@@ -116,7 +116,7 @@ def good_table(**over) -> dict[str, cp.Result]:
         "modal app list": ok(json.dumps([
             {"app_id": "ap-1", "description": "flora-balanced-lab", "state": "stopped"},
             {"app_id": "ap-2", "description": "plumbline-llm", "state": "deployed"}])),
-        "engine_settings_hash": ok(json.dumps({"tempseg": "t" * 64, "captioner": "c" * 64})),
+        "lab_engine_hashes": ok(json.dumps({"tempseg": "t" * 64, "captioner": "c" * 64})),
         "cert_freeze.py --check": ok("ok"),
         "pytest": ok("1 passed"),
         "spend.py": ok("flora-x  $ 20.00\nTOTAL                    $  26.10  of $50.00  "
@@ -364,8 +364,8 @@ def _lab_files(tmp_path, hashes):
     d.mkdir(parents=True, exist_ok=True)
     for k in cp.LAB_KINDS:
         res = {"baseline": {"l0": []}}
-        if hashes.get(k):
-            res[cp.HASH_KEY] = hashes[k]
+        if hashes.get(k):  # the lab's own shape: engine_hashes {"baseline", "plugin"}
+            res[cp.LAB_HASHES] = {"baseline": hashes[k], "plugin": "p" * 64}
         (d / f"balanced-{k}.json").write_text(json.dumps(res))
 
 

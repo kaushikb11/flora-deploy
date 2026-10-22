@@ -48,7 +48,8 @@ PLAN = "certified"
 GOLDEN_VOLUME = "flora-golden"
 GOLDEN = {"human": ("golden/v2", "human"), "yam": ("golden/v3-yam", "yam")}
 LAB_KINDS = ("tempseg", "captioner")
-HASH_KEY = "engine_settings_hash"  # Fix-13: the lab result's engine-settings hash
+HASH_KEY = "engine_settings_hash"  # a lab hash per kind (status JSON; older lab files)
+LAB_HASHES = "engine_hashes"  # balanced_lab results: {"baseline", "plugin"} engine hashes
 LIVE_STATES = {"running", "deployed", "ephemeral", "initializing", "stopping",
                "deployed (detached)"}
 PASS, WARN, FAIL = "pass", "warn", "fail"
@@ -526,16 +527,18 @@ def check_apps(env: Env) -> Check:
 # ---------------------------------------------------------------------------------------------
 # 7. Lab evidence
 
-_CURRENT_HASH = (
-    "import json\n"
-    "from flora_deploy.modal_app import balanced_lab as B\n"
-    "f=getattr(B,'engine_settings_hash',None)\n"
-    "print(json.dumps({k:(f(k) if f else None) for k in ('tempseg','captioner')}))\n"
+_CURRENT_HASH = (  # wave_h.lab_engine_hashes: what the runbook's lab reuse compares
+    "import json, sys\n"
+    "sys.path.insert(0, 'scripts')\n"
+    "import wave_h as W\n"
+    "print(json.dumps({k: W.lab_engine_hashes(k)['baseline'] for k in ('tempseg','captioner')}))\n"
 )
 
 
 def saved_hash(res: Mapping[str, Any]) -> str | None:
-    return res.get(HASH_KEY) or (res.get("baseline") or {}).get(HASH_KEY)
+    """The baseline engine-settings hash a saved lab result was measured under."""
+    return ((res.get(LAB_HASHES) or {}).get("baseline") or res.get(HASH_KEY)
+            or (res.get("baseline") or {}).get(HASH_KEY))
 
 
 def check_lab(env: Env, plan: PlanInfo | None) -> Check:
@@ -565,7 +568,8 @@ def check_lab(env: Env, plan: PlanInfo | None) -> Check:
         have, now = saved_hash(res), current.get(kind)
         d[kind] = {"saved": have, "current": now}
         if have is None:
-            warns.append(f"{kind}: no {HASH_KEY} (pre-Fix-13): treated as will re-run")
+            warns.append(f"{kind}: no engine-settings hash (an older lab file): treated as "
+                         "will re-run")
         elif now is None:
             warns.append(f"{kind}: saved {have[:12]} but the current hash is unavailable")
         elif have != now:
@@ -575,8 +579,7 @@ def check_lab(env: Env, plan: PlanInfo | None) -> Check:
     if fails:
         return Check(name, FAIL, "; ".join(fails), rerun, d)
     if warns:
-        return Check(name, WARN, "; ".join(warns), "land Fix-13 (the engine-settings hash) so a "
-                     "stale result re-runs, or " + rerun, d)
+        return Check(name, WARN, "; ".join(warns), rerun, d)
     return Check(name, PASS, "saved lab evidence matches the current engine settings: "
                  + ", ".join(oks), "", d)
 
