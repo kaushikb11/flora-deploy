@@ -198,7 +198,10 @@ prompts or code. See [`NOTICE.md`](NOTICE.md).
 
 ```bash
 uv sync --group dev
-uv run pytest -n auto        # ~30 s
+uv run pytest -n auto --dist loadfile -q   # ~3,000 CPU tests; about 2.5 min on 8 cores
 ```
+
+`-n auto` runs one worker per core (pytest-xdist); without it the suite takes several times
+longer. GPU and Modal tests are skipped unless asked for ([`docs/ci.md`](docs/ci.md)).
 
 How it works: [`docs/PLAN.md`](docs/PLAN.md). All docs: [`docs/`](docs/).
