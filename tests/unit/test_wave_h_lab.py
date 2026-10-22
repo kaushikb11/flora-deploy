@@ -340,7 +340,8 @@ def test_child_args_go_through_a_file_not_argv(tmp_path):
 
 
 def _saved(kind, **kw):
-    res = {"run": "wave-h-r", "kind": kind, **_good(kind)}
+    res = {"run": "wave-h-r", "kind": kind, **_good(kind),
+           "engine_hashes": wh.lab_engine_hashes(kind)}  # measured under today's settings
     res["baseline"] = {**res["baseline"], "episodes_requested": list(wh.EPISODES)}
     res.update(kw)
     return res

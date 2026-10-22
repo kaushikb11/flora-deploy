@@ -77,12 +77,16 @@ def _l0_rows(ok: bool = True) -> list[dict]:
 
 
 def _lab(kind: str, gpu: str, dlogit: float) -> dict:
+    from flora_deploy.engines.offline_llm import normalize_gpu
+    from tests.fakes.certrecords import lab_hashes
+
     return {"run": "wave-h-r1", "kind": kind, "baseline": {
         "gpu": gpu, "l0": _l0_rows(), "episodes": [{"id": "x", "ok": True,
                                                     "rows": [{"caption": SECRET}]}]},
         "gate_a": {"requests": 6, "greedy_identical": 6, "positions": 120,
                    "max_abs_dlogit": dlogit, "mean_abs_dlogit": dlogit / 10,
-                   "first_divergence": []}}
+                   "first_divergence": []},
+        "engine_hashes": lab_hashes(kind, normalize_gpu(gpu))}
 
 
 def _records(n: int, preset: str, stage: str, emb: str, *, shift: float = 0.0) -> list:

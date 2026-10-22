@@ -20,14 +20,16 @@ oracle's and balanced's episode uids (``<data dir>--<episode id>``) never pair.
 
 ``certified`` (:class:`PlanSpec`, ``docs/wave-h-runbook.md`` "The certified run") makes
 ``balanced`` certified for ``human``: b (exact oracle on the 12 golden/v2 episodes, default
-mode, H200) -> f (noise: 5 of them, the oracle's own config and data dir re-indexed with
-``flora index --limit 5``, so the same stage hash) -> d (balanced on the 12, the real ``flora
-deploy`` / ``flora run``) -> d2 (the lab, skipped when its evidence already exists:
-:func:`lab_already_done`) -> e (``flora certify`` per stage, then ``wave_h_finalize.py
---write`` when both are ``certified``: :func:`run_flora_certify`). Every job stages one data
-dir (:data:`CERT_DATA`). Its caps are each step's upper projection rounded up to $0.05
-(:func:`plan_caps`), its global cap their sum rounded up to $0.10; its state, work dir and
-records live under ``reports/wave-h/certified/``.
+mode, H200) -> f (noise: 6 of them, the selection's 5 plus one spare, the oracle's own config
+and data dir re-indexed with ``flora index --limit 6``, so the same stage hash) -> d (balanced
+on the 12, the real ``flora deploy`` / ``flora run``, then the **cold witness**: the same config
+re-run on the noise subset with ``FLORA_COMPILE_CACHE=off``, one container per kind forced
+cold) -> d2 (the lab, skipped only when its evidence exists **for the current engine
+settings**: :func:`lab_already_done`) -> e (``flora certify`` per stage, with the witness,
+then ``wave_h_finalize.py --write`` when both are ``certified``: :func:`run_flora_certify`).
+Every job stages one data dir (:data:`CERT_DATA`). Its caps are each step's upper projection
+rounded up to $0.05 (:func:`plan_caps`), its global cap their sum rounded up to $0.10; its
+state, work dir and records live under ``reports/wave-h/certified/``.
 
 Six ``human`` golden episodes (:data:`EPISODES`, ``docs/golden-manifest-v1.md``), one job and one
 app per stage. Steps, in order (each with a projected-spend stop rule before it and a spend
@@ -163,6 +165,11 @@ CERT_DATA = "cert-human"  # ONE data dir for the oracle, noise and balanced jobs
 NOISE_PREFIX, REST_PREFIX = "n-", "x-"  # local id prefixes: the noise episodes sort first
 MIN_CERT_EPISODES = 10  # certkey.POLICY min_samples (per pool)
 MIN_NOISE_EPISODES = 5  # certkey.POLICY min_noise_samples
+# One spare noise episode (review 13 S3-3): a noise episode the oracle or the noise run fails
+# is replaced by it, as the 2 spare oracle episodes replace a failed balanced one.
+NOISE_SPARES = 1
+COLD_JOB = "cold"  # (d)'s cold witness job (review 13 W1): the noise subset, forced cold
+COMPILE_CACHE_ENV = "FLORA_COMPILE_CACHE"  # modal_app.balanced_app.COMPILE_CACHE_ENV
 
 
 def golden_selection(version: str) -> dict[str, Any]:
@@ -173,14 +180,20 @@ def golden_selection(version: str) -> dict[str, Any]:
 
 
 def _cert_sets() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """The certified plan's episodes and noise subset: the selection's ``noise_subset`` plus
+    :data:`NOISE_SPARES` spare(s), the first other episodes in selection order. All of them
+    are oracle episodes (the noise run repeats the oracle's job), so every one can pair."""
     sel = golden_selection(CERT_GOLDEN)
     eps = tuple(f"{e['pool']}/{e['dataset']}/{e['slug']}" for e in sel["episodes"]
                 if e["pool"] == EMBODIMENT)
-    return eps, tuple(sel.get("noise_subset") or ())
+    noise = tuple(g for g in sel.get("noise_subset") or () if g in eps)
+    spares = tuple(g for g in eps if g not in noise)[:NOISE_SPARES]
+    return eps, noise + spares
 
 
-# All 12 golden/v2 human episodes (10 for the certificate + 2 spares, all run), and the 5 the
-# noise job repeats (the selection's ``noise_subset``: one VFR HomER row and four EgoDex clips).
+# All 12 golden/v2 human episodes (10 for the certificate + 2 spares, all run), and the 6 the
+# noise job repeats (the selection's ``noise_subset``, one VFR HomER row and four EgoDex clips,
+# plus one spare).
 CERT_EPISODES, CERT_NOISE = _cert_sets()
 
 
@@ -522,6 +535,13 @@ def project(step: str, manifest: Mapping[str, Any], spec: PlanSpec | None = None
               secs["segment"][0], upper_s=secs["segment"][1])
         p.add(f"balanced caption {JOB} ({len(eps)} ep, {v:.1f} s, cold compile)", cap,
               secs["caption"][0], upper_s=secs["caption"][1])
+        if spec.shared_data:  # certified: the cold witness on the noise subset (W1)
+            neps = [i for i in spec.noise if i in dur]
+            nv = sum(dur[i] for i in neps)
+            ws = balanced_job_seconds(nv)
+            for kind, c in (("segment", seg), ("caption", cap)):
+                p.add(f"cold witness {kind} {JOB} ({len(neps)} ep, {nv:.1f} s, forced cold)",
+                      c, ws[kind][0], upper_s=ws[kind][1])
         p.peak_usd_per_s = seg.usd_per_s() + cap.usd_per_s()
     elif step == "lab" and lab_done:
         p.add("balanced lab: L0 + Gate A already done (evidence present): skipped",
@@ -632,12 +652,40 @@ def plan_projections(plan: str, manifest: Mapping[str, Any], *, lab_done: bool =
                        reuse=reuse if s == "lab" else ()) for s in STEPS}
 
 
+def lab_engine_hashes(kind: str) -> dict[str, str]:
+    """``certkey.engine_settings_hash`` of the engines the lab builds for ``kind`` now (the
+    baseline and the ``dt_bias`` plugin one), on the lab's GPU: what a saved lab result must
+    have recorded to count (review 13 S3-1)."""
+    from flora_deploy.engines.offline_llm import EngineSpec
+    from flora_deploy.validate.certkey import engine_settings_hash
+
+    gpu = LAB[kind].gpu or ""
+    return {"baseline": engine_settings_hash(EngineSpec.for_gpu(kind, "", gpu).hashed()),
+            "plugin": engine_settings_hash(EngineSpec.for_gpu(kind, "", gpu,
+                                                              dtbias_fp32=True).hashed())}
+
+
+def lab_hash_problem(kind: str, res: Mapping[str, Any]) -> str | None:
+    """Why a saved lab result was not measured under the current engine settings (None: it
+    was): its baseline engine hash, and its plugin engine's when it built one."""
+    got = res.get("engine_hashes") or {}
+    want = lab_engine_hashes(kind)
+    if got.get("baseline") != want["baseline"]:
+        return f"{kind}: measured under other engine settings (lab engine hash " \
+            f"{str(got.get('baseline'))[:12]}, now {want['baseline'][:12]})"
+    if res.get("dtbias") is not None and got.get("plugin") != want["plugin"]:
+        return f"{kind}: plugin engine measured under other engine settings"
+    return None
+
+
 def lab_already_done(lab_dir: Path | None = None) -> tuple[bool, str]:
     """Whether the lab's L0 + Gate A evidence exists (``balanced-<kind>.json``, as step d2 or
     ``--only lab`` writes it): per kind non-empty L0 rows, every one with equal ids and grids,
-    Gate A over at least one request, measured on the balanced pool's GPU. The certificate
-    takes L0 per model kind, not per episode (``validate.certify.l0_summary``), so the
-    certified run reuses it instead of paying two cold compiles per kind again."""
+    Gate A over at least one request, measured on the balanced pool's GPU **under the current
+    engine settings** (:func:`lab_hash_problem`; a lab from before batch fill, or from before
+    the hash was recorded, is not done). The certificate takes L0 per model kind, not per
+    episode (``validate.certify.l0_summary``), so the certified run reuses it instead of
+    paying two cold compiles per kind again."""
     from flora_deploy.engines.offline_llm import EngineArgsError, normalize_gpu
 
     lab_dir = lab_dir or LAB_OUT
@@ -666,6 +714,8 @@ def lab_already_done(lab_dir: Path | None = None) -> tuple[bool, str]:
             why.append(f"{kind}: L0 not passing")
         if not gate.get("requests"):
             why.append(f"{kind}: no Gate A requests")
+        if stale := lab_hash_problem(kind, res):
+            why.append(stale)
         gpu = base.get("gpu") or res.get("gpu")
         want = pool_container(stage, "balanced").gpu or ""
         try:
@@ -675,7 +725,8 @@ def lab_already_done(lab_dir: Path | None = None) -> tuple[bool, str]:
             why.append(f"{kind}: unknown GPU {gpu!r}")
     if why:
         return False, "; ".join(why)
-    return True, f"L0 + Gate A evidence in {lab_dir}/balanced-{{tempseg,captioner}}.json"
+    return True, (f"L0 + Gate A evidence for the current engine settings in "
+                  f"{lab_dir}/balanced-{{tempseg,captioner}}.json")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1562,7 +1613,44 @@ def run_balanced(ctx: Ctx) -> dict[str, Any]:
     if not e2e["ok"]:  # L2: the lab step refuses a job that did not finish
         out["lab"] = (f"not run: deployed balanced job ended {r.get('state')!r}"
                       + (f" ({r['error']})" if r.get("error") else ""))
+    elif ctx.spec.shared_data:  # certified: the cold witness (review 13 W1)
+        w = run_cold_witness(ctx, cfg, rate, spent=float(e2e["tracked_usd"]))
+        out["witness_jobs"] = {JOB: w}
+        e2e["tracked_usd"] = float(e2e["tracked_usd"]) + float(w.get("spend") or 0.0)
+        e2e["apps"] = sorted(set(e2e["apps"]) | ({w["app"]} if "app" in w else set()))
+        if w.get("state") != "done":
+            e2e["ok"] = False
+            out["error"] = (f"cold witness job ended {w.get('state')!r}"
+                            + (f" ({w['error']})" if w.get("error") else ""))
     return {**e2e, **out}
+
+
+def run_cold_witness(ctx: Ctx, cfg: Path, rate: float, *, spent: float) -> dict[str, Any]:
+    """(d)'s **cold witness** (review 13 W1): (d)'s own config and data dir re-indexed with
+    ``flora index --limit`` to the noise subset (the same stage hash, as the noise job does
+    for the oracle), then deployed and run with ``FLORA_COMPILE_CACHE=off`` in the deploying
+    process's env (``modal_app.factory`` forwards it), so its one container per kind
+    (``max_containers: 1``) compiles cold and publishes nothing. A warm start replays the
+    publisher's Inductor autotune picks; the witness is the independent cold compile the
+    certificate's evidence must also cover (``docs/certification.md``)."""
+    job_id = f"wave-h-{ctx.st.run_id}-{COLD_JOB}-{JOB}"
+    tag = f"{COLD_JOB}-{JOB}"
+    _index(ctx, cfg, job_id, tag, limit=len(ctx.spec.noise))
+    got = noise_index_problems(ctx.work / f"summary-{tag}.json", ctx.manifest, ctx.spec)
+    if got:
+        return {"job_id": job_id, "state": "skipped", "error": f"witness index: {got}",
+                "spend": 0.0, "compile_cache": "off"}
+    prev = os.environ.get(COMPILE_CACHE_ENV)
+    os.environ[COMPILE_CACHE_ENV] = "off"
+    try:
+        r = _run_job(ctx, "balanced", cfg, job_id, determinism=ORACLE_DETERMINISM,
+                     usd_per_s=rate, spent_in_step=spent, side="witness")
+    finally:
+        if prev is None:
+            os.environ.pop(COMPILE_CACHE_ENV, None)
+        else:
+            os.environ[COMPILE_CACHE_ENV] = prev
+    return {**r, "compile_cache": "off", "episodes": len(ctx.spec.noise)}
 
 
 def balanced_job_done(st: State) -> bool:
@@ -1722,9 +1810,10 @@ def reusable_lab_result(kind: str, run_id: str, episodes: Sequence[str],
                         segments_from: Mapping[str, str] | None = None
                         ) -> dict[str, Any] | None:
     """A saved lab result for ``kind`` a re-run can keep instead of paying for it again: same
-    run id and kind, (d)'s episodes, no error anywhere, L0 rows and Gate A requests. A
-    Captioner result must also have captioned ``segments_from`` ((d)'s job id and segment stage
-    hash, :func:`segment_binding`); without a known binding it is never reused."""
+    run id and kind, (d)'s episodes, no error anywhere, L0 rows and Gate A requests, measured
+    under the current engine settings (:func:`lab_hash_problem`). A Captioner result must also
+    have captioned ``segments_from`` ((d)'s job id and segment stage hash,
+    :func:`segment_binding`); without a known binding it is never reused."""
     p = path or lab_result_path(kind)
     try:
         res = json.loads(p.read_text())
@@ -1738,7 +1827,8 @@ def reusable_lab_result(kind: str, run_id: str, episodes: Sequence[str],
           and not res.get("error") and not base.get("error") and not res.get("no_evidence")
           and bool(base.get("l0")) and int(gate.get("requests") or 0) > 0
           and list(base.get("episodes_requested") or ()) == list(episodes)
-          and not (res.get("dtbias") or {}).get("error"))
+          and not (res.get("dtbias") or {}).get("error")
+          and lab_hash_problem(kind, res) is None)
     if kind == "captioner":
         ok = ok and segments_from is not None and res.get("segments_from") == dict(segments_from)
     return res if ok else None
@@ -1769,6 +1859,7 @@ def _lab_kind_summary(res: Mapping[str, Any], wall: float, usd: float) -> dict[s
             "l0": l0, "gate_a": gate, "evidence": evidence,
             "episode_errors": len(base.get("episode_errors") or {}),
             "compile_cache": res.get("compile_cache"),
+            "engine_hashes": res.get("engine_hashes"),
             "error": err or (None if evidence else NO_EVIDENCE)}
 
 
@@ -2023,20 +2114,28 @@ def run_flora_certify(ctx: Ctx, *, finalize: Any = None, sh: Callable[..., Any] 
     stages: dict[str, Any] = {}
     for o in outcomes:
         c = o.get("cert") or {}
+        metrics = c.get("metrics") or {}
         stages[o["stage"]] = {
             "verdict": c.get("verdict"), "id": c.get("id"), "reasons": c.get("reasons"),
-            "episodes": sum(b.get("n", 0) for b in
-                            ((c.get("metrics") or {}).get("candidate") or {}).values()),
-            "noise_episodes": ((c.get("metrics") or {}).get("noise") or {}).get("n"),
+            "episodes": sum(b.get("n", 0) for b in (metrics.get("candidate") or {}).values()),
+            "noise_episodes": (metrics.get("noise") or {}).get("n"),
+            "witness_episodes": (metrics.get("witness") or {}).get("n"),
+            # review 13 B1 / W1: what the engines did, as the certificate states it
+            "preemptions": c.get("preemptions"),
+            "compile_cache": (c.get("compile_cache") or {}).get("covers"),
             "missing": finalize.missing_for_certified(c) if c else None,
             "refused": o.get("refused") or o.get("deferred")}
-    ok = (set(stages) == set(CERT_STAGES)
+    # certified, and the evidence covers a forced-cold container (the cold witness, W1)
+    no_witness = sorted(k for k, v in stages.items() if not v.get("witness_episodes"))
+    ok = (set(stages) == set(CERT_STAGES) and not no_witness
           and all(v["verdict"] == "certified" for v in stages.values()))
     res: dict[str, Any] = {"ok": ok, "stages": stages, "tracked_usd": 0.0, "apps": []}
     if not ok:
         res["error"] = "not certified: " + "; ".join(
             f"{k}: {v['verdict'] or v['refused']}" + (f" ({', '.join(v['missing'])})"
                                                       if v.get("missing") else "")
+            + (" (no cold witness: (d)'s forced-cold job on the noise subset)"
+               if k in no_witness else "")
             for k, v in sorted(stages.items()))
         return res
     args = [sys.executable, str(ROOT / "scripts" / "wave_h_finalize.py"), "--state",
@@ -2181,6 +2280,11 @@ def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
             "(rates.json `compile_cache: warm`, placeholders) are never used here: a cache is "
             "keyed by the engine spec, so none is published for this code's yet; a worker that "
             "compiled publishes one after its first shard (engines/compile_cache.py)")
+        if plan == CERTIFIED:
+            out("  assumption: (d) then runs the cold witness, the same config on the "
+                f"{len(spec.noise)} noise episodes with {COMPILE_CACHE_ENV}=off (one container "
+                "per kind forced cold, priced cold): the certificate's evidence covers warm "
+                "(the cache (d)'s first container publishes) and cold compiles")
         lim = balanced_engine_limits()
         out("  assumption: (d) runs the batch-fill engine limits and batch policy: "
             + ", ".join(f"{k} on {v['gpu']} max_num_seqs {v['max_num_seqs']}, "
