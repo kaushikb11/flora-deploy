@@ -28,7 +28,9 @@ Severity follows what a certificate unlocks. Only the deciding certificate of ea
 kind, GPU, key, pool) is checked (newest ``generated_at``; on a tie ``fail`` beats
 ``provisional`` beats ``certified``, as in ``certkey.matching``). A drifted ``certified`` one is
 an **error**; a drifted ``provisional`` one is a **warning** (it unlocks nothing); a deciding
-``fail`` (a revocation) and superseded certificates are **info**.
+``fail`` (a revocation) and superseded certificates are **info**, and so is a certificate of a
+**retired** generator version (``certkey.RETIRED_GENERATOR_VERSIONS``: it matches nothing, and
+is deleted in the commit that adds its re-certified replacement).
 """
 
 from __future__ import annotations
@@ -404,6 +406,13 @@ def _invalid(body: Any) -> str | None:
 def _check_one(c: dict[str, Any], d: Path, pools: list[str] | None, kw: dict[str, Any],
                git_history: bool) -> list[Finding]:
     what = _what(c)
+    version = (c.get("generator") or {}).get("version")
+    if version in K.RETIRED_GENERATOR_VERSIONS:
+        return [Finding("info", "retired", c["id"], what,
+                        f"generator version {version!r} is retired (certkey.GENERATOR_VERSIONS "
+                        f"= {K.GENERATOR_VERSIONS}): it matches nothing and unlocks nothing. "
+                        "Delete it, and its freeze lock, in the commit that adds its "
+                        f"re-certified replacement ({RECERTIFY_DOC})")]
     if pools is None:
         return [Finding("info", "superseded", c["id"], what,
                         "superseded by a newer certificate for the same key and pools; it "

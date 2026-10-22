@@ -142,3 +142,57 @@ def lab_for(stage: str) -> dict:
     kind = L0_STAGES.get(stage, "x")
     hashes = lab_hashes(kind, BAL_GPU[stage]) if kind in ("tempseg", "captioner") else {}
     return {**L0_PASS, "kind": kind, "engine_hashes": hashes}
+
+
+# ---------------------------------------------------------------------------------------------
+# Stage-isolated caption evidence (certify v4)
+
+
+def row_digest(uid: str, seg: Segment) -> str:
+    """A stand-in for NVIDIA's input digest of a Captioner call: a function of the episode and
+    the row's bounds, so two runs on the same segments agree and a moved boundary does not."""
+    import hashlib
+
+    return hashlib.sha256(f"{uid}|{seg.start_s:.6f}|{seg.end_s:.6f}".encode()).hexdigest()
+
+
+def digests_of(records) -> dict[str, list[str | None]]:
+    """``{uid: [digest | None per row]}``: a digest for every ``complete`` row."""
+    return {r.uid: [row_digest(r.uid, s) if s.status == "complete" else None
+                    for s in r.segments] for r in records}
+
+
+def oracle_segment_records(exact) -> list[StageRecord]:
+    """The oracle's ``segment`` records behind its caption records (same stage hash)."""
+    return [dataclasses.replace(r, stage="segment", segments=tuple(
+        dataclasses.replace(s, caption=None, status="complete") for s in r.segments))
+        for r in exact]
+
+
+def isolated(exact, balanced, witness=None, noise=None, *, directory=None):
+    """Make caption ``balanced`` / ``witness`` records stage-isolated (``segments_from`` of a
+    staged oracle segment file) and return ``(balanced, witness, certify_stage kwargs)`` with
+    the oracle segment file and every side's digests."""
+    import hashlib
+    import tempfile
+    from pathlib import Path
+
+    exact = list(exact)
+    d = Path(directory or tempfile.mkdtemp(prefix="oracle-segments-"))
+    path = d / "oracle-segments.jsonl"
+    data = "".join(r.to_json() + "\n" for r in oracle_segment_records(exact)).encode()
+    path.write_bytes(data)
+    sf = {"sha256": hashlib.sha256(data).hexdigest(),
+          "oracle_stage_hash": exact[0].provenance.config_hash}
+
+    def stamp(recs):
+        return None if recs is None else [dataclasses.replace(r, provenance=dataclasses.replace(
+            r.provenance, segments_from=dict(sf))) for r in recs]
+
+    balanced, witness = stamp(list(balanced)), stamp(None if witness is None else list(witness))
+    digests = {"exact": digests_of(exact), "balanced": digests_of(balanced)}
+    if witness is not None:
+        digests["witness"] = digests_of(witness)
+    if noise is not None:
+        digests["noise"] = digests_of(noise)
+    return balanced, witness, {"digests": digests, "oracle_segments": path}

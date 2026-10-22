@@ -96,6 +96,22 @@ def certify(
         help="Certificate time YYYY-MM-DDTHH:MM:SSZ (default: now). Pass the run's own time to "
              "make re-certifying the same records reproduce the same certificate id.")
     ] = None,
+    digests: Annotated[list[str] | None, typer.Option(
+        help="Per-row Captioner input digests SIDE=PATH, JSON {uid: [hex|null per row]} "
+             "(repeatable; SIDE: exact, noise, balanced, witness, repeat). Caption needs "
+             "exact, balanced (and noise / witness when given).")] = None,
+    oracle_segments: Annotated[Path | None, typer.Option(
+        help="Caption: the staged oracle segment JSONL the isolated candidate captioned "
+             "(byte-identical to the pinned file).")] = None,
+    reported_e2e: Annotated[Path | None, typer.Option(
+        help="Caption: the stack's end-to-end caption records, JSONL (reported only).")
+    ] = None,
+    reported_repeat: Annotated[Path | None, typer.Option(
+        help="Caption: another exact repeat's caption records, JSONL, with --digests repeat= "
+             "(reported only).")] = None,
+    families: Annotated[Path | None, typer.Option(
+        help="Caption: JSON {uid: label} (label [a-z0-9_.-]{1,32}) for the reported family "
+             "split.")] = None,
 ) -> None:
     """Certify a balanced stack against exact, within NVIDIA's own run-to-run noise."""
     from flora_deploy.config.hashing import kind_modes
@@ -120,6 +136,14 @@ def certify(
         wit = C.read_records(witness) if witness else None
         labs = [json.loads(p.read_text(encoding="utf-8")) for p in l0 or ()]
         slacks = {k: float(v) for k, v in _pairs(slack, "--slack").items()}
+        dig_paths = _pairs(digests, "--digests")
+        bad = sorted(set(dig_paths) - set(C.DIGEST_SIDES))
+        if bad:
+            raise ValueError(f"--digests sides {bad}: use {', '.join(C.DIGEST_SIDES)}")
+        dig = {k: json.loads(Path(v).read_text(encoding="utf-8")) for k, v in dig_paths.items()}
+        e2e = C.read_records(reported_e2e) if reported_e2e else None
+        rep = C.read_records(reported_repeat) if reported_repeat else None
+        fam = json.loads(families.read_text(encoding="utf-8")) if families else None
     except (OSError, ValueError) as e:
         raise _fail(f"bad input: {e}") from None
     lab_by_kind = {lab.get("kind"): lab for lab in labs}
@@ -152,7 +176,9 @@ def certify(
                 st, exact=ex, balanced=bal, noise=nz, witness=wit, engine_spec=doc, gpu=g,
                 preset=cfg.preset, kind=kind, l0=lab_by_kind.get(C.L0_STAGES.get(st)),
                 thresholds=th, similarity=sim, similarity_name=similarity,
-                generated_at=generated_at)
+                generated_at=generated_at, digests=dig or None,
+                oracle_segments=oracle_segments, reported_e2e=e2e, reported_repeat=rep,
+                families=fam)
         except C.CertifyRefused as e:
             raise _fail(f"{st}: certified: false ({e.reason}): {e}", 1) from None
         except C.CertifyError as e:

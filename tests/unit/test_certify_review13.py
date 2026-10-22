@@ -25,6 +25,7 @@ from tests.fakes.certrecords import (
     L0_PASS,
     caption_set,
     cold_witness,
+    isolated,
     key,
     lab_for,
     rec,
@@ -49,6 +50,9 @@ def uids(n, start=0):
 def certify(exact, balanced, noise, *, stage="segment", l0=L0_PASS, gpu="L40S", **kw):
     balanced = list(balanced)
     kw.setdefault("witness", cold_witness(balanced) if stage in C.L0_STAGES else None)
+    if stage == "caption":  # v4: stage-isolated evidence (oracle segments, digests)
+        balanced, kw["witness"], extra = isolated(exact, balanced, kw["witness"], noise)
+        kw = {**extra, **kw}
     return C.certify_stage(stage, exact=exact, balanced=balanced, noise=noise,
                            engine_spec=key("balanced", stage, gpu), gpu=gpu, l0=l0,
                            generated_at=STAMP, **kw)
@@ -91,16 +95,24 @@ def test_mean_boundary_error_above_the_floor_fails_with_every_count_matching():
     assert "boundary_error_s" in {ch["metric"] for ch in c["checks"] if ch["pass"] is False}
 
 
-def test_caption_counts_are_bounded_and_caption_means_stay_tight():
+def test_caption_is_stage_isolated_and_its_means_stay_tight():
+    """v4: caption certifies on the oracle's own rows; a candidate whose rows differ from the
+    oracle's (a split interval) is refused, not scored; count_mismatch is not a caption
+    metric (the segment certificate bounds counts)."""
     split = segs(SPLIT, ["a", "b", "b2", "c"])
     ex = caption_set("exact", 12)
     one = [*caption_set("balanced", 12)[:11],
            rec("u11", "caption", "balanced", segments=split)]
-    c = certify(ex, one, caption_set("exact", 5), stage="caption", l0=lab_for("caption"),
+    with pytest.raises(C.CertifyRefused) as e:
+        certify(ex, one, caption_set("exact", 5), stage="caption", l0=lab_for("caption"),
                 gpu="H100!")
+    assert e.value.reason == "segments_not_oracle"
+    c = certify(ex, caption_set("balanced", 12), caption_set("exact", 5), stage="caption",
+                l0=lab_for("caption"), gpu="H100!")
     assert c["verdict"] == "certified", c["reasons"]
-    assert "count_mismatch" in c["metrics"]["candidate"]["yam"]["means"]
-    # one differing caption on a count-matched episode: 1/(12*3) of the slots, under 0.075
+    assert "count_mismatch" not in c["metrics"]["candidate"]["yam"]["means"]
+    assert c["metrics"]["count_flips"] is None
+    # one differing caption: 1/3 of one episode's slots, a macro mean of 1/36, under 0.075
     off = caption_set("balanced", 12)
     off[0] = rec("u0", "caption", "balanced", segments=segs(BOUNDS, ["a", "b", "z"]))
     clean = cold_witness(caption_set("balanced", 12))  # the witness does not repeat the typo

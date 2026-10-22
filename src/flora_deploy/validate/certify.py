@@ -63,6 +63,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -94,7 +95,7 @@ from flora_deploy.validate.certkey import (
     threshold_problems,
 )
 
-CERTIFY_VERSION = "3"
+CERTIFY_VERSION = "4"
 # Provenance every record must carry to be certified against (docs/certification.md).
 REQUIRED_PROVENANCE = ("config_hash", "gpu", "embodiment", "cert_key")
 EMBODIMENTS = ("human", "yam", "yam32", "dex", "tianji")  # config.schema.Embodiment
@@ -104,11 +105,19 @@ Similarity = Callable[[str, str], float]
 
 STAGE_METRICS: dict[str, tuple[str, ...]] = {
     "segment": ("iou_divergence", "boundary_error_s", "count_mismatch", "label_disagreement"),
-    "caption": ("caption_mismatch", "caption_edit_distance", "count_mismatch"),
+    # v4: stage-isolated (the candidate captions the oracle's own segments); count_mismatch is
+    # structurally 0 and gated by the segment certificate, so it is not a caption metric
+    "caption": ("caption_mismatch", "caption_edit_distance"),
     "reward.terminal": ("expected_score_abs_delta", "score_mismatch"),
     "reward.dense": ("per_step_abs_delta", "rank_divergence", "length_mismatch"),
 }
+# The v3 end-to-end caption metrics (the candidate captions its own segments): reported only.
+E2E_CAPTION_METRICS = ("caption_mismatch", "caption_edit_distance", "count_mismatch")
 SIMILARITY_METRIC = "caption_similarity_divergence"
+SCORING_ISOLATED = "stage_isolated"
+DIGEST_SIDES = ("exact", "noise", "balanced", "witness", "repeat")
+BOUNDS_EPS = 1e-6  # |candidate bound - oracle bound| allowed (float round trips only)
+_FAMILY = re.compile(r"^[a-z0-9_.-]{1,32}\Z")  # reported family labels (never record text)
 # Stages whose balanced engine differs from exact's, so L0 input parity must be shown. Their
 # records also carry the compile cache and the engine's preemptions (records.Provenance).
 L0_STAGES = {"segment": "tempseg", "caption": "captioner"}
@@ -408,6 +417,329 @@ def compare(stage: str, ref: Mapping[str, StageRecord], cand: Mapping[str, Stage
 
 
 # ---------------------------------------------------------------------------------------------
+# Stage-isolated caption certification (v4; docs/certification.md, "Metrics: caption")
+#
+# The candidate captions the exact oracle's own segments (``pipeline.caption_segments``), so
+# every oracle caption row i has a candidate row i, and every Captioner call must have been
+# given byte-identical inputs: its NVIDIA input digest (``stages.segment.nvidia_input_digest``)
+# equals the oracle's logged ``input_tensor_digest``. Digests come per side as
+# ``{uid: [hex | None per caption row]}`` (``scripts/wave_h_finalize.py --fetch``); None is a
+# row without a model call.
+
+Digests = Mapping[str, Sequence[str | None]]
+
+
+def _cap(seg: Segment) -> str:
+    return (seg.caption or "").strip()
+
+
+def _side_digests(digests: Mapping[str, Digests] | None, side: str) -> Digests | None:
+    d = (digests or {}).get(side)
+    if d is None:
+        return None
+    if not isinstance(d, Mapping):
+        raise CertifyError(f"{side} digests must map episode uid -> per-row digests")
+    return d
+
+
+def row_digests(d: Digests | None, rec: StageRecord, side: str, *, reason: str
+                ) -> list[str | None]:
+    """The validated per-row digests of ``rec``: a list as long as its caption rows, each a
+    64-hex digest or None. Missing or malformed: :class:`CertifyRefused` ``reason``."""
+    got = None if d is None else d.get(rec.uid)
+    n = len(rec.segments)
+    if not isinstance(got, list | tuple) or len(got) != n or not all(
+            x is None or (isinstance(x, str) and _HEX64.match(x)) for x in got):
+        raise CertifyRefused(reason, f"{side} caption record of an episode has no valid "
+                             f"per-row input digests ({n} rows): the isolated caption "
+                             "certificate needs every Captioner call's input digest")
+    return list(got)
+
+
+def oracle_row_digests(d: Digests | None, rec: StageRecord, side: str) -> list[str | None]:
+    """An oracle (or noise) episode's digests: every row NVIDIA captioned (``complete``) must
+    have one, no other row may (``oracle_digests_missing``)."""
+    ds = row_digests(d, rec, side, reason="oracle_digests_missing")
+    for seg, dg in zip(rec.segments, ds, strict=True):
+        if (seg.status == "complete") != (dg is not None):
+            raise CertifyRefused("oracle_digests_missing", f"{side} caption record: a row "
+                                 f"with status {seg.status!r} has "
+                                 f"{'no' if dg is None else 'an'} input digest")
+    return ds
+
+
+def pinned_segments(path: str | Path) -> tuple[str, dict[str, StageRecord]]:
+    """The staged oracle segment JSONL: its sha256 and uid -> record."""
+    data = Path(path).read_bytes()
+    out: dict[str, StageRecord] = {}
+    for line in data.decode("utf-8").splitlines():
+        if line.strip():
+            r = StageRecord.from_json(line)
+            out[r.uid] = r
+    return hashlib.sha256(data).hexdigest(), out
+
+
+def check_segments_oracle(side: str, records: Mapping[str, StageRecord],
+                          ref: Mapping[str, StageRecord], pinned_sha: str,
+                          oracle_hash: str) -> None:
+    """``segments_not_oracle`` unless every ``side`` caption record says it captioned the pinned
+    file (``provenance.segments_from``) of the oracle's stage hash, and its rows are the
+    oracle's rows: same count, bounds within :data:`BOUNDS_EPS`."""
+    for uid, r in records.items():
+        sf = r.provenance.segments_from or {}
+        if sf.get("sha256") != pinned_sha or sf.get("oracle_stage_hash") != oracle_hash:
+            raise CertifyRefused("segments_not_oracle", f"{side} caption records were not "
+                                 "made from the pinned oracle segments (provenance."
+                                 "segments_from differs from the oracle segment file / stage "
+                                 "hash)")
+        if uid not in ref:
+            continue
+        a, b = ref[uid].segments, r.segments
+        if len(a) != len(b) or any(
+                not (abs(x.start_s - y.start_s) <= BOUNDS_EPS
+                     and abs(x.end_s - y.end_s) <= BOUNDS_EPS) for x, y in zip(a, b)):
+            raise CertifyRefused("segments_not_oracle", f"{side} caption rows of an episode "
+                                 "are not the oracle's (count or bounds differ)")
+
+
+def input_identity(ref: Mapping[str, StageRecord], side: Mapping[str, StageRecord],
+                   d_ref: Mapping[str, list[str | None]], d_side: Digests | None,
+                   name: str) -> dict[str, Any]:
+    """Every row of every paired episode: the side's input digest equals the oracle's (a row
+    with a call on one side only is a mismatch). Refused (``inputs_not_isolated``) otherwise:
+    byte-identical inputs are the premise, so a mismatch is a harness defect, never a metric."""
+    pairs = equal = episodes = 0
+    for uid in sorted(set(ref) & set(side)):
+        dc = row_digests(d_side, side[uid], name, reason="inputs_not_isolated")
+        do = d_ref[uid]
+        episodes += 1
+        for x, y in zip(do, dc, strict=True):
+            if x is None and y is None:
+                continue
+            pairs += 1
+            equal += x == y
+    if equal != pairs:
+        raise CertifyRefused("inputs_not_isolated", f"{name}: {pairs - equal} of {pairs} "
+                             "Captioner calls had inputs other than the oracle's (input digest "
+                             "differs): the isolation harness is wrong; fix it, not a threshold")
+    return {"pairs": pairs, "equal": equal, "episodes": episodes, "status": "pass"}
+
+
+def _texts_metrics(texts: Sequence[tuple[str, str]], similarity: Similarity | None
+                   ) -> dict[str, float | None]:
+    k = len(texts)
+    out: dict[str, float | None] = {
+        "caption_mismatch": sum(x != y for x, y in texts) / k,
+        "caption_edit_distance": sum(normalized_edit_distance(x, y) for x, y in texts) / k}
+    if similarity is not None:
+        out[SIMILARITY_METRIC] = sum(1.0 - min(1.0, max(0.0, float(similarity(x, y))))
+                                     for x, y in texts) / k
+    return out
+
+
+def caption_isolated_metrics(ref: StageRecord, cand: StageRecord, d_ref: Sequence[str | None],
+                             similarity: Similarity | None = None
+                             ) -> dict[str, float | None] | None:
+    """Over the rows the oracle captioned (``S_u``: oracle digest not None), paired by index:
+    the share of differing captions and the mean normalized edit distance. None when the oracle
+    captioned no row (the episode does not count)."""
+    slots = [i for i, d in enumerate(d_ref) if d is not None]
+    if not slots:
+        return None
+    return _texts_metrics([(_cap(ref.segments[i]), _cap(cand.segments[i])) for i in slots],
+                          similarity)
+
+
+def noise_pairs(ref: StageRecord, nz: StageRecord, d_ref: Sequence[str | None],
+                d_nz: Sequence[str | None]) -> list[tuple[int, int]]:
+    """``P_u``: the IoU-aligned oracle / repeat pairs whose Captioner inputs were byte-identical
+    in the two exact runs."""
+    if not _bounds_finite(ref.segments, nz.segments):
+        return []
+    return [(i, j) for i, j, _ in align(ref.segments, nz.segments)
+            if d_ref[i] is not None and d_ref[i] == d_nz[j]]
+
+
+def noise_isolated_metrics(ref: StageRecord, nz: StageRecord, d_ref: Sequence[str | None],
+                           d_nz: Sequence[str | None], similarity: Similarity | None = None
+                           ) -> dict[str, float | None] | None:
+    """The isolated noise of one episode over :func:`noise_pairs` (None when there are none:
+    the episode leaves the noise means; a count-flip episode still counts through its pairs)."""
+    pairs = noise_pairs(ref, nz, d_ref, d_nz)
+    if not pairs:
+        return None
+    return _texts_metrics([(_cap(ref.segments[i]), _cap(nz.segments[j])) for i, j in pairs],
+                          similarity)
+
+
+def _plain_means(per_ep: Mapping[str, Mapping[str, float | None]],
+                 names: Sequence[str]) -> dict[str, float | None]:
+    return {m: _r(_mean(per_ep[u][m] for u in per_ep)) for m in names}
+
+
+def _iso_block(per_ep: Mapping[str, Mapping[str, float | None]], names: Sequence[str],
+               slots: int) -> dict[str, Any]:
+    return {"n": len(per_ep), "slots": slots, "means": _plain_means(per_ep, names)}
+
+
+def _differing(ref: Mapping[str, StageRecord], side: Mapping[str, StageRecord],
+               pairs: Mapping[str, Sequence[tuple[int, int]]]) -> dict[str, Any]:
+    k = sum(_cap(ref[u].segments[i]) != _cap(side[u].segments[j])
+            for u, ps in pairs.items() for i, j in ps)
+    n = sum(len(ps) for ps in pairs.values())
+    return {"slots": n, "differing": k, "rate": _r(k / n) if n else None}
+
+
+def _e2e_block(ref: Mapping[str, StageRecord], cand: Mapping[str, StageRecord],
+               nz: Mapping[str, StageRecord] | None, th: Thresholds) -> dict[str, Any]:
+    """The v3 end-to-end caption metrics (candidate on its own segments), reported only."""
+    per_ep = compare("caption", ref, cand)
+    means = stage_means("caption", per_ep, E2E_CAPTION_METRICS)
+    out: dict[str, Any] = {
+        "reported_only": True,
+        "n": len(per_ep),
+        "count_matched": sum(1 for u in per_ep if not per_ep[u].get("count_mismatch")),
+        "count_flips": sum(1 for u in per_ep if per_ep[u].get("count_mismatch")),
+        "means": {m: v if finite(v) else None for m, v in means.items()},
+        "noise": None, "would_be_thresholds": None}
+    if nz is not None:
+        nz_ep = compare("caption", ref, nz)
+        nm = stage_means("caption", nz_ep, E2E_CAPTION_METRICS)
+        out["noise"] = {"reported_only": True, "n": len(nz_ep),
+                        "means": {m: v if finite(v) else None for m, v in nm.items()}}
+        out["would_be_thresholds"] = {
+            m: metric_threshold(m, nm[m], th.tolerance, float(th.slack.get(m, 0.0)))
+            for m in E2E_CAPTION_METRICS if nm.get(m) is not None and finite(nm[m])}
+    return out
+
+
+def _isolate(ref: Mapping[str, StageRecord], cand: Mapping[str, StageRecord],
+             nz: Mapping[str, StageRecord] | None, wit: Mapping[str, StageRecord] | None,
+             o: Mapping[str, Any], *, digests: Mapping[str, Digests] | None,
+             oracle_segments: str | Path | None, similarity: Similarity | None,
+             names: Sequence[str]) -> dict[str, Any]:
+    """The validity checks (refusals) and the per-episode isolated metrics of v4 caption."""
+    if oracle_segments is None:
+        raise CertifyRefused("segments_not_oracle", "a stage-isolated caption certificate "
+                             "needs the pinned oracle segment file (--oracle-segments)")
+    sha, pinned = pinned_segments(oracle_segments)
+    if not pinned or any(r.stage != "segment" or r.provenance.preset != "exact"
+                         or r.provenance.config_hash != o["stage_hash"]
+                         for r in pinned.values()):
+        raise CertifyRefused("segments_not_oracle", "the oracle segment file is not the "
+                             "oracle's segment records (stage, preset or stage hash differs)")
+    check_segments_oracle("balanced", cand, ref, sha, o["stage_hash"])
+    if wit is not None:
+        check_segments_oracle("witness", wit, ref, sha, o["stage_hash"])
+    d_exact = _side_digests(digests, "exact")
+    if d_exact is None:
+        raise CertifyRefused("oracle_digests_missing", "no oracle input digests (--digests "
+                             "exact=...): input identity cannot be shown")
+    d_ref = {u: oracle_row_digests(d_exact, r, "exact") for u, r in ref.items()}
+    identity: dict[str, Any] = {"candidate": input_identity(
+        ref, cand, d_ref, _side_digests(digests, "balanced"), "balanced"), "witness": None}
+    if wit is not None:
+        identity["witness"] = input_identity(ref, wit, d_ref, _side_digests(digests, "witness"),
+                                             "witness")
+
+    def scored(side: Mapping[str, StageRecord]) -> tuple[dict[str, Any], int]:
+        out, slots = {}, 0
+        for u in sorted(set(ref) & set(side)):
+            m = caption_isolated_metrics(ref[u], side[u], d_ref[u], similarity)
+            if m is not None:
+                out[u] = m
+                slots += sum(d is not None for d in d_ref[u])
+        return out, slots
+
+    cand_ep, cand_slots = scored(cand)
+    res: dict[str, Any] = {"candidate": cand_ep, "noise": {}, "witness": {},
+                           "slots": {"candidate": cand_slots, "noise": 0, "witness": 0},
+                           "identity": identity, "d_ref": d_ref, "noise_pairs": {},
+                           "segments_from": {"sha256": sha, "oracle_stage_hash": o["stage_hash"]}}
+    if wit is not None:
+        res["witness"], res["slots"]["witness"] = scored(wit)
+    if nz is not None:
+        d_noise = _side_digests(digests, "noise")
+        if d_noise is None:
+            raise CertifyRefused("oracle_digests_missing", "no input digests for the noise run "
+                                 "(--digests noise=...): its input-identical pairs are unknown")
+        for u in sorted(set(ref) & set(nz)):
+            dn = oracle_row_digests(d_noise, nz[u], "noise")
+            pairs = noise_pairs(ref[u], nz[u], d_ref[u], dn)
+            if pairs:
+                res["noise_pairs"][u] = pairs
+                res["noise"][u] = _texts_metrics(
+                    [(_cap(ref[u].segments[i]), _cap(nz[u].segments[j])) for i, j in pairs],
+                    similarity)
+        res["slots"]["noise"] = sum(len(p) for p in res["noise_pairs"].values())
+    return res
+
+
+def _reported(ref: Mapping[str, StageRecord], cand: Mapping[str, StageRecord],
+              nz: Mapping[str, StageRecord] | None, iso: Mapping[str, Any], th: Thresholds,
+              *, b: Mapping[str, Any], preset: str, names: Sequence[str],
+              digests: Mapping[str, Digests] | None,
+              reported_e2e: Iterable[StageRecord] | None,
+              reported_repeat: Iterable[StageRecord] | None,
+              families: Mapping[str, str] | None) -> dict[str, Any]:
+    """``metrics.reported`` (docs/certification.md, "Reported-only"): never in ``checks``, never
+    in the verdict, never in ``certkey.policy_problems``."""
+    d_ref = iso["d_ref"]
+    slots = {u: [(i, i) for i, d in enumerate(d_ref[u]) if d is not None]
+             for u in iso["candidate"]}
+    out: dict[str, Any] = {
+        "reported_only": True,
+        "micro": {"candidate": _differing(ref, cand, slots),
+                  "noise": (_differing(ref, nz, iso["noise_pairs"]) if nz is not None
+                            else None)},
+        "e2e": None, "families": None, "repeat": None, "set_valued": None}
+    if reported_e2e is not None:
+        e2e = _index(reported_e2e, "caption", "reported e2e", preset)
+        if e2e:
+            if bind(e2e, "caption", "reported e2e")["key"] != b["key"]:
+                raise CertifyError("reported e2e caption records are another stack's (cert_key)")
+            out["e2e"] = _e2e_block(ref, _paired(e2e, ref)[0], nz, th)
+    if families:
+        groups: dict[str, dict[str, Any]] = {}
+        for u, label in families.items():
+            if not isinstance(label, str) or not _FAMILY.match(label):
+                raise CertifyError("family labels must match [a-z0-9_.-]{1,32}")
+            if u in iso["candidate"]:
+                groups.setdefault(label, {})[u] = iso["candidate"][u]
+        out["families"] = {k: {"reported_only": True, "n": len(v),
+                               "means": _plain_means(v, names)}
+                           for k, v in sorted(groups.items())}
+    if reported_repeat is not None:
+        rep = _paired(_index(reported_repeat, "caption", "reported repeat", "exact"), ref)[0]
+        d_rep = _side_digests(digests, "repeat")
+        if rep and d_rep is not None:
+            ep, pairs = {}, {}
+            for u in sorted(rep):
+                dn = oracle_row_digests(d_rep, rep[u], "repeat")
+                p = noise_pairs(ref[u], rep[u], d_ref[u], dn)
+                if p:
+                    pairs[u] = p
+                    ep[u] = _texts_metrics([(_cap(ref[u].segments[i]),
+                                             _cap(rep[u].segments[j])) for i, j in p], None)
+            out["repeat"] = {"reported_only": True, "n": len(ep),
+                             "means": _plain_means(ep, ("caption_mismatch",
+                                                        "caption_edit_distance")),
+                             "micro": _differing(ref, rep, pairs)}
+    if nz is not None:
+        agree = total = 0
+        for u, ps in slots.items():
+            by_i = {i: j for i, j in iso["noise_pairs"].get(u, ())}
+            for i, _ in ps:
+                c = _cap(cand[u].segments[i])
+                total += 1
+                agree += (c == _cap(ref[u].segments[i])
+                          or (i in by_i and c == _cap(nz[u].segments[by_i[i]])))
+        out["set_valued"] = {"reported_only": True, "slots": total, "agree": agree,
+                             "rate": _r(agree / total) if total else None}
+    return out
+
+
+# ---------------------------------------------------------------------------------------------
 # L0 / Gate A (balanced_lab output)
 
 
@@ -592,8 +924,20 @@ def certify_stage(
     similarity: Similarity | None = None,
     similarity_name: str | None = None,
     generated_at: str | None = None,
+    digests: Mapping[str, Digests] | None = None,
+    oracle_segments: str | Path | None = None,
+    reported_e2e: Iterable[StageRecord] | None = None,
+    reported_repeat: Iterable[StageRecord] | None = None,
+    families: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """The certificate body (with its content-addressed ``id``) for one stage.
+
+    ``caption`` (v4) is **stage-isolated**: ``balanced`` / ``witness`` captioned the oracle's
+    own segments (``oracle_segments``: the staged JSONL they were given), ``digests`` holds
+    each side's per-row input digests (``exact``, ``noise``, ``balanced``, ``witness``,
+    optional ``repeat``); without them it refuses. ``reported_e2e`` (the candidate stack's
+    end-to-end caption records), ``reported_repeat`` (another exact repeat) and ``families``
+    (uid -> a short label) only add ``metrics.reported``, which never enters a check.
 
     ``engine_spec``: ``validate.certkey.key_document`` of the stack as this checkout would run
     it. The candidate records' own key (``provenance.cert_key``) must equal it; the
@@ -656,28 +1000,47 @@ def certify_stage(
     names = metric_names(stage, similarity)
     pool = b["embodiment"]
 
-    per_ep = compare(stage, ref, cand, similarity)
-    matched = sum(1 for u in per_ep if not per_ep[u].get("count_mismatch"))
-    candidate = ({pool: {"n": len(per_ep), "count_matched": matched,
-                         "means": stage_means(stage, per_ep, names)}} if per_ep else {})
+    isolated = stage == "caption"
+    iso: dict[str, Any] = {}
+    if isolated:  # v4: stage-isolated (refusals first: they are not verdicts)
+        iso = _isolate(ref, cand, nz, wit, o, digests=digests, oracle_segments=oracle_segments,
+                       similarity=similarity, names=names)
+        per_ep = iso["candidate"]
+        candidate = ({pool: _iso_block(per_ep, names, iso["slots"]["candidate"])}
+                     if per_ep else {})
+    else:
+        per_ep = compare(stage, ref, cand, similarity)
+        matched = sum(1 for u in per_ep if not per_ep[u].get("count_mismatch"))
+        candidate = ({pool: {"n": len(per_ep), "count_matched": matched,
+                             "means": stage_means(stage, per_ep, names)}} if per_ep else {})
     coverage = len(per_ep) / len(ref)
     missing = len(set(ref) - set(cand))
 
     noise_block = None
     noise_means: dict[str, float | None] = {}
     if nz is not None:
-        nz_ep = compare(stage, ref, nz, similarity)
-        noise_means = stage_means(stage, nz_ep, names)
+        if isolated:
+            nz_ep = iso["noise"]
+            noise_means = _plain_means(nz_ep, names)
+        else:
+            nz_ep = compare(stage, ref, nz, similarity)
+            noise_means = stage_means(stage, nz_ep, names)
         noise_block = {"n": len(nz_ep), "means": noise_means, "unpaired": unpaired,
                        "episodes": {k: v for k, v in episode_set(nz_ep).items()
                                     if k != "uid_sha256"}}
+        if isolated:
+            noise_block["pairs"] = iso["slots"]["noise"]
     witness_block = None
     if wit is not None:
-        w_ep = compare(stage, ref, wit, similarity)
-        witness_block = {"n": len(w_ep), "means": stage_means(stage, w_ep, names),
+        w_ep = iso["witness"] if isolated else compare(stage, ref, wit, similarity)
+        witness_block = {"n": len(w_ep),
+                         "means": (_plain_means(w_ep, names) if isolated
+                                   else stage_means(stage, w_ep, names)),
                          "unpaired": wit_unpaired,
                          "episodes": {k: v for k, v in episode_set(w_ep).items()
                                       if k != "uid_sha256"}}
+        if isolated:
+            witness_block["slots"] = iso["slots"]["witness"]
 
     per_metric = {}
     for m in names:
@@ -685,7 +1048,8 @@ def certify_stage(
         base = noise_means.get(m) if nz is not None else None
         per_metric[m] = {"slack": slack, "floor": NOISE_FLOOR.get(m, 0.0),
                          "absolute_floor": ABSOLUTE_FLOOR.get(m, 0.0),
-                         "cap": ABSOLUTE_CAPS.get(m), "over": metric_basis(stage, m),
+                         "cap": ABSOLUTE_CAPS.get(m),
+                         "over": "input_identical" if isolated else metric_basis(stage, m),
                          "threshold": metric_threshold(m, base, th.tolerance, slack)
                          if base is not None and finite(base) else None}
     blocks = dict(candidate)
@@ -822,6 +1186,18 @@ def certify_stage(
     if stage in L0_STAGES:
         body["preemptions"] = preempt
         body["compile_cache"] = caches
+    if isolated:  # computed after the verdict: nothing below can change it
+        body["scoring"] = {"caption": SCORING_ISOLATED}
+        body["segments_from"] = dict(iso["segments_from"])
+        body["input_identity"] = {
+            "candidate": {**iso["identity"]["candidate"], "stage_hash": b["stage_hash"],
+                          "oracle_stage_hash": o["stage_hash"]},
+            "witness": ({**iso["identity"]["witness"], "stage_hash": b["stage_hash"],
+                         "oracle_stage_hash": o["stage_hash"]}
+                        if iso["identity"].get("witness") is not None else None)}
+        body["metrics"]["reported"] = _reported(
+            ref, cand, nz, iso, th, b=b, preset=preset, names=names, digests=digests,
+            reported_e2e=reported_e2e, reported_repeat=reported_repeat, families=families)
     body["id"] = certificate_id(body)
     return body
 

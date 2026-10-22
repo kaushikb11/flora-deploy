@@ -29,6 +29,7 @@ from tests.fakes.certrecords import (
     L0_PASS,
     STAGE_SETS,
     cold_witness,
+    isolated,
     key,
     lab_for,
     prov,
@@ -265,11 +266,15 @@ def _write_stage(tmp_path, cfg, stage, *, noise=True, content=CONTENT, stamp=STA
     lab = lab_for(stage)
     doc = key("balanced", stage, gpu, fp=None, modes=modes, content=content)
     bal = mk("balanced", 10, fp=None, modes=modes)
+    ex = mk("exact", 10, fp=None)
+    nz = mk("exact", 5, fp=None) if noise else None
+    wit = cold_witness(bal) if stage in C.L0_STAGES else None
+    extra = {}
+    if stage == "caption":  # v4: stage-isolated evidence
+        bal, wit, extra = isolated(ex, bal, wit, nz, directory=tmp_path)
     C.write_certificate(C.certify_stage(
-        stage, exact=mk("exact", 10, fp=None), balanced=bal,
-        noise=mk("exact", 5, fp=None) if noise else None, engine_spec=doc, gpu=gpu,
-        witness=cold_witness(bal) if stage in C.L0_STAGES else None,
-        l0=lab if stage in C.L0_STAGES else None, generated_at=stamp), tmp_path)
+        stage, exact=ex, balanced=bal, noise=nz, engine_spec=doc, gpu=gpu, witness=wit,
+        l0=lab if stage in C.L0_STAGES else None, generated_at=stamp, **extra), tmp_path)
 
 
 SCHEMA_CFG = {"project": "demo", "license_ack": "research-only",
@@ -371,15 +376,25 @@ def test_certificate_never_contains_a_record_string(seed):
     nz = [_random_record(rng, u, stage, "exact") for u in uids[:2]]
     lab = lab_for(stage)
     gpu = {"segment": "L40S"}.get(stage, "H100!")
+    extra: dict = {}
+    if stage == "caption":  # v4: the candidate captions the oracle's own rows
+        by_uid = {r.uid: r for r in ex}
+        bal = [StageRecord(**{**r.__dict__, "segments": tuple(
+            Segment(**{**s.__dict__, "caption": _rand(rng)}) for s in by_uid[r.uid].segments)})
+            for r in bal]
+        bal, _, extra = isolated(ex, bal, None, nz)
+        extra["reported_e2e"] = [_random_record(rng, u, stage, "balanced") for u in uids]
     cert = C.certify_stage(stage, exact=ex, balanced=bal, noise=nz,
                            engine_spec=key("balanced", stage, gpu), gpu=gpu,
                            l0=lab if stage in C.L0_STAGES else None,
-                           similarity=(lambda a, b: 0.5) if stage == "caption" else None)
+                           similarity=(lambda a, b: 0.5) if stage == "caption" else None,
+                           **extra)
     ours = {"complete", "uncertified_stack", "flora_labels_v1", stage, "exact", "balanced"}
     ours |= {f.name for cls in (StageRecord, Provenance, Segment, TerminalReward, DenseReward)
              for f in fields(cls)}
     for r in ex + bal + nz:  # the binding fields: validated and ours
         ours |= _strings(r.provenance.cert_key, set()) | {r.provenance.config_hash}
+        ours |= _strings(r.provenance.segments_from or {}, set())
 
     def leaks(text: str, records) -> set[str]:
         return {s for r in records for s in _strings(asdict(r), set())
