@@ -14,7 +14,8 @@ fake workers alike:
   episode, inference inside it). ``tests/nvlink/test_balanced_accel.py`` checks that every
   model request is byte-identical with and without the patches, and on both paths.
 * :class:`StampedJob` stamps each record with the certification provenance
-  (``workers_impl.certstamp``).
+  (``workers_impl.certstamp``) and its ``certified`` flag: a committed certificate matching the
+  stack's key (``CertStamp.certify``) and the episode's measured envelope verdict.
 """
 
 from __future__ import annotations
@@ -67,7 +68,11 @@ class StampedJob(_Wrapped):
 
     async def run(self, ref, batcher, ctx):
         out = await self.job.run(ref, batcher, ctx)
-        return dataclasses.replace(out, records=[self.stamp.apply(r) for r in out.records])
+        certify = getattr(self.stamp, "certify", None)
+        recs = [self.stamp.apply(r) for r in out.records]
+        if callable(certify):
+            recs = [certify(r, getattr(ref, "envelope_ok", None)) for r in recs]
+        return dataclasses.replace(out, records=recs)
 
 
 def accel_names(env: Mapping[str, str] = os.environ) -> tuple[str, ...]:

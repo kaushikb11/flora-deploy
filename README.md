@@ -33,8 +33,8 @@ flora results caption
 ## Label your own data
 
 <!-- wave-h:certified -->
-Accuracy certificates: segmentation for `human` data (`L40S`).
-Rewards run NVIDIA's own engine, as `exact` does, and need none. Everything else runs uncertified.
+Accuracy certificates: none yet, so `balanced` segmentation and captioning records say `certified: false`.
+Rewards run NVIDIA's own engine, as `exact` does, and need none.
 <!-- /wave-h:certified -->
 
 What flora-deploy doesn't do yet, and what is still an estimate: [`docs/limitations.md`](docs/limitations.md).
@@ -103,9 +103,8 @@ output:
 ```
 
 <!-- wave-h:allow-uncertified -->
-`allow_uncertified: true` runs the stages that have no accuracy certificate for your embodiment and GPU;
-their records say `certified: false`. Certified today: segmentation for `human` data (`L40S`).
-A config whose every stage is certified does not need it; `flora doctor` tells you.
+`allow_uncertified: true` lets `balanced` run segmentation and captioning without accuracy certificates.
+None exist yet, so it is required for them.
 <!-- /wave-h:allow-uncertified -->
 
 **Cameras.** Flora reads one camera view, or three (`main`, `left_wrist`, `right_wrist`). If your

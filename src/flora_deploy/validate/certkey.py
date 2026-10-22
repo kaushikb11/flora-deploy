@@ -571,6 +571,31 @@ def matching(preset: str, pools: Mapping[str, Any], *,
     return out
 
 
+def deciding_for_key(preset: str, kind: str, gpu: str, embodiment: str | None, key: str, *,
+                     cert_dir: Path | None = None) -> dict[str, Any] | None:
+    """The committed certificate that decides (preset, kind, GPU, embodiment) for the stack
+    whose key is ``key`` (the sha256 of a record's ``provenance.cert_key``), by
+    :func:`matching`'s rule (newest; ``fail`` before ``provisional`` before ``certified``;
+    a certified / provisional one must meet the policy). None when none applies."""
+    if not embodiment:
+        return None
+    ok = [c for c in load_certificates(cert_dir)
+          if c.get("preset") == preset and c.get("kind") == kind and c.get("gpu") == gpu
+          and _covers(c, embodiment) and c.get("engine_spec_hash") == key
+          and (c["verdict"] == "fail" or not policy_problems(c))]
+    if not ok:
+        return None
+    return max(ok, key=lambda c: (c["generated_at"], VERDICTS.index(c["verdict"]), c["id"]))
+
+
+def certified_for_key(preset: str, kind: str, gpu: str, embodiment: str | None, key: str, *,
+                      cert_dir: Path | None = None) -> str | None:
+    """The id of the deciding certificate (:func:`deciding_for_key`) when it is ``certified``,
+    else None: what makes a non-reference record ``certified: true``."""
+    c = deciding_for_key(preset, kind, gpu, embodiment, key, cert_dir=cert_dir)
+    return c["id"] if c is not None and c["verdict"] == "certified" else None
+
+
 REFERENCE_PRESET = "exact"
 _KEY_KWARGS = ("modes", "derived_content", "dtbias_fp32", "engines", "image_fingerprint",
                "logic_root")
