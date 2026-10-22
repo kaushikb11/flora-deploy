@@ -4,6 +4,8 @@ SDK readers work through it."""
 
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 
 import yaml
@@ -92,3 +94,78 @@ def test_writes_invalidate_the_snapshot(tmp_path):
     assert st.exists("flora/j/h/receipts/k/aa/bb/s3.json")
     assert list(st.list("flora/j/h/receipts/k/")) == [
         f"flora/j/h/receipts/k/aa/bb/s{i}.json" for i in (1, 2, 3)]
+
+
+class _TimedVolume(FakeClientVolume):
+    """Records every ``read_file`` (path, thread) and the most reads in flight at once."""
+
+    def __init__(self, files=None, delay_s: float = 0.0):
+        super().__init__()
+        self.files.update(files or {})
+        self.reads: list[tuple[str, str]] = []
+        self.delay_s, self.in_flight, self.max_in_flight = delay_s, 0, 0
+        self._mu = threading.Lock()
+
+    def read_file(self, path):
+        with self._mu:
+            self.reads.append((path, threading.current_thread().name))
+            self.in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        try:
+            time.sleep(self.delay_s)
+            yield from super().read_file(path)
+        finally:
+            with self._mu:
+                self.in_flight -= 1
+
+
+def test_prefetch_reads_each_file_once_in_parallel():
+    vol = _TimedVolume({f"r/a/f{i:03d}.json": b"x" * 10 for i in range(40)}, delay_s=0.01)
+    st = ClientVolumeStore(vol, "r")
+    paths = list(st.list("a/"))
+    assert st.prefetch([*paths, "a/missing.json"]) == 40
+    assert vol.calls["read_file"] == 41 and vol.max_in_flight > 1
+    assert {t for _p, t in vol.reads} != {"MainThread"}
+    vol.calls.clear()
+    assert [st.get_bytes(p) for p in paths] == [b"x" * 10] * 40
+    assert vol.calls["read_file"] == 0  # served from the cache
+    assert st.prefetch(paths) == 0  # nothing left to read
+
+
+def test_status_report_and_compose_read_their_shard_files_in_parallel(tmp_path):
+    src = _job_on_volume(tmp_path, episodes=12)
+    for op in ("status", "report", "compose"):
+        vol = _TimedVolume(src.files, delay_s=0.002)
+        st = ClientVolumeStore(vol, "/s")
+        job = sdk.open_job(JOB, store="modal-volume://flora-results/s", backend=_Backend(st))
+        shards = len(job._deps().manifests.load().shards)
+        vol.reads.clear()
+        getattr(job, op)()
+        paths = [p for p, _t in vol.reads]
+        assert len(paths) == len(set(paths)), f"{op}: a file was read twice"
+        shard_reads = [t for p, t in vol.reads if "/manifest" not in p and "summary" not in p]
+        on_pool = sum(t.startswith("flora-prefetch") for t in shard_reads)
+        # every per-shard read (ledger, receipt, marker, part) went through the parallel prefetch
+        assert on_pool == len(shard_reads) >= shards, (op, on_pool, len(shard_reads), shards)
+        assert vol.max_in_flight > 1, op
+
+
+def test_submit_reads_the_index_receipts_once_in_parallel(tmp_path):
+    """``flora run --detach`` plans from every index receipt (one per episode): read ahead in
+    parallel, each once (the fake-modal rehearsal's submit took 5.5 min, one round trip at a
+    time)."""
+    from tests.fakes.flora_backend import RECEIPTS, DeployedApp
+
+    app = DeployedApp(tmp_path, run=False)
+    root = app.store.root
+    vol = _TimedVolume({"s/" + f.relative_to(root).as_posix(): f.read_bytes()
+                        for f in root.rglob("*") if f.is_file()})
+    st = ClientVolumeStore(vol, "/s")
+    app.backend.store = lambda uri, environment=None: st  # type: ignore[method-assign]
+    sdk.submit(app.config_path, receipts=RECEIPTS, backend=app.backend)
+    index = [(p, t) for p, t in vol.reads
+             if "/index/" in p and not p.endswith("summary.json")]
+    episodes = len([p for p in vol.files if "/index/" in p and not p.endswith("summary.json")])
+    assert episodes > 1 and len(index) == episodes  # each receipt read once
+    assert all(t.startswith("flora-prefetch") for _p, t in index)
+    assert vol.calls["listdir"] <= 10, dict(vol.calls)

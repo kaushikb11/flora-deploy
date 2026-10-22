@@ -59,7 +59,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from flora_deploy.jobs.store import JobPaths, Store, fake_job_id, is_fake_job_id
+from flora_deploy.jobs.store import (
+    JobPaths,
+    Store,
+    fake_job_id,
+    is_fake_job_id,
+    prefetch,
+    prefetch_areas,
+)
 from flora_deploy.jobs.stores.client_volume import ClientVolumeStore
 
 RUN_SPEC_SCHEMA = "flora_run_v1"
@@ -433,6 +440,12 @@ class Job:
         if callable(fn):
             fn()
 
+    def _prefetch(self, manifest: Any, areas: Iterable[str]) -> None:
+        """Read the job's ``areas`` ahead, in parallel (``jobs.store.prefetch_areas``: one
+        Volume round trip per shard file otherwise; a no-op on a mounted or local store)."""
+        hashes = [self.config_hash, *dict(getattr(manifest, "stage_hashes", None) or {}).values()]
+        prefetch_areas(self.store, JobPaths(self.job_id).root, hashes, areas)
+
     def _deps(self) -> Any:
         from flora_deploy.jobs.deps import build_deps
 
@@ -467,6 +480,7 @@ class Job:
         self._refresh()
         deps = self._deps()
         settings = deps.settings
+        self._prefetch(deps.manifests.load(), ("calls", "receipts"))
         st = reconcile(job_id=self.job_id, config_hash=self.config_hash, store=self.store,
                        manifests=deps.manifests, attempts=deps.attempts, lease=self._lease(),
                        clock=self.clock, max_starts=settings.max_starts_before_quarantine,
@@ -667,6 +681,7 @@ class Job:
         settings = self.settings
         deps = self._deps()
         manifest = deps.manifests.load()
+        self._prefetch(manifest, ("attempts",))  # the per-container rows read every marker
         now = self.clock()
         rates = pinned_rates(region_multiplier=region_multiplier_for(settings.region))
         calls = budget_state_from_ledgers(
@@ -920,6 +935,10 @@ def submit(cfg: Any, *, job_id: str | None = None, store: str | None = None,
     if budget_usd is not None:
         settings = dataclasses.replace(settings, budget_usd=float(budget_usd))
     now = utc(time.time())
+    if not st.exists(JobPaths(job_id).config_manifest(plan.config_hash)):
+        # planning reads every index receipt, one per episode: read them ahead in parallel
+        # (on a Volume through the client, one round trip each made submit take minutes)
+        prefetch(st, st.list(f"{JobPaths(job_id).root}/index/"))
     try:
         plan_job(st, settings, envelope=cfg.pipeline.envelope, created_utc=now,
                  default_task=cfg.pipeline.episode_instruction.text, log=say)
