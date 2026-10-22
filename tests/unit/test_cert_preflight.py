@@ -264,6 +264,13 @@ def test_plan_status_json_preferred(tmp_path):
     assert not any("--dry-run" in c for c in fake.calls)
 
 
+def test_plan_is_read_for_the_preflights_embodiment(tmp_path):
+    env, fake = make_env(tmp_path)
+    cp.load_plan(env, "yam")
+    wave = [c for c in fake.calls if "wave_h.py" in c]
+    assert wave and all(c.endswith("--embodiment yam") for c in wave)
+
+
 def test_plan_unreadable_and_wrong_embodiment(tmp_path):
     env, _ = make_env(tmp_path, **{
         "wave_h.py --plan certified --dry-run": cp.Result(1, "", "boom")})

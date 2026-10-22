@@ -182,6 +182,22 @@ def test_embodiment_flag_picks_the_yam_plan_and_its_state(no_lab, tmp_path, caps
     assert not state.exists()  # a dry run saves nothing
 
 
+@pytest.mark.parametrize("emb", ["human", "yam"])
+def test_status_shows_the_embodiments_episodes_and_command(no_lab, tmp_path, capsys, emb):
+    spec = HUMAN if emb == "human" else YAM
+    state = tmp_path / f"{emb}-state.json"
+    assert wh.main(["--plan", "certified", "--embodiment", emb, "--status", "--offline",
+                    "--state", str(state)]) == 0
+    out = capsys.readouterr().out
+    assert f"({emb}), plan certified" in out
+    assert f"episodes: {len(spec.episodes)} {emb} ({spec.golden}), noise subset " \
+           f"{len(spec.noise)}" in out
+    assert f"b. exact oracle, {len(spec.episodes)} {emb} episodes ({spec.golden})" in out
+    cmd = next(ln for ln in out.splitlines() if "command:" in ln)
+    assert ("--embodiment yam" in cmd) == (emb == "yam")
+    assert not state.exists()
+
+
 def test_unsupported_embodiments_are_refused(capsys):
     for emb in ("dex", "tianji", "yam32"):
         with pytest.raises(SystemExit) as e:

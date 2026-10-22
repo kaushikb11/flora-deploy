@@ -24,7 +24,9 @@ taken with the current engine settings), ``freeze`` (the certificate freeze guar
 
 The plan is read from ``wave_h.py --status --plan certified --json`` when the runbook has it
 (the shared ``scripts/_runbook.py`` ``decide()``); otherwise from ``--status`` text plus the
-``--dry-run`` listing (:func:`load_plan`). Only the runbook's CLI is used, never its internals.
+``--dry-run`` listing (:func:`load_plan`), each for the preflight's ``--embodiment``. Only the
+runbook's CLI is used, except for the lab check's current engine-settings hash, which comes from
+``wave_h.lab_engine_hashes`` (what the runbook's lab reuse compares), in a child process.
 """
 
 from __future__ import annotations
@@ -303,20 +305,21 @@ def parse_status_json(doc: Mapping[str, Any]) -> PlanInfo:
         lab_hashes=dict(lab.get(HASH_KEY) or {}))
 
 
-def load_plan(env: Env) -> tuple[PlanInfo | None, str]:
-    """``--status --json`` when the runbook has it; else ``--status`` text over ``--dry-run``."""
-    wave = "scripts/wave_h.py"
-    r = env.py(wave, "--status", "--plan", PLAN, "--json")
+def load_plan(env: Env, embodiment: str = "human") -> tuple[PlanInfo | None, str]:
+    """``--status --json`` when the runbook has it; else ``--status`` text over ``--dry-run``,
+    all for ``embodiment``'s certified plan."""
+    wave, emb = "scripts/wave_h.py", ("--embodiment", embodiment)
+    r = env.py(wave, "--status", "--plan", PLAN, "--json", *emb)
     if r.rc == 0:
         try:
             return parse_status_json(json.loads(r.out)), ""
         except ValueError:
             pass  # an older --status without JSON output
-    d = env.py(wave, "--plan", PLAN, "--dry-run")
+    d = env.py(wave, "--plan", PLAN, "--dry-run", *emb)
     if d.rc != 0:
         return None, f"wave_h.py --dry-run exited {d.rc}: {_tail(d)}"
     p = parse_dry_run(d.out)
-    s = env.py(wave, "--status", "--plan", PLAN)
+    s = env.py(wave, "--status", "--plan", PLAN, *emb)
     if s.rc == 0:
         parse_status_text(s.out, p)
     return p, ""
@@ -641,7 +644,7 @@ def check_budget(env: Env, plan: PlanInfo | None, *, budget: float, margin: floa
 
 def preflight(env: Env, *, embodiment: str = "human", budget: float = PROJECT_BUDGET_USD,
               margin: float = MARGIN_USD) -> list[Check]:
-    plan, why = load_plan(env)
+    plan, why = load_plan(env, embodiment)
     checks: list[Callable[[], Check]] = [
         lambda: check_git(env),
         lambda: check_plan(env, plan, why, embodiment),

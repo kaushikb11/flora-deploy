@@ -922,13 +922,15 @@ def gpu_deadline_s(st: State, step: str, c: Container | float, *, spent_in_step:
 
 
 def decide(st: State, plan: str, step: str, projections: Mapping[str, Projection], *,
-           only: str | None = None) -> Decision:
+           only: str | None = None, embodiment: str = EMBODIMENT) -> Decision:
     """The decision the dry run, ``--status`` and a real run take for ``step``
-    (``_runbook.decide``, on the plan's caps and global cap), with the command that acts on it."""
+    (``_runbook.decide``, on the plan's caps and global cap), with the command that acts on it
+    (``--embodiment`` named when it is not the default)."""
     gcap = plan_global_cap(plan, projections, st.override_for(plan))
     d = rb.decide(st, PLANS[plan], step, projections, caps=plan_caps(plan, projections),
                   global_cap=gcap)
     run = f"uv run python scripts/wave_h.py --plan {plan} --yes-spend" + (
+        f" --embodiment {embodiment}" if embodiment != EMBODIMENT else "") + (
         f" --only {only}" if only else "")
     if d.action == "run":
         d.command = run
@@ -2271,7 +2273,7 @@ def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
     for name in steps:
         p = projections[name]
         s = st.steps.get(name, StepState())
-        d = decide(st, plan, name, projections, only=only)
+        d = decide(st, plan, name, projections, only=only, embodiment=spec.embodiment)
         rule = {"run": "ok", "done": "done"}.get(d.action) or f"{d.action.upper()}: {d.message}"
         out(f"  {title[name]:66s} [{s.status}] cap ${caps[name]:.2f}  nominal "
             f"${p.usd:.2f}  upper ${p.usd_upper:.2f}  rule: {rule}")
@@ -2412,10 +2414,10 @@ def simulate_run_start(st: State, *, out: Callable[[str], None] = print) -> None
 
 
 def next_decision(st: State, plan: str, projections: Mapping[str, Projection],
-                  only: str | None = None) -> Decision | None:
+                  only: str | None = None, embodiment: str = EMBODIMENT) -> Decision | None:
     """The decision a run takes first: the first step (of ``--only`` or the plan) not done."""
     for name in (only,) if only else PLANS[plan]:
-        d = decide(st, plan, name, projections, only=only)
+        d = decide(st, plan, name, projections, only=only, embodiment=embodiment)
         if d.action != "done":
             return d
     return None
@@ -2423,12 +2425,17 @@ def next_decision(st: State, plan: str, projections: Mapping[str, Projection],
 
 def print_status(st: State, projections: Mapping[str, Projection], *, plan: str,
                  only: str | None = None, state_path: Path | None = None,
-                 out: Callable[[str], None] = print) -> Decision | None:
-    """``--status``: spend, holds, the cap in force and the next decision (on a copy)."""
+                 out: Callable[[str], None] = print,
+                 spec: PlanSpec | None = None) -> Decision | None:
+    """``--status``: spend, holds, the cap in force and the next decision (on a copy), for the
+    plan's embodiment (``spec``: its episodes, step titles and next command)."""
+    spec = spec or SPECS[plan]
     gcap = plan_global_cap(plan, projections, st.override_for(plan))
-    caps, title = plan_caps(plan, projections), titles(plan)
-    out(f"Wave H-lite run {st.run_id}, plan {plan}" + (f", state {state_path}" if state_path
-                                                       else ""))
+    caps, title = plan_caps(plan, projections), titles(plan, spec)
+    out(f"Wave H-lite run {st.run_id} ({spec.embodiment}), plan {plan}"
+        + (f", state {state_path}" if state_path else ""))
+    out(f"  episodes: {len(spec.episodes)} {spec.embodiment} ({spec.golden}), noise subset "
+        f"{len(spec.noise)}")
     basis = ("from the billing rows" if st.billed_through is not None else
              f"by the {BILLING_LAG_S} s lag rule: no rows kept yet")
     out(f"  billing: read {rb.utc(st.billed_at)}, complete through {rb.utc(st.watermark)} "
@@ -2458,7 +2465,7 @@ def print_status(st: State, projections: Mapping[str, Projection], *, plan: str,
             + ("" if s.billed_usd is None else f"  billed ${s.billed_usd:.2f}") + why)
     for line in held_lines(st):
         out(line)
-    d = next_decision(st, plan, projections, only)
+    d = next_decision(st, plan, projections, only, spec.embodiment)
     if d is None:
         out("  next: nothing (every step is done)")
         return None
@@ -2581,7 +2588,8 @@ def main(argv: list[str] | None = None) -> int:
     if preview and not args.offline:  # what a run reads first (billing is read-only)
         simulate_run_start(st)
     if args.status:
-        print_status(st, projections, plan=args.plan, only=args.only, state_path=args.state)
+        print_status(st, projections, plan=args.plan, only=args.only, state_path=args.state,
+                     spec=spec)
         return 0
     print_plan(st, projections, manifest=manifest, plan=args.plan, only=args.only, spec=spec)
     report = spec.report or REPORT
@@ -2618,7 +2626,8 @@ def main(argv: list[str] | None = None) -> int:
         st, [n for n in PLANS[args.plan] if not args.only or n == args.only],
         state_path=args.state, ctx=ctx, run=lambda name, c: runner(args.plan, name)(c),
         projection=projections.__getitem__,
-        decide=lambda name, p: decide(st, args.plan, name, projections, only=args.only),
+        decide=lambda name, p: decide(st, args.plan, name, projections, only=args.only,
+                                      embodiment=spec.embodiment),
         check_after=lambda name: check_after(st, name, caps=caps, global_cap=gcap),
         refresh=lambda s: refresh_billing(s),  # looked up per call (tests patch it)
         attempt_kw=lambda name: {"slack_s": STEP_SLACK_S.get(name, CLIENT_SLACK_S),
