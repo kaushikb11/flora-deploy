@@ -22,12 +22,18 @@ so a preempted shard, a bisection child or a re-run produce byte-identical recor
 hooks: ``before(uid)`` runs before each episode (``local.faults.checkpoint`` locally,
 ``workers_app.FakeFaultHook`` on Modal) and ``rejects(uid)`` turns an episode into NVIDIA's input
 rejection (``nv_failure``).
+
+On Modal (``MODAL_TASK_ID`` set) the runner samples container resources as the real workers do
+(``sample_resources``) and, before its first shard of each job, writes its startup facts
+(``BalancedShardRunner.startup_facts``) to the job store (``jobs.containers.write_startup_facts``):
+the real workers only print them, and the H0 rehearsal checks them.
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -206,9 +212,11 @@ def fake_balanced_runner(kind: str, store, *, media_root: str | None, gpu: str |
                          fatal: Callable[[BaseException], None] | None = None,
                          stamp: Any = None, max_inflight_episodes: int = 4,
                          prefetch_episodes: int | None = None,
-                         flush_every: int = 1) -> BalancedShardRunner:
+                         flush_every: int = 1, sample_resources: bool | None = None
+                         ) -> BalancedShardRunner:
     """The real ``BalancedShardRunner`` for ``kind`` (``segment`` | ``caption``) with the fake
-    job and engine (module docstring). ``stamp``: a ``workers_impl.certstamp.CertStamp``."""
+    job and engine (module docstring). ``stamp``: a ``workers_impl.certstamp.CertStamp``.
+    ``sample_resources`` (default: on Modal only) also writes the startup facts per job."""
     from flora_deploy.workers_impl.balanced import StampedJob
     from flora_deploy.workers_impl.segment import InputResolver
 
@@ -222,10 +230,31 @@ def fake_balanced_runner(kind: str, store, *, media_root: str | None, gpu: str |
     if stamp is not None:
         job = StampedJob(job, stamp)
     kw: dict[str, Any] = {} if container_id is None else {"container_id": container_id}
+    on_modal = bool(os.environ.get("MODAL_TASK_ID")) if sample_resources is None \
+        else bool(sample_resources)
     settings = BalancedWorkerSettings(max_inflight_episodes=max_inflight_episodes,
                                       prefetch_episodes=prefetch_episodes or
                                       max_inflight_episodes,
                                       flush_every=flush_every, max_wait_s=0.05,
-                                      local_dir=local_dir, gpu=gpu, **kw)
-    return BalancedShardRunner(store, FakeBalancedEngine(), job, settings, call_id=call_id,
-                               fatal=fatal)
+                                      local_dir=local_dir, gpu=gpu,
+                                      sample_resources=on_modal, **kw)
+    cls_ = FactsShardRunner if on_modal else BalancedShardRunner
+    return cls_(store, FakeBalancedEngine(), job, settings, call_id=call_id, fatal=fatal)
+
+
+class FactsShardRunner(BalancedShardRunner):
+    """``BalancedShardRunner`` that writes its startup facts before its first shard of each job
+    (module docstring). Diagnostics only: a failed write never fails the shard."""
+
+    def run_shard(self, job_id: str, shard_id: str, config_hash: str, token: str = ""):
+        written = self.__dict__.setdefault("_facts_jobs", set())
+        if job_id not in written:
+            written.add(job_id)
+            try:
+                from flora_deploy.jobs.containers import write_startup_facts
+
+                write_startup_facts(self.store, job_id, self.container_id, self.job.stage,
+                                    self.startup_facts())
+            except Exception as exc:  # noqa: BLE001 - diagnostics only
+                print(f"startup facts not written: {exc!r}", flush=True)
+        return super().run_shard(job_id, shard_id, config_hash, token=token)

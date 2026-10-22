@@ -52,12 +52,15 @@ gate's estimator) and, at ``ready - own startup``, raises the class's ``min_cont
 a container is booting while segment finishes. Once the kind's first call is live (it lands on
 that container), ``min_containers`` goes back to the deployed value. Decided once per kind and
 recorded as a ``pool_prewarm_plan`` event (``prewarm`` or ``skip`` with the reason and the
-expected saving); ``pool_prewarm_started`` / ``pool_prewarm_released`` follow. Cost: the error
-of the ready estimate in idle H100 time (about $0.09 per minute early); saving: up to one
-caption startup of wall-clock. The warm-up container is charged to the budget from its start
-(``BudgetState.prewarms``, ``jobs.budget.calls_cost``). Two jobs on one app share the class's
-``min_containers`` override: one job's release can end another's pre-warm early (a cold start,
-never a lost shard).
+expected saving) and in the job's pool file (``prewarm_plans``, :func:`read_prewarm_plans`: the
+decision time ``t`` and the latest ``start_at`` / ``ready_at``, so ``flora report`` and the H0
+rehearsal can compare the planned start with the container's real one; a successor generation
+reloads it and does not decide again); ``pool_prewarm_started`` / ``pool_prewarm_released``
+follow. Cost: the error of the ready estimate in idle H100 time (about $0.09 per minute early);
+saving: up to one caption startup of wall-clock. The warm-up container is charged to the budget
+from its start (``BudgetState.prewarms``, ``jobs.budget.calls_cost``). Two jobs on one app
+share the class's ``min_containers`` override: one job's release can end another's pre-warm
+early (a cold start, never a lost shard).
 
 **Budget.** Drains are recorded per kind as ``(start, end | None)`` intervals
 (:meth:`PoolScaler.drains`, persisted to :func:`drains_path` so a successor generation and
@@ -155,6 +158,19 @@ def read_drains(store: Any, root: str, config_hash: str
         return {}, {}
 
 
+def read_prewarm_plans(store: Any, root: str, config_hash: str) -> dict[str, dict[str, Any]]:
+    """Kind -> the pre-warm decision a job's orchestrator recorded (``decision``, ``t``, and
+    ``start_at`` / ``ready_at`` / ``saves_s`` or ``reason``); empty when none or unreadable."""
+    try:
+        p = drains_path(root, config_hash)
+        if not store.exists(p):
+            return {}
+        raw = json.loads(store.get_bytes(p))
+        return {str(k): dict(v) for k, v in dict(raw.get("prewarm_plans", {})).items()}
+    except Exception:
+        return {}
+
+
 def idle_tail_s(t: float, scaledown_s: float, drains: Iterable[Interval] = (),
                 drained_s: float = DRAINED_SCALEDOWN_S) -> float:
     """Idle seconds billed for a container that went idle at ``t``: the deployed window, cut
@@ -235,6 +251,7 @@ class PoolScaler:
         self._drains: dict[str, list[list[float | None]]] = {}
         self.base_min = 0  # the deployed min_containers (restored after a pre-warm)
         self._prewarm_plan: dict[str, dict[str, Any]] = {}  # kind -> decision (once)
+        self._plan_meta: dict[str, dict[str, Any]] = {}  # kind -> decided at, own startup
         self._prewarms: dict[str, list[float | None]] = {}  # kind -> [start, end | None]
         self._dep_kinds: set[str] = set()  # kinds with dependencies (released at job end)
         if store is not None and path is not None:
@@ -254,12 +271,17 @@ class PoolScaler:
         for kind, (a, b) in dict(raw.get("prewarms", {})).items():
             self._prewarms[str(kind)] = [float(a), None if b is None else float(b)]
             self._dep_kinds.add(str(kind))
+        for kind, plan in dict(raw.get("prewarm_plans", {})).items():
+            self._prewarm_plan[str(kind)] = {k: v for k, v in dict(plan).items()
+                                             if k not in ("t", "startup_s")}
+            self._plan_meta[str(kind)] = {k: plan[k] for k in ("t", "startup_s") if k in plan}
 
     def _save(self) -> None:
         if self.store is None or self.path is None:
             return
+        plans = {k: {**p, **self._plan_meta.get(k, {})} for k, p in self._prewarm_plan.items()}
         data = {"schema": "flora_pool_drains_v1", "drained_s": self.drained_s,
-                "drains": self._drains, "prewarms": self._prewarms}
+                "drains": self._drains, "prewarms": self._prewarms, "prewarm_plans": plans}
         try:
             self.store.put_bytes(self.path, json.dumps(data, sort_keys=True).encode())
         except Exception as exc:
@@ -339,6 +361,8 @@ class PoolScaler:
                          "ready_at": ready_at, "saves_s": round(saves, 1)} if saves > 0 else
                         {"decision": "skip", "reason": "its first shard is runnable now"})
             self._prewarm_plan[kind] = plan
+            self._plan_meta[kind] = {"t": now, "startup_s": startup}
+            self._save()
             self._emit("pool_prewarm_plan", worker_class=cls, kind=kind, startup_s=startup,
                        **plan)
         if plan["decision"] != "prewarm" or has_call:
