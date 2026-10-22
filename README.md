@@ -145,9 +145,9 @@ a finished job actually spent. With `balanced`, segmentation runs on an L40S, ca
 rewards on H100s (`exact` runs segmentation + captioning on an H200).
 
 <!-- wave-h:cost -->
-`balanced` costs about **$5.28 per video-hour** of GPU work (±50%) for segmentation + captioning (`exact`: $36.39), at Modal list prices.
-That is a projection: per-video-second rates measured on one job of 3.9 min of video (2026-10-22, n=1), not yet confirmed at scale.
-Startup (a few minutes per container), idle time and rewards are extra and dominate small jobs: `flora plan` shows the all-in estimate for your dataset.
+`balanced` costs about **$5.28 per video-hour** of GPU work (±50%) for segmentation + captioning (`exact`: $36.39),
+at Modal list prices; a projection from rates measured on one 3.9-min job (2026-10-22, n=1), not yet confirmed at scale.
+Startup, idle time and rewards are extra and dominate small jobs: `flora plan` shows the all-in estimate for your dataset.
 <!-- /wave-h:cost -->
 
 Three numbers, three definitions:

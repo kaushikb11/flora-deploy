@@ -1239,27 +1239,29 @@ def results_block(f: Findings) -> str:
 
 
 def cost_block(f: Findings) -> str | None:
-    bal, ex = f.cost.get("balanced"), f.planned.get("exact")
+    bal, ex = f.cost.get("balanced"), (getattr(f, "planned", None) or {}).get("exact")
     if not bal:
         return None
     # README wording (no internal run names): the busy-only figure, said plainly to be
-    # busy-only and a projection; `exact` as `flora plan` prices it, so the two agree
+    # busy-only and a projection; `exact` as `flora plan` prices it, so the two agree. Three
+    # lines of at most ~125 characters (the README's changed lines stay short).
     vs = f" (`exact`: ${ex['usd_per_video_h']:.2f})" if ex else ""
     return (f"`balanced` costs about **${bal['usd_per_video_h']:.2f} per video-hour** of GPU "
-            f"work (±{bal['uncertainty']:.0%}) for segmentation + captioning{vs}, at Modal list "
-            "prices.\n"
-            f"That is a projection: per-video-second rates {projection_basis(f)}.\n"
-            "Startup (a few minutes per container), idle time and rewards are extra and dominate "
-            "small jobs: `flora plan` shows the all-in estimate for your dataset.")
+            f"work (±{bal['uncertainty']:.0%}) for segmentation + captioning{vs},\n"
+            f"at Modal list prices; a projection from rates {projection_basis(f)}.\n"
+            "Startup, idle time and rewards are extra and dominate small jobs: `flora plan` "
+            "shows the all-in estimate for your dataset.")
 
 
-def projection_basis(f: Findings) -> str:
-    """Where the ``balanced`` rate comes from, in plain words: ``measured on one job of 3.9
-    min of video (2026-10-22, n=1), not yet confirmed at scale``."""
-    m = f.ms[("balanced", "segment")]
-    jobs = "one job" if m.n == 1 else f"{m.n} jobs"
-    return (f"measured on {jobs} of {m.video_s / 60:.1f} min of video ({f.date}, n={m.n}), "
-            "not yet confirmed at scale")
+def projection_basis(f: Any) -> str:
+    """Where the ``balanced`` rate comes from, in plain words: ``measured on one 3.9-min job
+    (2026-10-22, n=1), not yet confirmed at scale``."""
+    m = (getattr(f, "ms", None) or {}).get(("balanced", "segment"))
+    if m is None or not m.n:
+        return f"measured {f.date}, not yet confirmed at scale"
+    what = (f"one {m.video_s / 60:.1f}-min job" if m.n == 1
+            else f"{m.n} jobs ({m.video_s / 60:.1f} min of video)")
+    return f"measured on {what} ({f.date}, n={m.n}), not yet confirmed at scale"
 
 
 def and_list(items: Sequence[str]) -> str:
