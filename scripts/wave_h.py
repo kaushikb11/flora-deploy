@@ -956,7 +956,7 @@ def cert_titles(spec: PlanSpec) -> dict[str, str]:
     return {**TITLES,
             "exact_e2e": f"b. exact oracle, {len(spec.episodes)} {spec.embodiment} episodes "
                          f"({spec.golden}), nvidia mode, H200",
-            "noise": f"f. noise: {len(spec.noise)} of (b)'s episodes, same config/GPU/mode",
+            "noise": f"f. noise: {len(spec.noise)} of (b)'s episodes, (b)'s stage hash/GPU/mode",
             "balanced": f"d. balanced via flora deploy/run, {len(spec.episodes)} episodes",
             "lab": "d2. lab L0 / Gate A (skipped when already done)",
             "certify": ("e. flora certify, then wave_h_finalize.py" if spec.embodiment == "human"
@@ -2694,10 +2694,20 @@ def simulate_run_start(st: State, *, out: Callable[[str], None] = print) -> None
 def next_decision(st: State, plan: str, projections: Mapping[str, Projection],
                   only: str | None = None, embodiment: str = EMBODIMENT) -> Decision | None:
     """The decision a run takes first: the first step (of ``--only`` or the plan) not done,
-    and not running in a parallel run (one that reserved: it is shown as running)."""
-    for name in (only,) if only else PLANS[plan]:
-        cur = (st.steps.get(name) or StepState()).current
-        if cur is not None and cur.reserved_usd is not None:
+    not running in a parallel run (one that reserved: it is shown as running), and not
+    waiting for a running step it needs (``lab`` while ``balanced`` runs cannot start)."""
+    steps = (only,) if only else PLANS[plan]
+    deps = plan_deps(plan)
+
+    def running(n: str) -> bool:
+        cur = (st.steps.get(n) or StepState()).current
+        return cur is not None and cur.reserved_usd is not None
+
+    def waits(n: str) -> bool:  # ``n`` or a step it needs (directly or not) is running
+        return running(n) or any(waits(d) for d in rb.deps_within(n, deps, steps))
+
+    for name in steps:
+        if waits(name):
             continue
         d = decide(st, plan, name, projections, only=only, embodiment=embodiment)
         if d.action != "done":
@@ -2754,7 +2764,9 @@ def print_status(st: State, projections: Mapping[str, Projection], *, plan: str,
         out(line)
     d = next_decision(st, plan, projections, only, spec.embodiment)
     if d is None:
-        out("  next: nothing (every step is done)")
+        busy = st.running()
+        out(f"  next: none until {', '.join(busy)} ends (every other step waits for it)"
+            if busy else "  next: nothing (every step is done)")
         return None
     out(f"  next: {d.step}: {d.action}: {d.message}")
     for r in d.reasons:

@@ -277,6 +277,61 @@ def test_one_step_failing_does_not_corrupt_the_others(tmp_path):
     assert any(m.startswith("not started: lab, certify") for m in msgs if isinstance(m, str))
 
 
+def test_a_stop_rule_keeps_exit_3_when_running_steps_fail_after_it(tmp_path):
+    """b hits an in-step stop rule (exit 3, as sequentially); f and d, already running beside
+    it, fail afterwards. Their failures are recorded but never replace the halting code."""
+    stopped = threading.Event()
+    run = Fake(fail=("noise", "balanced"))
+    base = run.__call__
+
+    def runner(name, ctx):
+        if name == "exact_e2e":
+            try:
+                raise rb.StopRule("in-step stop")
+            finally:
+                stopped.set()
+        assert stopped.wait(10)
+        time.sleep(0.05)
+        return base(name, ctx)
+
+    st = rb.State("r", 0.0, "x")
+    rc = _run(st, tmp_path / "s.json", runner)
+    assert st.step("exact_e2e").status == "stopped"
+    assert st.step("noise").status == st.step("balanced").status == "failed"
+    assert rc == 3
+
+
+def test_ctrl_c_waits_for_the_running_steps_cleanup(tmp_path, monkeypatch):
+    """Ctrl-C reaches the main thread while it waits for a step. The steps' threads are
+    daemons, so re-raising at once would kill them before their ``finally`` stopped the apps
+    they deployed (sequentially that ``finally`` runs). The main thread waits for them first."""
+    import queue as q
+
+    cleaned: list[str] = []
+    started = threading.Barrier(4, timeout=10)  # the three steps and the main thread
+
+    def runner(name, ctx):
+        try:
+            started.wait()
+            time.sleep(0.2)  # the subprocess got the SIGINT too and is winding down
+            return {"ok": False, "tracked_usd": 0.1}
+        finally:
+            cleaned.append(name)  # `modal app stop` in the real runner
+
+    class Interrupted(q.Queue):
+        def get(self, *a, **k):
+            started.wait()  # all three are running
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(rb, "queue", SimpleNamespace(Queue=Interrupted))
+    st = rb.State("r", 0.0, "x")
+    msgs: list[str] = []
+    with pytest.raises(KeyboardInterrupt):
+        _run(st, tmp_path / "s.json", runner, out=msgs.append)
+    assert sorted(cleaned) == ["balanced", "exact_e2e", "noise"]
+    assert any(m.startswith("interrupted: waiting up to") for m in msgs)
+
+
 def test_a_failed_dependency_blocks_its_dependents(tmp_path):
     run = Fake(fail=("balanced",))
     st = rb.State("r", 0.0, "x")
@@ -368,6 +423,25 @@ def test_status_shows_running_steps_and_their_reservations():
     assert "ready to start: noise (what each needs is done)" in text
     assert d is not None and d.step == "noise"  # the next decision skips the running steps
     assert d.budget.terms["running"] == pytest.approx(7.25)
+
+
+def test_status_next_never_names_a_step_whose_dependency_runs():
+    """b and f done, d running: lab needs d and certify needs everything, so nothing can
+    start; --status must not say `next: lab: run` (cert_preflight reads that line), nor that
+    every step is done."""
+    st = rb.State("r", 0.0, "x", plan=wh.CERTIFIED)
+    for n in ("exact_e2e", "noise"):
+        st.step(n).status = "done"
+    st.step("balanced").status = "running"
+    st.step("balanced").attempts.append(rb.Attempt(
+        started=time.time() - 60, budget_usd=4.55, reserved_usd=4.55, tracked_usd=0.5,
+        heartbeat=time.time()))
+    projs = wh.plan_projections(wh.CERTIFIED, wh.offline_manifest(0.0, wh.CERT_GOLDEN))
+    lines: list[str] = []
+    assert wh.print_status(st, projs, plan=wh.CERTIFIED, out=lines.append) is None
+    text = "\n".join(lines)
+    assert "next: lab" not in text and "every step is done" not in text
+    assert "next: none until balanced ends" in text
 
 
 def test_dry_run_prints_wall_clock_sequential_vs_parallel():

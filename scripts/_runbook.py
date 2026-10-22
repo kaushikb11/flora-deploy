@@ -37,6 +37,11 @@ LEGACY_CAP_PLAN = "balanced-only"
 # (f)'s H200 (one app each) beside (d)'s L40S + H100. GPUs are capped across apps by
 # ``gpu_caps`` (``wave_h.py --max-gpus``), not by this.
 DEFAULT_MAX_PARALLEL = 3
+# Ctrl-C in a parallel run: how long the main thread waits for the running steps (their
+# subprocesses got the same SIGINT) to finish their own cleanup, ``modal app stop`` included,
+# before it re-raises. The step threads are daemons: without this wait, exiting killed them
+# before their ``finally`` stopped the apps they deployed.
+INTERRUPT_GRACE_S = 300.0
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1051,6 +1056,7 @@ def run_parallel(st: State, steps: Iterable[str], *, state_path: Path, ctx: Any,
     waiting: set[str] = set()
     gpu_waiting: set[str] = set()
     rc, halted = 0, False
+    halt_rc: int | None = None  # the code of what halted the run first: it is the exit code
     log = StepLog(sys.stdout)
 
     def worker(name: str, s: StepState, att: Attempt, c: Any) -> None:
@@ -1070,7 +1076,7 @@ def run_parallel(st: State, steps: Iterable[str], *, state_path: Path, ctx: Any,
     def start(name: str) -> bool:
         """Decide ``name`` and start it. False: it waits (refused while others run) or the
         run halts."""
-        nonlocal rc, halted
+        nonlocal rc, halted, halt_rc
         s = st.step(name)
         if refresh is not None:
             refresh(st)
@@ -1086,6 +1092,7 @@ def run_parallel(st: State, steps: Iterable[str], *, state_path: Path, ctx: Any,
                         f"{', '.join(running)} ends)")
                 return False
             s.status, rc, halted = "stopped", 3, True
+            halt_rc = rc if halt_rc is None else halt_rc
             note_stop(s, f"stop rule before: {d.message}")
             out(f"{d.action} {name}: {d.message}" + (f"\n  next: {d.command}" if d.command
                                                      else ""))
@@ -1096,6 +1103,7 @@ def run_parallel(st: State, steps: Iterable[str], *, state_path: Path, ctx: Any,
             s.notes.append(f"refused: {no}")
             out(f"refuse {name}: {no}")
             rc, halted = 1, True
+            halt_rc = rc if halt_rc is None else halt_rc
             pending.remove(name)
             ended[name] = s.status
             return False
@@ -1169,26 +1177,40 @@ def run_parallel(st: State, steps: Iterable[str], *, state_path: Path, ctx: Any,
                 note_stop(s, f"stop rule after: {e}")
                 out(f"stop after {name}: {e}")
                 rc, halted = 3, True
+                halt_rc = rc if halt_rc is None else halt_rc
                 continue
             if s.status == "stopped":
                 halted = True
+                halt_rc = rc if halt_rc is None else halt_rc
                 ended[name] = s.status
                 continue
             if after is not None and (code := after(name, s)) is not None:
                 rc, halted = code, True
+                halt_rc = rc if halt_rc is None else halt_rc
                 continue
             if s.status != "done":
                 rc = 1
                 ended[name] = s.status
                 if not (keep_going and keep_going(name)):
                     halted = True
+                    halt_rc = rc if halt_rc is None else halt_rc
+    except BaseException:  # Ctrl-C (or a bug) here: let the running steps clean up first
+        if running:
+            out(f"interrupted: waiting up to {INTERRUPT_GRACE_S:.0f} s for {', '.join(running)} "
+                "to stop their apps (interrupt again to abandon them)")
+            end = time.monotonic() + INTERRUPT_GRACE_S
+            for th in list(running.values()):
+                th.join(max(0.0, end - time.monotonic()))
+        raise
     finally:
         sys.stdout = old
         st.queued = set()
     if pending:
         out("not started: " + ", ".join(pending) + (" (the run stopped)" if halted else
                                                      " (a step they need did not finish)"))
-    return rc
+    # The steps still running when the run halted finish and are recorded, but what they
+    # return never replaces the halting code (a stop rule's 3 must not read as a failure).
+    return rc if halt_rc is None else halt_rc
 
 
 def wall_clock(steps: Sequence[str], deps: Mapping[str, Sequence[str]],

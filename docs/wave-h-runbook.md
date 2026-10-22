@@ -435,7 +435,8 @@ engine-settings hash was recorded carry no hash, so today's certified run runs (
   cap`, and its in-step deadlines use its own reservation alone. When it ends, the reservation
   becomes its tracked, then billed, spend. A step refused only while others run waits for one
   of them to end. A killed process leaves every running step `running` in the state; the next
-  run marks them all killed. A failed step starts nothing new; the running ones finish and
+  run marks them all killed. Ctrl-C first waits up to 5 min for the running steps, which got the
+  same interrupt, to stop their apps (a second Ctrl-C abandons them). A failed step starts nothing new; the running ones finish and
   are recorded. (e) certifies the finished steps' jobs only. The dry run prints the expected
   wall-clock both ways (offline: 91 min one at a time, 49 min with `--max-parallel 3`; with d2
   already done, 65 and 29 min); `--status` lists the running steps and their reservations.
