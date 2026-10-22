@@ -1,7 +1,8 @@
 # flora.yaml: REFERENCE / CERTIFICATION template. Labels a LeRobot dataset with NVIDIA's own
 # pipeline (`exact` preset): the reference `balanced` is certified against. For everyday
 # labelling start from balanced_lerobot.yaml (`flora init`'s default).
-# Every key is documented below. Unknown keys are an error.
+# The common keys are documented below; the full list is in src/flora_deploy/config/schema.py.
+# Unknown keys are an error.
 
 project: my-lerobot-labels          # names the job and its Modal tags
 
@@ -11,7 +12,8 @@ license_ack: research-only
 modal:
   environment: main                 # Modal Environment to deploy into
   max_gpus: 3                       # workspace GPU cap; all pools together stay under it
-  budget_usd: 25                    # hard spend cap (a Modal Environment budget backs it up)
+  budget_usd: 25                    # hard spend cap; also set a Modal Environment budget as a
+                                    # backstop (`flora doctor` prints the amount)
   region: null                      # null = any region (pinning costs >= 1.15x)
   tags: {}                          # extra key/value tags on every Modal object
 
@@ -40,20 +42,24 @@ input:
   stage_to: null
 
 pipeline:
-  # segment, caption, reward.terminal, reward.dense, reward.rubric
+  # segment, caption, reward.terminal, reward.dense, reward.rubric (rubric needs
+  # `pipeline.rubric`: robot, cameras, steps; its pool is 2 x H100!, which counts 2 toward max_gpus)
   stages: [segment, caption, reward.terminal, reward.dense]
   embodiment: human                 # human | yam | yam32 | dex | tianji
   episode_instruction:
-    source: dataset_task            # dataset_task | fixed (then set `text`) | none
+    source: dataset_task            # dataset_task | fixed (then set `text`) | none; with
+                                    # dataset_task an episode with an empty task is excluded
+                                    # (missing_task)
                                     # (none is refused with reward stages: they need a task)
   envelope: warn                    # warn | enforce | ignore: episodes outside NVIDIA's tested conditions
-  # determinism: nvidia             # nvidia (NVIDIA's kernels) | deterministic (D-1: cuDNN SDPA
-                                    # off, a different reference); in the segcap stage hash
+  # determinism: nvidia             # nvidia (NVIDIA's kernels) | deterministic (cuDNN SDPA off,
+                                    # a different reference; see docs/determinism.md); in the segcap stage hash
   # terminal_rationale: false       # true: reward.terminal also returns NVIDIA's rationale;
                                     # in the reward.terminal stage hash
 
 # Per shard kind overrides of the preset's pools: gpu, gpu_count, max_containers, max_inputs,
-# cpu (physical cores), memory (GiB). The exact preset runs segment+caption as one `segcap`
+# cpu (physical cores), memory (GiB); segcap also takes episode_concurrency (episodes per
+# container, default 4). The exact preset runs segment+caption as one `segcap`
 # worker, which needs >= 81 GiB of GPU memory (H200 or B200); rewards need an 80 GB GPU
 # (H100!, H100, A100-80GB, H200, B200). These are not in the config hash: they never change
 # the model inputs, but a different GPU type runs different kernels, so outputs are
@@ -64,7 +70,8 @@ resources:
   reward.dense: {max_containers: 1}
 
 output:
-  sink: volume://flora-results/my-lerobot-labels   # volume:// (`flora deploy` creates it), s3:// r2:// gs:// file://
+  # volume:// (`flora deploy` creates it) or s3://; file:// for `flora run --local` only
+  sink: volume://flora-results/my-lerobot-labels
   formats: [parquet, jsonl]
 
 retries:

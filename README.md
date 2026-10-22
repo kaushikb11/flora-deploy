@@ -10,8 +10,8 @@ for every episode:
 |---|---|---|
 | `segment` | the episode split into subtasks, with timestamps | `0.0–3.5 s`, `3.5–7.2 s`, … |
 | `caption` | a description of each subtask | "The left arm lifts the cup lid." |
-| `reward.terminal` | did the episode succeed? A 1–5 score with probabilities | `4.6` |
-| `reward.dense` | progress score for every step of the episode | `3, 3, 2, 3, …` |
+| `reward.terminal` | did the episode succeed? A 1–5 score with probabilities | `5` (expected score `4.6`) |
+| `reward.dense` | a 1–3 label (failure / suboptimal / normal) for every 0.5 s of the episode | `3, 3, 2, 3, …` |
 
 Labels come back as Parquet and JSONL, keyed by episode, ready for pandas or 🤗 `datasets`.
 
@@ -43,8 +43,9 @@ Rewards run NVIDIA's own engine, as `exact` does, and need none.
   (`flora prepare` downloads them anonymously). A token (`hf auth login`) is optional and raises
   rate limits. `flora doctor` checks that every model repo and your dataset can be read.
 - An output location Modal can write to: a Modal Volume (`volume://name/dir`, the `flora init`
-  default; `flora deploy` creates the Volume if it does not exist) or a bucket (`s3://`,
-  `gs://`, `r2://`) with its credentials in a Modal Secret named `flora-bucket`.
+  default; `flora deploy` creates the Volume if it does not exist) or an S3 bucket (`s3://`;
+  for R2 or GCS, their S3 endpoint in `AWS_ENDPOINT_URL`) with its credentials in a Modal Secret
+  named `flora-bucket`. `gs://` and `r2://` sinks are not supported.
 
 To start from a working config instead, see [`examples/`](examples/): `lerobot_small` labels a
 50-episode public dataset for a few dollars.
@@ -60,7 +61,8 @@ flora results caption      # or segment, reward.terminal, reward.dense
 ```
 
 `flora run` stops before it would exceed your budget, and `flora resume` picks up where a stopped
-or interrupted job left off. GPUs start when the job starts and shut down when it ends.
+or interrupted job left off. GPUs start when the job starts and scale to zero when it ends (a 2 s
+idle window once a stage has no work left); captioning GPUs boot while segmentation finishes.
 
 ## Configuration
 
@@ -108,9 +110,10 @@ scores = pd.read_parquet("terminal.parquet")       # flora results reward.termin
 labels = captions.merge(scores[["uid", "terminal_score"]], on="uid")
 ```
 
-Training on LeRobot? `flora export --to lerobot --out labeled/` writes the labels into a copy of
-your dataset: subtasks and success scores per episode, dense rewards per frame
-([`docs/export.md`](docs/export.md)).
+Training on LeRobot? `flora export --to lerobot --out labeled/ --allow-uncertified` writes the
+labels into a copy of your dataset: subtasks and success scores per episode, dense rewards per
+frame ([`docs/export.md`](docs/export.md)). The flag is needed while `balanced` segment/caption
+are uncertified, and is recorded in the export.
 
 Every record has a `uid` (the episode) to join stages on, plus provenance: which models, engine and
 GPU produced it. Field reference: [`docs/output-format.md`](docs/output-format.md).
@@ -130,14 +133,17 @@ Three numbers, three definitions:
 - **GPU work** (above): only the seconds the GPUs spend labelling. A large job's segmentation +
   captioning approaches it.
 - **`flora plan`**: the all-in estimate for your dataset: GPU work for every stage you chose,
-  plus each container's startup and the orchestrator. Idle time after the work is not included.
+  plus each container's startup, a short idle tail after its stage's last episode (about 17 s),
+  and the orchestrator. `balanced` shows as "partly certified" (rewards need no certificate).
 - **`flora report`**: what the job actually spent: everything above plus idle time. On a job of
   a few minutes of video, startup and idle can make this several times the GPU-work rate.
 
 `flora index` runs on Modal CPU containers (no GPU, about $0.06 per container-hour), so it costs a
 few cents for most datasets; `flora index --local` runs it on your machine for free. `flora
-doctor` and `flora plan` cost nothing. The measurement behind these rates:
-[`docs/wave-h-report.md`](docs/wave-h-report.md).
+doctor` and `flora plan` cost nothing. A `balanced` stage's first container publishes its compiled
+engine, so later containers and jobs start warm; after an image or engine change the first starts
+cold (`flora plan --check-cache`). The measurement behind these rates:
+[measurement report](docs/wave-h-report.md).
 
 Cost by job size, where the money goes and how to spend less: [`docs/costs.md`](docs/costs.md).
 

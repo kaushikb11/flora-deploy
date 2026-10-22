@@ -1,19 +1,33 @@
 # Wave H-lite runbook
 
+Operator runbook for `scripts/wave_h.py`. Terms: **Wave H** is the GPU measurement-and-
+certification session this script runs (H-lite is its reduced 2026-10-22 form); **H0** is the
+CPU rehearsal on real Modal with fake models (`scripts/h0_rehearsal.py`, "What H0 proves
+first"); the **oracle** is the `exact` reference run (b); **L0** is the in-engine token/grid
+parity check against NVIDIA's HF processor; **Gate A** is the FP32 `dt_bias` logit drift check
+(max |Δlogit| ≤ 0.5); a **poison episode** is an episode made to fail on purpose, to test that
+the job sets it aside.
+
 Wave H-lite is the one GPU session that replaces Wave H (decision of 2026-10-22 in
 `docs/archive/NEXT_EXECUTION.md`). The user then narrowed it (2026-10-22): **run the GPU
-session balanced only, now.** The default plan, `--plan balanced-only`, runs three steps:
+session balanced only, now.** The default plan, `--plan balanced-only`, runs four steps:
 - step 0: build TempSeg with merger v2, check its equivalence, then pin it;
 - (a): the balanced preflight;
-- (d): `balanced` through the real `flora deploy` / `flora run` on the 6 human episodes, plus the
-  lab's L0 input parity and Gate A.
+- (d): `balanced` through the real `flora deploy` / `flora run` on the 6 human episodes;
+- (d2): the lab's L0 input parity and Gate A against (d)'s finished job.
 
 The exact oracle (b), the provisional certification (e) and the noise run (f) are **deferred to
 the certified run**, a later session that uses `--plan certified` (see "The certified run"
-below; `--plan full` cannot certify). The approved scope is about $2.1
-nominal and $4.2 upper. With the cold-compile startup priced in (see "Cold compile" below), the
-dry run comes to **$2.25 nominal and $4.42 upper**, so its global cap is **$4.50**. The session
-runs only after review 10 is clean, CI is green and H0 passes.
+below; `--plan full` cannot certify). The dry run comes to **$3.25 nominal and $5.31 upper**
+(steps 0, a, d and d2, with the cold-compile startup priced in), so the derived global cap is
+**$5.40**. The user later approved a $7.90 global cap (`--global-cap 7.90`). The session has
+run: every step is done, at $5.16.
+
+**`--global-cap USD`** applies to every plan. It can only raise the derived cap: it is refused
+above $50 (`MAX_GLOBAL_CAP_USD`), below the derived cap, or below what was already spent. It is
+saved in the state only with `--yes-spend` (a dry run only shows its effect) and holds for that
+`--plan` only. The dry run labels the cap in force "user-approved override for plan ...;
+derived $X".
 
 ```
 uv run python scripts/h0_rehearsal.py               # H0: balanced CPU rehearsal on Modal (~$0.4)
@@ -53,12 +67,12 @@ The seventh, `homer_40` (59.6 s), is left out to keep the cost down.
 writes. All six must be staged: otherwise (d) refuses before starting anything, and is charged
 $0. (b), which runs only in `--plan full`, uses whatever the manifest stages and says so.
 
-One job means **one app per stage**: one cold start per pool for (d). In the certified run there
-is also one H200 cold start for (b) and one for (f). The noise run (f) repeats (b)'s job: the
-same config file, staged data and stage hash under a new job id, on **all six** episodes.
-Fix-Cert H2 needs the noise episodes to be a subset of the oracle's and the stage hash to match.
-The input content is hashed, so a strict subset would be another stage hash, which
-`flora certify` refuses.
+One job means **one app per stage**: one cold start per pool for (d). `flora certify` needs the
+noise episodes to be a subset of the oracle's and the stage hash to match
+(`docs/certification.md`, "Binding checks"). In `--plan full` the noise run (f) repeats (b)'s
+job on all six episodes, because a new data dir holding a subset would hash differently. The
+certified run instead re-indexes (b)'s own data dir with `flora index --limit 5` (same stage
+hash; see "The certified run"). Each of (b) and (f) is one H200 cold start.
 
 Every job is staged the same way:
 - the episodes are fetched into a local `mp4_dir`, with the task text next to each video;
@@ -67,15 +81,16 @@ Every job is staged the same way:
   `pins.DERIVED_PINS` (`config.receipts.check_pinned`). Their file sha256 is written into the
   generated config's `weights.derived`, which is how `flora deploy` resolves them
   (`config.receipts.resolve`). An unpinned derived weight is refused before anything starts
-  (`plan_app` refuses it too, review 10 M1);
+  (`plan_app` refuses it too);
 - `flora index --local` writes the receipts into a local store, and they are mirrored into the
   job store on the Volume;
 - then `flora plan --index`, `flora deploy` and `flora run`.
 
 ## Step 0: build and pin TempSeg
 
-`pins.DERIVED_PINS["tempseg-merged"].content_sha256` is `None` until merger v2 is built and
-checked, and every balanced plan refuses it until then. Step 0:
+Done: the TempSeg merger v2 pin is set (`config/pins.py`, `6356ab8c…`), so step 0 now completes
+at $0. Kept as history. `pins.DERIVED_PINS["tempseg-merged"].content_sha256` was `None` until
+merger v2 was built and checked, and every balanced plan refused it until then. Step 0:
 
 1. `modal run src/flora_deploy/modal_app/convert_app.py::tempseg --step merge --force` (CPU,
    8 cores, 32 GiB; client deadline 20 min);
@@ -135,9 +150,9 @@ is its own upper projection rounded up to 5 cents, so no step is refused by its 
 $6.50. Its dry run says "NOT HONEST AT $6.50". It is superseded by `--plan certified` (below),
 which is the only plan that can make a certificate come out `certified`.
 
-`wave_h_finalize.py` needs at least 2 job samples and 2 cold starts per (preset, kind) to write a
-measured rate. One job per stage gives one of each, so finalize **refuses the rate update** after
-this session (it still writes the report).
+`wave_h_finalize.py` writes a measured rate from at least 1 job sample and 1 cold-start container
+per (preset, kind, GPU) with at least 30 video seconds behind it. One job per stage meets that,
+so finalize updates the rates (marked n=1, ±50%).
 
 ### The lab step (d2) and `--only lab`
 
@@ -164,14 +179,16 @@ Now:
 
   If one fails, no container starts and the step is charged $0.
 - **Fail loudly.** A baseline that runs no episode or sends zero requests returns `error` and
-  `no_evidence`, and the plugin engine is not built. Wave H then skips the Captioner (it reads
+  `no_evidence`, and the plugin engine is not built. The runbook then skips the Captioner (it reads
   the same inputs). A kind with no L0 rows or no Gate A requests is reported as "produced no
   L0 / Gate A evidence". The step is charged only the wall time of the calls it started.
 - **Reuse.** A kind's saved result (`reports/wave-h/balanced-<kind>.json`) is kept, not re-run,
   when it has evidence: L0 rows, Gate A requests and no error, for the same run id and (d)'s
   episodes. The dry run prices only the kinds that still run. The global cap stays derived from
   the whole step. Each kind's summary is saved to the state as soon as it returns, and a lab
-  call that raises is recorded as that kind's error.
+  call that raises is recorded as that kind's error. The run prints "note: lab reuses the saved
+  <kind> result(s) ..." and, in the certified plan's dry run, "lab (d2): already done, skipped at
+  $0 (...)".
 - **Child args** go to the engine child through a JSON file. Inline argv broke Linux's 128 KiB
   per-argument limit once the deployed segments were included (2026-10-22 Captioner).
 - **Deadlines** cover two cold compiles: overhead + baseline build + plugin build + work, × 1.25.
@@ -189,17 +206,28 @@ measurement (a projection, a placeholder or a warm measurement) is scaled by the
 cold/warm `@modal.enter` ratio, 318 s / 229 s ≈ 1.39 (`cold_startup_s`; `docs/rewarder-smoke.md`,
 `docs/cold-start.md`). The dry run says which applies.
 
-**Write-back.** The deployed balanced workers mount `flora-cache` **read-only**
-(`FLORA_CACHE_MODE=ro`; a local copy, never committed), so the deployed job leaves no cache
-behind, and nothing can flow from a deployed run to the lab. The lab calls (d2) are the
-writers: each writes `flora-cache:/balanced/<engine>` (and `<engine>-dtbias` for Gate A's plugin
-side) and commits it after each engine. Each result records whether its cache was warm
-(`compile_cache`). The deployed workers seed from the same `balanced/<engine>` directory. Whether
-their vLLM config hash matches the lab's has not been measured: the lab's engine adds
-`logprobs_mode: raw_logits` and `max_logprobs: 20`. Triton and CUDA kernel caches are
-content-addressed either way. After 2026-10-22, `flora-cache` holds finished torch.compile
-entries for `balanced/tempseg`, `balanced/captioner` and `balanced/tempseg-dtbias`.
+**Write-back.** The deployed workers mount `flora-cache` read-only (`FLORA_CACHE_MODE=ro`). At
+start they load a verified keyed cache (`balanced-cc/<key>`, keyed by image, versions,
+compile-relevant engine spec, plugin flag, model content and GPU), else the lab's
+`balanced/<engine>` tree (same GPU and plugin flag), else they compile cold. A worker that
+compiled publishes its cache once, after its first shard, through the Volume client API
+(`engines/compile_cache.py`; `FLORA_COMPILE_CACHE_PUBLISH=0` disables it). The lab (d2) still
+writes `balanced/<engine>[-dtbias]`. The key ignores `logprobs_mode` and defaults
+`max_logprobs`, so lab and worker engines share a key. Pricing stays cold until a cache for this
+code's key is published. After 2026-10-22, `flora-cache` holds finished torch.compile entries
+for `balanced/tempseg`, `balanced/captioner` and `balanced/tempseg-dtbias`;
 `balanced/captioner-dtbias` was cut off mid-compile.
+
+**Batch fill.** (d) runs the batch-fill engine limits and batch policy, and the dry run says so:
+TempSeg on the L40S with `max_num_seqs` 64 and 64 episodes per batcher, the Captioner on the
+H100 with `max_num_seqs` 16 and 32 episodes per batcher. Its rates were measured before batch
+fill, so they can only overstate it.
+
+**Scale-to-zero.** When a pool has no work left, mid-job or at job end, the orchestrator drops
+that worker class's `scaledown_window` to 2 s within one 15 s poll (`jobs/pools.py`), and it
+raises caption's `min_containers` ahead of segment's expected readiness (the caption pre-warm,
+a `pool_prewarm_plan` event) so the H100 boots while segment finishes. The price still charges
+the segment pool a full 300 s scale-down tail (below), so it overstates what (d) spends.
 
 Projections are container-seconds × list $/h (GPU + cores + memory, as pinned in `jobs.budget`).
 Container-seconds come from `planner/rates.json`: startup + video-s × container-s per video-s, plus
@@ -207,7 +235,8 @@ Container-seconds come from `planner/rates.json`: startup + video-s × container
 - the table's upper quantiles;
 - **240 s client slack per app** (the `flora run` timeout margin, then cancel + `modal app stop`);
 - every cold start (for (d), a cold compile);
-- the segment pool's scale-down tail while captions run;
+- the segment pool's scale-down tail while captions run (priced at the full 300 s
+  `WORKER_SCALEDOWN_S`; the 2 s drain makes the real tail about 17 s, so this is conservative);
 - each lab call's two-cold-compile deadline plus 60 s, and step 0's deadlines plus 60 s.
 
 ## Stop rules
@@ -245,7 +274,7 @@ The state, the billing reads, the stop rules and the step loop live in `scripts/
   against the global cap.
 - **The lab (d2) runs only against (d)'s `done` job.** If the job failed or was cut short,
   (d) ends `failed` with `lab: not run: ...`, and the lab step refuses to run before any app
-  starts, so it spends nothing (review 10 L2).
+  starts, so it spends nothing.
 - **Step 0** ends with exit 4 (`needs_pin`) until the pin is set; see above.
 
 ## Spend accounting
@@ -277,8 +306,7 @@ The state, the billing reads, the stop rules and the step loop live in `scripts/
   The charge is never more than the budget. Each hold prints when it should clear: the end of
   its billing hour plus 15 minutes, in UTC. Today's crashed lab attempt (tracked $0.72) is
   charged about $0.84 this way, not its $2.35 budget. An attempt that failed before it noted
-  any app (a refusal on the CPU, such as an unpinned weight) started nothing and is charged $0
-  (review 10 L1).
+  any app (a refusal on the CPU, such as an unpinned weight) started nothing and is charged $0.
 - **Billing is re-read before every step and after it, for every app seen so far.** Once settled,
   an attempt is charged the larger of tracked and its own apps' billed cost over the hours it
   ran. Each billed hour of an app goes to the attempt with that app that started last. So an
@@ -319,7 +347,7 @@ The state, the billing reads, the stop rules and the step loop live in `scripts/
     against `exact` are within 2× the measured exact-vs-exact noise, or within absolute bounds
     before step f has run.
 
-  With 6 noise episodes (at least 5) but 6 candidates (fewer than 10 per pool), H-lite is
+  With 6 noise episodes (at least 5) but 6 candidates (fewer than 10 per pool), `--plan full` is
   **provisional by design** (`docs/certification.md`).
 
 ## Before a paid run
@@ -362,11 +390,12 @@ uv run python scripts/wave_h.py --plan certified --yes-spend --only noise # one 
 
 ### What it needs, and how each need is met
 
-`flora certify` gives `certified` only when all of these hold (`docs/certification.md`, H4):
+`flora certify` gives `certified` only when all of these hold (`docs/certification.md`, "What
+`certified` needs"):
 
 | Requirement | How the plan meets it |
 |---|---|
-| at least 10 candidate episodes of the pool | 12 golden/v2 `human` episodes (`docs/golden-manifest-v2.md`): 10 plus 2 spares, all run. (b) and (d) refuse before any app when fewer than 10 are staged |
+| at least 10 candidate episodes of the pool | 12 golden/v2 `human` episodes (`docs/golden-manifest-v2.md`): 10 plus 2 spares, all run. (b) and (d) refuse before any app unless all 12 are staged (and the selection has at least 10, with a noise subset of at least 5 inside it) |
 | every oracle episode labelled (coverage 1.0) | (d) runs exactly (b)'s episodes |
 | oracle and candidate uids pair | **every job stages one data dir**, `cert-human`. Episode uids are `<data dir>--<episode id>`, and `--plan full` staged one dir per step, so its uids never paired and every certificate it could make had coverage 0 |
 | a noise run of at least 5 of the oracle's episodes, same stage hash, key, GPU and determinism | (f) re-indexes **(b)'s own config and data dir** with `flora index --limit 5`. The stage hash covers the config and the whole input dir, not the index, so it is (b)'s. The five noise episodes (`noise_subset` in the selection) are named `n-<id>` and the rest `x-<id>`, so they sort first. Before any app starts, (f) checks that the index holds exactly those five (count and video seconds). Same H200, `nvidia` mode, a new job id |
@@ -385,7 +414,9 @@ uv run python scripts/wave_h.py --plan certified --yes-spend --only noise # one 
 | | **total, lab runs** | | global **$10.60** | **$6.75** | **$10.58** |
 | | **total, lab already done** | | global **$8.30** | **$5.00** | **$8.27** |
 
-The dry run on the staged manifest (`--plan certified --dry-run`) prints these numbers.
+These numbers come from the dry run on the **staged** manifest (`--plan certified --dry-run`,
+staged durations). The offline dry run (`--offline`, expected durations +10%: 250.2 s and
+86.2 s) prints slightly higher figures: b $4.20, f $1.95, d $2.45, lab $0, global $8.60.
 
 - **Caps.** Each step's cap is its own upper projection rounded up to $0.05 (`plan_caps`), and
   the global cap is the sum of the upper projections rounded up to $0.10 (`plan_global_cap`).
@@ -395,7 +426,7 @@ The dry run on the staged manifest (`--plan certified --dry-run`) prints these n
 - **Resumable.** The plan has its own state, `reports/wave-h/certified/state.json`, and its own
   work dir and records. It never inherits a v1 job. A done step is skipped, and a failed or
   killed step is retried. The state records `plan: certified`, and a v1 plan refuses to run on
-  it (and the other way round).
+  it (and the other way round): it prints "refused: <state> was run under plan ..." and exits 2.
 - **(e)** exports the three jobs' records (`wave_h_finalize.fetch_records`, a Volume read). It
   then runs `flora certify` per stage (`wave_h_finalize.certify_all`) with the oracle, the
   noise run, the L0 JSON and the derived content digests. The step is `done` only when
@@ -407,10 +438,11 @@ The dry run on the staged manifest (`--plan certified --dry-run`) prints these n
 
 ### Assumptions in the prices
 
-- **Exact rate:** the measured 6.4 container-s per video-s ±35% (H200, default mode, c=4,
-  P1a-5s). It was measured on a 1-/3-view mix in a 160 GiB container. Here all 12 episodes are
-  single view, so it is probably pessimistic.
-- **Exact cold start: measured.** It is 103 s @enter ±100% per job (S1; P1a-5s measured 78 s).
+- **Exact rate:** the measured 6.4 container-s per video-s ±35% (H200, default mode, c=4;
+  `docs/reference-smoke.md`). It was measured on a 1-/3-view mix in a 160 GiB container. Here
+  all 12 episodes are single view, so it is probably pessimistic.
+- **Exact cold start: measured.** It is 103 s @enter ±100% per job (an earlier smoke measured
+  78 s; `docs/reference-smoke.md`, `docs/cold-start.md`).
   (b) and (f) are each a cold start, because the oracle's app is stopped before (f) deploys it
   again. Image pull and scheduling are not in the measured startup; the +100% and the 240 s of
   client slack per app cover them.
@@ -432,7 +464,7 @@ what the same config hashes to now. They still cannot be the certified run's can
 - **Uids.** They are `balanced-human--…`, while the certified oracle's are `cert-human--…`.
 - **Key.** `modal_app/balanced_app.py` is on the `segment` / `caption` certificate logic digest
   (`certkey.cert_modules`), and it is being changed. Any code change there changes the key, and
-  certify (H1) then refuses records made before it.
+  certify then refuses records made before it (`docs/certification.md`, "Binding checks").
 
 So **(d) is rerun on the 12 episodes.** It is about $1.35 nominal, and is priced above.
 
@@ -509,7 +541,7 @@ H0 (`scripts/h0_rehearsal.py`) runs the exact, reward and balanced deployments o
 episodes (2 human, 4 yam / single-view robot; a wider rehearsal than this session's scope) with
 `flora deploy --fake-models`. That is the real factory app: the same orchestrator, stores,
 Volumes, media mounts, env, secrets, worker contract and timeouts. The differences are:
-- G2's fake engines in CPU containers;
+- fake engines in CPU containers (`flora_deploy.local`);
 - a distinct `fake_models` hash component, so fake outputs never share an app or store path with
   real ones;
 - records marked `certificate: fake-models`.

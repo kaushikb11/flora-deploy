@@ -1,5 +1,7 @@
 # flora.yaml: score policy rollouts with the Flora Rewarder only (terminal + dense rewards).
-# Every key is documented in `flora init --template exact_lerobot`. Unknown keys are an error.
+# Common keys are documented in `flora init --template exact_lerobot`;
+# the full list is in src/flora_deploy/config/schema.py.
+# Unknown keys are an error.
 
 project: my-rollout-rewards
 
@@ -25,7 +27,8 @@ pipeline:
   stages: [reward.terminal, reward.dense]
   embodiment: yam                   # human | yam | yam32 | dex | tianji
   episode_instruction:
-    source: dataset_task            # task text from the dataset; or `fixed` + `text`
+    source: dataset_task            # task text from <video>.txt next to each MP4 (an episode
+                                    # without one is excluded: missing_task); or `fixed` + `text`
                                     # (`none` is refused: reward prompts need a task)
   envelope: warn
   # terminal_rationale: false       # true: reward.terminal also returns NVIDIA's rationale

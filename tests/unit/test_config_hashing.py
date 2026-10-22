@@ -83,7 +83,7 @@ BASE = h(base())
         ("input.path", "./sub/"),
         ("input.path", "sub//"),
         ("allow_uncertified", True),
-        ("output", {"sink": "gs://other/q", "formats": ["jsonl", "parquet"]}),
+        ("output", {"sink": "s3://other/q", "formats": ["jsonl", "parquet"]}),
         ("retries", {"max_starts_before_quarantine": 7}),
         ("pipeline.shard_target_gpu_minutes", 33),
         ("observability", {"log_level": "debug", "heartbeat_s": 5, "progress": False}),

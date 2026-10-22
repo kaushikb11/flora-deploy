@@ -1,4 +1,17 @@
-# W3-B cold-start lab: where startup time goes, and how to cut it
+# Cold starts: where startup time goes, and how flora cuts it
+
+This is a maintainer doc. It starts with a lab report from 2026-10-21 (the cold-start lab, run as
+"W3-B", a work-package label used in its raw-result paths), then covers what the deployed pools do
+today: [ending idle](#ending-idle) at a stage's end (the 2 s drain and the caption pre-warm) and
+[warm starts](#warm-start-keyed-compile-caches-for-the-balanced-workers-2026-10-22) from keyed
+compile caches.
+
+What a user sees: the first job after a deploy that changes the image or the engine settings
+starts each `balanced` stage cold (about 5 minutes per container) and publishes a compile cache;
+later jobs and later containers start warm. `flora plan --check-cache` shows which stages have a
+published cache and prices those warm.
+
+## 2026-10-21 lab
 
 Run 2026-10-21 with the ephemeral app `flora-coldstart-lab`
 (`src/flora_deploy/modal_app/coldstart_lab.py`). The helpers are in
@@ -19,7 +32,7 @@ uv run modal run src/flora_deploy/modal_app/coldstart_lab.py::run_engine --conta
 | Volume read throughput | **About 1–2 GB/s for one sequential stream and 3–5 GB/s with 4–16 parallel readers** (US regions, cold). One container in `ap-northeast` got 0.55 GB/s single and 1.0–1.3 GB/s parallel. Beyond 4–8 readers there is no further gain. |
 | Second read | A re-read **in the same container** comes from the page cache (7–28 GB/s), as long as the data fits in container memory. A **new container** gets no speed-up from earlier reads (no cross-container cache was seen). |
 | The 8-min Rewarder load | **Sequential throughput variance does not explain it.** The worst sequential rate measured, 0.55 GB/s, would load 52 GiB in about 100 s. This lab's cold lazy (mmap) load took 35 s. 8 min means about 0.11 GB/s, which looks like slow mmap page-fault reads on a bad host or region. A parallel prefetch into the page cache removes the dependence on the mmap access pattern (weights load in 10 s once prefetched). |
-| Rewarder engine startup on H100 | Cold everything: **341 s** (weights 35 s, compile 66 s, warm-up/profiling 81 + 81 s, CUDA graphs 3 s). With the `flora-cache` compile cache, same container: **95 s**. With the compile cache, a **fresh** container and prefetch: **224 s**. About 95 s of that is a cache that lives on container-local disk, not on `flora-cache` (see below). |
+| Rewarder engine startup on H100 | Cold everything: **341 s** (weights 35 s, compile 66 s, warm-up/profiling 81 + 81 s, CUDA graphs 3 s). With the `flora-cache` compile cache, same container: **95 s**. With the compile cache, a **fresh** container and prefetch: **224 s**. About 95 s of that was a cache that lived on container-local disk, not on `flora-cache` (now cached too; see §2). |
 | Load-format options in vLLM 0.24.0 | `safetensors_load_strategy="prefetch"` exists. It reads the files into the page cache with 8 threads and 16 MiB blocks, starting when weight loading starts (about 45 s into startup). The auto mode never enables it on Modal, because the Volume is `9P`, not NFS or Lustre. With it on, output tokens were identical. `fastsafetensors` / `instanttensor` / `runai_streamer` need extra packages that `img_vllm` doesn't have, so they were not tested. |
 | Avoiding the 109 GB Captioner copy | **Yes.** A writable "link farm" passes `huggingface_hub`'s offline resolution and NVIDIA's unmodified `snapshot()` + `validate_manifest` (full hash, 109.4 GB, 92–145 s). No copy is made and no local disk is used. |
 | NVIDIA's manifest re-hash | It is paid **once per process**. The second `validate_manifest` returns `manifest_verified_reuse` in 0.04–0.07 s with 0 bytes read. The hash is single-threaded SHA-256, so it is CPU-bound at about 1.1–1.2 GB/s (92–103 s with prefetch, 145 s without). |
@@ -85,11 +98,13 @@ Findings:
   - on the **AOT-load** path (`decorators.py:550-557`) it only sets `TORCHINDUCTOR_CACHE_DIR`;
   - so on a cache hit, the Triton kernels launched outside the compiled graph (FLA/GDN prefill and conv kernels, plus their autotune results) are JIT-compiled into the default `~/.triton/cache` on local disk.
   
-  **Fix (not yet measured):** set `TRITON_CACHE_DIR` (and
-  `CUDA_CACHE_PATH`, plus FlashInfer's `XDG_CACHE_HOME`) to Volume paths keyed like the
-  compile cache. Expected saving: about 90 s per fresh container.
+  **Fixed (not yet re-measured):** `rewarder_app.py` sets `TRITON_CACHE_DIR`,
+  `CUDA_CACHE_PATH` and `XDG_CACHE_HOME` under `/cache/rewarder/<key>`, and the balanced
+  workers' keyed cache (`engines/compile_cache.py`) carries the same directories. Expected
+  saving: about 90 s per fresh container.
 - **Weight loading is not the bottleneck when the Volume is healthy** (35 s lazy, 10 s with
-  prefetch). Prefetch is the insurance against the slow-mmap case (WS-H's 8 min).
+  prefetch). Prefetch is the insurance against the slow-mmap case (the 8 min Rewarder load seen in the
+  earlier Rewarder smoke test, `docs/rewarder-smoke.md`).
 - vLLM's own `"prefetch"` strategy is equivalent to `warm.start_prefetch`, but it starts later (at weight
   load, not at t=0) and with 8 threads. Our t=0 prefetch overlaps the 45–55 s of imports and
   config before loading, so the weights are already resident when loading starts.
@@ -102,7 +117,7 @@ Findings:
 /snapshots/captioner/                 real, writable dir  (FLORA_MODEL_CACHE=/snapshots)
   model-0000N-of-00011.safetensors -> /weights/snapshots/nvidia--Flora-Captioner@fef0…/…   (one symlink per payload file)
   .cache/huggingface/…                real copies of the prep metadata (24 small files; locks go here)
-/tmp/flora-offline/hf/hub/models--Qwen--Qwen3.5-9B/snapshots/<sha> -> Volume  (as in WS-D)
+/tmp/flora-offline/hf/hub/models--Qwen--Qwen3.5-9B/snapshots/<sha> -> Volume  (as in the reference worker's offline layout)
 ```
 
 **Why it passes unmodified:**
@@ -167,26 +182,28 @@ Prices: H100 $3.95/h, H200 $4.54/h, CPU $0.0472/core-h, memory $0.008/GiB-h.
 **Rewarder (H100, 8 cores), for `rewarder_app.py` / `images.py` owners:**
 
 1. Mount `flora-cache` at `/cache`. `img_vllm` already sets `VLLM_CACHE_ROOT=/cache`; key the
-   subdirectory by image + model + engine args. Populate it with one warm-up job that mounts
-   the Volume read-write; workers mount it read-only. That read-only mount is untested, so check it
-   once, because vLLM may write on a hit.
-2. Set `TRITON_CACHE_DIR=/cache/<key>/triton` (plus `CUDA_CACHE_PATH`, and `XDG_CACHE_HOME` for
-   FlashInfer) so the ≈ 95 s of container-local JIT/autotune is cached too.
-3. `warm.start_prefetch(<rewarder snapshot>, threads=16)` as the first line of `@modal.enter`, and
-   raise memory from 48 GiB to **≥ 72 GiB** so the 52 GiB stays resident (+$0.19/h). Equivalently,
+   subdirectory by image + model + engine args. The Rewarder commits its cache after the engine
+   is built (`rewarder_app.py`). The balanced workers instead read a read-only mount and publish
+   through `Volume.batch_upload` (see "Warm start" below).
+2. Done: `TRITON_CACHE_DIR=/cache/rewarder/<key>/triton` (plus `CUDA_CACHE_PATH`, and
+   `XDG_CACHE_HOME` for FlashInfer), so the ≈ 95 s of container-local JIT/autotune is cached too.
+3. `warm.start_prefetch(<rewarder snapshot>, threads=16)` as the first line of `@modal.enter`, with
+   memory **≥ 72 GiB** so the 52 GiB stays resident (done: reward pools run at 80 GiB). Equivalently,
    pass `safetensors_load_strategy="prefetch"`, which is I/O only, as an extra `load_llm` kwarg.
 4. Expected: 224 s measured (fresh container, warm compile cache, prefetch, about $0.31 at $4.97/h) →
-   ≈ **130 s** with step 2 (≈ $0.18). Fully cold (no cache) is 341 s (≈ $0.47). WS-H's worst case,
-   929 s, was $1.0+.
+   ≈ **130 s** with step 2 (≈ $0.18). Fully cold (no cache) is 341 s (≈ $0.47). The worst case seen in
+   the Rewarder smoke test, 929 s, was $1.0+.
 5. Keep containers alive across shards (`scaledown_window`). A second engine in the same container
    costs 85–95 s.
 
-**Future vLLM TempSeg / Captioner (`balanced`):** use the Rewarder recipe:
+**`balanced` TempSeg / Captioner:** the Rewarder recipe:
 - compile + Triton caches on `flora-cache`, keyed per model and engine args;
 - t=0 prefetch, with memory ≥ snapshot + 16 GiB (the Captioner BF16 derived weights ≈ 19 GiB; FP32 would need ≥ 120 GiB);
 - no NVIDIA manifest, since vLLM doesn't run NVIDIA's loader. Our prep receipts are the integrity anchor.
 
-Expect ≈ 100–130 s per fresh container. Also consider pinning GPU workers to the Volume's region
+Measured cold (no compile cache): 300 s on L40S and 325 s on H100 (2026-10-22, n=1). With the
+keyed compile cache (below) the planner assumes 150 s and 180 s until a warm start is measured.
+Also consider pinning GPU workers to the Volume's region
 (US): the one `ap-northeast` container read 3× slower. Regional pinning has a price multiplier
 (≥ 1.15×), so weigh it against that.
 
@@ -245,7 +262,8 @@ stays at 300 s. Changing it would also change every config hash, because `jobs/s
 hashed.
 
 **Caption pre-warm.** Caption shards spawn only once their segment dependency is met
-(`orchestrator.deps_ready`, tested in `tests/unit/test_pools.py`). On a small job, that puts
+(`orchestrator.deps_ready`, tested in `tests/unit/test_balanced_deps.py`; the pre-warm in
+`tests/unit/test_pools.py`). On a small job, that puts
 caption's 325 s cold start after segment's, one after the other. Here is how the orchestrator
 handles it:
 1. It estimates when the first caption shard becomes runnable: segment's spawn time, plus its
@@ -293,11 +311,11 @@ the cause. Nothing wrote a cache back, so every later container would also have 
 
 | Step | What happens |
 |---|---|
-| Key | `<engine kind>[-dtbias]-<GPU>-<24 hex>`, the sha256 of: `img_vllm` fingerprint; declared vLLM, torch, Triton and CUDA base versions (pins and the `img_vllm` lock); the engine's compile-relevant kwargs (model path, dtype, `max_model_len`, scheduler limits, `gdn_prefill_backend`, `enforce_eager`, video kwargs, ...); `dtbias_fp32`; the derived weights' content digest; the sha256 of `engines/patches/dt_bias_fp32.py` + `engines/worker_ext.py` (they run inside vLLM's workers); the normalised GPU type. A laptop can compute it (`worker_key`), so `flora plan --check-cache` can ask whether one exists. |
+| Key | `<engine kind>[-dtbias]-<GPU>-<24 hex>`, the sha256 of: `img_vllm` fingerprint; declared vLLM, torch, Triton and CUDA base versions (pins and the `img_vllm` lock); the engine's compile-relevant kwargs (model path, dtype, `max_model_len`, scheduler limits, `gdn_prefill_backend`, `enforce_eager`, video kwargs, ...); `dtbias_fp32`; the derived weights' content digest; the sha256 of `engines/patches/dt_bias_fp32.py` + `engines/worker_ext.py` (they run inside vLLM's workers); the normalised GPU type. A laptop can compute it (`worker_key`), so `flora plan --check-cache` can ask whether one exists. A change to the scheduler limits in `GPU_LIMITS` (for example the Captioner's `max_num_seqs`) is a new key, so the next container starts cold. The batch policy (`engines/batch_policy.py`: episodes per batcher) is not in the key; it changes the config and certificate keys (it is in the `vllm-video` logic digest), not the compile cache. |
 | Load (every container) | `seed`: read `balanced-cc/<key>/MANIFEST.json` from the **read-only** mount. Check the schema, key digest, all key factors and the container's own runtime versions (vLLM, torch, Triton, `torch.version.cuda`). Then copy every listed file to `/tmp/flora-cache/balanced/<key>` while hashing it, into a staging dir that is renamed into place only if every size and sha256 matched. On any failure the local dir is emptied, the reason is logged, and the engine compiles cold. |
 | Legacy | With no keyed cache, the lab's unkeyed `balanced/<kind>[-dtbias]` tree is copied, but only on the GPU it was compiled on (`LEGACY_LAB_GPUS`: TempSeg L40S, Captioner H100). It is never counted as verified, so that container then publishes a keyed cache. |
 | Cold retry | `build_engine`: if the engine build fails on a loaded (`warm` / `legacy`) cache for a reason other than the spec itself, the cache is emptied and the engine is built once more, cold. `EngineArgsError`, `EngineVerifyError` and `DtBiasActivationError` are not retried, because a cold build fails the same way. |
-| Publish (one container per key) | After a shard whose engine ran requests and is alive (`after_shard` → `WorkerCache.maybe_publish`), a container that did not load a verified cache takes a lease: a `modal.Dict` `put(skip_if_exists=True)` on `<key>/<generation>`, TTL 30 min. An expired lease lets exactly one successor take generation + 1. The container then uploads its tree to a fresh `balanced-cc/<key>/<publish id>/` through `Volume.batch_upload`, so the mount stays read-only (M7). It re-checks the lease and only then writes `MANIFEST.json`, one file and atomic on a v2 Volume, as the commit. A partial or orphaned tree is never read, because no manifest names it. Lock and temp files and symlinks are not published. At most one attempt per container. `FLORA_COMPILE_CACHE_PUBLISH=0` turns publishing off. |
+| Publish (one container per key) | After a shard whose engine ran requests and is alive (`after_shard` → `WorkerCache.maybe_publish`), a container that did not load a verified cache takes a lease: a `modal.Dict` `put(skip_if_exists=True)` on `<key>/<generation>`, TTL 30 min. An expired lease lets exactly one successor take generation + 1. The container then uploads its tree to a fresh `balanced-cc/<key>/<publish id>/` through `Volume.batch_upload`, so the mount stays read-only (a review finding: workers must never write the shared mount). It re-checks the lease and only then writes `MANIFEST.json`, one file and atomic on a v2 Volume, as the commit. A partial or orphaned tree is never read, because no manifest names it. Lock and temp files and symlinks are not published. At most one attempt per container. `FLORA_COMPILE_CACHE_PUBLISH=0` turns publishing off. |
 
 A marker file on the Volume would not work as the lease. Each container sees its own view of a
 v2 Volume until it commits, so `O_EXCL` there is not exclusive across containers. `FileLeases`
@@ -330,7 +348,8 @@ is ours and not passed to vLLM. vLLM 0.24.0 source:
   scheduler limits from `GPU_LIMITS`, and the same `VLLM_*` env (the plugin's `VLLM_PLUGINS`
   only in the `-dtbias` caches).
 
-`tests/unit/test_compile_cache.py::test_lab_gate_a_engine_has_the_worker_key` pins this: the
+`tests/unit/test_compile_cache.py::test_lab_gate_a_engine_has_the_worker_key` pins this (Gate A
+is the lab's `dt_bias` FP32 drift check, `docs/balanced-engines.md`): the
 lab's spec and the worker's spec derive the same flora key. Today's lab caches (tempseg L40S,
 captioner H100, tempseg-dtbias; captioner-dtbias is partial) are therefore used by the next
 segment and caption containers through the legacy path. The first of each then publishes the
@@ -338,7 +357,8 @@ keyed cache.
 
 ### Pricing warm starts (`planner/rates.json`)
 
-Startup rows carry `compile_cache: cold | warm`, which extends Lab-fix's flag. Two new `balanced`
+Startup rows carry `compile_cache: cold | warm`, which extends the earlier cold-startup flag on
+the lab's rows. Two new `balanced`
 rows, `segment` 150 s and `caption` 180 s (±60%), are `warm` **placeholders** until a warm
 start is measured. `RateTable.startup_for(..., warm=False)`, the default and what `jobs.budget`
 charges, never returns a warm row. `warm=True` prefers one:
@@ -410,15 +430,16 @@ and `experimental_options={"enable_gpu_snapshot": True}` (both accepted by the p
 5. *CUDA graphs and allocator state* are restored at the same virtual addresses. That is fine
    in principle, but it is exactly what the canary has to prove.
 6. *Determinism.* A restored engine is the snapshotting process's engine, so outputs match it.
-   Gate C certifies the engine spec, so a canary mismatch must fail the container closed.
+   Certification (`docs/certification.md`) covers the engine spec, so a canary mismatch must
+   fail the container closed.
 
 **A $0.50 experiment.** Use an ephemeral app with TempSeg on an L40S
-(≈ $2.5/h with 8 cores and 48 GiB):
+(≈ $2.71/h with 8 cores and 48 GiB):
 
-1. One snapshotting container: about 5 min cold build, a sleep, then the snapshot, ≈ $0.21.
+1. One snapshotting container: about 5 min cold build, a sleep, then the snapshot, ≈ $0.23.
 2. Three restores, each with wake-up, the GDN dtype RPC and 2 greedy golden requests, about
    1 min each, ≈ $0.13.
 3. Compare the token ids with a non-snapshot engine's tokens from the same lab call (reuse the
-   balanced lab's recorded Gate A requests), and measure restore → first token.
+   balanced lab's recorded drift-check requests), and measure restore → first token.
 
 Stop at the first restore that fails or mismatches. Total ≈ $0.35–0.50.

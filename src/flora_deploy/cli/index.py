@@ -36,6 +36,11 @@ def default_index_summary(config: Path) -> Path:
 
 def store_for_sink(sink: str) -> str:
     """``output.sink`` -> a job-store URI (``volume://`` -> ``modal-volume://``)."""
+    from flora_deploy.config.schema import unsupported_sink_message
+
+    why = unsupported_sink_message(sink)
+    if why:
+        raise ValueError(f"sink {sink!r}: {why}")
     if sink.startswith("volume://"):
         return "modal-volume://" + sink[len("volume://"):]
     if sink.startswith(("file://", "s3://", "modal-volume://")):
@@ -81,7 +86,8 @@ def index(
     limit: Annotated[int | None, typer.Option(help="Index only the first N episodes.")] = None,
     decode: Annotated[bool | None, typer.Option(
         "--decode/--no-decode",
-        help="Decode-mode index of oracle-eligible cameras (default: on for preset exact).")
+        help="Decode-check the cameras that can be certified against NVIDIA's reference "
+             "(default: on for preset exact).")
     ] = None,
     max_episodes: Annotated[int, typer.Option(
         "--max-episodes-per-unit", help="Episodes per work unit (a source file is never "
@@ -94,7 +100,7 @@ def index(
         help="Also write the summary here (default: summary.json next to the config, where "
              "`flora plan` reads it).", show_default=False)] = None,
 ) -> None:
-    """Index a dataset: per-episode receipts (probe-equivalent, envelope, eligibility).
+    """Index a dataset: per-episode receipts (video probe, envelope, eligibility).
 
     Runs on Modal CPU containers (no GPU; 1 core and 2 GiB each, about $0.06 per
     container-hour at list prices), so it costs a few cents for most datasets. --local runs

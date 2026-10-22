@@ -229,6 +229,38 @@ def test_sink_needs_a_target(sink):
         parse_config(with_(base(), "output.sink", sink))
 
 
+@pytest.mark.parametrize("sink", ["gs://bucket/labels", "r2://bucket/labels", "GS://b"])
+def test_gs_and_r2_sinks_are_refused_with_the_way_out(sink):
+    """The client commands cannot read gs:// or r2:// stores: refuse them up front, and say
+    how to reach R2 / GCS instead (s3:// with AWS_ENDPOINT_URL)."""
+    with pytest.raises(ConfigError, match="sink") as e:
+        parse_config(with_(base(), "output.sink", sink))
+    msg = str(e.value)
+    assert "not supported" in msg and "s3://" in msg and "AWS_ENDPOINT_URL" in msg
+
+
+@pytest.mark.parametrize("uri", ["gs://bucket/labels", "r2://bucket"])
+def test_refused_sink_schemes_fail_the_same_way_everywhere(uri, tmp_path):
+    from typer.testing import CliRunner
+
+    from flora_deploy.cli import app
+    from flora_deploy.cli.index import store_for_sink
+    from flora_deploy.config.schema import unsupported_sink_message
+    from flora_deploy.export.results import store_from_uri
+
+    why = unsupported_sink_message(uri)
+    assert why and "AWS_ENDPOINT_URL" in why
+    for fn in (store_from_uri, store_for_sink):
+        with pytest.raises(ValueError, match="not supported"):
+            fn(uri)
+    r = CliRunner().invoke(app, ["deploy", "-c", str(tmp_path / "flora.yaml"), "--store", uri,
+                                 "--dry-run"], env={"COLUMNS": "400"})
+    assert r.exit_code == 2 and "not supported" in r.output
+    r = CliRunner().invoke(app, ["status", "j", "--store", uri], env={"COLUMNS": "400"})
+    assert r.exit_code != 0 and "not supported" in r.output
+    assert unsupported_sink_message("s3://bucket/labels") is None
+
+
 @pytest.mark.parametrize("repo", ["not a repo id!!", "noslash", "a/b/c", "/x", "org/"])
 def test_repo_must_be_a_repo_id(repo):
     with pytest.raises(ConfigError, match="repo"):

@@ -38,8 +38,9 @@ RUBRIC = """  rubric:
 def rubric_config(d: Path) -> Path:
     text = TEMPLATE.read_text().replace(
         "stages: [segment, caption, reward.terminal, reward.dense]", "stages: [reward.rubric]")
-    text = text.replace("  shard_target_gpu_minutes: 0.5     # small shards, so the demo has "
-                        "several of each kind\n",
+    text = text.replace("  shard_target_gpu_minutes: 0.5     # GPU-minutes per shard (default "
+                        "10); small shards, so the\n"
+                        "                                    # demo has several of each kind\n",
                         "  shard_target_gpu_minutes: 0.5\n" + RUBRIC)
     text = text.split("resources:")[0] + "resources:\n  reward.rubric: {max_containers: 1}\n\n" \
         + "output:" + text.split("output:")[1]

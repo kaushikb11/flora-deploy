@@ -530,12 +530,40 @@ def test_simulated_schedule_pipelines_and_respects_pool_sizes():
     assert seg.peak == 2 and cap.peak == 3
     assert seg.busy_s == pytest.approx(sc.VIDEO_S * 0.367, rel=1e-6)
     assert cap.busy_s == pytest.approx(sc.VIDEO_S * 0.906, rel=1e-6)
-    # captions start one caption cold start after the first segment receipt, and overlap
-    assert sim["pipelining"]["first_caption_after_first_segment_s"] == pytest.approx(325.0)
+    # the pre-warmed caption container is ready at the first segment receipt, and they overlap
+    assert sim["pipelining"]["first_caption_after_first_segment_s"] == pytest.approx(0.0)
     assert sim["pipelining"]["overlap_s"] > 0
     assert sim["wall_s"] > seg.last_end
     one = sc.simulate({"segment": 1, "caption": 1}, r)
     assert one["wall_s"] > sim["wall_s"]
+    # without the pre-warm, captions start one caption cold start after that receipt
+    cold = sc.simulate({"segment": 2, "caption": 3}, r, prewarm=False)
+    assert cold["pipelining"]["first_caption_after_first_segment_s"] == pytest.approx(325.0)
+    assert cold["wall_s"] >= sim["wall_s"]
+
+
+def test_simulated_tails_are_the_drained_tail():
+    """Once its pool's last shard ends, a container idles at most the planner's drained tail
+    (one poll + 2 s), not the deployed 300 s window (which still applies to a container that
+    goes idle while its pool has work)."""
+    from flora_deploy.jobs.settings import WORKER_SCALEDOWN_S
+    from flora_deploy.planner.options import POOL_END_TAIL_S
+
+    r = sc.kind_rates("real", warm=False)
+    sim = sc.simulate({"segment": 2, "caption": 3}, r)
+    for kind, p in sim["pools"].items():
+        assert 0 < p.tail_s < p.starts * WORKER_SCALEDOWN_S, kind
+        assert p.tail_s <= (p.starts - 1) * WORKER_SCALEDOWN_S + POOL_END_TAIL_S + 1e-6, kind
+    seg = sim["pools"]["segment"]
+    assert seg.tail_s == pytest.approx(seg.starts * POOL_END_TAIL_S)  # its shards end together
+
+
+def test_prewarm_is_charged_from_its_spawn():
+    r = sc.kind_rates("real", warm=False)
+    warm = sc.simulate({"segment": 1, "caption": 1}, r)["pools"]["caption"]
+    cold = sc.simulate({"segment": 1, "caption": 1}, r, prewarm=False)["pools"]["caption"]
+    assert warm.startup_s == pytest.approx(cold.startup_s)  # the same one cold start
+    assert warm.busy_s == pytest.approx(cold.busy_s)
 
 
 def test_pool_sizing_recommends_two_segment_three_caption():

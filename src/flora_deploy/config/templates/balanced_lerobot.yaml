@@ -1,5 +1,6 @@
 # flora.yaml: label a LeRobot dataset with the `balanced` preset (vLLM engines; the default).
-# Every key is documented below. Unknown keys are an error.
+# The common keys are documented below; the full list is in src/flora_deploy/config/schema.py.
+# Unknown keys are an error.
 
 project: my-lerobot-labels          # names the job and its Modal tags
 
@@ -9,13 +10,17 @@ license_ack: research-only
 modal:
   environment: main                 # Modal Environment to deploy into
   max_gpus: 4                       # workspace GPU cap; all pools together stay under it
-  budget_usd: 25                    # hard spend cap (a Modal Environment budget backs it up)
+  budget_usd: 25                    # hard spend cap; also set a Modal Environment budget as a
+                                    # backstop (`flora doctor` prints the amount)
   region: null                      # null = any region (pinning costs >= 1.15x)
   tags: {}                          # extra key/value tags on every Modal object
 
 # balanced: vLLM engines on stage-separated pools: TempSeg on an L40S, the Captioner on an
-# H100!, the Rewarder on an H100!. Workers scale from zero, so you pay only while a job runs.
-# A stage runs as certified when an accuracy certificate covers it for your embodiment and GPU.
+# H100!, the Rewarder on an H100! (`H100!` means exactly an H100: Modal never upgrades it to a
+# pricier GPU). Workers scale from zero, so you pay only while a job runs; a stage's containers
+# stop about 2 s after it runs out of work.
+# A stage runs as certified when an accuracy certificate covers it for your embodiment and GPU
+# (rewards are NVIDIA's own engine and need none).
 # Any stage without one needs `allow_uncertified: true` (its records say certified: false).
 # `flora doctor` shows each stage's status; once every stage is certified, remove the line.
 # exact: NVIDIA's own HF pipeline on an H200, the certification reference
@@ -48,12 +53,15 @@ input:
   stage_to: null
 
 pipeline:
-  # segment, caption, reward.terminal, reward.dense, reward.rubric
+  # segment, caption, reward.terminal, reward.dense, reward.rubric (rubric needs
+  # `pipeline.rubric`: robot, cameras, steps; its pool is 2 x H100!, which counts 2 toward max_gpus)
   # (caption needs segment; each stage runs on its own pool)
   stages: [segment, caption, reward.terminal, reward.dense]
-  embodiment: human                 # human | yam | yam32 | dex | tianji
+  embodiment: human                 # human | yam | yam32 (exactly 3 camera views) | dex | tianji
   episode_instruction:
-    source: dataset_task            # dataset_task | fixed (then set `text`) | none
+    source: dataset_task            # dataset_task | fixed (then set `text`) | none; with
+                                    # dataset_task an episode with an empty task is excluded
+                                    # (missing_task)
                                     # (none is refused with reward stages: they need a task)
   envelope: warn                    # warn | enforce | ignore: episodes outside NVIDIA's tested conditions
   # `determinism` applies to the exact preset's segcap worker only; leave it unset here.
@@ -61,9 +69,9 @@ pipeline:
                                     # in the reward.terminal stage hash
 
 # Per shard kind overrides of the preset's pools: gpu, gpu_count, max_containers, max_inputs,
-# cpu (physical cores), memory (GiB). balanced runs one pool per stage: `segment` (TempSeg,
-# >= 44 GiB GPU: L40S or larger), `caption` (Captioner, an 80 GB GPU: H100!, H100, A100-80GB,
-# H200, B200) and one per reward stage (an 80 GB GPU). These are not in the config hash: they
+# cpu (physical cores), memory (GiB). balanced runs one pool per stage: `segment` (TempSeg:
+# L40S, A100-80GB, H100 or H200), `caption` (Captioner: H100!, H100 or H200) and one per reward
+# stage (an 80 GB GPU). These are not in the config hash: they
 # never change the model inputs, but a different GPU type runs different kernels, so outputs
 # are input-identical, not bit-identical, across GPU types (recorded in provenance.gpu).
 resources:
@@ -73,7 +81,8 @@ resources:
   reward.dense: {gpu: H100!, max_containers: 1}
 
 output:
-  sink: volume://flora-results/my-lerobot-labels   # volume:// (`flora deploy` creates it), s3:// r2:// gs:// file://
+  # volume:// (`flora deploy` creates it) or s3://; file:// for `flora run --local` only
+  sink: volume://flora-results/my-lerobot-labels
   formats: [parquet, jsonl]
 
 retries:

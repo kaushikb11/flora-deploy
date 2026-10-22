@@ -137,7 +137,7 @@ def deploy(
     config: Annotated[Path, typer.Option("--config", "-c", help="flora.yaml")] = Path("flora.yaml"),
     store: Annotated[str | None, typer.Option(
         "--store", envvar="FLORA_STORE",
-        help="Job store seen by containers: modal-volume://name\\[/path] or s3|r2|gs://bucket"
+        help="Job store seen by containers: modal-volume://name\\[/path] or s3://bucket"
              "\\[/prefix] (default: output.sink).")] = None,
     bucket_secret: Annotated[str, typer.Option(
         help="Modal Secret holding the bucket credentials.")] = "flora-bucket",
@@ -161,16 +161,18 @@ def deploy(
         "--dry-run", help="Print the plan; do not contact Modal.")] = False,
     as_json: Annotated[bool, typer.Option("--json", help="Print the plan as JSON.")] = False,
     fake_models: Annotated[bool, typer.Option(
-        "--fake-models", help="Rehearsal app: fake engines on CPU workers (no GPU, no weights; "
+        "--fake-models", help="Test app: fake engines on CPU workers (no GPU, no weights; "
                               "hashed apart from real outputs).")] = False,
 ) -> None:
     """Deploy the config's Modal app (one app per config; workers scale from zero)."""
     from flora_deploy.config.hashing import MissingReceiptError
     from flora_deploy.config.receipts import load_certified
     from flora_deploy.config.receipts import resolve as resolve_receipts
-    from flora_deploy.config.schema import ConfigError
+    from flora_deploy.config.schema import ConfigError, unsupported_sink_message
     from flora_deploy.modal_app.factory import DeployError, deployment_record, materialize, plan_app
 
+    if store is not None and (why := unsupported_sink_message(store)):
+        raise _fail(f"store {store!r}: {why}")
     overrides = _receipts(receipt)
     try:
         cfg, content = load_certified(config, allow_uncertified=allow_uncertified,

@@ -1,11 +1,13 @@
 # Certificate freeze: what a certificate pins, and how to change it
 
-For contributors. Once a Gate certificate for a stack is committed under
+For contributors. Once an accuracy certificate for a stack is committed under
 `src/flora_deploy/config/certificates/`, the code it covers is **frozen**. Changing that code
 does not break anything you can see. The certificate just stops matching, and users of that
-stack see "uncertified" (`flora plan`, `flora deploy`, records with `certified: false`). This
-page says what is frozen, how to tell whether your change touches it, and what to do when it
-does. How certificates are computed and matched is in [`certification.md`](certification.md).
+stack see the stage as `not certified` (and the option as `partly certified` or `uncertified`)
+in `flora plan` and `flora deploy`, with `certified: false` in its records. This page says what
+is frozen, how to tell whether your change touches it, and what to do when it does. How
+certificates are computed and matched, and what partial certification looks like to users, is
+in [`certification.md`](certification.md).
 
 ## What is frozen
 
@@ -29,12 +31,16 @@ Matching also refuses a certificate that no longer meets `certkey.POLICY` (thres
 file whose `id` is not its content address. The guard checks all of these.
 
 `exact` is the reference by construction and needs no certificate, so nothing of it is frozen.
-Rewards (`reward.*`) under `balanced` run NVIDIA's own vLLM recipe, but they still need their
-own certificate to unlock, and are frozen the same way once one exists.
+Rewards (`reward.*`) under `balanced` run exactly `exact`'s engine, image, pins, modes and
+logic, so they are the reference by identity (`certkey.reference_identical`) and need no
+certificate. Nothing of them is frozen. A change that makes a reward key diverge from `exact`'s
+turns them into an uncertified stack that needs its own certificate (see
+[`certification.md`](certification.md#reference-by-identity)).
 
 ## How to tell whether a change affects a certificate
 
-- **CI tells you.** The first gate of the `test` job, `Gate: certificate drift`, recomputes the
+- **CI tells you.** The first gate after install in the `test` job, `Gate: certificate drift
+  (committed certificates still match the code)`, recomputes the
   key of every committed certificate (`tests/unit/test_certificate_drift.py`,
   `validate/certfreeze.py`). A drifted `certified` certificate fails the PR with a diff of the
   key documents: which modules changed, which engine kwargs, pins or derived digests changed,
@@ -57,8 +63,12 @@ What the guard reports, per certificate:
 |---|---|
 | `certified` | **error**: the PR fails |
 | `provisional` | warning: it unlocks nothing, so it does not block |
-| `fail` (a newer `fail` revokes the key) | not checked |
-| superseded (a newer certificate decides the same key and pool) | not checked |
+| `fail` (a newer `fail` revokes the key) | not checked (an `info` line) |
+| superseded (a newer certificate decides the same key and pool) | not checked (an `info` line) |
+
+Other findings: a certificate committed without its freeze lock is a `no_lock` warning, a lock
+without a certificate an `orphan_lock` warning, a file not named after its id a warning, and a
+certificate file that is not valid JSON or not a valid certificate an error.
 
 The deciding certificate is the one `certkey.matching` uses: per (preset, kind, GPU, key,
 embodiment pool) the newest `generated_at`, and on a tie `fail` beats `provisional` beats
@@ -76,9 +86,14 @@ lists the kind's modules touched since the certificate was committed. Matching n
 lock. It is for diagnosis only.
 
 `flora certify` writes the lock next to every certificate it writes.
-`scripts/wave_h_finalize.py --write` copies only the certificates, so run
-`scripts/cert_freeze.py --lock` after it. `--lock` writes a missing lock when this tree still
-computes the certificate's key, and removes locks whose certificate is gone.
+`scripts/wave_h_finalize.py --write` writes the locks too, for every certificate it writes (and
+any committed one whose lock is missing). If this tree can no longer compute a certificate's key
+it writes nothing (exit 1). When it replaces a certificate it wrote earlier for the same preset,
+stage, kind, GPU, pools and key, it removes the old one and its lock; it never removes one for an
+*old* key, so the manual delete below is still needed after a re-certification.
+`scripts/cert_freeze.py --lock` is only needed for certificates copied in by hand: it writes a
+missing lock when this tree still computes the certificate's key, and removes locks whose
+certificate is gone.
 
 ## When your change affects a certificate: revert or re-certify
 
@@ -88,8 +103,8 @@ The drift report ends with the choice:
    changed code on the path, a pin bump that can wait. Often the change can be moved out of
    the kind's modules, or made a comment-only edit.
 2. **Re-certify**, if it was meant to (a fix, a new engine setting, new weights). Re-certifying
-   costs GPU time: the oracle, the noise run and `balanced` on the human episodes. Maintainers
-   decide the spend (`docs/wave-h-runbook.md`).
+   costs GPU time: the oracle (the `exact` reference run), the noise run and `balanced` on the
+   human episodes. Maintainers decide the spend (`docs/wave-h-runbook.md`).
 
 ### Re-certification workflow
 
@@ -103,7 +118,7 @@ uv run python scripts/wave_h.py --plan certified
 # 2. certify (one certificate per stage; or scripts/wave_h_finalize.py --write, which runs
 #    flora certify for every balanced job)
 flora certify -c flora.yaml --exact oracle/segment.jsonl --balanced bal/segment.jsonl \
-  --noise noise/segment.jsonl --l0 reports/balanced-lab/tempseg.json \
+  --noise noise/segment.jsonl --l0 reports/wave-h/balanced-tempseg.json \
   --derived-content tempseg_merged=<sha256>
 
 # 3. locks, then the check must pass
@@ -130,293 +145,22 @@ Edge cases:
 
 ## Current freeze listing
 
-`uv run python scripts/cert_freeze.py` on this tree (2026-10-22, `main` + this change). For
-each (preset, kind, GPU): the key with the default template's modes and the pinned derived
-digests, every part of the key with its hash, the modules of the logic digest with the sha256
-of their normalized source, and the certificate that covers it. **No certificate is committed
-yet, so nothing is frozen.** The first `balanced` certificates from the certified run will
-freeze the `segment` / `caption` rows (and the reward rows, if certified). Hashes change with
-every merge on these paths until then. Re-run the script for the current values.
+Run `uv run python scripts/cert_freeze.py` for the current listing. For each (preset, kind, GPU)
+it prints the key with the default template's modes and the pinned derived digests, every part
+of the key with its hash, the modules of the logic digest with the sha256 of their normalized
+source, and the certificate that covers it. The hashes change with every merge on these paths,
+so they are not copied here.
 
-<details>
-<summary>Full listing</summary>
+**No certificate is committed yet, so nothing is frozen.** What the listing covers:
 
-```text
-# Certificate freeze listing (scripts/cert_freeze.py)
-
-`exact` is the reference by construction: nothing of it is frozen.
-
-## balanced / segment / L40S (default pool)
-
-- key (`engine_spec_hash`, default modes, pinned derived digests): `6a8914be2ad6d39a`
-- engine: `vllm-offline` {'vllm': '0.24.0'}, image `img_vllm` fingerprint `4df6c7826a52`, patches [], engine_args `69000031fceb`, sampling `44136fa355b3`, mm_kwargs `44136fa355b3`
-- vllm_engine: `vllm-0.24.0-offline` (dtbias_fp32=False), max_num_seqs=32, max_num_batched_tokens=16384, gpu_memory_utilization=0.9, engine_kwargs `cbf7a2a5023c`
-- nvidia_pins: `tempseg`@114a1076f70e (`a658b05c0b79`), `tempseg_base`@c20223623576 (`03d525461ebc`), `tempseg_code`@78a0e4ac75d3 (`05df4cce31a5`)
-- decode: av 16.0.1, pillow 12.3.0, numpy 2.3.5, arch x86_64
-- derived_weights: `tempseg_merged` `6356ab8c1499`
-- modes: {}
-- logic: `0.0.1`, cert logic digest `92d64eb036f679dc` over 60 modules:
-  - `accel/__init__.py` `676cbb99d188`
-  - `accel/captioner_load.py` `99bda878938f`
-  - `accel/determinism.py` `eb361614c047`
-  - `accel/framecache.py` `0ebdc4c2209e`
-  - `accel/geometry.py` `76f03e3993a1`
-  - `accel/gpu_thread.py` `f6862177f058`
-  - `accel/patches.py` `d412a607ead0`
-  - `accel/pngmem.py` `ca433c7acf1e`
-  - `accel/registry.py` `be0ffb6fb0e3`
-  - `accel/state.py` `4dc66ac0a02f`
-  - `accel/transport.py` `9a4a8459850d`
-  - `config/schema.py` `be1e93e2d01e`
-  - `engines/__init__.py` `e3b0c44298fc`
-  - `engines/base.py` `de5c025e8099`
-  - `engines/microbatch.py` `f6eb1697248a`
-  - `engines/offline_llm.py` `2afb1db81245`
-  - `engines/patches/__init__.py` `e3b0c44298fc`
-  - `engines/patches/dt_bias_fp32.py` `d2f7acd405e8`
-  - `engines/worker_ext.py` `ba5bbfe538cf`
-  - `jobs/indexing.py` `82fc1ced0547`
-  - `jobs/planning.py` `92a62110f8ac`
-  - `jobs/settings.py` `caaadcd39505`
-  - `jobs/types.py` `9891533d7e60`
-  - `media/__init__.py` `e3b0c44298fc`
-  - `media/avsafe.py` `bec4f276de2b`
-  - `media/cuts.py` `c73666ca2d09`
-  - `media/index.py` `d9becae9d2b3`
-  - `media/rangedecode.py` `d0133ce5903c`
-  - `media/safepath.py` `b8f47d754db0`
-  - `media/sources/__init__.py` `30b16c9dec00`
-  - `media/sources/base.py` `2a5e5f266091`
-  - `media/sources/lerobot_v21.py` `20726442a33a`
-  - `media/sources/lerobot_v3.py` `659c5fea74cf`
-  - `media/sources/mp4_dir.py` `b4b7f9813a1a`
-  - `media/types.py` `29f1608ac67f`
-  - `modal_app/balanced_app.py` `dbb18ed30bba`
-  - `modal_app/factory.py` `52e5826554fd`
-  - `nv/__init__.py` `52bb0565cbb7`
-  - `nv/budget.py` `330b1aef80c1`
-  - `nv/capture.py` `ea3cffdd9cf9`
-  - `nv/errors.py` `efc4f2053481`
-  - `nv/linker.py` `ee6c24e1469f`
-  - `nv/segment_glue.py` `518bdabee919`
-  - `nv/session.py` `49fadc7f1f5d`
-  - `observe/events.py` `59e290f57a71`
-  - `observe/locks.py` `7ddfe2335626`
-  - `observe/stdout.py` `184573a500c3`
-  - `observe/timers.py` `2f4463f8f91b`
-  - `prep/convert_captioner.py` `d9e0e97eacff`
-  - `records.py` `1fa4bc7179ac`
-  - `stages/__init__.py` `e3b0c44298fc`
-  - `stages/caption.py` `276c7156d311`
-  - `stages/reference.py` `5dfeedf19524`
-  - `stages/segment.py` `b723e411ed8d`
-  - `workers_impl/balanced.py` `73c640315191`
-  - `workers_impl/caption.py` `bae68943032a`
-  - `workers_impl/certstamp.py` `56ff03102855`
-  - `workers_impl/reward.py` `1ed7c890d26d`
-  - `workers_impl/segcap.py` `67d9cf6a4a7e`
-  - `workers_impl/segment.py` `9100d4c1b579`
-- covered by: **no certificate** (uncertified; nothing frozen yet)
-
-## balanced / caption / H100! (default pool)
-
-- key (`engine_spec_hash`, default modes, pinned derived digests): `65afdf765ae199bf`
-- engine: `vllm-offline` {'vllm': '0.24.0'}, image `img_vllm` fingerprint `4df6c7826a52`, patches [], engine_args `69000031fceb`, sampling `44136fa355b3`, mm_kwargs `44136fa355b3`
-- vllm_engine: `vllm-0.24.0-offline` (dtbias_fp32=False), max_num_seqs=16, max_num_batched_tokens=16384, gpu_memory_utilization=0.9, engine_kwargs `34e22299ab81`
-- nvidia_pins: `captioner`@fef0bbfe1182 (`3841e5e831e0`), `captioner_code`@f736ca36925a (`9a8050017924`)
-- decode: av 16.0.1, pillow 12.3.0, numpy 2.3.5, arch x86_64
-- derived_weights: `captioner_bf16` `d4c1bea5dbd3`
-- modes: {}
-- logic: `0.0.1`, cert logic digest `92d64eb036f679dc` over 60 modules:
-  - `accel/__init__.py` `676cbb99d188`
-  - `accel/captioner_load.py` `99bda878938f`
-  - `accel/determinism.py` `eb361614c047`
-  - `accel/framecache.py` `0ebdc4c2209e`
-  - `accel/geometry.py` `76f03e3993a1`
-  - `accel/gpu_thread.py` `f6862177f058`
-  - `accel/patches.py` `d412a607ead0`
-  - `accel/pngmem.py` `ca433c7acf1e`
-  - `accel/registry.py` `be0ffb6fb0e3`
-  - `accel/state.py` `4dc66ac0a02f`
-  - `accel/transport.py` `9a4a8459850d`
-  - `config/schema.py` `be1e93e2d01e`
-  - `engines/__init__.py` `e3b0c44298fc`
-  - `engines/base.py` `de5c025e8099`
-  - `engines/microbatch.py` `f6eb1697248a`
-  - `engines/offline_llm.py` `2afb1db81245`
-  - `engines/patches/__init__.py` `e3b0c44298fc`
-  - `engines/patches/dt_bias_fp32.py` `d2f7acd405e8`
-  - `engines/worker_ext.py` `ba5bbfe538cf`
-  - `jobs/indexing.py` `82fc1ced0547`
-  - `jobs/planning.py` `92a62110f8ac`
-  - `jobs/settings.py` `caaadcd39505`
-  - `jobs/types.py` `9891533d7e60`
-  - `media/__init__.py` `e3b0c44298fc`
-  - `media/avsafe.py` `bec4f276de2b`
-  - `media/cuts.py` `c73666ca2d09`
-  - `media/index.py` `d9becae9d2b3`
-  - `media/rangedecode.py` `d0133ce5903c`
-  - `media/safepath.py` `b8f47d754db0`
-  - `media/sources/__init__.py` `30b16c9dec00`
-  - `media/sources/base.py` `2a5e5f266091`
-  - `media/sources/lerobot_v21.py` `20726442a33a`
-  - `media/sources/lerobot_v3.py` `659c5fea74cf`
-  - `media/sources/mp4_dir.py` `b4b7f9813a1a`
-  - `media/types.py` `29f1608ac67f`
-  - `modal_app/balanced_app.py` `dbb18ed30bba`
-  - `modal_app/factory.py` `52e5826554fd`
-  - `nv/__init__.py` `52bb0565cbb7`
-  - `nv/budget.py` `330b1aef80c1`
-  - `nv/capture.py` `ea3cffdd9cf9`
-  - `nv/errors.py` `efc4f2053481`
-  - `nv/linker.py` `ee6c24e1469f`
-  - `nv/segment_glue.py` `518bdabee919`
-  - `nv/session.py` `49fadc7f1f5d`
-  - `observe/events.py` `59e290f57a71`
-  - `observe/locks.py` `7ddfe2335626`
-  - `observe/stdout.py` `184573a500c3`
-  - `observe/timers.py` `2f4463f8f91b`
-  - `prep/convert_captioner.py` `d9e0e97eacff`
-  - `records.py` `1fa4bc7179ac`
-  - `stages/__init__.py` `e3b0c44298fc`
-  - `stages/caption.py` `276c7156d311`
-  - `stages/reference.py` `5dfeedf19524`
-  - `stages/segment.py` `b723e411ed8d`
-  - `workers_impl/balanced.py` `73c640315191`
-  - `workers_impl/caption.py` `bae68943032a`
-  - `workers_impl/certstamp.py` `56ff03102855`
-  - `workers_impl/reward.py` `1ed7c890d26d`
-  - `workers_impl/segcap.py` `67d9cf6a4a7e`
-  - `workers_impl/segment.py` `9100d4c1b579`
-- covered by: **no certificate** (uncertified; nothing frozen yet)
-
-## balanced / reward.terminal / H100! (default pool)
-
-- key (`engine_spec_hash`, default modes, pinned derived digests): `24154dd56379f1e5`
-- engine: `nvidia-vllm-offline` {'vllm': '0.24.0'}, image `img_vllm` fingerprint `4df6c7826a52`, patches [], engine_args `44136fa355b3`, sampling `44136fa355b3`, mm_kwargs `44136fa355b3`
-- vllm_engine: none (not a balanced vLLM video kind)
-- nvidia_pins: `rewarder`@7de68d22c4a9 (`0c6136d2830a`)
-- decode: av 16.0.1, pillow 12.3.0, numpy 2.3.5, arch x86_64
-- derived_weights: none
-- modes: {"terminal_mode": "terminal"}
-- logic: `0.0.1`, cert logic digest `f7f55ffb66f4f93f` over 30 modules:
-  - `config/schema.py` `be1e93e2d01e`
-  - `jobs/indexing.py` `82fc1ced0547`
-  - `jobs/manifest.py` `1b2cd8b89ad6`
-  - `jobs/planning.py` `92a62110f8ac`
-  - `jobs/settings.py` `caaadcd39505`
-  - `jobs/types.py` `9891533d7e60`
-  - `media/__init__.py` `e3b0c44298fc`
-  - `media/avsafe.py` `bec4f276de2b`
-  - `media/cuts.py` `c73666ca2d09`
-  - `media/index.py` `d9becae9d2b3`
-  - `media/rangedecode.py` `d0133ce5903c`
-  - `media/safepath.py` `b8f47d754db0`
-  - `media/sources/__init__.py` `30b16c9dec00`
-  - `media/sources/base.py` `2a5e5f266091`
-  - `media/sources/lerobot_v21.py` `20726442a33a`
-  - `media/sources/lerobot_v3.py` `659c5fea74cf`
-  - `media/sources/mp4_dir.py` `b4b7f9813a1a`
-  - `media/types.py` `29f1608ac67f`
-  - `modal_app/factory.py` `52e5826554fd`
-  - `modal_app/rewarder_app.py` `11338ffc0a49`
-  - `modal_app/warm.py` `f3768d107f7e`
-  - `modal_app/workers_app.py` `30b288a63562`
-  - `nv/__init__.py` `52bb0565cbb7`
-  - `nv/linker.py` `ee6c24e1469f`
-  - `records.py` `1fa4bc7179ac`
-  - `stages/__init__.py` `e3b0c44298fc`
-  - `stages/reward.py` `a8ae59644323`
-  - `workers_impl/__init__.py` `e3b0c44298fc`
-  - `workers_impl/certstamp.py` `56ff03102855`
-  - `workers_impl/reward.py` `1ed7c890d26d`
-- covered by: **no certificate** (uncertified; nothing frozen yet)
-
-## balanced / reward.dense / H100! (default pool)
-
-- key (`engine_spec_hash`, default modes, pinned derived digests): `1edaa3b60ea88874`
-- engine: `nvidia-vllm-offline` {'vllm': '0.24.0'}, image `img_vllm` fingerprint `4df6c7826a52`, patches [], engine_args `44136fa355b3`, sampling `44136fa355b3`, mm_kwargs `44136fa355b3`
-- vllm_engine: none (not a balanced vLLM video kind)
-- nvidia_pins: `rewarder`@7de68d22c4a9 (`0c6136d2830a`)
-- decode: av 16.0.1, pillow 12.3.0, numpy 2.3.5, arch x86_64
-- derived_weights: none
-- modes: {}
-- logic: `0.0.1`, cert logic digest `f7f55ffb66f4f93f` over 30 modules:
-  - `config/schema.py` `be1e93e2d01e`
-  - `jobs/indexing.py` `82fc1ced0547`
-  - `jobs/manifest.py` `1b2cd8b89ad6`
-  - `jobs/planning.py` `92a62110f8ac`
-  - `jobs/settings.py` `caaadcd39505`
-  - `jobs/types.py` `9891533d7e60`
-  - `media/__init__.py` `e3b0c44298fc`
-  - `media/avsafe.py` `bec4f276de2b`
-  - `media/cuts.py` `c73666ca2d09`
-  - `media/index.py` `d9becae9d2b3`
-  - `media/rangedecode.py` `d0133ce5903c`
-  - `media/safepath.py` `b8f47d754db0`
-  - `media/sources/__init__.py` `30b16c9dec00`
-  - `media/sources/base.py` `2a5e5f266091`
-  - `media/sources/lerobot_v21.py` `20726442a33a`
-  - `media/sources/lerobot_v3.py` `659c5fea74cf`
-  - `media/sources/mp4_dir.py` `b4b7f9813a1a`
-  - `media/types.py` `29f1608ac67f`
-  - `modal_app/factory.py` `52e5826554fd`
-  - `modal_app/rewarder_app.py` `11338ffc0a49`
-  - `modal_app/warm.py` `f3768d107f7e`
-  - `modal_app/workers_app.py` `30b288a63562`
-  - `nv/__init__.py` `52bb0565cbb7`
-  - `nv/linker.py` `ee6c24e1469f`
-  - `records.py` `1fa4bc7179ac`
-  - `stages/__init__.py` `e3b0c44298fc`
-  - `stages/reward.py` `a8ae59644323`
-  - `workers_impl/__init__.py` `e3b0c44298fc`
-  - `workers_impl/certstamp.py` `56ff03102855`
-  - `workers_impl/reward.py` `1ed7c890d26d`
-- covered by: **no certificate** (uncertified; nothing frozen yet)
-
-## balanced / reward.rubric / H100! (default pool)
-
-- key (`engine_spec_hash`, default modes, pinned derived digests): `5b48d5d080c4e80a`
-- engine: `nvidia-vllm-offline` {'vllm': '0.24.0'}, image `img_vllm` fingerprint `4df6c7826a52`, patches [], engine_args `44136fa355b3`, sampling `44136fa355b3`, mm_kwargs `44136fa355b3`
-- vllm_engine: none (not a balanced vLLM video kind)
-- nvidia_pins: `rewarder`@7de68d22c4a9 (`0c6136d2830a`)
-- decode: av 16.0.1, pillow 12.3.0, numpy 2.3.5, arch x86_64
-- derived_weights: none
-- modes: {"rubric": null}
-- logic: `0.0.1`, cert logic digest `612531b1948abf36` over 32 modules:
-  - `config/schema.py` `be1e93e2d01e`
-  - `jobs/indexing.py` `82fc1ced0547`
-  - `jobs/manifest.py` `1b2cd8b89ad6`
-  - `jobs/planning.py` `92a62110f8ac`
-  - `jobs/settings.py` `caaadcd39505`
-  - `jobs/types.py` `9891533d7e60`
-  - `media/__init__.py` `e3b0c44298fc`
-  - `media/avsafe.py` `bec4f276de2b`
-  - `media/cuts.py` `c73666ca2d09`
-  - `media/index.py` `d9becae9d2b3`
-  - `media/rangedecode.py` `d0133ce5903c`
-  - `media/safepath.py` `b8f47d754db0`
-  - `media/sources/__init__.py` `30b16c9dec00`
-  - `media/sources/base.py` `2a5e5f266091`
-  - `media/sources/lerobot_v21.py` `20726442a33a`
-  - `media/sources/lerobot_v3.py` `659c5fea74cf`
-  - `media/sources/mp4_dir.py` `b4b7f9813a1a`
-  - `media/types.py` `29f1608ac67f`
-  - `modal_app/factory.py` `52e5826554fd`
-  - `modal_app/rewarder_app.py` `11338ffc0a49`
-  - `modal_app/warm.py` `f3768d107f7e`
-  - `modal_app/workers_app.py` `30b288a63562`
-  - `nv/__init__.py` `52bb0565cbb7`
-  - `nv/errors.py` `efc4f2053481`
-  - `nv/linker.py` `ee6c24e1469f`
-  - `records.py` `1fa4bc7179ac`
-  - `stages/__init__.py` `e3b0c44298fc`
-  - `stages/reward.py` `a8ae59644323`
-  - `stages/rubric.py` `ff6853682925`
-  - `workers_impl/__init__.py` `e3b0c44298fc`
-  - `workers_impl/certstamp.py` `56ff03102855`
-  - `workers_impl/reward.py` `1ed7c890d26d`
-- covered by: **no certificate** (uncertified; nothing frozen yet)
-```
-
-</details>
+- `exact`: nothing (the reference by construction).
+- `balanced` / `segment` / `L40S` and `balanced` / `caption` / `H100!`: the `vllm-offline`
+  engine on `img_vllm`, with `max_num_seqs` 64 (TempSeg on the L40S) and 16 (Captioner on the
+  H100), `max_num_batched_tokens` 16384 and `gpu_memory_utilization` 0.9; the TempSeg or
+  Captioner NVIDIA pins; the `tempseg_merged` or `captioner_bf16` derived digest; and a cert
+  logic digest over the 61 modules of the `common` + `vllm-video` groups (`engines/batch_policy.py`
+  included). The first `balanced` certificates from the certified run will freeze these two rows.
+- `balanced` / `reward.terminal`, `reward.dense`, `reward.rubric` / `H100!`: the
+  `nvidia-vllm-offline` engine, the Rewarder pin, a logic digest over 30 modules (32 for
+  rubric). These are the reference by identity, so no certificate will freeze them; the script
+  still lists them as "no certificate (uncertified ...)".

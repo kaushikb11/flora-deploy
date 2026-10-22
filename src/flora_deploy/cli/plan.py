@@ -147,9 +147,12 @@ def _print_plan(cfg, workload, req, deadline_s, options, best, rates, table, con
     if any("!" in k.gpu for o in options for k in o.kinds):
         console.print("H100! means exactly an H100 (Modal never upgrades it to a pricier GPU).",
                       soft_wrap=True)
+    from flora_deploy.planner.options import POOL_END_TAIL_S
+
     console.print("Cost: the all-in estimate for this workload at Modal list prices: GPU work, "
-                  "plus each container's startup and the orchestrator (idle time after the "
-                  "work is not included). `flora report` shows what a job actually spent.",
+                  "plus each container's startup, a short idle tail once its stage has no "
+                  f"work left (about {POOL_END_TAIL_S:g} s, then it scales to zero) and the "
+                  "orchestrator. `flora report` shows what a job actually spent.",
                   soft_wrap=True)
     console.print(f"Prices: {escape(rates.source)}" +
                   (f" (x{rates.region_multiplier} region)" if rates.region_multiplier != 1
@@ -224,7 +227,7 @@ def plan(
     rates_file: Annotated[Path | None, typer.Option(
         "--rates", help="rates.json to use instead of the shipped one.")] = None,
     live_prices: Annotated[bool, typer.Option(
-        help="Read prices from Workspace.billing.rates() (needs Modal credentials).")] = False,
+        help="Read live prices from your Modal workspace (needs Modal credentials).")] = False,
     write: Annotated[int | None, typer.Option(
         help="Write option N (1-based) into the config.")] = None,
     as_json: Annotated[bool, typer.Option("--json", help="Print options as JSON.")] = False,

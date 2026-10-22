@@ -8,7 +8,8 @@
 # outputs only demonstrate the pipeline (index -> plan -> run -> compose -> results); they are
 # marked `certificate: local-fake-models` and never share a config hash with real outputs.
 # Fake-models jobs run under `<project>.fake`, so they never share job state with real jobs.
-# Every key is documented in `flora init --template exact_lerobot`. Unknown keys are an error.
+# Common keys are documented in `flora init --template exact_lerobot`; the full list is in
+# src/flora_deploy/config/schema.py. Unknown keys are an error.
 
 project: local-demo
 
@@ -35,7 +36,8 @@ pipeline:
   episode_instruction:
     source: dataset_task            # the .txt next to each video
   envelope: warn
-  shard_target_gpu_minutes: 0.5     # small shards, so the demo has several of each kind
+  shard_target_gpu_minutes: 0.5     # GPU-minutes per shard (default 10); small shards, so the
+                                    # demo has several of each kind
 
 resources:
   segcap: {max_containers: 2}

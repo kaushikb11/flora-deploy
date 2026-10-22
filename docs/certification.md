@@ -1,9 +1,11 @@
 # Certification: `balanced` vs `exact`, within NVIDIA's own noise
 
-Status: 2026-10-22 (review 7 fixes). The generator (`validate/certify.py`, `flora certify`) and
-its consumption (`validate/certkey.py`, `config/presets.find_certificates`, config validation,
-`plan_app`, `flora plan`) are built and tested on CPU. No certificate exists yet. **No record
-written today can be certified**: the workers do not yet stamp the binding provenance below.
+Status: 2026-10-22. The generator (`validate/certify.py`, `flora certify`) and its consumption
+(`validate/certkey.py`, `config/presets.find_certificates`, config validation, `plan_app`,
+`flora plan`) are built and tested on CPU. No certificate is committed yet
+(`config/certificates/` holds only its README). Real workers stamp the binding provenance below,
+so records from a run on this commit can be certified once an `exact` reference run, a noise run
+and a candidate run exist (`docs/wave-h-runbook.md`, "The certified run").
 
 Background:
 - `exact` runs NVIDIA's own HF code with model inputs proven identical. It is the reference.
@@ -19,6 +21,50 @@ the re-certification workflow: [`certificate-freeze.md`](certificate-freeze.md).
 Principle: a certificate is **derived from the records themselves** and **fails closed**.
 Anything that cannot be shown from the records refuses or downgrades the certificate.
 
+## What you see
+
+`balanced`'s reward stages (`reward.terminal`, `reward.dense`, `reward.rubric` on `H100!`) run
+exactly what `exact` runs, so they are the **reference** and need no certificate ("Reference by
+identity" below). `segment` and `caption` need one, and none exists yet. So today:
+
+- `flora plan` labels each option `reference`, `certified`, `partly certified` (some stages are
+  certified or the reference, others are not) or `uncertified`. Today's `balanced` option is
+  **partly certified**. Each option also gets a `certificates:` line with one label per stage:
+  `certified (human, L40S)`, `reference (NVIDIA's own engine, no certificate needed)`, `not
+  certified`, `certified for human, not for yam`, or `not certified (...)` with the reason: `only a
+  provisional certificate`, `its certificate failed`, `certified for another build (engine,
+  image, models, run modes, code or weights changed)` or `certificate not checked without the
+  prepared weights (run flora prepare)`.
+- A `balanced` config with an uncovered stage is refused unless you opt in with
+  `allow_uncertified: true` in `flora.yaml`, or `--allow-uncertified` on `flora deploy` / `flora
+  run`. The refusal says either "has no accuracy certificate for ..." (nothing certified) or "is
+  not certified for every stage of this config (certified: ...; reference: ...): ..." (partial
+  coverage). With the opt-in, `flora plan` keeps the option's `uncertified` label, ranks it on
+  cost and flags it "balanced: uncertified, allowed by `allow_uncertified: true`"; without it the
+  option is `unavailable`.
+- The uncovered stages' records say `certified: false`. `flora export` refuses uncertified
+  records unless you pass `--allow-uncertified` (the `flora.yaml` key does not carry over); the
+  choice is recorded in the export's metadata.
+- Once a certificate is committed, CI fails a change that makes a `certified` one drift; a
+  drifted `provisional` one, or one committed without its freeze lock, only warns
+  ([`certificate-freeze.md`](certificate-freeze.md)).
+
+The first `certified` certificates are meant to come from the certified run
+(`scripts/wave_h.py --plan certified`: 12 human episodes, a noise run on 5 of them;
+[`wave-h-runbook.md`](wave-h-runbook.md)).
+
+## Method (contributors)
+
+Terms used below:
+
+- **oracle**: the `exact` reference run that a candidate is compared with.
+- **noise run**: the oracle run repeated on a subset of its episodes; `exact` vs noise is the
+  noise floor.
+- **L0**: the in-engine token/grid parity check (each request's `prompt_token_ids` and
+  `video_grid_thw` against NVIDIA's HF processor), from `modal_app/balanced_lab.py`.
+- **Gate A**: the FP32 `dt_bias` logit drift check, recorded alongside L0.
+- **stage hash**: the hash of a shard kind's config and code (`config/hashing.py`).
+
 ## Inputs
 
 | Input | What | Required |
@@ -27,8 +73,18 @@ Anything that cannot be shown from the records refuses or downgrades the certifi
 | `--balanced` | the candidate stack's records on the same episodes | yes |
 | `--noise` | the oracle run **repeated** on a subset of its episodes: same stage hash, key, GPU and determinism mode. `exact` vs `noise` is the noise floor | no (without it: `provisional`) |
 | `--l0` | `modal_app/balanced_lab.py` result JSON (L0 rows and Gate A), one per model kind | no (without it, video stages are `provisional`) |
-| `--config` | the candidate run's `flora.yaml`: preset, pool GPUs, output-affecting modes, embodiment | yes |
-| `--derived-content NAME=SHA256` | content digest of each derived weight the kind needs (`tempseg_merged`, `captioner_bf16`): W1-Prepare's `content_digest(receipt)`, the value `DerivedPin.content_sha256` pins | yes for `segment`/`caption` |
+| `--config` / `-c` | the candidate run's `flora.yaml`: preset, pool GPUs, output-affecting modes, embodiment | default `flora.yaml` |
+| `--derived-content NAME=SHA256` | content digest of each derived weight the kind needs (`tempseg_merged`, `captioner_bf16`): `flora prepare`'s `content_digest(receipt)`, the value `DerivedPin.content_sha256` pins | yes for `segment`/`caption` |
+| `--stage` | stage(s) to certify (repeatable) | default: every certifiable stage in the candidate records |
+| `--gpu` | GPU type certified | default: the config's pool GPU for the stage |
+| `--tolerance`, `--min-samples`, `--min-noise-samples`, `--slack` | the policy knobs (below) | defaults 1.5, 10, 5, 0 |
+| `--generated-at` | certificate time `YYYY-MM-DDTHH:MM:SSZ`; pass the run's own time so re-certifying the same records reproduces the same certificate id | default: now |
+| `--json`, `--out-dir`, `--similarity` | print JSON; where to write; the optional caption-similarity hook | no |
+
+`flora certify` refuses an `exact` config ("exact is the reference by construction"), a records
+file with no certifiable stage (e.g. `reward.rubric` only), and records whose embodiment differs
+from the config's. After a `provisional` verdict it prints "Provisional certificates do not
+unlock a preset: runs still need allow_uncertified."
 
 There is no `--pools`: the embodiment pool comes from the records (`provenance.embodiment`).
 
@@ -38,7 +94,7 @@ Every record of every set (oracle, noise, candidate) must carry, in `provenance`
 
 | Field | Content | Today |
 |---|---|---|
-| `config_hash` | the D11 stage hash of its shard kind (64 hex) | set (segcap: stamped by the sink) |
+| `config_hash` | the stage hash of its shard kind (64 hex) | set (segcap: stamped by the sink) |
 | `gpu` | the GPU it ran on (`nvidia-smi` name; compared via `engines.offline_llm.normalize_gpu`) | stamped by every worker (`workers_impl.certstamp`; a record's own value wins) |
 | `embodiment` | the job's `pipeline.embodiment` | stamped by every worker (`FLORA_EMBODIMENT`, `workers_impl.certstamp`) |
 | `cert_key` | `validate.certkey.key_document(preset, kind, pool_gpu, modes=kind_modes(cfg, kind), derived_content=..., dtbias_fp32=...)` of the stack that produced it | stamped by every real worker: exact segcap (`reference_app`), the balanced `SegmentWorker` / `CaptionWorker` (`balanced_app.build_stage`) and the Rewarder (`workers_app`); fake workers stamp none (refused as `fake_models`) |
@@ -52,17 +108,18 @@ outright (`certified: false`, `fake_models`).
 
 ### Binding checks
 
-1. **Candidate (H1).** Uniform in key, stage hash, GPU, embodiment and preset. Its key (sha256
+1. **Candidate.** Uniform in key, stage hash, GPU, embodiment and preset. Its key (sha256
    of `cert_key`) must equal the key of the stack this checkout would run, computed from
    `--config`, the pool GPU and `--derived-content`. The error names the differing key fields.
    The GPU must be the certified GPU.
-2. **Oracle (H2).** Uniform in the same fields: one oracle run. Same embodiment as the candidate.
-3. **Noise (H2).** Same stage hash, key, GPU and determinism mode as the oracle; its episodes a
+2. **Oracle.** Uniform in the same fields: one oracle run. Same embodiment as the candidate.
+3. **Noise.** Same stage hash, key, GPU and determinism mode as the oracle; its episodes a
    subset of the oracle's; no record with the oracle's own `audit_ref` (a copy). The oracle's
    stage hash, key, GPU and determinism mode are recorded in the certificate (`oracle`).
 
-Note for Wave H-lite: an oracle run in `deterministic` mode needs its noise run in
-`deterministic` mode too (they would otherwise differ in key and determinism).
+Note: an oracle run in `deterministic` mode needs its noise run in `deterministic` mode too (they
+would otherwise differ in key and determinism). The certified run uses NVIDIA's default mode
+(`determinism: nvidia`) for all of its jobs.
 
 ## Metrics
 
@@ -108,10 +165,10 @@ end-to-end segment + caption result.
 | `reward.terminal` | `expected_score_abs_delta` | `|E[s]_A - E[s]_B|` (renormalized top-k expectation) |
 | `reward.terminal` | `score_mismatch` | `1` if the decoded score differs |
 | `reward.dense` | `per_step_abs_delta` | mean `|a_i - b_i|` over the common prefix of `per_step` |
-| `reward.dense` | `rank_divergence` | `1 - rho`, Spearman rank correlation (average ranks for ties) over the common prefix. When rho is undefined (either side constant, or fewer than 2 steps): the mean `|a_i - b_i|`. So two equal constant series score 0, and one `2` in ten `3`s scores 0.1, not the maximum (M6) |
+| `reward.dense` | `rank_divergence` | `1 - rho`, Spearman rank correlation (average ranks for ties) over the common prefix. When rho is undefined (either side constant, or fewer than 2 steps): the mean `|a_i - b_i|`. So two equal constant series score 0, and one `2` in ten `3`s scores 0.1, not the maximum |
 | `reward.dense` | `length_mismatch` | `1` if the `per_step` lengths differ |
 
-Rubric has no certificate yet (P2, distributional).
+Rubric has no certificate metric yet (it would need a distributional comparison).
 
 ## Pass rule
 
@@ -127,7 +184,7 @@ mean over episodes of m(exact, balanced)  <=  min(cap_m, tolerance x max(noise_m
 ### Policy (`certkey.POLICY`)
 
 The knobs are bounded. `flora certify` refuses values outside the bounds, and matching refuses a
-certificate that records them (H3).
+certificate that records them.
 
 | Knob | Default | Bound |
 |---|---|---|
@@ -137,7 +194,7 @@ certificate that records them (H3).
 | `min_coverage` | 1.0 | >= 1.0 |
 | `slack_m` (`--slack`) | 0 | [0, `floor_m`] |
 
-**Absolute noise floors** `floor_m` (M4). A zero measured noise (two greedy runs that agree,
+**Absolute noise floors** `floor_m`. A zero measured noise (two greedy runs that agree,
 likely on short episodes) would otherwise demand a bit-identical engine on another GPU. Each
 floor is below what a real regression costs:
 
@@ -177,11 +234,12 @@ In this order:
    - a metric could not be evaluated (`metric_not_evaluable`).
 3. **`certified`** otherwise.
 
-**What `certified` needs** (H4), per stage and GPU: binding provenance on every record; at least
+**What `certified` needs**, per stage and GPU: binding provenance on every record; at least
 10 candidate episodes of the pool, all oracle episodes labelled; a noise run of at least 5 of the
-oracle's episodes; L0 passing for `segment`/`caption`; every check within threshold. **Wave
-H-lite (6 episodes, 2 noise episodes) is `provisional` by construction**, with or without
-anything else.
+oracle's episodes; L0 passing for `segment`/`caption`; every check within threshold. **The
+six-episode `--plan full` session (6 candidate episodes, a 6-episode noise run) is `provisional`
+by construction**: 6 is below `min_samples` (10). The certified run (`scripts/wave_h.py --plan
+certified`: 12 human episodes, a noise run on 5 of them) is sized to meet these requirements.
 
 Gate A (FP32 `dt_bias`) numbers from the L0 JSON are recorded, but they do not affect the verdict.
 The plugin flag is part of the key (`vllm_engine.dtbias_fp32`): plugin-on and plugin-off stacks
@@ -203,7 +261,7 @@ certificate is written only with an explicit `--out-dir`.
 | `generated_at` | UTC `YYYY-MM-DDTHH:MM:SSZ`; orders certificates for one key (below) |
 | `verdict`, `reasons`, `unlocks` | `certified` / `provisional` / `fail`; machine reasons; whether it unlocks the preset |
 | `preset`, `stage`, `kind`, `gpu` | what it certifies; `gpu` is the Modal GPU type (`H100!` is not `H100`) |
-| `covered_pools` | the embodiment pool(s) measured (D16) |
+| `covered_pools` | the embodiment pool(s) measured |
 | `stage_hash` | the candidate records' stage hash |
 | `engine_spec_hash` | **the match key**, computed from the candidate records' `cert_key` |
 | `engine`, `modes`, `logic`, `pins`, `derived_weights` | from the key: engine name, versions, image and fingerprint, patches and vLLM spec; output-affecting modes; logic version and certificate logic digest; NVIDIA pin revisions; derived-weight content digests |
@@ -232,10 +290,10 @@ and validated: stage hashes (64 hex), the key document (equal to this checkout's
 - `derived_weights`: name -> content digest, for every derived weight the kind needs (a missing
   one is an error: no key);
 - `modes`: `config.hashing.kind_modes` (`determinism` for segcap, `terminal_mode` for terminal);
-- `logic_version` and `logic_digest`: the **certificate logic digest** (M1).
+- `logic_version` and `logic_digest`: the **certificate logic digest**.
 
-The certificate logic digest (`cert_logic_digest`) is not the D11 config-hash digest (which is
-unchanged). It covers the kind's D11 modules (`config.logic.modules_for`) minus
+The certificate logic digest (`cert_logic_digest`) is not the config-hash logic digest
+(`config/logic.py`, which is unchanged). It covers the kind's output-affecting modules (`config.logic.modules_for`) minus
 `config/logic.py` (the registry), `config/hashing.py` and `validate/certkey.py` (versioned by
 `KEY_SCHEMA`), each **normalized**: comments, docstrings, trailing whitespace and blank lines
 removed (from the source text, so it is the same under every Python version). A comment or
@@ -246,17 +304,17 @@ code edit on the kind's path, or adding a module to its group, does.
 
 A certificate applies to a pool when **all** of these hold:
 - `preset`, `kind` and `gpu` are equal;
-- the config's `pipeline.embodiment` is in `covered_pools` (H5; no embodiment: no match);
+- the config's `pipeline.embodiment` is in `covered_pools` (no embodiment: no match);
 - `engine_spec_hash` equals the key of the stack that would run now. The caller passes the
-  derived content digests; **without them a kind with derived weights matches nothing** (H6,
-  fail closed);
+  derived content digests; **without them a kind with derived weights matches nothing** (fail
+  closed);
 - a `certified`/`provisional` certificate passes `policy_problems`: known generator version,
   knobs within policy and, for `certified`, every check recomputed from its own noise means and
   knobs, its sample counts and coverage (so editing a body and recomputing its id does not
   help);
 - the file's `id` is its content address and `generated_at` is set.
 
-**Order and revocation (M2).** Among the matching certificates for one key and pool, the newest
+**Order and revocation.** Among the matching certificates for one key and pool, the newest
 `generated_at` decides; on a tie `fail` beats `provisional` beats `certified`. So a newer `fail`
 revokes an older `certified`, and a later `certified` (e.g. on more data) supersedes an older
 `fail`. Only a deciding `certified` unlocks.
@@ -264,18 +322,19 @@ revokes an older `certified`, and a later `certified` (e.g. on more data) supers
 The stage hash is recorded but not matched: it also covers the input dataset, and a certificate
 must apply to the same pool on other data (archive/PLAN-v3.md §9).
 
-One lookup for every caller (H7): `certkey.lookup_context(cfg, kinds, derived_content=...)`
+One lookup for every caller: `certkey.lookup_context(cfg, kinds, derived_content=...)`
 gives embodiment, modes and content digests to:
 - config validation (`parse_config(..., derived_content=...)`): refuses a non-`exact` preset
   unless every pool has a deciding `certified` certificate, or `allow_uncertified` is set. The
   opt-in is one boolean: a config whose every stage is covered needs none, and the refusal
   names each stage that is not covered and why, in plain words
-  (`config.presets.refusal_message`), e.g. `reward.terminal on H100!: no certificate;
-  embodiment yam: segment/caption certified for human only`. Records say per stage whether
+  (`config.presets.refusal_message`), e.g. `segment on L40S: no certificate; embodiment yam:
+  segment/caption certified for human only` (a reward stage appears only when its stack diverges
+  from `exact`'s; see "Reference by identity"). Records say per stage whether
   they are certified, so a per-stage knob would add config without adding information;
 - `plan_app(..., derived_content=...)` (`flora deploy`): the same check;
-- `flora plan`: each non-`exact` option's per-pool status (`certified` / `provisional` /
-  `fail` / `none` / `unverified_weights`), and `recommended()` treats an all-certified option
+- `flora plan`: each non-`exact` option's per-pool status (`certified` / `reference` /
+  `provisional` / `fail` / `none` / `unverified_weights`), and `recommended()` treats an all-certified option
   like the reference, so a cheaper certified `balanced` wins over `exact`.
 
 `flora plan`, `flora doctor` and `flora deploy` print each stage's status in plain words
@@ -310,18 +369,22 @@ rule says while it holds. Applying the rule at stamping time as well (so a diver
 stack's records say `uncertified_stack`) belongs in `workers_impl/certstamp.py`
 (`CertStamp.apply`, which has the record's `cert_key`), calling `certkey.reference_identical`.
 
-Not wired yet: the CLI and SDK do not pass content digests (W1-Prepare's `content_digest`), so
-`segment`/`caption` certificates match only through the API until integration.
+The CLI and SDK pass the content digests: `flora deploy`, `flora run`, `flora plan`, `flora
+doctor` and `sdk.submit` load the config with `config.receipts.load_certified`. That takes the
+digest from the `pins.DERIVED_PINS` entry of each derived weight recorded under `weights.derived`
+(`flora prepare`). A weight with no recorded receipt, or no pinned digest, is left out, and its
+kind shows `unverified_weights` (fail closed).
 
 ## Usage
 
 ```bash
 flora certify -c flora.yaml --exact oracle/segment.jsonl --balanced bal/segment.jsonl \
-  --noise noise/segment.jsonl --l0 reports/balanced-lab/tempseg-r1.json \
+  --noise noise/segment.jsonl --l0 reports/wave-h/balanced-tempseg.json \
   --derived-content tempseg_merged=<sha256>
 ```
 
-It prints the verdict per stage, the failing checks and where each certificate was written. Next
+(From a standalone lab run the L0 file is `reports/balanced-lab/<run>-tempseg.json`.) It prints
+the verdict per stage, the failing checks and where each certificate was written. Next
 to each certificate it writes a freeze lock (`freeze/<id>.json`: the full key document and
 per-module hashes) for the drift report ([`certificate-freeze.md`](certificate-freeze.md)). It
 exits 1 if any stage fails or the records are refused (`certified: false`), 2 on bad input.

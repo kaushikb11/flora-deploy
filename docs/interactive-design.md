@@ -5,7 +5,7 @@
 The main recommendation is to **ship the online API without AsyncLLM at first.** Run the same offline `LLM` engine and `MicroBatcher` that batch uses, inside long-lived Modal services. That keeps the model inputs and the `cert_key` identical to the batch path, so batch certificates can cover online records. AsyncLLM becomes an optional, separately certified `interactive` preset later.
 
 Three facts shape everything below:
-- **Nothing in `balanced` is certified yet.** The `config/certificates/` directory holds only a README. P1b-1 GPU validation has not been run (`docs/balanced-engines.md:4`). The TempSeg merge is not pinned, so `SegmentWorker` refuses to start (`balanced-engines.md:25`). Gate C is recorded as FAIL on the quota and C2 run-level criteria (`docs/gate-c.md`).
+- **Nothing in `balanced` is certified yet.** The `config/certificates/` directory holds only a README. A first `balanced` GPU run happened on 2026-10-22 (`docs/balanced-engines.md`, Results). The TempSeg merge (v2) is now pinned (`config/pins.py`), so `SegmentWorker` starts. Gate C is recorded as FAIL on the quota and C2 run-level criteria (`docs/gate-c.md`).
 - **The Rewarder is the only certified-today path.** It runs NVIDIA's own engine, and `certified` depends only on the envelope verdict (`stages/reward.py:648`).
 - **Per-request cost is tiny compared with idle cost.** Cost control is mostly about keeping GPUs cold.
 
