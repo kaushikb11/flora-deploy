@@ -183,7 +183,7 @@ def test_full_receipt_check(tmp_path, weights):
     pin = PINS_BY_KEY["tempseg_base"]
     d = Path(snapshot_path(pin, weights))
     rep = ref.check_prep_receipt(pin, d)
-    assert rep["files"] == 2 and rep["fingerprints"] == ["size", "mtime_ns", "ino"]
+    assert rep["files"] == 2 and rep["fingerprints"] == ["size", "mtime_ns"]
     assert rep["hashed_files"] == 2  # both are small
     # the old shallow check accepted any receipt with ok + revision; these must all fail
     good = json.loads((d / RECEIPT_NAME).read_text())
@@ -204,6 +204,29 @@ def test_full_receipt_check(tmp_path, weights):
     (d / "extra.json").write_text("{}")
     with pytest.raises(ref.OfflineLayoutError, match="file set"):
         ref.check_prep_receipt(pin, d, fields=("size",))
+
+
+def test_worker_receipt_check_survives_inode_change(weights):
+    """The exact worker's startup check (default fields) on a fresh Volume mount: new inode
+    numbers are accepted, a changed size or mtime is not."""
+    pin = PINS_BY_KEY["tempseg"]
+    d = Path(snapshot_path(pin, weights))
+    rec = json.loads((d / RECEIPT_NAME).read_text())
+    for e in rec["digests"]:
+        e["ino"] += 1_000_003
+        e["dev"] += 7
+    (d / RECEIPT_NAME).write_text(json.dumps(rec))
+    assert ref.check_prep_receipt(pin, d)["files"] == 2
+    f = d / "config.json"
+    st = f.stat()
+    os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns + 1))
+    with pytest.raises(ref.OfflineLayoutError, match=r"fingerprint changed \(mtime_ns\)"):
+        ref.check_prep_receipt(pin, d)
+    os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns))
+    f.write_text("{ }")
+    os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns))
+    with pytest.raises(ref.OfflineLayoutError, match=r"fingerprint changed \(size\)"):
+        ref.check_prep_receipt(pin, d)
 
 
 def test_legacy_schema1_receipt(tmp_path, weights):

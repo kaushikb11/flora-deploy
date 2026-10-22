@@ -242,16 +242,52 @@ def test_same_size_rewrite_rejects_reuse(tmp_path):
     assert receipt is None and "fingerprint changed" in why
 
 
-def test_replaced_file_rejects_reuse_even_with_same_mtime(tmp_path):
+def _remount(snap):
+    """What a fresh Modal Volume mount looks like: same files, new inode and device numbers."""
+    path = snap / RECEIPT_NAME
+    rec = json.loads(path.read_text())
+    for d in rec["digests"]:
+        d["ino"] += 1_000_003
+        d["dev"] += 7
+    path.write_text(json.dumps(rec))
+    return rec
+
+
+def test_receipt_survives_inode_change(tmp_path):
+    """Volume inode numbers differ per mount; they must not invalidate a receipt."""
+    plan, snap = passing_receipt(tmp_path)
+    rec = _remount(snap)
+    assert check_receipt(plan, snap) == (rec, "reused")
+
+
+def test_inode_change_still_fails_on_size_or_mtime(tmp_path):
+    plan, snap = passing_receipt(tmp_path)
+    _remount(snap)
+    p = snap / "config.json"
+    st = p.stat()
+    os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 1))
+    receipt, why = check_receipt(plan, snap)
+    assert receipt is None and "fingerprint changed" in why
+    os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))
+    assert check_receipt(plan, snap)[1] == "reused"
+    p.write_bytes(CONFIG + b" ")
+    os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))  # size differs, mtime restored
+    receipt, why = check_receipt(plan, snap)
+    assert receipt is None
+
+
+def test_replaced_file_with_same_size_and_mtime_needs_full_verify(tmp_path):
+    # Inode is not compared (it changes per Volume mount), so a replacement that restores both
+    # size and mtime is reused; only a full verify (--reverify) catches it.
     plan, snap = passing_receipt(tmp_path)
     p = snap / "config.json"
     st = p.stat()
     tmp = snap / "config.json.new"
     tmp.write_bytes(CONFIG.replace(b"5", b"6"))
     os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
-    os.replace(tmp, p)  # like `volume put --force`: new inode, same size and mtime
-    receipt, why = check_receipt(plan, snap)
-    assert receipt is None and "fingerprint changed" in why
+    os.replace(tmp, p)  # new inode, same size and mtime
+    assert check_receipt(plan, snap)[1] == "reused"
+    assert not verify_snapshot(plan, snap).ok
 
 
 def test_storage_corruption_needs_full_verify(tmp_path):
