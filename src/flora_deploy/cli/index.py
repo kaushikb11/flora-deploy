@@ -126,7 +126,8 @@ def index(
         from flora_deploy.export.results import store_from_uri
 
         try:
-            st = store_from_uri(store_uri)
+            # a missing Volume is created, as `flora deploy` would (index runs before deploy)
+            st = store_from_uri(store_uri, environment=cfg.modal.environment, create=True)
         except (ValueError, ImportError) as e:
             raise _fail(str(e)) from None
         local_root = None
@@ -136,8 +137,8 @@ def index(
             if not local_root.is_dir():
                 raise _fail(f"input.path {local_root} is not a directory")
         stage = cfg.input.stage_to
-        work_dir = work or (Path(stage).expanduser() if stage and "://" not in stage else
-                            Path("~/.cache/flora-deploy/datasets").expanduser())
+        work_dir = (work or (Path(stage).expanduser() if stage and "://" not in stage else
+                             Path("~/.cache/flora-deploy/datasets"))).expanduser().resolve()
         files = open_dataset(ijob.dataset, work=work_dir, local_root=local_root, staged=True)
         try:
             summary = run_index(ijob, st, files, limit=limit, max_episodes=max_episodes,

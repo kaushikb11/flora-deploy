@@ -61,7 +61,7 @@ flora init [PATH] [OPTIONS]
 | Argument / option | Default | |
 |---|---|---|
 | `PATH` | `flora.yaml` | Where to write the config. |
-| `--template`, `-t` | `balanced_lerobot` | One of: balanced_lerobot, balanced_mp4_dir, exact_lerobot, exact_mp4_dir, rewards_only, local_demo. |
+| `--template`, `-t` | `balanced_lerobot` | One of: balanced_lerobot, balanced_mp4_dir, exact_lerobot, exact_mp4_dir, rewards_only, local_demo, local_demo_lerobot. |
 | `--force` | off | Overwrite an existing file. |
 | `--list` | off | List the templates and exit. |
 
@@ -206,7 +206,7 @@ flora run [OPTIONS]
 | `--job` |  | Job id (default: project). |
 | `--resume` | off | Local: lift a budget stop (Modal: use `flora resume &lt;job&gt;`). |
 | `--budget` |  | USD budget override (default: modal.budget_usd). |
-| `--sample-data` | off | Local: write a synthetic mp4_dir dataset to input.path first. |
+| `--sample-data` | off | Local: write a synthetic dataset (as input.format says) to input.path first. |
 | `--json` | off | Print the result as JSON. |
 | `--verbose`, `-v` | off | Local: every event. |
 

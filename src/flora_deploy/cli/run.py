@@ -184,7 +184,8 @@ def run(
     budget: Annotated[float | None, typer.Option(
         "--budget", help="USD budget override (default: modal.budget_usd).")] = None,
     sample_data: Annotated[bool, typer.Option(
-        "--sample-data", help="Local: write a synthetic mp4_dir dataset to input.path first.")
+        "--sample-data", help="Local: write a synthetic dataset (as input.format says) to "
+                              "input.path first.")
     ] = False,
     as_json: Annotated[bool, typer.Option("--json", help="Print the result as JSON.")] = False,
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Local: every event.")

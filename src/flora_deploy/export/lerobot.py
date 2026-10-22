@@ -58,6 +58,10 @@ DENSE_STEP_S = 0.5  # NVIDIA's dense group length (stages.reward.per_step: 2 / D
 TIME_EPS_S = 1e-4
 
 DENSE_COLUMN = "flora_dense_reward"
+NOT_LEROBOT_HINT = (
+    "`flora export` writes into LeRobot datasets (v2.1 and v3.0) only; for an mp4_dir job use "
+    "`flora results <stage> --format parquet --out FILE`. To try export locally: `flora init "
+    "-t local_demo_lerobot`, then `flora run --local --fake-models --sample-data`")
 SUBTASK_COLUMN = "flora_subtask_index"
 
 SUBTASK_TYPE = pa.list_(pa.struct([("start_s", pa.float64()), ("end_s", pa.float64()),
@@ -396,7 +400,7 @@ class _V3(_Layout):
 def open_layout(root: Path) -> _Layout:
     info_path = root / "meta" / "info.json"
     if not info_path.is_file():
-        raise ExportError(f"{root}: not a LeRobot dataset (no meta/info.json)")
+        raise ExportError(f"{root}: not a LeRobot dataset (no meta/info.json). {NOT_LEROBOT_HINT}")
     info = _load_json(_src(root, "meta/info.json"))
     version = str(info.get("codebase_version", ""))
     if version.startswith("v3."):

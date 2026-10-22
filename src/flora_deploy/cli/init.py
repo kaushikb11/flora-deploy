@@ -31,6 +31,8 @@ TEMPLATE_INFO: dict[str, tuple[str, str]] = {
     "rewards_only": ("rewards_only.yaml",
                      "score policy rollouts with the Rewarder only (terminal + dense)"),
     "local_demo": ("local_demo.yaml", "local demo: fake models, no GPU, no Modal account"),
+    "local_demo_lerobot": ("local_demo_lerobot.yaml",
+                           "local demo on a sample LeRobot dataset (try `flora export`)"),
 }
 TEMPLATES: dict[str, str] = {name: f for name, (f, _) in TEMPLATE_INFO.items()}
 
@@ -45,6 +47,7 @@ NEXT_STEPS: dict[str, tuple[tuple[str, ...], str]] = {
     "exact_mp4_dir": (_MP4, "flora doctor"),
     "rewards_only": (_MP4, "flora doctor"),
     "local_demo": ((), "flora run --local --fake-models --sample-data"),
+    "local_demo_lerobot": ((), "flora run --local --fake-models --sample-data"),
 }
 
 

@@ -104,10 +104,13 @@ dataset has several cameras, map them under `input.cameras`; the template shows 
 
 ## Using the labels
 
+Write each stage to a file first, e.g. `flora results caption --format parquet --out
+caption.parquet`. Then, with `pip install pandas pyarrow`:
+
 ```python
 import pandas as pd
 
-captions = pd.read_parquet("caption.parquet")      # flora results caption --format parquet --out caption.parquet
+captions = pd.read_parquet("caption.parquet")
 scores = pd.read_parquet("terminal.parquet")       # flora results reward.terminal --format parquet --out terminal.parquet
 labels = captions.merge(scores[["uid", "terminal_score"]], on="uid")
 ```
@@ -115,7 +118,9 @@ labels = captions.merge(scores[["uid", "terminal_score"]], on="uid")
 Training on LeRobot? `flora export --to lerobot --out labeled/ --allow-uncertified` writes the
 labels into a copy of your dataset: subtasks and success scores per episode, dense rewards per
 frame ([`docs/export.md`](docs/export.md)). The flag is needed while `balanced` segment/caption
-are uncertified, and is recorded in the export.
+are uncertified, and is recorded in the export; `flora.yaml`'s `allow_uncertified` doesn't apply.
+A fake-models run needs `--allow-fake` instead. Export needs a LeRobot dataset, so the MP4 demo
+can't be exported; `flora init --template local_demo_lerobot` is the same demo on LeRobot data.
 
 Every record has a `uid` (the episode) to join stages on, plus provenance: which models, engine and
 GPU produced it. Field reference: [`docs/output-format.md`](docs/output-format.md).
