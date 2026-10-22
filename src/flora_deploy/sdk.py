@@ -690,7 +690,8 @@ class Job:
 
             containers = job_container_rows(
                 self.store, self.job_id, self.config_hash, manifest, pools=settings.pools,
-                scaledown_s=float(settings.scaledown_s), now=now, rates=rates)
+                scaledown_s=float(settings.scaledown_s), now=now, rates=rates,
+                settings=settings)
         if self.is_local and not v.orchestrator_alive:  # its containers died with the process
             containers = [{**c, "stopped": True} for c in containers]
         done_ids = _done_shards(self, manifest)
