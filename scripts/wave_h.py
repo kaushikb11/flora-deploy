@@ -108,6 +108,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import json
 import math
 import os
@@ -1970,6 +1971,8 @@ def render_report(st: State, projections: Mapping[str, Projection], *,
             continue
         lines += ["", f"## {title[name]}", "", f"Status: {s.status}."]
         lines += [f"- {n}" for n in s.notes]
+        if s.attempts:  # only the latest attempt's notes: older errors are history
+            lines += [f"- attempt {len(s.attempts)}: {n}" for n in s.attempts[-1].notes]
         res = {k: v for k, v in s.result.items() if k not in ("apps",)}
         if res:
             lines += ["", "```json", json.dumps(_numbers_only(res), indent=1, default=str)[:6000],
@@ -2118,6 +2121,101 @@ def held_lines(st: State) -> list[str]:
             for name, i, a in st.held()]
 
 
+DEAD_HEARTBEAT_S = 3 * HEARTBEAT_S  # a running attempt silent this long: its process is gone
+
+
+def approver() -> str:
+    """Who approved a ``--global-cap`` (the login running ``--yes-spend``)."""
+    import getpass
+
+    try:
+        return getpass.getuser()
+    except Exception:  # noqa: BLE001 - no login name: still recorded as approved
+        return "unknown"
+
+
+def note_stop(s: StepState, text: str) -> None:
+    """A step's stop-rule note replaces the one before it (the notes never go stale)."""
+    s.notes = [n for n in s.notes if not n.startswith("stop rule")] + [text]
+
+
+def simulate_run_start(st: State, *, out: Callable[[str], None] = print) -> None:
+    """On a copy of the state (the dry run, ``--status``): what ``--yes-spend`` does before its
+    first step, without writing or stopping anything. It reads the billing baseline when there
+    is none and billing (read-only), and takes the apps of killed attempts as stopped now (a
+    run stops them by id first; if that stop fails, the run charges them their budget)."""
+    if not st.billing_baseline:
+        try:
+            st.billing_baseline = dict(billed_by_app(st.billing_since))
+        except Exception as e:  # noqa: BLE001
+            out(f"note: billing unavailable ({e!r}); tracking only")
+    now = time.time()
+    for a in st.killed_unstopped():
+        a.stopped_at = now
+        out(f"note: a run first stops {', '.join(a.app_ids or a.apps)} (left by a killed run) "
+            "by id; this preview assumes that stop succeeds")
+    refresh_billing(st)
+
+
+def next_decision(st: State, plan: str, projections: Mapping[str, Projection],
+                  only: str | None = None) -> Decision | None:
+    """The decision a run takes first: the first step (of ``--only`` or the plan) not done."""
+    for name in (only,) if only else PLANS[plan]:
+        d = decide(st, plan, name, projections, only=only)
+        if d.action != "done":
+            return d
+    return None
+
+
+def print_status(st: State, projections: Mapping[str, Projection], *, plan: str,
+                 only: str | None = None, state_path: Path | None = None,
+                 out: Callable[[str], None] = print) -> Decision | None:
+    """``--status``: spend, holds, the cap in force and the next decision (on a copy)."""
+    gcap = plan_global_cap(plan, projections, st.override_for(plan))
+    caps, title = plan_caps(plan, projections), titles(plan)
+    out(f"Wave H-lite run {st.run_id}, plan {plan}" + (f", state {state_path}" if state_path
+                                                       else ""))
+    basis = ("from the billing rows" if st.billed_through is not None else
+             f"by the {BILLING_LAG_S} s lag rule: no rows kept yet")
+    out(f"  billing: read {rb.utc(st.billed_at)}, complete through {rb.utc(st.watermark)} "
+        f"({basis})")
+    ov = st.override_for(plan)
+    approved = ""
+    if ov is not None:
+        approved = (f"; --global-cap ${ov:.2f} approved by {st.cap_override_by} at "
+                    f"{rb.utc(st.cap_override_at)}" if st.cap_override_by else
+                    f"; --global-cap ${ov:.2f} approved (who and when not recorded)")
+    out(f"  global cap ${gcap:.2f} ({global_cap_label(st, plan, projections)}{approved}), "
+        f"derived ${plan_global_cap(plan, projections):.2f}")
+    wm = st.watermark
+    tracked = sum(s.tracked_usd for s in st.steps.values())
+    charged = sum(s.charged(wm) for s in st.steps.values())
+    out(f"  spent ${st.spent:.2f}: tracked ${tracked:.2f}, charged ${charged:.2f}, billed "
+        + ("-" if st.billed_total is None else f"${st.billed_total:.2f}"))
+    for name in (only,) if only else PLANS[plan]:
+        s = st.steps.get(name) or StepState()
+        last = s.attempts[-1] if s.attempts else None
+        err = next((n for n in reversed(last.notes) if n.startswith(("error", "stop rule"))),
+                   None) if last else None
+        stop = next((n for n in s.notes if n.startswith("stop rule")), None)
+        why = f"  [{err or stop}]" if (err or stop) and s.status != "done" else ""
+        out(f"  {title[name]:66s} {s.status:9s} cap ${caps[name]:.2f}  attempts "
+            f"{len(s.attempts)}  charged ${s.charged(wm):.2f}  tracked ${s.tracked_usd:.2f}"
+            + ("" if s.billed_usd is None else f"  billed ${s.billed_usd:.2f}") + why)
+    for line in held_lines(st):
+        out(line)
+    d = next_decision(st, plan, projections, only)
+    if d is None:
+        out("  next: nothing (every step is done)")
+        return None
+    out(f"  next: {d.step}: {d.action}: {d.message}")
+    for r in d.reasons:
+        out(f"    because {r}")
+    if d.command:
+        out(f"    command: {d.command}")
+    return d
+
+
 def load_manifest(offline: bool, version: str = "golden/v1") -> dict[str, Any]:
     if offline:
         return offline_manifest(DURATION_HEADROOM, version)
@@ -2137,6 +2235,9 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--report", action="store_true",
                    help="rewrite reports/wave-h/runbook.md from the state (never "
                         "docs/wave-h-report.md: wave_h_finalize.py owns it)")
+    g.add_argument("--status", action="store_true",
+                   help="where the run stands: spend, held attempts and when they clear, the "
+                        "cap and who approved it, and the next decision (reads; never writes)")
     ap.add_argument("--plan", choices=tuple(PLANS), default=DEFAULT_PLAN,
                     help="balanced-only (default): steps 0, a, d; full: every step; "
                          "certified: b, f, d, (d2), e on golden/v2 (its own state)")
@@ -2167,12 +2268,17 @@ def main(argv: list[str] | None = None) -> int:
     if st.plan is not None and st.plan != args.plan and CERTIFIED in (st.plan, args.plan):
         print(f"refused: {args.state} was run under plan {st.plan}, not {args.plan}")
         return 2
+    preview = args.dry_run or args.status or not (args.yes_spend or args.report)
+    if preview:  # the dry run and --status decide on a copy: the state file is never written
+        st = copy.deepcopy(st)
     if args.plan == CERTIFIED:
         st.plan = CERTIFIED
     if adopt_balanced_job(st):
         print("note: (d)'s deployed job is done; (d) counts as done and its lab is step lab")
     if args.yes_spend:
         st.mark_killed()
+    elif preview:  # what a run would find: a heartbeat this old is a dead process
+        st.mark_killed(stale_before=time.time() - DEAD_HEARTBEAT_S)
     manifest = load_manifest(args.offline, spec.golden)
     miss = missing_episodes(manifest, spec.episodes)
     if miss:
@@ -2196,6 +2302,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             st.cap_override, st.cap_override_plan = round(args.global_cap, 2), args.plan
             if args.yes_spend:  # only a run approves it; a dry run only shows its effect
+                st.cap_override_by, st.cap_override_at = approver(), time.time()
                 save_state(st, args.state)
                 print(f"global cap for plan {args.plan} raised to ${st.cap_override:.2f} "
                       "(user-approved; saved in the state)")
@@ -2203,6 +2310,11 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"dry run: would raise the global cap for plan {args.plan} to "
                       f"${st.cap_override:.2f}; not saved (pass --yes-spend to approve it)")
     gcap = plan_global_cap(args.plan, projections, st.override_for(args.plan))
+    if preview and not args.offline:  # what a run reads first (billing is read-only)
+        simulate_run_start(st)
+    if args.status:
+        print_status(st, projections, plan=args.plan, only=args.only, state_path=args.state)
+        return 0
     print_plan(st, projections, manifest=manifest, plan=args.plan, only=args.only)
     report = spec.report or REPORT
     if args.report:
@@ -2242,7 +2354,7 @@ def main(argv: list[str] | None = None) -> int:
         d = decide(st, args.plan, name, projections, only=args.only)
         if not d.runs:
             s.status, rc = "stopped", 3
-            s.notes.append(f"stop rule before: {d.message}")
+            note_stop(s, f"stop rule before: {d.message}")
             print(f"{d.action} {name}: {d.message}" + (f"\n  next: {d.command}" if d.command
                                                           else ""))
             break
@@ -2264,7 +2376,8 @@ def main(argv: list[str] | None = None) -> int:
         except StopRule as e:  # an in-step stop rule raised before any app started
             att.status = s.status = "stopped"
             att.tracked_usd = 0.0
-            s.notes.append(f"stop rule before: {e}")
+            att.notes.append(f"stop rule: {e}")
+            note_stop(s, f"stop rule before: {e}")
             rc = 3
         except Exception as e:  # noqa: BLE001 - recorded; the runbook stops
             att.status = s.status = "failed"
@@ -2273,7 +2386,7 @@ def main(argv: list[str] | None = None) -> int:
             else:  # L1: failed before it started any app: nothing to charge
                 att.tracked_usd = 0.0
                 att.notes.append("failed before any app started: charged $0")
-            s.notes.append(f"error: {e!r}")
+            att.notes.append(f"error: {e!r}")
         att.finished = time.time()
         for a in s.result.get("apps", ()):
             if a not in att.apps:
@@ -2283,7 +2396,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             check_after(st, name, caps=caps, global_cap=gcap)
         except StopRule as e:
-            s.notes.append(f"stop rule after: {e}")
+            note_stop(s, f"stop rule after: {e}")
             rc = 3
             break
         if s.status == "stopped":

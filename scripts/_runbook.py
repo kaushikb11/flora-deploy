@@ -169,6 +169,8 @@ class State:
     # the billing watermark: billing covers every hour before this (the latest billed hour's
     # end, from the rows' interval_start). None: never read with rows (an older state)
     billed_through: float | None = None
+    cap_override_by: str | None = None  # who approved cap_override (``--yes-spend``), and when
+    cap_override_at: float | None = None
 
     @property
     def watermark(self) -> float | None:
@@ -210,6 +212,8 @@ class State:
                 "cap_override": self.cap_override, "cap_override_plan": self.cap_override_plan,
                 "gate_cap": self.gate_cap, "gate_cap_plan": self.gate_cap_plan,
                 "plan": self.plan, "billed_through": self.billed_through,
+                "cap_override_by": self.cap_override_by,
+                "cap_override_at": self.cap_override_at,
                 "steps": {k: asdict(v) for k, v in self.steps.items()}}
 
     @classmethod
@@ -228,7 +232,9 @@ class State:
                    dict(d.get("billing_baseline", {})), steps, d.get("billed_total"),
                    d.get("billed_at"), d.get("cap_override"), d.get("cap_override_plan"),
                    d.get("gate_cap"), d.get("gate_cap_plan"), d.get("plan"),
-                   billed_through=d.get("billed_through"))
+                   billed_through=d.get("billed_through"),
+                   cap_override_by=d.get("cap_override_by"),
+                   cap_override_at=d.get("cap_override_at"))
 
     def held(self) -> list[tuple[str, int, Attempt]]:
         """``(step, attempt number, attempt)`` of every attempt charged over its tracked cost
@@ -242,21 +248,22 @@ class State:
         return [a for s in self.steps.values() for a in s.attempts
                 if a.status == "killed" and a.stopped_at is None and (a.apps or a.app_ids)]
 
-    def mark_killed(self) -> list[str]:
+    def mark_killed(self, stale_before: float | None = None) -> list[str]:
         """Attempts left ``running`` by a killed process: ``killed`` (charged their bound, or
         their budget, until billing covers them), their step ``failed`` (retried). Returns
-        their apps."""
+        their apps. ``stale_before`` (a preview): only attempts silent since before then."""
         apps: list[str] = []
-        for name, s in self.steps.items():
+        for s in self.steps.values():
+            hit = False
             for a in s.attempts:
-                if a.status == "running":
-                    a.status = "killed"
+                if a.status == "running" and (stale_before is None
+                                              or a.last_activity < stale_before):
+                    a.status, hit = "killed", True
                     a.notes.append("process killed while running; charged its bound (or its "
                                    "budget) until billing covers it")
                     apps += a.apps
-            if s.status == "running":
+            if s.status == "running" and (hit or stale_before is None):
                 s.status = "failed"
-                s.notes.append(f"{name}: the previous run was killed mid-step")
         return sorted(set(apps))
 
 

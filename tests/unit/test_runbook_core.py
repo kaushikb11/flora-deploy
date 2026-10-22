@@ -411,3 +411,107 @@ def test_dry_run_rule_and_the_real_runs_budget_use_one_formula():
         assert d.runs and d.budget.usd == wh.check_before(
             st, s, ps[s], caps=caps, global_cap=g, reserve=res).usd == wh.step_budget(
             st, s, caps=caps, global_cap=g, reserve=res)
+
+
+# --- WP6: --status, and a dry run that is read-only and takes the real decision ---------------
+
+
+def _rule(out: str, title_start: str) -> str:
+    line = next(ln for ln in out.splitlines() if ln.strip().startswith(title_start))
+    return line.split("rule: ", 1)[1]
+
+
+def _preview_env(monkeypatch, tmp_path):
+    """No Volume, no billing, no Modal: what both a preview and a run read."""
+    monkeypatch.setattr(wh, "load_manifest", lambda offline, version="golden/v1":
+                        wh.offline_manifest(wh.DURATION_HEADROOM, version))
+    monkeypatch.setattr(wh, "billed_by_app", lambda since: {})
+    monkeypatch.setattr(wh, "refresh_billing", lambda st, **kw: False)
+    monkeypatch.setattr(wh, "LAB_OUT", tmp_path / "lab")
+    monkeypatch.setattr(wh, "REPORT", tmp_path / "runbook.md")
+    monkeypatch.chdir(tmp_path)
+
+
+def test_dry_run_and_status_never_write_the_state(monkeypatch, tmp_path, capsys):
+    _preview_env(monkeypatch, tmp_path)
+    d = _at_the_retry(stopped=False)
+    d["steps"]["lab"]["status"] = "running"  # a dead process left it running
+    d["steps"]["lab"]["attempts"][0]["status"] = "running"
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps(d, indent=3))
+    before = state.read_bytes()
+    for argv in (["--dry-run"], ["--status"], ["--dry-run", "--global-cap", "9.0"],
+                 ["--status", "--offline"], []):
+        assert wh.main([*argv, "--state", str(state)]) == 0
+        assert state.read_bytes() == before, argv  # byte for byte
+    out = capsys.readouterr().out
+    assert "would raise the global cap" in out and "not saved" in out
+
+
+def test_the_dry_run_verdict_is_the_decision_a_run_takes(monkeypatch, tmp_path, capsys):
+    _preview_env(monkeypatch, tmp_path)
+    d = _at_the_retry(stopped=False)
+    d["cap_override"] = 6.5  # attempt 1's held $2.35 leaves the lab no room: wait
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps(d))
+    assert wh.main(["--dry-run", "--only", "lab", "--state", str(state)]) == 0
+    rule = _rule(capsys.readouterr().out, "d2.")
+    assert rule.startswith("WAIT: ")
+    assert wh.main(["--status", "--only", "lab", "--state", str(state)]) == 0
+    status = capsys.readouterr().out
+    assert "next: lab: wait: " + rule[len("WAIT: "):] in status
+    assert "command: after 2026-10-22 06:15 UTC: uv run python scripts/wave_h.py" in status
+    monkeypatch.setitem(wh.RUNNERS, "lab", lambda ctx: pytest.fail("must not run"))
+    assert wh.main(["--yes-spend", "--only", "lab", "--state", str(state), "--work",
+                    str(tmp_path / "w")]) == 3
+    note = wh.load_state(state).steps["lab"].notes[-1]
+    assert note == "stop rule before: " + rule[len("WAIT: "):]
+
+
+def test_a_dead_running_attempt_is_previewed_as_the_run_will_find_it(monkeypatch, tmp_path,
+                                                                    capsys):
+    _preview_env(monkeypatch, tmp_path)
+    d = _at_the_retry(stopped=False)
+    d["steps"]["lab"]["status"] = "running"
+    att = d["steps"]["lab"]["attempts"][0]
+    att.update(status="running", app_ids=["ap-lab1"], hard_timeout_s=2 * wh.LAB_TIMEOUT_S,
+               slack_s=wh.LAB_SLACK_S)
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps(d))
+    assert wh.main(["--status", "--only", "lab", "--state", str(state)]) == 0
+    out = capsys.readouterr().out
+    assert "assumes that stop succeeds" in out
+    nxt = next(ln for ln in out.splitlines() if ln.strip().startswith("next:"))
+    assert "next: lab: run: lab: runs with $2.35 (binding: attempt cap)" in nxt
+    fake = _Modal([{"app_id": "ap-lab1", "description": "flora-balanced-lab",
+                    "state": "ephemeral"}])
+    monkeypatch.setattr(rb.subprocess, "run", fake)
+    seen = {}
+    monkeypatch.setitem(wh.RUNNERS, "lab", lambda ctx: seen.setdefault(
+        "budget", ctx.st.step("lab").current.budget_usd) and {"ok": True, "tracked_usd": 1.0})
+    assert wh.main(["--yes-spend", "--only", "lab", "--state", str(state), "--work",
+                    str(tmp_path / "w")]) == 0
+    assert seen["budget"] == 2.35
+    first = wh.load_state(state).steps["lab"].attempts[0]
+    assert first.status == "killed" and first.stopped_at is not None
+    assert ["modal", "app", "stop", "--yes", "ap-lab1"] in fake.calls
+
+
+def test_status_shows_the_approval_and_only_the_latest_error(monkeypatch, tmp_path, capsys):
+    _preview_env(monkeypatch, tmp_path)
+    d = _at_the_retry(stopped=True)
+    lab = d["steps"]["lab"]
+    lab["attempts"][0]["notes"] = ["error: BlockingIOError(36, 'File name too long')"]
+    lab["attempts"].append(_att(RETRY_AT, RETRY_AT + 5, status="failed", tracked=0.0,
+                                budget=2.35, rate=LAB_RATE, apps=[]))
+    lab["attempts"][-1]["notes"] = ["error: RuntimeError('camera files missing')"]
+    lab["notes"] = []
+    d.update(cap_override_by="kaushik", cap_override_at=RETRY_AT - 120)
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps(d))
+    assert wh.main(["--status", "--offline", "--state", str(state)]) == 0
+    out = capsys.readouterr().out
+    assert "approved by kaushik at 2026-10-22 06:20 UTC" in out
+    row = next(ln for ln in out.splitlines() if ln.strip().startswith("d2."))
+    assert "camera files missing" in row and "BlockingIOError" not in row
+    assert "held: lab attempt 1 charged $0.84" in out and "06:15 UTC" in out
