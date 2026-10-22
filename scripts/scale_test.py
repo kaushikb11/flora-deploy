@@ -263,7 +263,11 @@ class KindRate:
     status: str
 
 
-def kind_rates(mode: str, table: Any = None) -> dict[str, KindRate]:
+def kind_rates(mode: str, table: Any = None, *,
+               warm_kinds: tuple[str, ...] = ()) -> dict[str, KindRate]:
+    """Per pool: rate and startup. ``warm_kinds``: pools priced with the warm startup row (a
+    compile cache is published for their key: ``engines.compile_cache.published_kinds``);
+    the others, and every pool by default, cold."""
     from flora_deploy.planner.rates import RateTable
 
     if mode != "real":
@@ -273,7 +277,7 @@ def kind_rates(mode: str, table: Any = None) -> dict[str, KindRate]:
     out = {}
     for kind in POOLS:
         e = t.rate("balanced", kind, 1, 1)
-        st = t.startup_for("balanced", kind)
+        st = t.startup_for("balanced", kind, warm=kind in warm_kinds)
         out[kind] = KindRate(e.container_s_per_video_s, e.uncertainty, st.startup_s,
                              st.uncertainty, e.status)
     return out

@@ -198,3 +198,145 @@ Expect ≈ 100–130 s per fresh container. Also consider pinning GPU workers to
 - H100: two containers, 436 s + 310 s of function time, plus image and mount startup. ≈ $1.2.
 - **Total ≈ $1.4** of the $4 cap. These are my own minute counts.
 - `scripts/spend.py --app flora-coldstart-lab` still showed $0.00 because billing lags by about an hour.
+
+## Warm start: keyed compile caches for the balanced workers (2026-10-22)
+
+**Why the first balanced run compiled cold.** The deployed segment worker started at
+02:11:55Z (300 s on an L40S) and the caption worker at 02:18:31Z (325 s on an H100). The lab's
+caches on `flora-cache:/balanced/{tempseg,captioner}` were written from 02:23Z (07:53 IST, read
+with `modal volume ls --json`). So the workers had nothing to copy. The lab's settings were not
+the cause. Nothing wrote a cache back, so every later container would also have compiled cold.
+
+### Design (`src/flora_deploy/engines/compile_cache.py`)
+
+| Step | What happens |
+|---|---|
+| Key | `<engine kind>[-dtbias]-<GPU>-<24 hex>`, the sha256 of: `img_vllm` fingerprint; declared vLLM, torch, Triton and CUDA base versions (pins and the `img_vllm` lock); the engine's compile-relevant kwargs (model path, dtype, `max_model_len`, scheduler limits, `gdn_prefill_backend`, `enforce_eager`, video kwargs, ...); `dtbias_fp32`; the derived weights' content digest; the sha256 of `engines/patches/dt_bias_fp32.py` + `engines/worker_ext.py` (they run inside vLLM's workers); the normalised GPU type. A laptop can compute it (`worker_key`), so `flora plan --check-cache` can ask whether one exists. |
+| Load (every container) | `seed`: read `balanced-cc/<key>/MANIFEST.json` from the **read-only** mount. Check the schema, key digest, all key factors and the container's own runtime versions (vLLM, torch, Triton, `torch.version.cuda`). Then copy every listed file to `/tmp/flora-cache/balanced/<key>` while hashing it, into a staging dir that is renamed into place only if every size and sha256 matched. On any failure the local dir is emptied, the reason is logged, and the engine compiles cold. |
+| Legacy | With no keyed cache, the lab's unkeyed `balanced/<kind>[-dtbias]` tree is copied, but only on the GPU it was compiled on (`LEGACY_LAB_GPUS`: TempSeg L40S, Captioner H100). It is never counted as verified, so that container then publishes a keyed cache. |
+| Cold retry | `build_engine`: if the engine build fails on a loaded (`warm` / `legacy`) cache for a reason other than the spec itself, the cache is emptied and the engine is built once more, cold. `EngineArgsError`, `EngineVerifyError` and `DtBiasActivationError` are not retried, because a cold build fails the same way. |
+| Publish (one container per key) | After a shard whose engine ran requests and is alive (`after_shard` → `WorkerCache.maybe_publish`), a container that did not load a verified cache takes a lease: a `modal.Dict` `put(skip_if_exists=True)` on `<key>/<generation>`, TTL 30 min. An expired lease lets exactly one successor take generation + 1. The container then uploads its tree to a fresh `balanced-cc/<key>/<publish id>/` through `Volume.batch_upload`, so the mount stays read-only (M7). It re-checks the lease and only then writes `MANIFEST.json`, one file and atomic on a v2 Volume, as the commit. A partial or orphaned tree is never read, because no manifest names it. Lock and temp files and symlinks are not published. At most one attempt per container. `FLORA_COMPILE_CACHE_PUBLISH=0` turns publishing off. |
+
+A marker file on the Volume would not work as the lease. Each container sees its own view of a
+v2 Volume until it commits, so `O_EXCL` there is not exclusive across containers. `FileLeases`
+is for tests and local runs only.
+
+The key and the load result are in the worker's startup facts
+(`balanced <kind> worker ready: {... "compile_cache": {...}}`), so a run report can tell a warm
+start from a cold one.
+
+### Do the lab's caches hit for the workers? Yes, on the same GPU
+
+The lab's engines (`balanced_lab.child`) differ from the workers' engines in two engine
+arguments, `logprobs_mode="raw_logits"` and `max_logprobs=20`, and in `keep_prompt_ids`, which
+is ours and not passed to vLLM. vLLM 0.24.0 source:
+
+- `vllm/config/model.py` `ModelConfig.compute_hash`: `logprobs_mode` is in `ignored_factors`.
+  `max_logprobs` is hashed by value, and its default is 20 (`max_logprobs: int = 20`), so the
+  lab's explicit 20 and the workers' default 20 hash identically.
+- `vllm/compilation/backends.py:1026-1065`: the compile-cache dir hashes the env factors, the
+  `VllmConfig.compute_hash()`, the traced code and the compiler (Inductor system + torch)
+  factors. `vllm/envs.py:compile_factors` ignores `VLLM_CACHE_ROOT`, so the lab's
+  `/cache/balanced/...` root and the workers' `/tmp/flora-cache/...` copy key the same.
+- `vllm/compilation/decorators.py:528-560`: the AOT artifact
+  (`torch_compile_cache/torch_aot_compile/<hash>/rank_0_0/model`, the path torch ≥ 2.10 takes)
+  is keyed by `aot_compile_hash_factors`, which is env + config (+ Inductor factors only with
+  `VLLM_USE_MEGA_AOT_ARTIFACT`, off below torch 2.12) + the forward's qualname. It is a
+  self-contained serialized file, so relocating the root is safe. **It has no GPU factor.** That
+  is why flora's key includes the GPU.
+- Same model path (`/weights/derived/<name>@<rev>` in both), same `worker_extension_cls`, same
+  scheduler limits from `GPU_LIMITS`, and the same `VLLM_*` env (the plugin's `VLLM_PLUGINS`
+  only in the `-dtbias` caches).
+
+`tests/unit/test_compile_cache.py::test_lab_gate_a_engine_has_the_worker_key` pins this: the
+lab's spec and the worker's spec derive the same flora key. Today's lab caches (tempseg L40S,
+captioner H100, tempseg-dtbias; captioner-dtbias is partial) are therefore used by the next
+segment and caption containers through the legacy path. The first of each then publishes the
+keyed cache.
+
+### Pricing warm starts (`planner/rates.json`)
+
+Startup rows carry `compile_cache: cold | warm`, which extends Lab-fix's flag. Two new `balanced`
+rows, `segment` 150 s and `caption` 180 s (±60%), are `warm` **placeholders** until a warm
+start is measured. `RateTable.startup_for(..., warm=False)`, the default and what `jobs.budget`
+charges, never returns a warm row. `warm=True` prefers one:
+
+- `flora plan --check-cache` passes the balanced kinds whose key has a published manifest
+  (`PlanRequest.warm_kinds`);
+- `--assume-warm` prices every pool warm, as a projection.
+
+Options priced warm carry a `startup priced warm (...)` flag naming the row's status.
+`scripts/scale_test.py:kind_rates` and `scripts/wave_h.py:balanced_job_seconds` take
+`warm_kinds` too, and default to cold.
+
+### Determinism
+
+vLLM does not promise bitwise-identical outputs across compiles, and it does not promise that a
+cache hit is bitwise identical to a fresh compile. What loading a cache does is replay the
+artifacts one compile produced. The question is whether a cold compile would choose differently:
+
+- Inductor's `max_autotune` (timing-based kernel choice) is enabled only for single-size compile
+  ranges (`compiler_interface.py:set_inductor_config`), that is `compile_sizes`. Flora does not
+  set it, and the default is none (`config/compilation.py:556`). The dynamic-shape graph uses
+  Inductor's deterministic heuristics.
+- The FLA/GDN Triton kernels use `@triton.autotune` (`model_executor/layers/fla/ops/*`), which
+  times configs in every process. vLLM 0.24 sets no `cache_results`, so no choice is read from
+  disk. A warm start autotunes exactly as a cold one does.
+- vLLM recompiles when a traced source changed (`_verify_source_unchanged`) or an AOT load
+  fails (`_try_load_aot_compiled_fn` logs and compiles again).
+
+So a warm start runs the kernels a cold start would have compiled. The cache key is in the
+startup facts but **not** in record provenance. `engines/compile_cache.py` is classified
+non-output in `config/logic.py`. `modal_app/balanced_app.py`, which applies it, stays in the
+`vllm-video` group.
+
+### GPU memory snapshots (investigated, not built)
+
+Modal can snapshot a container after `@modal.enter(snap=True)`, with `enable_memory_snapshot=True`
+and `experimental_options={"enable_gpu_snapshot": True}` (both accepted by the pinned client
+1.6.2), and restore it with GPU memory instead of re-running startup.
+
+**Feasibility for vLLM 0.24: plausible but unproven.**
+
+- The V1 engine runs EngineCore in a child process (`VLLM_ENABLE_V1_MULTIPROCESSING=1`). The
+  front end talks to it over ZMQ IPC sockets in `/tmp`.
+- A container snapshot covers the whole process tree and its file system, so both processes
+  and the sockets come back together.
+- Modal's own vLLM examples pair GPU snapshots with vLLM sleep mode
+  (`enable_sleep_mode=True`, `llm.sleep()` before the snapshot, `wake_up()` after). That shrinks
+  the snapshot, because the KV cache and, at level 1, the weights are offloaded.
+- I have not checked that this works with our `OfflineEngine` and worker extension.
+
+**Risks.**
+
+1. *What goes into the snapshot.* Everything in `@modal.enter` before the snapshot is frozen:
+   the job store, `FLORA_*` per-deployment env, preflight facts and the derived-weight
+   verification. The start would have to be split. The `snap=True` phase would be the image
+   and engine only (weights from the pinned path, the engine build). The `snap=False` phase
+   would be the store, preflight, receipts, cert stamp and runner.
+2. *Re-verification after restore.* The weights in GPU memory were verified when the snapshot
+   was taken, not when it was restored. After restore, re-run `verify_gdn_dtypes` (worker
+   extension RPC) and a canary greedy generate compared token for token with a recorded
+   sequence. Keep the receipt and content-digest checks on the Volume in the `snap=False`
+   phase.
+3. *Snapshot keying.* Modal keys snapshots by app version and GPU type. Flora's
+   image/spec/content key must still gate it: a redeploy with a different engine spec must
+   never restore an old engine.
+4. *NCCL / torch.distributed.* At TP=1 vLLM still initialises a world-size-1 process group. A
+   restored NCCL communicator would be unsafe, but TP=1 should not create one. Any TP>1 pool,
+   such as the rubric, is out of scope.
+5. *CUDA graphs and allocator state* are restored at the same virtual addresses. That is fine
+   in principle, but it is exactly what the canary has to prove.
+6. *Determinism.* A restored engine is the snapshotting process's engine, so outputs match it.
+   Gate C certifies the engine spec, so a canary mismatch must fail the container closed.
+
+**A $0.50 experiment.** Use an ephemeral app with TempSeg on an L40S
+(≈ $2.5/h with 8 cores and 48 GiB):
+
+1. One snapshotting container: about 5 min cold build, a sleep, then the snapshot, ≈ $0.21.
+2. Three restores, each with wake-up, the GDN dtype RPC and 2 greedy golden requests, about
+   1 min each, ≈ $0.13.
+3. Compare the token ids with a non-snapshot engine's tokens from the same lab call (reuse the
+   balanced lab's recorded Gate A requests), and measure restore → first token.
+
+Stop at the first restore that fails or mismatches. Total ≈ $0.35–0.50.

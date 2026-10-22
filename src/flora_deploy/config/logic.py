@@ -198,6 +198,13 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     "config/pins.py",  # hashed by value (nvidia_pins, decode)
     "config/presets.py",  # hashed by value (engine identity); pools are deliberately unhashed
     "config/receipts.py",  # finds the receipt values; they are hashed by value (derived_weights)
+    # Warm start: which verified compile artifacts a vLLM engine loads, never which engine runs.
+    # The engine is fixed by the hashed spec; vLLM keys every artifact by its own config, env
+    # and traced-source hashes and recompiles on a failed load, and loading a cache reproduces
+    # the compile that wrote it (no timing-based choice is read from disk: Inductor
+    # max_autotune only for compile_sizes, unset; Triton @autotune is per process). A bad cache
+    # falls back to a cold compile. Its key is in the startup facts (docs/cold-start.md).
+    "engines/compile_cache.py",
     # export: rebuilt from the parts on every export, never mixed into stored results
     "export/__init__.py",
     "export/compose.py",

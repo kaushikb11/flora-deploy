@@ -27,6 +27,11 @@ An option that is uncertified, priced from placeholder rates or uses a shard kin
 factory refuses (``modal_app.factory.PENDING_WORKERS``) is shown with ``unavailable`` reasons
 and never recommended (review 6 M2).
 
+Startup (``rates.json`` ``startup``): a pool is priced with the ``compile_cache: warm`` row
+only when ``PlanRequest.warm_kinds`` names its kind (a compile cache is published for the
+pool's key, ``engines.compile_cache.published``) or ``assume_warm`` projects one; otherwise
+cold, as ``jobs.budget`` charges. A warm start priced from a placeholder row is flagged.
+
 Everything is deterministic: same inputs, same options in the same order.
 """
 
@@ -40,7 +45,7 @@ from typing import Any, Literal
 from flora_deploy.config.presets import AVAILABLE_PRESETS, get_preset, shard_kinds_for
 from flora_deploy.jobs.budget import Rates, pinned_rates
 from flora_deploy.jobs.settings import IN_WORKER_CONCURRENCY, PoolSettings
-from flora_deploy.planner.rates import DEPLOYED_FEATURES, STATUS_RANK, RateTable
+from flora_deploy.planner.rates import DEPLOYED_FEATURES, STATUS_RANK, RateTable, startup_cache
 from flora_deploy.records import Stage
 
 ORCHESTRATOR_CORES = 0.25  # modal_app/orchestrator_app.py
@@ -166,6 +171,7 @@ class KindPlan:
     rate_status: str
     rate_provenance: str
     rate_samples: str = ""  # measured rates: "n=1, ±50%" (planner/rates.json `n`)
+    startup_cache: str = "cold"  # "warm": priced with a published compile cache's startup
 
 
 @dataclass(frozen=True)
@@ -222,6 +228,10 @@ class PlanRequest:
     # Worker features of the configuration that will run (rates.json ``requires`` /
     # ``excludes``): by default the deployed ones, as ``jobs.budget`` assumes.
     features: tuple[str, ...] = DEPLOYED_FEATURES
+    # Shard kinds whose pool has a published compile cache for its key (warm startup row);
+    # ``assume_warm``: price every kind warm (a projection: no cache need exist).
+    warm_kinds: tuple[str, ...] = ()
+    assume_warm: bool = False
 
 
 def _pool(req: PlanRequest, preset: str, kind: str) -> PoolSettings:
@@ -243,6 +253,8 @@ class _Kind:
     n: int = 1
     requires: tuple[str, ...] = ()
     samples: str = ""  # "n=1, ±50%" for a measured rate that names its sample count
+    startup_cache: str = "cold"
+    startup_status: str = "measured"
 
     def finish(self, which: int = 1, n: int | None = None) -> float:
         return self.startup[which] + self.work[which] / (n or self.n)
@@ -273,13 +285,16 @@ def _kinds(req: PlanRequest, table: RateTable, rates: Rates, preset: str, conc: 
             note = samples_note(e.n, e.uncertainty) if e.status == "measured" else ""
             if note and note not in notes:
                 notes.append(note)
-        st = table.startup_for(preset, kind)
+        st = table.startup_for(preset, kind, warm=startup_cache(
+            kind, warm_kinds=req.warm_kinds, assume_warm=req.assume_warm))
         u = st.uncertainty
         startup = (st.startup_s / (1 + u), st.startup_s, st.startup_s * (1 + u))
         cap = max(1, math.ceil(req.workload.episodes / used_c))
         out.append(_Kind(kind, pool, used_c, (lo, mid, hi), startup, cap,
                          rates.pool_per_second(pool), worst, " | ".join(prov),
-                         requires=tuple(sorted(needs)), samples="; ".join(notes)))
+                         requires=tuple(sorted(needs)), samples="; ".join(notes),
+                         startup_cache="warm" if st.compile_cache == "warm" else "cold",
+                         startup_status=st.status))
     return out
 
 
@@ -369,6 +384,11 @@ def build_option(req: PlanRequest, table: RateTable, rates: Rates, preset: str, 
         what = ("placeholder rates (not measured yet)" if worst == "placeholder"
                 else "includes projected (unconfirmed) rates")
         flags.append(f"warning: {what}: {', '.join(unmeasured)}")
+    warm = [k for k in kinds if k.startup_cache == "warm"]
+    if warm:
+        what = "assumed (--assume-warm)" if req.assume_warm else "a published compile cache"
+        flags.append(f"startup priced warm ({what}): " + ", ".join(
+            f"{k.kind} {k.startup[1]:.0f} s ({k.startup_status})" for k in warm))
     cert: Certification = "reference" if preset == "exact" else "needs certificates"
     if cert == "needs certificates":
         flags.append(_UNCERTIFIED_FLAG.format(preset=preset)
@@ -390,7 +410,8 @@ def build_option(req: PlanRequest, table: RateTable, rates: Rates, preset: str, 
         max_inputs=k.conc, cpu_cores=k.pool.cpu_cores, memory_gib=k.pool.memory_gib,
         work_s=round(k.work[1], 3), startup_s=k.startup[1], finish_s=round(k.finish(1), 3),
         cost_usd=round(k.per_s * (k.work[1] + k.n * k.startup[1]), 4), rate_status=k.status,
-        rate_provenance=k.provenance, rate_samples=k.samples) for k in kinds)
+        rate_provenance=k.provenance, rate_samples=k.samples,
+        startup_cache=k.startup_cache) for k in kinds)
     main_c = max(k.conc for k in kinds)
     suffix = "".join(f" +{f}" for f in missing)
     return PlanOption(
