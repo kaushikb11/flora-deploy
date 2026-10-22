@@ -6,6 +6,7 @@ system temp directory. No Modal; the drift tests are replaced by a runner the te
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -136,6 +137,58 @@ def test_human_then_yam_lists_both(human, tmp_path, capsys):
     assert rows["dex"][:2] == ["not yet", "not yet"]
     assert "Certified today: `segment` and `caption` for `human` and `yam`." in lim
     assert len(list(human.cert_dir.glob("cert_*.json"))) == 4
+
+
+# ---------------------------------------------------------------------------------------------
+# A partly certified run: segment certified, caption fail (the real human run, 2026-10-22)
+
+
+def _partial(tmp_path, *, record_fail: bool = True) -> A.AfterFake:
+    """The witness's captions all differ, so caption fails and only segment certifies. The
+    runbook records each stage's verdict in the certify step (``wave_h.run_certify``)."""
+    f = A.build(tmp_path, R.Options(witness_drift="caption"))
+    if record_fail:
+        st = json.loads(f.state.read_text(encoding="utf-8"))
+        st["steps"]["certify"]["status"] = "failed"
+        st["steps"]["certify"]["result"] = {"ok": False, "stages": {
+            "segment": {"verdict": "certified", "reasons": [], "refused": None},
+            "caption": {"verdict": "fail", "reasons": ["divergence_above_noise_floor"],
+                        "refused": None}}}
+        f.state.write_text(json.dumps(st, indent=1), encoding="utf-8")
+    return f
+
+
+def test_a_partial_run_flips_only_segment(tmp_path, capsys):
+    f = _partial(tmp_path)
+    assert run(f) == ac.OK  # the dry run
+    out = capsys.readouterr().out
+    assert ("Verdict: segment certified, caption fail (divergence_above_noise_floor; no "
+            "certificate, it stays uncertified).") in out
+    assert run(f, "--write") == ac.OK
+    capsys.readouterr()
+    readme = (f.root / "README.md").read_text()
+    lim = (f.root / "docs" / "limitations.md").read_text()
+    assert ac.block(readme, "certified") == (
+        "Accuracy certificates: segmentation for `human` data (`L40S`).\n"
+        "Rewards run NVIDIA's own engine, as `exact` does, and need none. Everything else runs "
+        "uncertified.")
+    assert "Certified today: segmentation for `human` data (`L40S`)." in \
+        ac.block(readme, "allow-uncertified")
+    rows = limitations_rows(lim)
+    assert rows["human"][:2] == ["**certified**", "not yet"]
+    assert "Certified today: `segment` for `human`.\n" in lim
+    certs = [json.loads(p.read_text()) for p in f.cert_dir.glob("cert_*.json")]
+    assert [(c["stage"], c["verdict"]) for c in certs] == [("segment", "certified")]
+
+
+def test_a_missing_certificate_without_the_runs_fail_is_still_refused(tmp_path, capsys):
+    """Only the run's own recorded ``fail`` excuses a stage's missing certificate."""
+    f = _partial(tmp_path, record_fail=False)
+    before = f.tree()
+    assert run(f, "--write") == ac.FAILED
+    out = capsys.readouterr().out
+    assert "no balanced caption certificate for human" in out
+    assert f.tree() == before
 
 
 # ---------------------------------------------------------------------------------------------

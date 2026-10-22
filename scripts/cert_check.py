@@ -1525,6 +1525,20 @@ def check_spend(run: Run) -> list[Row]:
 # Driver
 
 
+def run_failed(run: Run, stage: str) -> str | None:
+    """The run's ``fail`` for ``stage`` (its reasons), when the certify step recorded one.
+    ``wave_h_finalize.py`` never writes a ``fail`` certificate, so a partly certified run (one
+    stage certified, the other fail) has no certificate for the failed stage, and that is the
+    expected outcome rather than a missing input. Anything else (no verdict, refused,
+    provisional) is not a fail and still needs its certificate."""
+    steps = (run.state or {}).get("steps") or {}
+    res = ((steps.get("certify") or {}).get("result") or {}).get("stages") or {}
+    got = res.get(stage) or {}
+    if got.get("verdict") != "fail" or got.get("refused"):
+        return None
+    return ", ".join(map(str, got.get("reasons") or ())) or "fail"
+
+
 def check_all(inp: Inputs) -> list[Row]:
     run = load_run(inp)
     rows: list[Row] = []
@@ -1536,7 +1550,10 @@ def check_all(inp: Inputs) -> list[Row]:
                 rows.append(Row("0 inputs", f"{side} {stage} records", FAIL,
                                 f"none under {inp.records / side / inp.job}"))
         if stage not in run.certs:
-            rows.append(Row("0 inputs", f"{stage} certificate", FAIL,
+            failed = run_failed(run, stage)
+            rows.append(Row("0 inputs", f"{stage} certificate", PASS if failed else FAIL,
+                            f"the run's verdict is fail ({failed}): no certificate is "
+                            f"committed, so {stage} stays uncertified" if failed else
                             f"no {inp.preset} {stage} certificate for {inp.embodiment} in "
                             f"{inp.cert_dir}"))
     if run.state is None:

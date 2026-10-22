@@ -109,6 +109,7 @@ class Change:
 class Outcome:
     st: Any
     certs: dict[str, dict[str, Any]] = field(default_factory=dict)  # stage -> certificate
+    failed: dict[str, str] = field(default_factory=dict)  # stage -> why (fail: no certificate)
     rows: list[cc.Row] = field(default_factory=list)
     changes: list[Change] = field(default_factory=list)
     readme: str | None = None
@@ -405,9 +406,11 @@ def summary(o: Outcome, *, emb: str, root: Path, write: bool, error: Refused | N
     out = [f"## After the certified run: `{emb}`, run `{st.run_id}`: {head}", ""]
     if error is not None:
         out += [f"Failed at **{error.step}**:", "", "```", *error.problems, "```", ""]
-    if o.certs:
-        verdicts = ", ".join(f"{s} {c.get('verdict')}" for s, c in sorted(o.certs.items()))
-        out += [f"Verdict: {verdicts}.", ""]
+    if o.certs or o.failed:
+        verdicts = [f"{s} {c.get('verdict')}" for s, c in sorted(o.certs.items())]
+        verdicts += [f"{s} fail ({why}; no certificate, it stays uncertified)"
+                     for s, why in sorted(o.failed.items())]
+        out += [f"Verdict: {', '.join(verdicts)}.", ""]
         for stage, c in sorted(o.certs.items()):
             out += cert_lines(stage, c, emb) + [""]
     if o.rows and error is None:
@@ -436,6 +439,13 @@ def summary(o: Outcome, *, emb: str, root: Path, write: bool, error: Refused | N
 def decided_certs(inp: cc.Inputs) -> dict[str, dict[str, Any]]:
     """stage -> the certificate ``cert_check`` decides on (the newest for the embodiment)."""
     return {s: c for s, (_, c) in cc.load_run(inp).certs.items()}
+
+
+def failed_stages(inp: cc.Inputs) -> dict[str, str]:
+    """stage -> its reasons, for each stage the run failed (``cert_check.run_failed``): it gets
+    no certificate, so it stays uncertified while the other stage may flip."""
+    run = cc.load_run(inp)
+    return {s: why for s in inp.stages if s not in run.certs and (why := cc.run_failed(run, s))}
 
 
 def main(argv: list[str] | None = None, *, fetch_run: Callable[..., Any] = subprocess.run,
@@ -480,6 +490,7 @@ def main(argv: list[str] | None = None, *, fetch_run: Callable[..., Any] = subpr
         try:
             finalize(staged, state, records, emb)
             o.certs = decided_certs(inp)
+            o.failed = failed_stages(inp)
             o.rows = check(inp)  # 2.
             freeze(staged.certs)  # 3. (staged)
             docs = regenerate(real, staged, emb)  # 4.
