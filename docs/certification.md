@@ -1,15 +1,28 @@
 # Certification: `balanced` vs `exact`, within NVIDIA's own noise
 
-Status: 2026-10-22. The generator (`validate/certify.py`, `flora certify`) and its consumption
+Status: 2026-10-23. The generator (`validate/certify.py`, `flora certify`) and its consumption
 (`validate/certkey.py`, `config/presets.find_certificates`, config validation, `plan_app`,
-`flora plan`) are built and tested on CPU. One certificate is committed:
-**`segment` is certified for `human` on the L40S** (`config/certificates/cert_f5d6433f….json`,
-with its freeze lock in `certificates/freeze/`), from run `10221548f1b8`: 12 candidate episodes,
-a 6-episode noise run and a 6-episode cold witness. **`caption` is not certified**: on the same
-run it failed its noise-floor check (`caption_mismatch`, `caption_edit_distance`), and a failed
-certificate is never committed. Its re-certification is planned under rules fixed before that
-run ([`wave-h-runbook.md`](wave-h-runbook.md), "The certified run";
-[`wave-h-report.md`](wave-h-report.md)).
+`flora plan`) are built and tested on CPU. **Generator version 4** is the current rule
+(`certkey.GENERATOR_VERSIONS = ("4",)`): caption certificates gate on **stage-isolated**
+metrics (the balanced Captioner captions the oracle's own segments, with byte-identical model
+inputs checked per call), and the end-to-end caption metrics are published as reported-only.
+Every version-3 certificate is retired: it matches nothing under v4.
+
+What this means for the committed files:
+- One certificate is committed, the version-3 **`segment`** certificate for `human` on the L40S
+  (`config/certificates/cert_f5d6433f….json`, with its freeze lock in `certificates/freeze/`),
+  from run `10221548f1b8`. It is **retired**: v4 does not accept its generator version, and its
+  key drifted anyway when `engines/offline_llm.py` changed (the Captioner limits below). The
+  drift guard reports it as `retired` (information, not an error;
+  [`certificate-freeze.md`](certificate-freeze.md)). The file stays until the re-certified v4
+  segment certificate exists; the commit that adds the new one deletes it and its lock.
+  **Balanced segmentation is therefore uncertified** between landing the v4 code and that
+  re-certification.
+- **`caption` is not certified.** On run `10221548f1b8` it failed its end-to-end noise-floor
+  check (`caption_mismatch`, `caption_edit_distance`), and a failed certificate is never
+  committed. Both stages are re-certified under v4 by the `recertify` plan, with rules fixed
+  before that run ("Pre-registration and re-runs" below; [`wave-h-runbook.md`](wave-h-runbook.md),
+  "The re-certification run"; [`wave-h-report.md`](wave-h-report.md)).
 
 Background:
 - `exact` runs NVIDIA's own HF code with model inputs proven identical. It is the reference.
@@ -55,17 +68,32 @@ in [`limitations.md`](limitations.md#accuracy-certificates). So:
   drifted `provisional` one, or one committed without its freeze lock, only warns
   ([`certificate-freeze.md`](certificate-freeze.md)).
 
-The committed certificate came from the certified run (`scripts/wave_h.py --plan certified`:
-12 human episodes, a noise run on 6 of them, a 6-episode cold witness;
-[`wave-h-runbook.md`](wave-h-runbook.md)).
+The committed (now retired) certificate came from the certified run (`scripts/wave_h.py --plan
+certified`: 12 human episodes, a noise run on 6 of them, a 6-episode cold witness). Its v4
+replacement and the first caption certificate come from the re-certification run
+(`scripts/wave_h.py --plan recertify`: 12 human episodes, a noise run on **all 12**, 6-episode
+cold witnesses; [`wave-h-runbook.md`](wave-h-runbook.md)).
 
 ## Method (contributors)
 
 Terms used below:
 
 - **oracle**: the `exact` reference run that a candidate is compared with.
-- **noise run**: the oracle run repeated on a subset of its episodes; `exact` vs noise is the
-  noise floor.
+- **noise run**: the oracle run repeated on its episodes (all 12 under v4); `exact` vs noise is
+  the noise floor.
+- **stage-isolated caption run**: a balanced caption-only job whose Captioner captions a pinned
+  copy of the oracle's own `segment` records instead of balanced TempSeg's
+  (`pipeline.caption_segments`). It measures the Captioner alone: segmentation differences
+  cannot reach its captions.
+- **input identity**: the per-call check that a Captioner request's model inputs are
+  byte-identical on both sides. Each side records NVIDIA's `input_tensor_digest` per caption
+  row (the oracle and noise runs in their audit's `model_calls`, the balanced workers through
+  the same digest rule restated in the tap); input identity holds when the digests are equal.
+- **input-identical pair**: an oracle caption row and the other side's row whose Captioner
+  digests are equal. The isolated metrics compare captions over these pairs only.
+- **reported-only**: a metric computed from the records and published in the certificate
+  (`metrics.reported`) that is never a check, never part of the verdict and never read by
+  matching. Under v4 the end-to-end caption metrics are reported-only.
 - **L0**: the in-engine token/grid parity check (each request's `prompt_token_ids` and
   `video_grid_thw` against NVIDIA's HF processor), from `modal_app/balanced_lab.py`.
 - **Gate A**: the FP32 `dt_bias` logit drift check, recorded alongside L0.
@@ -76,9 +104,13 @@ Terms used below:
 | Input | What | Required |
 |---|---|---|
 | `--exact` | `exact` records of the oracle run (JSONL, `flora_labels_v1`) | yes |
-| `--balanced` | the candidate stack's records on the same episodes | yes |
+| `--balanced` | the candidate stack's records on the same episodes; for a v4 `caption`, the stage-isolated caption run's records | yes |
 | `--noise` | the oracle run **repeated** on some of its episodes: same stage hash, key, GPU and determinism mode. `exact` vs `noise` is the noise floor. Noise episodes the oracle did not label are dropped (`metrics.noise.unpaired`), so a spare fills in | no (without it: `provisional`) |
-| `--witness` | the **cold witness**: candidate records from one container forced cold (`FLORA_COMPILE_CACHE=off`), the same stack, on some of the oracle's episodes. Its means are held to the same thresholds as the candidate's on their own; its subtask-count flips are counted together with the candidate's ("Pass rule", "Warm and cold compiles") | no (without it, or with no record forced cold, `segment`/`caption` are `provisional`: `no_witness`) |
+| `--witness` | the **cold witness**: candidate records from one container forced cold (`FLORA_COMPILE_CACHE=off`), the same stack, on some of the oracle's episodes. Its means are held to the same thresholds as the candidate's on their own; for `segment`, its subtask-count flips are counted together with the candidate's ("Pass rule", "Warm and cold compiles"). For a v4 `caption` it is a stage-isolated caption-only job, held to input identity like the candidate | no (without it, or with no record forced cold, `segment`/`caption` are `provisional`: `no_witness`) |
+| `--oracle-segments` | `caption`: the pinned oracle segment JSONL the stage-isolated caption run captioned (the oracle's `segment` records, `exact` preset, one record per line), byte-identical to the file pinned in the run's `pipeline.caption_segments` (its sha256 is checked against every candidate record's `provenance.segments_from`) | yes for `caption` (without it: refused) |
+| `--digests SIDE=PATH` | `caption`: one digest JSON per side, `{uid: [hex64 or null, one per caption row in record order]}`, hex only, no text (`scripts/wave_h_finalize.py --fetch` writes them). Sides: `exact` (the oracle, from its audit's Captioner `model_calls`), `noise`, `balanced` (the isolated candidate), `witness` (the isolated cold witness), and optionally `repeat` (reported only). Repeatable | `exact` and `balanced` yes for `caption` (without them: refused); `noise` and `witness` as their records |
+| `--reported-e2e` | `caption`: the end-to-end balanced job's (J1) caption records, on its own segmentation, for the reported-only block (`metrics.reported.e2e`) | no (without it the block is absent) |
+| `--reported-repeat`, `--families` | reported only: the old 6-episode noise run's caption records (needs `--digests repeat=`); a JSON `{uid: label}` (label `[a-z0-9_.-]{1,32}`, e.g. `n-egodex`) for the per-family split | no |
 | `--l0` | `modal_app/balanced_lab.py` result JSON (L0 rows, Gate A and `engine_hashes`, the `certkey.engine_settings_hash` of each engine it built), one per model kind. A lab whose baseline engine hash is not the candidate's engine settings is stale (`stale_l0`) | no (without it, or stale, video stages are `provisional`) |
 | `--config` / `-c` | the candidate run's `flora.yaml`: preset, pool GPUs, output-affecting modes, embodiment | default `flora.yaml` |
 | `--derived-content NAME=SHA256` | content digest of each derived weight the kind needs (`tempseg_merged`, `captioner_bf16`): `flora prepare`'s `content_digest(receipt)`, the value `DerivedPin.content_sha256` pins | yes for `segment`/`caption` |
@@ -109,6 +141,11 @@ Every record of every set (oracle, noise, candidate) must carry, in `provenance`
 | `models` | pin key -> revision; each must agree with `cert_key.nvidia_pins` | set |
 | `compile_cache` | `segment`/`caption`: the compile cache its container ran (`warm:<key>:<manifest sha256[:16]>`, `legacy:<key>`, `cold`, `cold:forced`); counted, not required | stamped by the balanced workers |
 | `engine_preemptions` | `segment`/`caption`: vLLM preemptions while the episode's requests were in flight (`vllm:num_preemptions`); `None` is unknown | stamped by the balanced workers; > 0 or `None` makes the certificate `provisional` |
+| `segments_from` | stage-isolated `caption` records only: `{sha256, oracle_stage_hash}` of the pinned oracle segment file they captioned. Absent from every other record (and from its JSON, so older records and their bytes are unchanged) | stamped by the balanced `CaptionWorker` when `pipeline.caption_segments` is set |
+
+The per-row Captioner input digests are not provenance: they are in the caption audits (the
+balanced episode audit rows' `input_digests`; the oracle's and noise run's
+`result.flora_reference.model_calls`), and certify reads them from the digest JSONs.
 
 `flora certify` refuses records without them (`certified: false`, `missing_provenance`, naming
 the fields). Records made by fake engines (`provenance.certificate` in `{fake-models,
@@ -128,6 +165,27 @@ outright (`certified: false`, `fake_models`).
    mode are recorded in the certificate (`oracle`).
 4. **Witness.** Same key, stage hash, GPU and embodiment as the candidate; paired with the
    oracle like the noise run.
+5. **Isolated caption inputs** (`caption`, v4). Each of these **refuses**: no certificate is
+   written (`CertifyRefused`), so it can neither pass nor revoke anything.
+   - `segments_not_oracle`: a candidate (or witness) caption record's
+     `provenance.segments_from.sha256` is not the sha256 of the `--oracle-segments` file, or its
+     `oracle_stage_hash` is not the oracle records' stage hash, or an episode's caption rows are
+     not the oracle's segments: a different row count, or a start or end more than 1e-6 s from
+     the oracle row's.
+   - `oracle_digests_missing`: an oracle caption row with a Captioner call (status `complete`)
+     has no digest. The k-th Captioner call of the oracle's audit (`output_limit` 512, in order)
+     pairs with its k-th `complete` caption row; other rows have no call and a `null` digest.
+   - `inputs_not_isolated`: for some row the candidate's (or witness's) digest is not the
+     oracle's, including one side `null` and the other not. Byte-identical model inputs are the
+     premise of isolation, so a mismatch means the harness (the row reconstruction from the
+     oracle's records) is wrong, not the engine. The fix is the harness, never a threshold.
+
+   The isolated run's caption stage hash differs from an end-to-end job's (the pinned file is in
+   its caption shard entry, so its shards never mix with production ones), but its certificate
+   key is the production caption key (`caption_segments` is not a mode and not in
+   `key_document`): the certificate is for the stack, not for the input. A v4 `caption`
+   certification without `--oracle-segments`, `--digests exact=` and `--digests balanced=`
+   refuses too. `segment` and the reward stages are unchanged.
 
 Note: an oracle run in `deterministic` mode needs its noise run in `deterministic` mode too (they
 would otherwise differ in key and determinism). The certified run uses NVIDIA's default mode
@@ -156,20 +214,85 @@ matched pairs and `slots = max(|A|, |B|)`.
 
 Two empty episodes score 0 on every metric.
 
-### Caption (`caption` records)
+### Caption (`caption` records, stage-isolated)
 
-The intervals of the two caption records are aligned as above. Captions are compared after
-`strip()`, and a `None` caption is `""`.
+Under v4 the caption certificate measures the **Captioner alone**. The candidate is a
+stage-isolated caption run: it captions the oracle's own segments, and every compared caption had
+byte-identical model inputs on both sides (input identity, verified per call). Segmentation is
+gated by the `segment` certificate, not charged a second time here.
+
+Notation, per episode in oracle ∩ candidate: `o_1..o_n` are the oracle's caption rows and
+`c_1..c_m` the candidate's, in order; `cap(x)` is the caption after `strip()`, with `None` as
+`""`; `ned(a, b) = lev(a, b) / max(len a, len b)` (normalized Levenshtein in characters, 0 when
+both are empty); `dO(i)` and `dC(i)` are the Captioner input digests of row `i` (`null` for a
+row with no call, e.g. `unsupported_target_frames`).
+
+**Candidate (the gate).** After the refusals ("Binding checks", 5), `m == n` and the bounds are
+the oracle's. The slots are `S = {i : dO(i) is not null}`, the rows the oracle actually
+captioned, and the pairs are `(o_i, c_i)` for `i` in `S`: no IoU alignment is needed.
 
 | Metric | Per episode |
 |---|---|
-| `caption_mismatch` | `1 - (exact matches over P) / slots`: 1 minus the exact-match rate |
-| `caption_edit_distance` | `(sum over P of lev(a, b) / max(len a, len b) + unmatched) / slots`. Normalized Levenshtein in characters; an unmatched slot counts 1 |
-| `caption_similarity_divergence` | only with `--similarity module:function`: `(sum over P of 1 - sim(a, b) + unmatched) / slots`, with `sim` clipped to [0, 1]. **Off by default.** The hook is the caller's own code; nothing here touches the network |
+| `caption_mismatch` | `#{i in S : cap(o_i) != cap(c_i)} / |S|` |
+| `caption_edit_distance` | mean over `S` of `ned(cap(o_i), cap(c_i))`. No unmatched term: it is structurally 0 |
 
-Caption records carry their own (balanced) segmentation, so caption metrics measure the
-end-to-end segment + caption result. Caption certificates also check `count_mismatch` (`1` if the
-two records have different numbers of intervals).
+Every oracle episode with a candidate record and `|S| >= 1` counts; there is no count-matched
+restriction, because the counts match by construction. Aggregation is macro (the plain mean
+over episodes), as in v3. `count_mismatch` is **not** a caption metric under v4: it is
+structurally 0 (`segments_not_oracle` guarantees it), so the caption certificate runs no
+count-flip check. Subtask counts stay gated by the `segment` certificate. The cold witness (an
+isolated caption-only job forced cold) is scored the same way and must pass input identity too.
+
+**Input identity** (required evidence). The certificate records `input_identity = {candidate,
+witness}`, each `{pairs, equal, episodes, status, stage_hash, oracle_stage_hash}`. It is
+`pass` only when `equal == pairs` over every slot of every episode; anything else has already
+refused (`inputs_not_isolated`). It covers **every** Captioner request (98 for the human
+candidate), not the 6 that L0 samples. It complements L0: input identity shows the candidate's
+HF-side inputs equal the oracle's, and L0 shows vLLM's own rendering equals HF's.
+
+**Noise (stage-isolated): `exact` vs `exact` on input-identical pairs.** The noise run is the
+oracle job repeated on all its episodes, with digests `dN(j)` from its audit. Per episode in
+oracle ∩ noise:
+- `A` is the monotone IoU alignment of the oracle's and the noise run's rows (as for segments);
+- `P = {(i, j) in A : dO(i) is not null and dO(i) == dN(j)}`, the pairs whose Captioner inputs
+  were byte-identical in the two `exact` runs;
+- `caption_mismatch_noise = #{(i, j) in P : cap(o_i) != cap(n_j)} / |P|`, and
+  `caption_edit_distance_noise` the mean `ned` over `P`;
+- an episode with `|P| = 0` is left out of the isolated noise means. A count-flip episode is
+  **not** left out: its input-identical pairs count.
+
+The noise `n` is the number of episodes with `|P| >= 1`; means are macro. The candidate is
+conditioned on identical inputs, so the noise is conditioned the same way (equal bounds alone
+are not enough). The selection keeps the segments whose TempSeg output was stable across the
+two `exact` runs; they are plausibly easier, so this estimate leans **low**, which makes the
+threshold stricter, not looser. If the oracle's or the noise run's audits lack digests, certify
+stops; no bounds-plus-neighbours proxy is substituted without a new pre-registration.
+
+`caption_similarity_divergence` (only with `--similarity module:function`: `1 - sim(a, b)`
+with `sim` clipped to [0, 1], over the same slots) is **off by default** and not used by the
+certified run. The hook is the caller's own code; nothing here touches the network.
+
+### Reported-only (`metrics.reported`)
+
+These are computed from the records and published, but they are never in `checks`, never part
+of the verdict and never read by `policy_problems` or matching:
+
+- **`e2e`**: the v3 end-to-end definitions, unchanged, comparing the end-to-end balanced job's
+  (J1) caption records, on balanced TempSeg's own segmentation, against the oracle and against
+  the noise run. The intervals are aligned as for segments, and per episode:
+  `caption_mismatch = 1 - (exact matches over P) / slots`; `caption_edit_distance = (sum over P
+  of ned + unmatched) / slots` (an unmatched slot counts 1); `count_mismatch = 1` if the two
+  records have different numbers of intervals. The block records the means (over the
+  count-matched episodes, `count_mismatch` over all), `n`, the count flips and the thresholds
+  these would have had, each labelled `"reported_only": true`.
+- **Isolated micro rate**: the pooled differing captions over all slots, for the candidate and
+  the noise run.
+- **Split by family**: `n-` vs `x-` episodes, and EgoDex vs WGO, for the isolated candidate
+  (`--families`).
+- **Second repeat**: the old 6-episode noise run vs the oracle under the isolated definition
+  (run-to-run stability of the noise estimate; `--reported-repeat`).
+- **Set-valued agreement**: per input-identical slot, the candidate equal to the oracle **or** to
+  the noise run. Information only.
 
 ### Rewards
 
@@ -192,11 +315,18 @@ For the stage's (single) embodiment pool and each metric:
 mean of m(exact, balanced)  <=  min(cap_m, max(absolute_floor_m, tolerance x max(noise_m, floor_m) + slack_m))
 ```
 
-(`certkey.metric_threshold`). **Which mean** (`per_metric.over`): `count_mismatch` is averaged
-over every paired episode; for `segment` and `caption` every other metric is averaged over the
-episodes whose subtask counts agree (`count_matched`). The same rule gives `noise_m`.
+(`certkey.metric_threshold`). Version 4 leaves this formula, every knob and every floor
+**unchanged**; it changes only what the caption metrics are computed on (the stage-isolated
+definitions above). For `caption` that gives `1.5 x max(noise, 0.05) = 0.075` for
+`caption_mismatch` unless the measured isolated noise exceeds 5%, and `1.5 x max(noise, 0.02)`
+for `caption_edit_distance`.
 
-**Count flips are counted over the union.** For `segment` and `caption`, the `count_mismatch`
+**Which mean** (`per_metric.over`): `count_mismatch` is averaged over every paired episode; for
+`segment` every other metric is averaged over the episodes whose subtask counts agree
+(`count_matched`). For `caption` (v4) both metrics are averaged (`over: input_identical`) over every episode with at least
+one slot (candidate) or one input-identical pair (noise). The same rule gives `noise_m`.
+
+**Count flips are counted over the union.** For `segment` (and, before v4, `caption`), the `count_mismatch`
 check is not made per group but once (`class: union`), over the candidate's episodes and the
 cold witness's together: each witness episode is a sample of its own (the same episode, run in
 another container). It passes while
@@ -231,7 +361,8 @@ fail-closed for real regressions: at the floor, three count flips in 18 episodes
 without a witness), or a boundary error mean over 0.15 s with every count equal, in the
 candidate or in the witness, fail.
 
-**The committed certificate** (`segment`, `human`, L40S). The 10% is a floor, not the
+**The committed certificate** (`segment`, `human`, L40S; version 3, now retired, kept here as
+the worked example: the v4 segment rule is the same). The 10% is a floor, not the
 threshold. The threshold is `max(0.10, 1.5 x max(noise, 0.05) + slack)`, and the noise run
 measured `count_mismatch` noise of **1 flip in 6** episodes (0.1667). So the applied threshold
 is `1.5 x 0.1667 = 0.25` (recorded as 0.250001), which allows **5 of the 18** union episodes to
@@ -271,6 +402,9 @@ floor is below what a real regression costs:
 | `rank_divergence` | 0.05 | rho >= 0.925 |
 | `length_mismatch` | 0 | the step count is fixed by the video length |
 
+Version 4 changed none of these knobs or floors. A rule change of any kind needs a new generator
+version and a new pre-registration before any run ("Pre-registration and re-runs").
+
 **Absolute floors** `absolute_floor_m` on the threshold itself: `count_mismatch` 0.10 (above).
 The certificate records `noise_floor` and `absolute_floor` (and each check's `floor`,
 `absolute_floor` and `over` in `per_metric`); matching refuses a certificate whose recorded
@@ -279,10 +413,14 @@ floors are not the policy's (`certkey.floor_problems`).
 **Spares.** The certificate evaluates **every** episode both sides labelled,
 never a chosen subset: the candidate paired with the oracle (`n`), the noise run paired with the
 oracle, the witness paired with the oracle. So a failed episode is replaced by whichever spare
-is present, deterministically. The golden/v2 certified plan runs 12 oracle episodes for the 10
-`min_samples` (2 spares, `max_missing`) and 6 noise episodes for the 5 `min_noise_samples` (1
-spare): one missing balanced, noise or oracle episode, including an oracle miss on a noise
-episode, still certifies while >= 10 candidate and >= 5 noise episodes pair.
+is present, deterministically. The golden/v2 plans run 12 oracle episodes for the 10
+`min_samples` (2 spares, `max_missing`). Under v4 the noise run covers **all 12** oracle
+episodes, and the cold witnesses are the 6 `n-` episodes (the selection's 5 plus one spare, for
+the 5 `min_noise_samples`, which is still 5). For `caption` the isolated noise `n` counts the
+episodes with at least one input-identical pair, so an episode where no Captioner input
+repeated is not a noise sample. One missing balanced, noise or oracle episode still certifies
+while >= 10 candidate and >= 5 noise (and witness) episodes pair. (The v3 certified plan ran
+the noise on the 6 `n-` episodes only.)
 
 **Absolute caps** from archive/PLAN-v3.md §2: terminal `E[s]` MAE <= 0.05 (`expected_score_abs_delta`).
 PLAN's other bar, "boundary F1 at most 1 point below", is not enforced: no boundary-F1 metric
@@ -291,6 +429,10 @@ is computed yet.
 ### Verdict
 
 In this order:
+0. **Refused** (no certificate is written, `CertifyRefused`): missing or fake provenance and the
+   binding checks above, and for `caption` the three isolation refusals,
+   `segments_not_oracle`, `oracle_digests_missing` and `inputs_not_isolated` ("Binding checks",
+   5). A refusal is not a verdict, so it cannot revoke a certificate.
 1. **`fail`** if any check fails (`divergence_above_noise_floor`), or a present L0 fails
    (`l0_failed`: any request whose `prompt_token_ids` or `video_grid_thw` differ from NVIDIA's HF
    processor).
@@ -315,15 +457,29 @@ In this order:
    - a metric could not be evaluated (`metric_not_evaluable`).
 3. **`certified`** otherwise.
 
+The reported-only metrics (`metrics.reported`) never affect the verdict, in any direction.
+
 **What `certified` needs**, per stage and GPU: binding provenance on every record; at least
 10 candidate episodes of the pool, at most 2 oracle episodes unlabelled; a noise run pairing at
-least 5 of the oracle's episodes; L0 passing for `segment`/`caption` under the candidate's engine
-settings; for `segment`/`caption`, a cold witness of at least 5 episodes, every record forced
-cold; no preempted or unknown-preemption engine record; every check within threshold. **The
-six-episode `--plan full` session (6 candidate episodes, a 6-episode noise run) is `provisional`
-by construction**: 6 is below `min_samples` (10). The certified run (`scripts/wave_h.py --plan
-certified`: 12 episodes, a noise run on 6 of them, the selection's 5 plus one spare) is sized
-to meet these requirements.
+least 5 of the oracle's episodes (for `caption`, 5 with an input-identical pair); L0 passing for
+`segment`/`caption` under the candidate's engine settings; for `segment`/`caption`, a cold
+witness of at least 5 episodes, every record forced cold; for `caption`, a stage-isolated
+candidate and witness that pass input identity on every Captioner request; no preempted or
+unknown-preemption engine record; every check within threshold. **The six-episode `--plan full`
+session (6 candidate episodes, a 6-episode noise run) is `provisional` by construction**: 6 is
+below `min_samples` (10). The re-certification run (`scripts/wave_h.py --plan recertify`: 12
+episodes, a noise run on all 12, a segment-only and a caption-only isolated cold witness on the
+6 `n-` episodes) is sized to meet these requirements.
+
+The engine limits behind "no preempted record" (`engines/offline_llm.py`,
+[`balanced-engines.md`](balanced-engines.md)): the Captioner on the H100 runs `max_num_seqs`
+**11**, fixed before the run for margin. Its worst-case request is **17,920 tokens** (the
+16,811-token 3-view prompt, about 600 tokens of instruction and the 512-token budget), which
+takes **26 blocks of 784 tokens** (`ceil(17920 / 784) + 3`). Eleven sequences need 286 blocks of
+the estimated ~313, and the build check (`check_mamba_blocks`) fails closed below 286. TempSeg is
+unchanged. yam 3-view prompts (~16.8k tokens) are longer than `max_num_batched_tokens` 16384,
+so they are **always** prefilled in two chunks; that chunked path is what the yam certificate
+measures.
 
 **Preemptions.** A preempted GDN sequence recomputes its generated tokens through the
 chunked-prefill kernel instead of the recurrent decode kernel, a numerics path the oracle and
@@ -331,8 +487,11 @@ noise runs never used, and timing-dependent. Records whose engine preempted are 
 certified** rather than covered: covering them would vouch for a path that was measured only by
 accident, and excluding them would drop episodes silently. The engine limits fit a full batch of
 worst-case requests (`engines/offline_llm.py`: TempSeg `max_num_seqs` 48 on L40S, room for 55;
-the Captioner 16 on H100, room for 18), and the build fails when vLLM's blocks do not
-(`check_mamba_blocks`), so a certified run should see none.
+the Captioner 11 on H100 at 17,920 worst-case tokens, room for 12 in the estimated 313-block
+pool), and the build fails when vLLM's blocks do not (`check_mamba_blocks`), so a certified run
+should see none. (Before v4 the Captioner ran 16 against a 10,752-token worst case, which a
+full yam batch would not have fit.) A preempted run is `provisional`; the pre-registered remedy
+is a lower `max_num_seqs`, which re-keys every embodiment (the key has none).
 
 ### Warm and cold compiles
 
@@ -346,7 +505,10 @@ and the witness's caches and lists what its evidence `covers`. The certified pla
 per kind, which compiles (cold, or from the lab's legacy cache) and publishes the cache every
 later warm container loads, so its records are exactly the kernels warm production replays;
 then the **cold witness** re-runs the same config on the 6 noise episodes with
-`FLORA_COMPILE_CACHE=off`, one container per kind forced cold. A certificate with a witness
+`FLORA_COMPILE_CACHE=off`, one container per kind forced cold. The `recertify` plan splits the
+witness by stage: a segment-only forced-cold job (J1w) for `segment`, and a caption-only
+stage-isolated forced-cold job (J2w, the same config as the isolated candidate) for `caption`.
+A certificate with a witness
 therefore covers warm containers loading that publish and independent cold compiles; one
 without covers only the caches it lists.
 
@@ -366,7 +528,10 @@ certificate is written only with an explicit `--out-dir`.
 | Field | Content |
 |---|---|
 | `id` | `cert_` + the first 32 hex characters of the sha256 of the canonical body without `id` (content address; a hand-edited file is ignored) |
-| `generator` | `{name: flora-certify, version: "3", framework}` (`certkey.GENERATOR_VERSIONS`: version 3 is the current rule; earlier ones no longer match) |
+| `generator` | `{name: flora-certify, version: "4", framework}` (`certkey.GENERATOR_VERSIONS = ("4",)`: version 4 is the current rule; version 3 and earlier no longer match, and the drift guard reports them as `retired`) |
+| `scoring` | `caption`: `{"caption": "stage_isolated"}`. `policy_problems` refuses a v4 caption certificate without it |
+| `segments_from` | `caption`: `{sha256, oracle_stage_hash}` of the pinned oracle segment file the candidate captioned |
+| `input_identity` | `caption`: for the candidate and the witness, `{candidate, witness}`, each `{pairs, equal, episodes, status, stage_hash, oracle_stage_hash}`; `policy_problems` requires `status: pass` for both |
 | `generated_at` | UTC `YYYY-MM-DDTHH:MM:SSZ`; orders certificates for one key (below) |
 | `verdict`, `reasons`, `unlocks` | `certified` / `provisional` / `fail`; machine reasons; whether it unlocks the preset |
 | `preset`, `stage`, `kind`, `gpu` | what it certifies; `gpu` is the Modal GPU type (`H100!` is not `H100`) |
@@ -376,17 +541,62 @@ certificate is written only with an explicit `--out-dir`.
 | `engine`, `modes`, `logic`, `pins`, `derived_weights` | from the key: engine name, versions, image and fingerprint, patches and vLLM spec; output-affecting modes; logic version and certificate logic digest; NVIDIA pin revisions; derived-weight content digests |
 | `oracle` | the oracle's `stage_hash`, `engine_spec_hash`, normalized `gpu` and `determinism` mode |
 | `episodes` | `{count, digest, uid_sha256: [...]}`: sha256 of each episode uid, never the uid |
-| `metrics` | per pool `{n, count_matched, means}`; noise and witness `{n, means, unpaired, episodes: {count, digest}}`; `count_flips` (`segment`/`caption`): per group `{n, flips}` and over the union `{n, flips, rate, threshold, allowed}`; `coverage`; `missing`; the similarity hook's name |
+| `metrics` | per pool `{n, count_matched, means}`; noise and witness `{n, means, unpaired, episodes: {count, digest}}`; `count_flips` (`segment`; `caption` before v4): per group `{n, flips}` and over the union `{n, flips, rate, threshold, allowed}`; `coverage`; `missing`; the similarity hook's name; `reported` (`caption`): the reported-only block `{reported_only, micro, e2e, families, repeat, set_valued}`; the noise block also records its `pairs` and the candidate block its `slots` |
 | `thresholds` | the knobs, `noise_floor`, `absolute_floor`, and per metric `{slack, floor, absolute_floor, cap, over, threshold}` |
 | `preemptions`, `compile_cache` | `segment`/`caption`: candidate and witness records whose engine preempted / could not say; the compile caches the candidate and the witness ran, and what the evidence `covers` |
-| `checks` | `[{class, metric, value, threshold, pass}]` (`class` is the pool, `cold-witness`, or `union` for the one `count_mismatch` check, which also carries `flips`, `n` and `allowed`) |
+| `checks` | `[{class, metric, value, threshold, pass}]` (`class` is the pool, `cold-witness`, or `union` for the one `count_mismatch` check, which also carries `flips`, `n` and `allowed`). `policy_problems` refuses a v4 caption certificate whose checks name a reported metric or include `count_mismatch` |
 | `l0`, `gate_a` | L0 status and counts; Gate A summary numbers |
 
 **Metrics only.** No caption, prompt, rationale, metadata, episode id or dataset name ever enters
 a certificate. A property test feeds random strings into every free-text field of the input
 records and checks that none appears in the certificate. The record values carried are our own
 and validated: stage hashes (64 hex), the key document (equal to this checkout's), the GPU
-(normalized), the embodiment and determinism mode (enums).
+(normalized), the embodiment and determinism mode (enums). The digest JSONs carry hex digests
+only, and only their pair counts enter the certificate.
+
+## Pre-registration and re-runs
+
+Fixed on **2026-10-23**, before the re-certification run, by the user's decisions on the
+pre-registration of the stage-isolated caption certificate. These rules hold for the
+`recertify` plan (human) and for the yam `certified` plan on the same v4 code and keys.
+
+**Fixed before the run:**
+- **Order A** for human: the noise run on all 12 episodes runs from the unchanged checkout
+  **before** the v4 code lands, so the existing `exact` oracle (run `10221548f1b8`, step (b)) is
+  reused and the noise run reproduces its stage hash and key.
+- **Engine limits:** Captioner H100 `max_num_seqs` **11** (fixed for margin: 11 x 26 = 286
+  blocks of the estimated ~313; `check_mamba_blocks` fails the build closed below 286),
+  `WORST_CASE_TOKENS["captioner"]` **17,920** (26 blocks of 784 tokens); TempSeg unchanged; yam
+  3-view prompts always prefill in two chunks of 16384, which the yam certificate measures.
+- **Policy unchanged:** tolerance 1.5, `NOISE_FLOOR`, `ABSOLUTE_FLOOR`, `min_samples` 10,
+  `min_noise_samples` 5, `max_missing` 2, slack 0, no similarity hook. The caption threshold is
+  `1.5 x max(noise, 0.05)` = **0.075** unless the measured isolated noise exceeds 5%.
+- **Generator v4**, `GENERATOR_VERSIONS = ("4",)`: every v3 certificate is retired, including
+  the committed v3 segment certificate (see the status at the top).
+
+**Outcome, committed in advance:**
+- **`certified`**: publish after `scripts/cert_check.py` passes
+  ([`certificate-check.md`](certificate-check.md)).
+- **`fail`**: no re-roll. Either ship the hybrid (balanced `segment`, certified, with `exact`'s
+  Captioner), or fund diagnostics toward a **new** stack (for example FP32 `dt_bias` or
+  batch-invariant decoding) that gets its own pre-registration.
+- **`provisional`** for an infrastructure reason or a preemption: re-run only the affected job.
+
+**Re-runs.** One attempt per job. A job is re-run only for an infrastructure outcome: no records
+or an infrastructure `EpisodeError`; more than `max_missing` missing episodes;
+`engine_preempted` or `preemptions_unknown`; a killed app; or `inputs_not_isolated` fixed in the
+harness, which re-runs the isolated caption jobs only and must not touch scoring code. Never
+because of a metric value. A completed `flora certify` on complete evidence is final for its key.
+Changing any rule needs a new generator version and a new pre-registration **before** any new
+run.
+
+**Power.** Twelve episodes and about 98 captions implement the pre-registered rule; they do not
+give statistical confidence in either direction. The gate is a point comparison (a macro mean
+against 0.075), not a hypothesis test: simulated at the human episode sizes, the probability of
+passing is about 0.92 for a true isolated mismatch rate of 4%, 0.72 at 6%, 0.60 at 7% and 0.48 at
+8%, so the verdict is close to a coin flip for true rates of 6-9%, and one caption in a
+3-caption episode moves the mean by 0.028. Telling a true 5% from 7.5% at 80% power would take
+about 600 captions (roughly 75 episodes). State this next to the verdict, whatever it is.
 
 ## The key (`validate/certkey.py`)
 
@@ -496,6 +706,26 @@ flora certify -c flora.yaml --exact oracle/segment.jsonl --balanced bal/segment.
   --l0 reports/wave-h/balanced-tempseg.json \
   --derived-content tempseg_merged=<sha256> --generated-at <run time, YYYY-MM-DDTHH:MM:SSZ>
 ```
+
+A v4 `caption` certificate takes the stage-isolated records, the pinned oracle segment file and
+the digest JSONs; the end-to-end records go in only as the reported-only block:
+
+```bash
+flora certify -c flora.yaml --stage caption \
+  --exact oracle/caption.jsonl --balanced iso/caption.jsonl \
+  --noise noise/caption.jsonl --witness iso-witness/caption.jsonl \
+  --oracle-segments oracle-segments/<oracle stage hash>.jsonl \
+  --digests exact=digests/exact.json --digests noise=digests/noise.json \
+  --digests balanced=digests/balanced.json --digests witness=digests/witness.json \
+  --reported-e2e e2e/caption.jsonl \
+  --l0 reports/wave-h/balanced-captioner.json \
+  --derived-content captioner_bf16=<sha256> --generated-at <run time, YYYY-MM-DDTHH:MM:SSZ>
+```
+
+Optional, reported only: `--reported-repeat old-noise/caption.jsonl --digests
+repeat=digests/repeat.json`, `--families families.json`. Without
+`--oracle-segments`, `--digests exact=` and `--digests balanced=`, a caption certification
+refuses.
 
 Without `--witness` (records from a container forced cold) `segment` and `caption` are at best
 `provisional` (`no_witness`); `--generated-at` with the run's own time makes a re-run reproduce

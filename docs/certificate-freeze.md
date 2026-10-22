@@ -65,6 +65,14 @@ What the guard reports, per certificate:
 | `provisional` | warning: it unlocks nothing, so it does not block |
 | `fail` (a newer `fail` revokes the key) | not checked (an `info` line) |
 | superseded (a newer certificate decides the same key and pool) | not checked (an `info` line) |
+| `retired` (its generator version is in `certkey.RETIRED_GENERATOR_VERSIONS`, today `1`, `2`, `3`) | not checked (an `info` line, not an error) |
+
+**Retired certificates.** A certificate from an older generator version (today: any version
+other than `4`) can never match again, whatever the code does, so the guard reports it as
+`retired` instead of drifted. Keep the file until its re-certified replacement is committed,
+then delete it and its freeze lock in the commit that adds the new certificate. The committed
+v3 segment certificate (`cert_f5d6433f….json`) is in this state: while it is retired, balanced
+segmentation is uncertified.
 
 Other findings: a certificate committed without its freeze lock is a `no_lock` warning, a lock
 without a certificate an `orphan_lock` warning, a file not named after its id a warning, and a
@@ -154,19 +162,20 @@ of the key with its hash, the modules of the logic digest with the sha256 of the
 source, and the certificate that covers it. The hashes change with every merge on these paths,
 so they are not copied here.
 
-**One certificate is committed, so one row is frozen:** `balanced` / `segment` / `L40S` for
-`human` (`cert_f5d6433f….json`, lock in `certificates/freeze/`, run `10221548f1b8`). `caption`
-failed on that run and has no certificate, so its row is not frozen until it is re-certified.
-What the listing covers:
+**No row is frozen today.** One certificate is committed, the v3 `balanced` / `segment` /
+`L40S` certificate for `human` (`cert_f5d6433f….json`, lock in `certificates/freeze/`, run
+`10221548f1b8`), and it is retired (above). `caption` failed on that run and has no
+certificate. Both rows are frozen again by the v4 re-certification
+([`wave-h-runbook.md`](wave-h-runbook.md), "The re-certification run"). What the listing
+covers:
 
 - `exact`: nothing (the reference by construction).
 - `balanced` / `segment` / `L40S` and `balanced` / `caption` / `H100!`: the `vllm-offline`
-  engine on `img_vllm`, with `max_num_seqs` 48 (TempSeg on the L40S) and 16 (Captioner on the
+  engine on `img_vllm`, with `max_num_seqs` 48 (TempSeg on the L40S) and 11 (Captioner on the
   H100), `max_num_batched_tokens` 16384 and `gpu_memory_utilization` 0.9; the TempSeg or
   Captioner NVIDIA pins; the `tempseg_merged` or `captioner_bf16` derived digest; and a cert
-  logic digest over the 61 modules of the `common` + `vllm-video` groups (`engines/batch_policy.py`
-  included). The segment row is frozen by the committed certificate; the caption row will be
-  frozen by its re-certification.
+  logic digest over the modules of the `common` + `vllm-video` groups (`engines/batch_policy.py`
+  included).
 - `balanced` / `reward.terminal`, `reward.dense`, `reward.rubric` / `H100!`: the
   `nvidia-vllm-offline` engine, the Rewarder pin, a logic digest over 30 modules (32 for
   rubric). These are the reference by identity, so no certificate will freeze them; the script
