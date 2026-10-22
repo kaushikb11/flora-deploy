@@ -2542,15 +2542,34 @@ def print_status(st: State, projections: Mapping[str, Projection], *, plan: str,
     return d
 
 
+class NotStaged(Exception):
+    """The golden set's manifest is not on the golden Volume (or the Volume does not exist)."""
+
+
+def _not_found(e: BaseException) -> bool:
+    """A missing Volume file (``FileNotFoundError``) or Volume (``modal`` ``NotFoundError``)."""
+    return isinstance(e, FileNotFoundError) or type(e).__name__ == "NotFoundError"
+
+
 def load_manifest(offline: bool, version: str = "golden/v1") -> dict[str, Any]:
+    """The ``version`` manifest from the golden Volume (``offline``: the selection's expected
+    durations). Raises :class:`NotStaged` when the set was never staged there."""
     if offline:
         return offline_manifest(DURATION_HEADROOM, version)
-    if version == "golden/v1":
-        return h0.golden_manifest()
-    import modal
+    try:
+        if version == "golden/v1":
+            return h0.golden_manifest()
+        import modal
 
-    vol = modal.Volume.from_name(h0.GOLDEN_VOLUME, version=2)
-    return json.loads(b"".join(vol.read_file(f"{version}/manifest.json")))
+        vol = modal.Volume.from_name(h0.GOLDEN_VOLUME, version=2)
+        return json.loads(b"".join(vol.read_file(f"{version}/manifest.json")))
+    except Exception as e:
+        if not _not_found(e):
+            raise
+        raise NotStaged(f"{version} is not staged: no {version}/manifest.json on Volume "
+                        f"{h0.GOLDEN_VOLUME} ({type(e).__name__}); run "
+                        f"scripts/golden_stage.py --version {version} (or pass --offline to "
+                        "price the selection's expected durations)") from None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2617,7 +2636,11 @@ def main(argv: list[str] | None = None) -> int:
         st.mark_killed()
     elif preview:  # what a run would find: a heartbeat this old is a dead process
         st.mark_killed(stale_before=time.time() - DEAD_HEARTBEAT_S)
-    manifest = load_manifest(args.offline, spec.golden)
+    try:
+        manifest = load_manifest(args.offline, spec.golden)
+    except NotStaged as e:
+        print(f"refused: {e}")
+        return 2
     miss = missing_episodes(manifest, spec.episodes)
     if miss:
         print(f"note: only {len(spec.episodes) - len(miss)} of the {len(spec.episodes)} "
