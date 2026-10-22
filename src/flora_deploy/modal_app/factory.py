@@ -399,7 +399,13 @@ def _recipe_env(recipe: str, determinism: str, cache_mode: str = "ro") -> dict[s
     if recipe == "balanced":  # compile caches: balanced_app.cache_env (read-only mount, M7)
         # No VLLM_ALLOW_INSECURE_SERIALIZATION: the GDN dtype check calls the worker extension's
         # method by name (engines/worker_ext.py), which vLLM's msgpack encoder accepts as is.
-        return {CACHE_MODE_ENV: cache_mode, "TOKENIZERS_PARALLELISM": "false"}
+        from flora_deploy.modal_app.balanced_app import COMPILE_CACHE_ENV, PUBLISH_ENV
+
+        # the compile-cache switches, from the deploying process (a certified run forces one
+        # job cold; review 13 W1); not hashed: the cache is recorded per record instead
+        switches = {k: os.environ[k] for k in (COMPILE_CACHE_ENV, PUBLISH_ENV)
+                    if os.environ.get(k)}
+        return {CACHE_MODE_ENV: cache_mode, "TOKENIZERS_PARALLELISM": "false", **switches}
     from flora_deploy.modal_app import rewarder_app as ra
 
     root = LOCAL_CACHE_ROOT if cache_mode == "ro" else None

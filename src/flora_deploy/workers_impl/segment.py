@@ -46,11 +46,12 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import dataclasses
 import json
 import re
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
@@ -555,6 +556,7 @@ class BalancedShardRunner:
         self.policy = settings.policy(job.stage)
         self.batcher_cls: Callable[..., MicroBatcher] = MicroBatcher  # the simulation's seam
         self.sampler: Any = None
+        self.compile_cache: Any = None  # engines.compile_cache.WorkerCache (balanced_app)
         if settings.sample_resources:
             from flora_deploy.observe.sampler import ContainerSampler
 
@@ -566,7 +568,9 @@ class BalancedShardRunner:
         out: dict[str, Any] = {"batch_policy": self.policy.as_json(),
                                "phased": self.settings.phased,
                                "executor_workers": executor_workers(self.settings),
-                               "cache_blocks": getattr(self.engine, "cache_blocks", None)}
+                               "cache_blocks": getattr(self.engine, "cache_blocks", None),
+                               # the compile cache is balanced_app's startup "compile_cache"
+                               "preemptions": self._preemptions()}
         if self.sampler is not None:
             try:
                 out["resources"] = self.sampler.snapshot()
@@ -618,6 +622,30 @@ class BalancedShardRunner:
         self.preempt()
 
     # -- internals -----------------------------------------------------------------------
+    def _preemptions(self) -> int | None:
+        """The engine's cumulative preemption count (``OfflineEngine.preemptions``); None when
+        the engine has no counter or it cannot be read."""
+        get = getattr(self.engine, "preemptions", None)
+        try:
+            n = get() if callable(get) else None
+        except Exception:  # noqa: BLE001 - unknown, never 0
+            return None
+        return n if type(n) is int else None
+
+    def _cache_identity(self) -> str | None:
+        ident = getattr(getattr(self.compile_cache, "status", None), "identity", None)
+        return ident() if callable(ident) else None
+
+    def _engine_facts(self, records: Sequence[Any], p0: int | None) -> list[Any]:
+        """Stamp ``provenance.compile_cache`` and ``engine_preemptions`` (the counter's change
+        over this episode's window, so a superset of the episodes whose requests were
+        preempted; None when unknown at either end)."""
+        p1 = self._preemptions()
+        delta = p1 - p0 if p0 is not None and p1 is not None else None
+        ident = self._cache_identity()
+        return [dataclasses.replace(r, provenance=dataclasses.replace(
+            r.provenance, compile_cache=ident, engine_preemptions=delta)) for r in records]
+
     def _end(self, active: _Active, *, preempted: bool = False, error: str | None = None,
              crashed: bool = False) -> bool:
         with self._lock:
@@ -676,9 +704,10 @@ class BalancedShardRunner:
         ctx = ShardContext(jf, shard, manifests, self.container_id)
         t_sample = self.sampler.clock() if self.sampler is not None else 0.0
         self.last_stats, self.last_gates = {}, {}
+        p_shard = self._preemptions()
         if todo:
             asyncio.run(self._episodes(todo, refs, sink, ctx, active))  # step 4
-        sink.add(audits=[self._shard_audit(shard, len(todo), t_sample)])
+        sink.add(audits=[self._shard_audit(shard, len(todo), t_sample, p_shard)])
         sink.flush()
         self._next_k[key] = sink.k
 
@@ -702,13 +731,19 @@ class BalancedShardRunner:
             active.ended = True
         return receipt
 
-    def _shard_audit(self, shard: Shard, episodes: int, t_sample: float) -> dict[str, Any]:
-        """The shard's audit row: batch policy, batcher and gate stats, container resources."""
+    def _shard_audit(self, shard: Shard, episodes: int, t_sample: float,
+                     p_shard: int | None = None) -> dict[str, Any]:
+        """The shard's audit row: batch policy, batcher and gate stats, container resources,
+        the engine's preemptions during the shard (None: unknown) and the compile cache."""
+        p1 = self._preemptions()
         row: dict[str, Any] = {"shard_audit": True, "shard_id": shard.shard_id,
                                "stage": self.job.stage, "episodes_run": episodes,
                                "batch_policy": self.policy.as_json(),
                                "phased": self.settings.phased,
-                               "batcher": dict(self.last_stats), "gates": dict(self.last_gates)}
+                               "batcher": dict(self.last_stats), "gates": dict(self.last_gates),
+                               "preemptions": (p1 - p_shard if p1 is not None
+                                               and p_shard is not None else None),
+                               "compile_cache": self._cache_identity()}
         if self.sampler is not None:
             try:
                 self.sampler.sample()
@@ -754,6 +789,7 @@ class BalancedShardRunner:
                 if dead:  # the engine died under an earlier episode: never start
                     return
                 with gates.slot():
+                    p0 = self._preemptions()
                     try:
                         if uid not in refs:
                             raise KeyError(f"episode {uid!r} is not in the manifest")
@@ -771,7 +807,7 @@ class BalancedShardRunner:
                             raise err from exc
                     else:
                         digest = pol.as_json()["digest"]
-                        sink.add(records=out.records,
+                        sink.add(records=self._engine_facts(out.records, p0),
                                  audits=[{**a, "batch_policy": digest} for a in out.audits])
                 finished += 1
                 if finished % max(1, s.flush_every) == 0:

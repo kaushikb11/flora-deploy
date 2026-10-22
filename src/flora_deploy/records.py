@@ -46,6 +46,14 @@ class Provenance:
     # the record. ``flora certify`` refuses records without them.
     embodiment: str | None = None
     cert_key: dict[str, Any] | None = None
+    # Balanced vLLM stages (review 13): the compile cache the container ran
+    # (``engines.compile_cache.CacheStatus.identity``: ``warm:<key>:<manifest sha256[:16]>``,
+    # ``legacy:<key>``, ``cold`` or ``cold:forced``; a warm start replays the publisher's
+    # Inductor autotune picks), and vLLM's preemption counter over the episode's inference
+    # window (``vllm:num_preemptions``; > 0: some request in flight then was preempted and
+    # recomputed; ``None``: unknown). ``flora certify`` reads both.
+    compile_cache: str | None = None
+    engine_preemptions: int | None = None
 
 
 @dataclass(frozen=True)

@@ -202,3 +202,70 @@ def _swap_engine(factory, eng):
         runner.engine = eng
         return runner
     return f
+
+
+# --- review 13 B1 / W1: engine preemptions and the compile cache, per record and per shard ----
+
+
+class CountingEngine(NullEngine):
+    """vLLM's ``vllm:num_preemptions`` counter: one preemption while ``preempt_key`` runs."""
+
+    def __init__(self, preempt_key=None):
+        self.count, self.preempt_key = 0, preempt_key
+
+    def generate_batch(self, requests, samplings):
+        if any(r.key == self.preempt_key for r in requests):
+            self.count += 1
+        return super().generate_batch(requests, samplings)
+
+    def preemptions(self):
+        return self.count
+
+
+def _runner_world(tmp_path, monkeypatch, engine, cache=None):
+    w = world(tmp_path, monkeypatch)
+    make = w.spec.factory
+
+    def factory(env):
+        r = make(env)
+        r.engine = engine
+        r.compile_cache = cache
+        return r
+
+    w.spec = WorkerSpec(w.spec.name, w.spec.kind, factory)
+    return w
+
+
+def test_records_and_audit_carry_preemptions_and_the_compile_cache(tmp_path, monkeypatch):
+    from flora_deploy.engines import compile_cache as cc
+
+    status = cc.CacheStatus("warm", "seg-key", manifest_sha256="f" * 64)
+    eng = CountingEngine()
+    w = _runner_world(tmp_path, monkeypatch, eng, SimpleNamespace(status=status))
+    bad = eng.preempt_key = w.uids[1]
+    assert w.run("ta-1") is not None
+    recs = {r.uid: r for r in w.records()}
+    # the counter's change over each episode's window: a superset of the preempted episodes
+    assert recs[bad].provenance.engine_preemptions == 1
+    assert {r.provenance.engine_preemptions for r in recs.values()} <= {0, 1}
+    assert {r.provenance.compile_cache for r in recs.values()} == {status.identity()}
+    rows = [json.loads(line) for p in (tmp_path / "w").rglob("*.jsonl")
+            for line in p.read_text().splitlines() if '"shard_audit"' in line]
+    rows = [r for r in rows if r.get("shard_audit")]
+    assert rows and rows[0]["preemptions"] == 1
+    assert rows[0]["compile_cache"] == status.identity()
+
+
+def test_unknown_preemptions_are_recorded_as_unknown(tmp_path, monkeypatch):
+    w = world(tmp_path, monkeypatch)  # NullEngine has no counter
+    assert w.run("ta-1") is not None
+    assert {r.provenance.engine_preemptions for r in w.records()} == {None}
+    assert {r.provenance.compile_cache for r in w.records()} == {None}
+
+
+def test_startup_facts_carry_preemptions():
+    eng = CountingEngine()
+    job = SegmentEpisodeJob(FakeStage(lambda uid: None), StageInfo("vllm-test"), inputs_ok,
+                            budget=1024)
+    r = BalancedShardRunner(SimpleNamespace(), eng, job, BalancedWorkerSettings())
+    assert r.startup_facts()["preemptions"] == 0  # the build's compile ran no request yet

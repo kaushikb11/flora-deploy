@@ -584,3 +584,62 @@ def test_scripts_price_warm_pools():
         100.0, t, warm_kinds=("segment", "caption"))
     assert w["segment"][0] < c["segment"][0] and w["caption"][0] < c["caption"][0]
     assert wh.warm_startup_s(t.startup_for("balanced", "segment")) is None
+
+
+# --- review 13 W1/W2: which cache a container ran is recorded; one can be forced cold --------
+
+
+def test_cache_identity_names_the_manifest(tmp_path, ba):
+    """A warm start replays the publisher's Inductor autotune picks (``.best_config``), so a
+    record must say which cache its container loaded: key + manifest hash, or cold."""
+    import hashlib
+
+    spec = spec_for("segment", MODEL, "L40S")
+    key = cc.spec_key(spec, model_content="c" * 64, image_fp="img")
+    mount = tmp_path / "mount"
+    kw = dict(mount=mount, local_root=tmp_path / "local", image_fp="img", log=lambda m: None)
+    cold = ba.prepare_cache("segment", spec, "c" * 64, {}, **kw)
+    assert cold.status.identity() == "cold"
+    src = tmp_path / "src"
+    fill_tree(src)
+    cc.publish(key, src, cc.DirSink(mount), cc.FileLeases(tmp_path / "l"), holder="x",
+               runtime=RUNTIME, log=lambda m: None)
+    warm = ba.prepare_cache("segment", spec, "c" * 64, {}, **kw)
+    sha = hashlib.sha256((mount / cc.ROOT / key.name / cc.MANIFEST).read_bytes()).hexdigest()
+    assert warm.status.manifest_sha256 == sha
+    assert warm.status.identity() == f"warm:{key.name}:{sha[:16]}"
+    assert warm.status.as_json()["identity"] == warm.status.identity()
+    assert cc.CacheStatus("legacy", key.name).identity() == f"legacy:{key.name}"
+
+
+def test_compile_cache_off_forces_one_container_cold(tmp_path, ba):
+    """``FLORA_COMPILE_CACHE=off``: no seed even when a verified cache exists, no publish."""
+    spec = spec_for("segment", MODEL, "L40S")
+    key = cc.spec_key(spec, model_content="c" * 64, image_fp="img")
+    mount = tmp_path / "mount"
+    src = tmp_path / "src"
+    fill_tree(src)
+    cc.publish(key, src, cc.DirSink(mount), cc.FileLeases(tmp_path / "l"), holder="x",
+               runtime=RUNTIME, log=lambda m: None)
+    fill_tree(mount / "balanced" / "tempseg")  # a legacy one is not offered either
+    kw = dict(mount=mount, local_root=tmp_path / "local", image_fp="img", log=lambda m: None)
+    wc = ba.prepare_cache("segment", spec, "c" * 64, {ba.COMPILE_CACHE_ENV: "off"}, **kw)
+    assert wc.status.state == "cold" and wc.status.reason == cc.FORCED_COLD
+    assert wc.status.identity() == "cold:forced" and not wc.publish_enabled
+    assert not any((tmp_path / "local" / key.name / "vllm").iterdir())
+    with pytest.raises(ValueError, match="FLORA_COMPILE_CACHE"):
+        ba.prepare_cache("segment", spec, "c" * 64, {ba.COMPILE_CACHE_ENV: "maybe"}, **kw)
+
+
+def test_deploy_forwards_the_compile_cache_switch(monkeypatch):
+    from flora_deploy.modal_app import balanced_app as ba
+    from flora_deploy.modal_app import factory
+
+    monkeypatch.delenv(ba.COMPILE_CACHE_ENV, raising=False)
+    monkeypatch.delenv(ba.PUBLISH_ENV, raising=False)
+    assert ba.COMPILE_CACHE_ENV not in factory._recipe_env("balanced", "nvidia")
+    monkeypatch.setenv(ba.COMPILE_CACHE_ENV, "off")
+    monkeypatch.setenv(ba.PUBLISH_ENV, "0")
+    env = factory._recipe_env("balanced", "nvidia")
+    assert env[ba.COMPILE_CACHE_ENV] == "off" and env[ba.PUBLISH_ENV] == "0"
+    assert ba.COMPILE_CACHE_ENV not in factory._recipe_env("segcap", "nvidia")

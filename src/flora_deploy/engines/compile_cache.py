@@ -38,15 +38,28 @@ Any problem (missing, unparsable, other key, other runtime, unsafe path, size or
 mismatch, I/O error) returns a ``cold`` status with the reason, and the engine compiles from
 scratch into an empty directory. Nothing here raises into the worker.
 
-**Determinism.** A compile cache holds the artifacts a compile produced; loading it gives the
-same kernels that compile would have run. vLLM states no bitwise guarantee across compiles,
-and the one input that is not a pure function of the key is Inductor's ``max_autotune`` (on
-only for single-size ``compile_sizes`` ranges, which flora never sets: none by default) and
-Triton's runtime ``@autotune`` in the FLA/GDN kernels (timing-based in every process, and not
-read from disk unless ``cache_results`` is set, which vLLM 0.24 does not). So a warm start runs
-what the publishing container compiled with the same heuristics a cold start would; outputs
-are a function of the hashed engine spec in both cases. The key is in the worker's startup
-facts, not in record provenance. Not output-affecting (``config/logic.py``).
+**Determinism: a warm start is not output-neutral** (review 13 W1). A compile cache holds the
+artifacts the publishing container's compile produced, including choices that are **not** a
+function of the key: torch 2.11 Inductor benchmarks several configs of some reduction kernels
+at their first launch, even with ``max_autotune`` off (``runtime/triton_heuristics.py``
+``_reduction_configs``: a ``DEFAULT`` hint, 3-D tiling, or the persistent-vs-looped RBLOCK
+extra config, which changes the accumulation order), and caches the winner as a
+``.best_config`` next to the kernel (``autotune_local_cache=True``). A later process reads it
+back instead of benchmarking. So a **warm** container replays the publisher's timing-based
+picks, while a **cold** one benchmarks afresh and may pick another config: a different
+reduction order and possibly bf16-level drift in greedy outputs. (Triton's runtime
+``@autotune`` in the FLA/GDN kernels is re-benchmarked in every process, warm or cold, since
+vLLM 0.24 does not set ``cache_results``: noise either way. ``TORCHINDUCTOR_DETERMINISTIC``
+would skip the benchmarking, but it changes kernels, so it would enter the key.)
+
+The key therefore does **not** carry the cache: which cache a container ran is **recorded**
+instead (:meth:`CacheStatus.identity`: ``warm:<key>:<manifest sha256[:16]>``,
+``legacy:<key>``, ``cold`` or ``cold:forced``) in the startup facts, each shard's audit row and
+every record's ``provenance.compile_cache``, and the certificate states the mix its evidence
+covers (``validate.certify``, ``compile_cache``). ``FLORA_COMPILE_CACHE=off`` forces a
+container cold (no seed, no publish) so a certified run can include an independent cold compile
+(``docs/certification.md``, "Warm and cold compiles"). Not in the certificate logic digest
+(``config/logic.py``): this module decides which artifacts load, recorded per record.
 """
 
 from __future__ import annotations
@@ -81,6 +94,7 @@ WORKER_SOURCES = ("engines/patches/dt_bias_fp32.py", "engines/worker_ext.py")
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SKIP_SUFFIXES = (".lock", ".tmp", ".partial")
 NO_CACHE = "no published cache for this key"
+FORCED_COLD = "forced cold (FLORA_COMPILE_CACHE=off)"
 
 
 class CacheInvalid(RuntimeError):
@@ -306,9 +320,21 @@ class CacheStatus:
     seconds: float = 0.0
     publish_id: str | None = None
     published: dict[str, Any] | None = None
+    manifest_sha256: str | None = None  # warm: sha256 of the MANIFEST.json bytes it loaded
+
+    def identity(self) -> str:
+        """Which compiled artifacts this container runs, for record provenance:
+        ``warm:<key>:<manifest sha256[:16]>``, ``legacy:<key>``, ``cold:forced`` or ``cold``."""
+        if self.state == "warm":
+            return f"warm:{self.key}:{(self.manifest_sha256 or 'unknown')[:16]}"
+        if self.state == "legacy":
+            return f"legacy:{self.key}"
+        return "cold:forced" if self.reason == FORCED_COLD else "cold"
 
     def as_json(self) -> dict[str, Any]:
-        return {k: v for k, v in self.__dict__.items() if v not in (None, "")}
+        out = {k: v for k, v in self.__dict__.items() if v not in (None, "")}
+        out["identity"] = self.identity()
+        return out
 
 
 def env_for(local: Path) -> dict[str, str]:
@@ -340,8 +366,9 @@ def seed(key: CacheKey, mount: Path | str, local: Path, *,
     stage = local.parent / f".{local.name}.staging-{uuid.uuid4().hex[:8]}"
     try:
         runtime = runtime_versions() if runtime is None else runtime
+        raw = mpath.read_bytes()
         try:
-            m = json.loads(mpath.read_bytes())
+            m = json.loads(raw)
         except ValueError as e:
             raise CacheInvalid(f"manifest is not JSON ({e})") from None
         check_manifest(m, key, runtime)
@@ -367,7 +394,8 @@ def seed(key: CacheKey, mount: Path | str, local: Path, *,
         env_for(local)
         return CacheStatus("warm", key.name, files=n, bytes=size,
                            seconds=round(time.perf_counter() - t0, 2),
-                           publish_id=m["publish_id"])
+                           publish_id=m["publish_id"],
+                           manifest_sha256=hashlib.sha256(raw).hexdigest())
     except Exception as e:  # noqa: BLE001 - a bad cache must never stop the worker
         shutil.rmtree(stage, ignore_errors=True)
         reset_local(local)

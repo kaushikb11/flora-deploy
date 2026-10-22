@@ -98,11 +98,13 @@ same `<stage_hash>` directory.
 | `logic_version` | string | framework logic version |
 | `framework` | string | `flora-deploy <version>` |
 | `gpu` | string or null | GPU the worker ran on (from `nvidia-smi`); not part of the config hash |
-| `certificate` | string or null | id of the Gate certificate that covers this record; null for `exact` (the reference) and for uncertified stacks; `fake-models` / `local-fake-models` for fake engines |
+| `certificate` | string or null | id of the Gate certificate that covers this record; null for `exact` (the reference), for a stage that is the reference by identity (`certkey.reference_identical`, e.g. `balanced`'s rewards), and for uncertified stacks; `fake-models` / `local-fake-models` for fake engines |
 | `source` | object | camera role to `{uri, range_s}`: the video file and time range the episode came from |
 | `engine_hash` | string or null | the producing stage's own hash (for `balanced`, the engine spec, sampling and pins), kept when the worker stamps `config_hash` with the job's stage hash; null when the stage set none |
 | `embodiment` | string or null | the job's `pipeline.embodiment` (the embodiment pool a certificate must cover) |
 | `cert_key` | object or null | the certificate key document of the stack that produced the record (`validate.certkey.key_document`: engine and image, vLLM engine spec, NVIDIA and decode pins, derived-weight content digests, run modes, logic); `flora certify` refuses records without it (`docs/certification.md`) |
+| `compile_cache` | string or null | `balanced` segment / caption: the vLLM compile cache the worker ran (`warm:<key>:<manifest sha256 prefix>`, `legacy:<key>`, `cold`, or `cold:forced` under `FLORA_COMPILE_CACHE=off`). A warm start replays the publisher's Inductor autotune choices, so it is recorded (`engines/compile_cache.py`, "Determinism"); null for other stages |
+| `engine_preemptions` | int or null | `balanced` segment / caption: vLLM preemptions (`vllm:num_preemptions`) while the episode's requests were in flight; > 0 means some request then was preempted and recomputed (a path no certificate measures), null that the counter could not be read. `flora certify` certifies neither |
 
 ### `segments[]` (segment and caption stages)
 
