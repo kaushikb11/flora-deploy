@@ -308,6 +308,130 @@ def test_lab_is_not_started_when_the_budget_cannot_carry_it(lab_ctx):
     assert all("budget left" in v["skipped"] for v in res["kinds"].values())
 
 
+# --- argv size, reuse of saved results, per-kind persistence ------------------------------------
+
+
+def test_child_args_go_through_a_file_not_argv(tmp_path):
+    import os
+    import subprocess
+
+    big = {"out": str(tmp_path / "a.json"), "kind": "captioner",
+           "segments": {f"ep{i}": [{"start_s": 0.0, "end_s": 1.0, "metadata": {"x": "y" * 900}}
+                                   for _ in range(40)] for i in range(40)}}
+    blob = json.dumps(big)
+    limit = os.sysconf("SC_ARG_MAX") if hasattr(os, "sysconf") else 2 ** 21
+    assert len(blob) > max(limit, 131072)  # inline, this one argv string could not exec
+    argv = lab.child_argv(big)
+    assert sum(len(a) for a in argv) < 4096 and blob not in argv
+    assert json.loads(Path(argv[-1]).read_text()) == big
+    # the child's entry reads it back from the file (child() swapped for an echo)
+    code = argv[2].replace("from flora_deploy.modal_app.balanced_lab import child; ", "").replace(
+        "child(", "print(len(").replace(")))", "))))")
+    p = subprocess.run([sys.executable, "-c", code, argv[3]], capture_output=True, text=True)
+    assert p.returncode == 0 and int(p.stdout) == len(big)
+
+
+def _saved(kind, **kw):
+    res = {"run": "wave-h-r", "kind": kind, **_good(kind)}
+    res["baseline"] = {**res["baseline"], "episodes_requested": list(wh.EPISODES)}
+    res.update(kw)
+    return res
+
+
+def test_reusable_lab_result_needs_evidence_and_the_same_run(tmp_path):
+    p = tmp_path / "balanced-tempseg.json"
+
+    def check(res, run="r", eps=wh.EPISODES):
+        p.write_text(json.dumps(res))
+        return wh.reusable_lab_result("tempseg", run, eps, path=p) is not None
+
+    assert check(_saved("tempseg"))
+    assert not check(_saved("tempseg"), run="other")
+    assert not check(_saved("tempseg"), eps=wh.EPISODES[:5])
+    assert not check(_saved("captioner"))  # another kind's file
+    assert not check(_saved("tempseg", error="client deadline 1131 s"))
+    assert not check(_saved("tempseg", gate_a={"requests": 0}))
+    no_l0 = _saved("tempseg")
+    no_l0["baseline"]["l0"] = []
+    assert not check(no_l0)
+    assert not check(_saved("tempseg", dtbias={"error": "child exit 1"}))
+    p.write_text("{not json")
+    assert wh.reusable_lab_result("tempseg", "r", wh.EPISODES, path=p) is None
+
+
+def test_lab_reuses_a_good_saved_kind_and_runs_only_the_rest(lab_ctx):
+    ctx, recs = lab_ctx
+    wh.LAB_OUT.mkdir(parents=True)
+    wh.lab_result_path("tempseg").write_text(json.dumps(_saved("tempseg")))
+    fake = _Lab({"captioner": _good("captioner")})
+    res = wh.run_lab(ctx, missing=lambda p: [], records=recs, lab_module=fake)
+    assert res["ok"] and [k for k, _ in fake.spawned] == ["captioner"]
+    assert res["kinds"]["tempseg"]["reused"] and res["kinds"]["tempseg"]["usd"] == 0.0
+    assert res["kinds"]["tempseg"]["l0"]  # its evidence is carried into the step result
+    # everything saved: nothing starts, no app is noted
+    wh.lab_result_path("captioner").write_text(json.dumps(_saved("captioner")))
+    ctx.st.step("lab").attempts.append(wh.Attempt(1.0))
+    fake2 = _Lab({})
+    again = wh.run_lab(ctx, missing=lambda p: [], records=recs, lab_module=fake2)
+    assert again["ok"] and fake2.spawned == [] and again["apps"] == []
+    assert ctx.st.step("lab").current.apps == []
+
+
+def test_a_later_kind_crashing_keeps_the_earlier_kinds_evidence(lab_ctx, monkeypatch):
+    ctx, recs = lab_ctx
+
+    class Boom(_Call):
+        def get(self, timeout):
+            raise OSError(36, "File name too long")
+
+    fake = _Lab({"tempseg": _good("tempseg")})
+    orig = fake._spawn
+    fake._spawn = lambda kind, args: Boom(None) if kind == "captioner" else orig(kind, args)
+    fake.run_captioner = SimpleNamespace(spawn=lambda *a: fake._spawn("captioner", a))
+    saved = []
+    real_save = wh.save_state
+
+    def spy(st, path=wh.STATE):
+        saved.append(json.loads(json.dumps(st.step("lab").result, default=str)))
+        real_save(st, path)
+
+    monkeypatch.setattr(wh, "save_state", spy)
+    res = wh.run_lab(ctx, missing=lambda p: [], records=recs, lab_module=fake)
+    assert not res["ok"] and "File name too long" in res["kinds"]["captioner"]["error"]
+    assert res["kinds"]["tempseg"]["evidence"] is True
+    # persisted after TempSeg returned, before the Captioner call
+    after_tempseg = [s for s in saved if "tempseg" in s.get("kinds", {})
+                     and "captioner" not in s["kinds"]]
+    assert after_tempseg and after_tempseg[0]["kinds"]["tempseg"]["evidence"] is True
+    on_disk = json.loads(ctx.state_path.read_text())["steps"]["lab"]["result"]
+    assert on_disk["kinds"]["tempseg"]["evidence"] is True
+
+
+def test_only_lab_dry_run_prices_only_what_is_not_reused(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(wh, "LAB_OUT", tmp_path / "out")
+    monkeypatch.setattr(h0, "golden_manifest", lambda: wh.offline_manifest(wh.DURATION_HEADROOM))
+    st = _done_state()
+    st.run_id = "r"
+    state = tmp_path / "state.json"
+    wh.save_state(st, state)
+    wh.LAB_OUT.mkdir()
+    wh.lab_result_path("tempseg").write_text(json.dumps(_saved("tempseg")))
+    full = wh.project("lab", wh.offline_manifest(wh.DURATION_HEADROOM))
+    assert wh.main(["--dry-run", "--only", "lab", "--state", str(state)]) == 0
+    out = capsys.readouterr().out
+    assert "lab reuses the saved tempseg result" in out
+    assert "tempseg: saved result reused" in out
+    cap_only = wh.project("lab", wh.offline_manifest(wh.DURATION_HEADROOM), reuse=("tempseg",))
+    assert f"upper ${cap_only.usd_upper:.2f}" in out
+    assert cap_only.usd_upper == pytest.approx(full.items[1]["usd_upper"], abs=1e-3)
+    assert cap_only.peak_usd_per_s == wh.LAB["captioner"].usd_per_s()
+    # the plan's global cap is still derived from the whole lab step, not the reduced one
+    ps = {s: wh.project(s, wh.offline_manifest(wh.DURATION_HEADROOM)) for s in wh.STEPS}
+    reduced = {**ps, "lab": cap_only}
+    assert wh.plan_global_cap("balanced-only", reduced) == wh.plan_global_cap(
+        "balanced-only", ps)
+
+
 # --- deadline and projection --------------------------------------------------------------------
 
 

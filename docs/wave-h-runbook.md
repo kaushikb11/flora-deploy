@@ -164,6 +164,13 @@ Now:
   `no_evidence`, and the plugin engine is not built. Wave H then skips the Captioner (it reads
   the same inputs). A kind with no L0 rows or no Gate A requests is reported as "produced no
   L0 / Gate A evidence". The step is charged only the wall time of the calls it started.
+- **Reuse.** A kind's saved result (`reports/wave-h/balanced-<kind>.json`) is kept, not re-run,
+  when it has evidence: L0 rows, Gate A requests and no error, for the same run id and (d)'s
+  episodes. The dry run prices only the kinds that still run. The global cap stays derived from
+  the whole step. Each kind's summary is saved to the state as soon as it returns, and a lab
+  call that raises is recorded as that kind's error.
+- **Child args** go to the engine child through a JSON file. Inline argv broke Linux's 128 KiB
+  per-argument limit once the deployed segments were included (2026-10-22 Captioner).
 - **Deadlines** cover two cold compiles: overhead + baseline build + plugin build + work, × 1.25.
   That is TempSeg 769 s and Captioner 1131 s, under the 1200 s container timeout. A call the
   budget left cannot carry to its expected length is not started.

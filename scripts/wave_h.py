@@ -240,6 +240,9 @@ class Projection:
     step: str
     items: list[dict[str, Any]] = field(default_factory=list)
     peak_usd_per_s: float = 0.0  # the most the step can burn at once (heartbeat estimate)
+    # The upper the plan's global cap is derived from, when it differs from ``usd_upper`` (a
+    # lab step that reuses saved results: the cap stays what the whole step was planned at).
+    cap_usd_upper: float | None = None
 
     def add(self, what: str, c: Container, seconds: float, *, upper_s: float | None = None
             ) -> None:
@@ -358,9 +361,11 @@ def balanced_job_seconds(video_s: float, table: Any = None, *,
     return out
 
 
-def project(step: str, manifest: Mapping[str, Any]) -> Projection:
+def project(step: str, manifest: Mapping[str, Any], *, reuse: Iterable[str] = ()
+            ) -> Projection:
     """What ``step`` is expected to cost (nominal rates; ``usd_upper``: upper quantiles plus
-    every cold start, scale-down tail and client slack the step can incur)."""
+    every cold start, scale-down tail and client slack the step can incur). ``reuse``: lab
+    kinds whose saved result is reused (:func:`lab_reuse`), priced at $0."""
     dur = durations(manifest)
     eps = episodes_in(manifest)
     v = sum(dur[i] for i in eps)
@@ -388,10 +393,20 @@ def project(step: str, manifest: Mapping[str, Any]) -> Projection:
               secs["caption"][0], upper_s=secs["caption"][1])
         p.peak_usd_per_s = seg.usd_per_s() + cap.usd_per_s()
     elif step == "lab":
+        reuse = set(reuse)
+        full = 0.0
         for kind in ("tempseg", "captioner"):
+            full += LAB[kind].usd_per_s() * (LAB_DEADLINE_S[kind] + LAB_SLACK_S)
+            if kind in reuse:
+                p.add(f"balanced lab {kind}: saved result reused (has evidence), not run",
+                      LAB[kind], 0.0, upper_s=0.0)
+                continue
             p.add(f"balanced lab {kind} (L0 + Gate A, 2 cold compiles; after (d)'s job)",
                   LAB[kind], LAB_EXPECTED_S[kind], upper_s=LAB_DEADLINE_S[kind] + LAB_SLACK_S)
-        p.peak_usd_per_s = max(c.usd_per_s() for c in LAB.values())  # one after the other
+        p.peak_usd_per_s = max((LAB[k].usd_per_s() for k in LAB if k not in reuse),
+                               default=0.0)  # one after the other
+        if reuse:
+            p.cap_usd_upper = round(full, 4)
     elif step == "noise":
         nv = sum(dur[i] for i in NOISE_EPISODES if i in dur)
         nominal, upper = exact_job_seconds(nv)
@@ -410,6 +425,11 @@ def deferred_steps(plan: str) -> tuple[str, ...]:
     return tuple(s for s in STEPS if s not in PLANS[plan])
 
 
+def _cap_upper(p: Any) -> float:
+    cap = getattr(p, "cap_usd_upper", None)
+    return float(p.usd_upper if cap is None else cap)
+
+
 def plan_global_cap(plan: str, projections: Mapping[str, Projection],
                     override: float | None = None) -> float:
     """``full``: :data:`GLOBAL_CAP_USD`. Otherwise the sum of the plan's upper projections,
@@ -418,7 +438,7 @@ def plan_global_cap(plan: str, projections: Mapping[str, Projection],
     if plan == "full":
         derived = GLOBAL_CAP_USD
     else:
-        up = round(sum(projections[s].usd_upper for s in PLANS[plan]), 6)
+        up = round(sum(_cap_upper(projections[s]) for s in PLANS[plan]), 6)
         derived = round(math.ceil(up * 10 - 1e-9) / 10, 2)
     return max(derived, override) if override is not None else derived
 
@@ -1340,6 +1360,39 @@ def lab_preconditions(manifest: Mapping[str, Any], episodes: Sequence[str],
 NO_EVIDENCE = "produced no L0 / Gate A evidence"
 
 
+def lab_result_path(kind: str) -> Path:
+    return LAB_OUT / f"balanced-{kind}.json"
+
+
+def reusable_lab_result(kind: str, run_id: str, episodes: Sequence[str],
+                        path: Path | None = None) -> dict[str, Any] | None:
+    """A saved lab result for ``kind`` a re-run can keep instead of paying for it again: same
+    run id and kind, (d)'s episodes, no error anywhere, L0 rows and Gate A requests."""
+    p = path or lab_result_path(kind)
+    try:
+        res = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(res, dict):
+        return None
+    base = res.get("baseline") or {}
+    gate = res.get("gate_a") or {}
+    ok = (res.get("run") == f"wave-h-{run_id}" and res.get("kind") == kind
+          and not res.get("error") and not base.get("error") and not res.get("no_evidence")
+          and bool(base.get("l0")) and int(gate.get("requests") or 0) > 0
+          and list(base.get("episodes_requested") or ()) == list(episodes)
+          and not (res.get("dtbias") or {}).get("error"))
+    return res if ok else None
+
+
+def lab_reuse(st: State) -> tuple[str, ...]:
+    """The lab kinds whose saved result (d2) reuses (:func:`reusable_lab_result`)."""
+    eps = (st.steps.get("balanced") or StepState()).result.get("episodes") or ()
+    if not eps:
+        return ()
+    return tuple(k for k in LAB if reusable_lab_result(k, st.run_id, eps) is not None)
+
+
 def _lab_kind_summary(res: Mapping[str, Any], wall: float, usd: float) -> dict[str, Any]:
     base = res.get("baseline", {}) if isinstance(res, Mapping) else {}
     err = res.get("error") or base.get("error")
@@ -1389,15 +1442,33 @@ def run_lab(ctx: Ctx, *, missing: Callable[[Iterable[str]], list[str]] | None = 
         out["error"] = "preconditions: " + "; ".join(why)
         out["note"] = f"no lab container started; charged $0; {NO_EVIDENCE}"
         return {"ok": False, **out, "tracked_usd": 0.0, "apps": []}
+    spent = 0.0
+
+    def persist() -> None:  # each kind's summary lands in the state as soon as it returns
+        ctx.st.step("lab").result = {"ok": False, "partial": True, **out, "tracked_usd": spent,
+                                     "apps": ["flora-balanced-lab"] if todo else []}
+        save_state(ctx.st, ctx.state_path)
+
+    for kind in LAB:
+        saved = reusable_lab_result(kind, ctx.st.run_id, episodes)
+        if saved is not None:
+            out["kinds"][kind] = {**_lab_kind_summary(saved, 0.0, 0.0), "reused": True,
+                                  "requests": ((saved.get("baseline") or {}).get("batcher")
+                                               or {}).get("requests")}
+    todo = [k for k in LAB if k not in out["kinds"]]
+    if not todo:
+        out["note"] = "every kind reused a saved result; nothing started"
+        return {"ok": True, **out, "tracked_usd": 0.0, "apps": []}
+    persist()
     import modal
 
-    spent = 0.0
     rdir = LAB_OUT
     rdir.mkdir(parents=True, exist_ok=True)
     ctx.note_app("flora-balanced-lab")  # only now: a precondition failure above charged $0
+    fns = {"tempseg": lab.run_tempseg, "captioner": lab.run_captioner}
     with modal.enable_output(), lab.app.run():
-        for kind, fn in (("tempseg", lab.run_tempseg), ("captioner", lab.run_captioner)):
-            c = LAB[kind]
+        for kind in todo:
+            fn, c = fns[kind], LAB[kind]
             limit = min(LAB_DEADLINE_S[kind],
                         gpu_deadline_s(ctx.st, "lab", c, spent_in_step=spent,
                                        slack_s=LAB_SLACK_S, global_cap=ctx.global_cap))
@@ -1420,6 +1491,8 @@ def run_lab(ctx: Ctx, *, missing: Callable[[Iterable[str]], list[str]] | None = 
             except (TimeoutError, modal.exception.TimeoutError):
                 call.cancel()
                 res = {"error": f"client deadline {limit:.0f} s"}
+            except Exception as e:  # noqa: BLE001 - the remote call raised: this kind failed
+                res = {"error": f"lab call raised {e!r}"[:2000]}
             wall = time.time() - t0
             usd = c.usd_per_s() * wall
             spent += usd
@@ -1427,6 +1500,7 @@ def run_lab(ctx: Ctx, *, missing: Callable[[Iterable[str]], list[str]] | None = 
             out["kinds"][kind] = _lab_kind_summary(res, wall, usd)
             stats = (res.get("baseline") or {}).get("batcher") or {}
             out["kinds"][kind]["requests"] = stats.get("requests")
+            persist()
     bad = {k: v["error"] for k, v in out["kinds"].items() if v.get("error")}
     bad.update({k: f"{v['episode_errors']} episode(s) failed" for k, v in out["kinds"].items()
                 if v.get("episode_errors") and k not in bad})
@@ -1683,7 +1757,12 @@ def main(argv: list[str] | None = None) -> int:
     if miss:
         print(f"note: only {len(EPISODES) - len(miss)} of the {len(EPISODES)} {EMBODIMENT} "
               f"episodes are staged; using those (missing: {', '.join(miss)})")
-    projections = {s: project(s, manifest) for s in STEPS}
+    reuse = lab_reuse(st)
+    projections = {s: project(s, manifest, reuse=reuse if s == "lab" else ())
+                   for s in STEPS}
+    if reuse:
+        print(f"note: lab reuses the saved {', '.join(reuse)} result(s) (evidence, run "
+              f"{st.run_id}, (d)'s episodes); only the rest runs")
     if args.global_cap is not None:
         if args.global_cap < st.spent:
             print(f"refused: --global-cap ${args.global_cap:.2f} is below the ${st.spent:.2f} "
