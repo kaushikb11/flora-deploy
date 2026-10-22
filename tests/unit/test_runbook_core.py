@@ -183,7 +183,7 @@ def test_billing_rows_outside_an_attempts_hours_are_not_its():
     assert a.billed_usd == pytest.approx(0.12) and a.charged(st.watermark) == pytest.approx(0.12)
 
 
-def test_a_legacy_shared_name_is_not_attributed_to_one_attempt():
+def test_a_shared_app_name_is_reconciled_apart_by_the_hours_and_the_later_attempt():
     st = rb.State("r", T0, "x", {"flora-balanced-lab": 0.0})
     pre = rb.Attempt(started=T0 + 0.1 * H, status="done", finished=T0 + 0.2 * H,
                      tracked_usd=0.0003, apps=["flora-balanced-lab"])
@@ -193,10 +193,29 @@ def test_a_legacy_shared_name_is_not_attributed_to_one_attempt():
     st.step("lab").attempts.append(lab)
     rb.refresh_billing(st, now=rb.Billing.from_rows(_rows(
         ("ap-old", "flora-balanced-lab", 0, 0.80), ("ap-z", "z", 1, 0.0))))
-    assert pre.billed_usd is None and lab.billed_usd is None  # the same hour, the same name
-    assert lab.settled(st.watermark) and lab.charged(st.watermark) == pytest.approx(0.72)
-    assert st.step("lab").billed_usd is None  # shared with preflight: the global total only
-    assert st.billed_total == pytest.approx(0.80) and st.spent == pytest.approx(0.80)
+    # the same hour, the same name: the hour goes to the attempt that started last
+    assert pre.billed_usd == 0.0 and lab.billed_usd == pytest.approx(0.80)
+    assert pre.charged(st.watermark) == pytest.approx(0.0003)
+    assert lab.settled(st.watermark) and lab.charged(st.watermark) == pytest.approx(0.80)
+    assert st.step("lab").billed_usd is None  # shared with preflight: no per-step delta
+    assert st.billed_total == pytest.approx(0.80) and st.spent == pytest.approx(0.8003)
+
+
+def test_scale_tests_deploy_and_run_share_an_app_but_reconcile_apart():
+    st = rb.State("r", T0, "x")
+    app = "flora-scale-102213-real"
+    dep = rb.Attempt(started=T0 + 0.10 * H, status="done", finished=T0 + 0.15 * H,
+                     tracked_usd=0.01, apps=[app])
+    run = rb.Attempt(started=T0 + 0.20 * H, status="done", finished=T0 + 1.6 * H,
+                     tracked_usd=9.0, apps=[app])
+    later = rb.Attempt(started=T0 + 3.1 * H, status="done", finished=T0 + 3.2 * H,
+                       tracked_usd=0.5, apps=[app])  # a retry, hours later
+    st.step("deploy").attempts.append(dep)
+    st.step("run").attempts += [run, later]
+    rb.refresh_billing(st, now=rb.Billing.from_rows(_rows(
+        ("ap-s", app, 0, 4.0), ("ap-s", app, 1, 5.5), ("ap-s", app, 3, 0.6))))
+    assert dep.billed_usd == 0.0 and dep.charged(st.watermark) == pytest.approx(0.01)
+    assert run.billed_usd == pytest.approx(9.5) and later.billed_usd == pytest.approx(0.6)
 
 
 # --- WP3: bounded charging, hold_clears_at, stop by id ----------------------------------------
@@ -407,7 +426,7 @@ def test_dry_run_rule_and_the_real_runs_budget_use_one_formula():
     caps, g = wh.plan_caps("certified", ps), wh.plan_global_cap("certified", ps)
     for s in wh.PLANS["certified"]:
         d = wh.decide(st, "certified", s, ps)
-        res = wh.reserve_for(st, wh.PLANS["certified"], s, ps)
+        res = wh.reserve_for(st, wh.PLANS["certified"], s, ps, caps)
         assert d.runs and d.budget.usd == wh.check_before(
             st, s, ps[s], caps=caps, global_cap=g, reserve=res).usd == wh.step_budget(
             st, s, caps=caps, global_cap=g, reserve=res)
@@ -515,3 +534,56 @@ def test_status_shows_the_approval_and_only_the_latest_error(monkeypatch, tmp_pa
     row = next(ln for ln in out.splitlines() if ln.strip().startswith("d2."))
     assert "camera files missing" in row and "BlockingIOError" not in row
     assert "held: lab attempt 1 charged $0.84" in out and "06:15 UTC" in out
+
+
+# --- WP7: the shared step loop, and finalize's billing rows on the watermark ------------------
+
+
+def test_finalize_billing_rows_read_the_watermark():
+    fin = _load("wave_h_finalize")
+    st = rb.State("r", T0, "x")
+    s = st.step("exact_e2e")
+    s.status, s.billed_usd = "done", 1.0
+    s.attempts.append(rb.Attempt(started=T0 + 0.2 * H, status="done", finished=T0 + 0.9 * H,
+                                 tracked_usd=1.0, apps=["flora-wh-r-exact-e2e-a1"]))
+    st.billed_at = T0 + 1.1 * H  # read 12 min after the step: the old lag rule said partial
+    st.billed_through = T0 + H  # but the rows already cover its whole hour
+    (row,), warnings = fin.billing_rows(st)
+    assert row[-1] == "reconciled" and not warnings
+    s.attempts[0].finished = T0 + 1.05 * H  # ran into the next, unbilled hour
+    (row,), warnings = fin.billing_rows(st)
+    assert row[-1].startswith("partial: read") and "billed through" in row[-1]
+    assert "final after 2026-10-22T07:15:00Z" in row[-1]  # finalize.utc()
+    assert "billing read after 2026-10-22T07:15:00Z" in warnings[0]
+
+
+def test_run_steps_is_the_loop_every_runbook_shares(tmp_path):
+    st = rb.State("r", 0.0, "x")
+    ps = {n: wh.Projection(n) for n in ("a", "b", "c")}
+    ps["b"].add("x", wh.LAB["tempseg"], 100.0)
+    caps = {"a": 1.0, "b": 1.0, "c": 1.0}
+    ctx = type("C", (), {"step": ""})()
+    ran = []
+
+    def run(name, c):
+        ran.append(name)
+        if name == "b":
+            raise RuntimeError("boom")
+        return {"ok": True, "tracked_usd": 0.1, "apps": []}
+
+    rc = rb.run_steps(
+        st, ["a", "b", "c"], state_path=tmp_path / "s.json", ctx=ctx, run=run,
+        projection=ps.__getitem__,
+        decide=lambda n, p: rb.decide(st, ["a", "b", "c"], n, ps, caps=caps, global_cap=3.0),
+        check_after=lambda n: rb.check_after(st, n, caps=caps, global_cap=3.0),
+        keep_going=lambda n: n == "b")
+    assert rc == 1 and ran == ["a", "b", "c"]  # b failed, and c still ran
+    b = st.step("b").attempts[0]
+    assert b.status == "failed" and b.notes == ["failed before any app started: charged $0",
+                                                "error: RuntimeError('boom')"]
+    assert st.step("b").notes == [] and st.step("c").status == "done"
+    assert [a.budget_usd for a in st.step("a").attempts] == [1.0]
+    assert rb.run_steps(st, ["a"], state_path=tmp_path / "s.json", ctx=ctx, run=run,
+                        projection=ps.__getitem__, decide=lambda n, p: pytest.fail("done"),
+                        check_after=lambda n: None, out=lambda m: ran.append(m)) == 0
+    assert ran[-1] == "skip a: done"

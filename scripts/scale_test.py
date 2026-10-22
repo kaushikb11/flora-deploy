@@ -73,6 +73,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import _runbook as rb  # noqa: E402 - the step loop, decisions, stop by id (shared)
 import h0_rehearsal as h0  # noqa: E402 - staging helpers (upload, mirror, sh)
 import wave_h as wh  # noqa: E402 - spend accounting, stop rules, billing
 
@@ -1693,11 +1694,8 @@ def print_plan(st: wh.State, mode: str, projs: Mapping[str, wh.Projection], out=
     for name in STEPS:
         p = projs[name]
         s = st.steps.get(name, wh.StepState())
-        try:
-            wh.check_before(st, name, p, caps=c, global_cap=g)
-            rule = "ok"
-        except wh.StopRule as e:
-            rule = f"STOP: {e}"
+        d = rb.decide(st, STEPS, name, projs, caps=c, global_cap=g)  # what a run decides
+        rule = {"run": "ok", "done": "done"}.get(d.action) or f"{d.action.upper()}: {d.message}"
         out(f"  {TITLES[name]:42s} [{s.status}] cap ${c[name]:.2f} nominal ${p.usd:.2f} "
             f"upper ${p.usd_upper:.2f}  rule: {rule}")
         for i in p.items:
@@ -1845,93 +1843,69 @@ def _main(args: argparse.Namespace) -> int:
             st.billing_baseline = wh.billed_by_app(st.billing_since)
         except Exception as e:  # noqa: BLE001
             print(f"billing baseline unavailable ({e!r}); tracking only")
-    for app in killed:
-        subprocess.run(["modal", "app", "stop", "--yes", app], capture_output=True, text=True)
-        print(f"stopped {app} (left by a killed run)")
+    rb.stop_killed(st)  # by id (an ephemeral app is never found by name)
     if killed and mode != "local":
         mark_app(st, APP_STOPPED)
     wh.save_state(st, spath)
     os.chdir(work)  # relative input.path is hashed against the cwd
     ctx = Ctx(mode, st, work, spath, args.poll or POLL_S[mode])
     c, gcap = caps(mode), global_cap(mode)
-    rc = 0
     selected = set(STEPS) if not args.only else {args.only}
     if args.only and args.only != "verify" and st.step("verify").status != "done":
         selected.add("verify")  # nothing is spent past an unchecked dataset pin (L1)
         print("--only: the dataset pin (verify) is not done; checking it first")
-    for name in STEPS:
-        if name not in selected:
-            continue
-        s = st.step(name)
+
+    def projections_now() -> dict[str, wh.Projection]:
+        return {**projs, "run": run_projection(st, mode, projs)}
+
+    def decide(name: str, p: wh.Projection | None = None) -> rb.Decision:
+        return rb.decide(st, STEPS, name, projections_now(), caps=c, global_cap=gcap,
+                         redo=name == "deploy")  # skip() said a done deploy runs again
+
+    def refresh(s: wh.State) -> None:
+        if mode != "local":
+            wh.refresh_billing(s)  # looked up per call (the tests patch it)
+
+    def skip(name: str, s: wh.StepState) -> str | None:
         redeploy = (name == "deploy" and mode != "local" and s.status == "done"
                     and st.step("run").status != "done" and app_state(st) != APP_DEPLOYED)
         if s.status == "done" and not redeploy:
-            print(f"skip {name}: done")
-            continue
-        if mode != "local":
-            wh.refresh_billing(st)
+            return "done"
         if redeploy:
-            try:  # no app is brought up for a run its stop rule would refuse
-                wh.check_before(st, "run", run_projection(st, mode, projs), caps=c,
-                                global_cap=gcap)
-            except wh.StopRule:
-                print("skip redeploy: the run step's stop rule refuses it")
-                continue
+            refresh(st)
+            if not decide("run").runs:  # no app is brought up for a run its stop rule refuses
+                return "no redeploy: the run step's stop rule refuses it"
             print(f"deploy again: the app is {app_state(st) or 'not known to be live'} "
                   "(an earlier run stopped it)")
             s.notes.append(f"redeploy: app {app_state(st) or 'state unknown'}")
-        p = run_projection(st, mode, projs) if name == "run" else projs[name]
-        s.projected_usd, s.projected_upper_usd = p.usd, p.usd_upper
-        try:
-            wh.check_before(st, name, p, caps=c, global_cap=gcap)
-        except wh.StopRule as e:
-            s.status, rc = "stopped", 3
-            s.notes.append(f"stop rule before: {e}")
-            break
+        return None
+
+    def refuse(name: str, s: wh.StepState) -> str | None:
         if name == "run" and mode != "local" and app_state(st) != APP_DEPLOYED:
-            s.notes.append(f"refused: the app is not deployed (app {app_state(st)}); run "
-                           "without --only so deploy runs first")
-            print(f"refuse run: {s.notes[-1]}")
-            rc = 1
-            break
-        att = wh.Attempt(started=time.time(), rate_usd_per_s=p.peak_usd_per_s,
-                         budget_usd=round(wh.step_budget(st, name, caps=c, global_cap=gcap), 4))
-        s.attempts.append(att)
-        s.status = "running"
-        ctx.step = name
-        wh.save_state(st, spath)
+            return (f"the app is not deployed (app {app_state(st)}); run without --only so "
+                    "deploy runs first")
+        return None
+
+    def run(name: str, ctx: Ctx) -> dict[str, Any]:
         print(f"== {TITLES[name]}", flush=True)
-        try:
-            with wh.Heartbeat(st, att, spath):
-                res = RUNNERS[name](ctx)
-            s.result = res
-            att.tracked_usd = round(float(res.get("tracked_usd") or 0.0), 4)
-            att.report_error = bool(res.get("report_error"))
-            att.status = s.status = "done" if res.get("ok") else "failed"
-            if name == "deploy" and res.get("ok") and mode != "local":
-                mark_app(st, APP_DEPLOYED)
-        except Exception as e:  # noqa: BLE001 - recorded; the runbook stops
-            att.status = s.status = "failed"
-            att.report_error = mode != "local"  # unknown spend: charged its budget
-            s.notes.append(f"error: {e!r}")
-            if name in ("deploy", "run") and mode != "local":
-                mark_app(st, APP_STOPPED)  # not known to be live: the next pass deploys
-        att.finished = time.time()
-        for a in s.result.get("apps", ()):
-            if a not in att.apps:
-                att.apps.append(a)
-        if mode != "local":
-            wh.refresh_billing(st)
-        wh.save_state(st, spath)
-        try:
-            wh.check_after(st, name, caps=c, global_cap=gcap)
-        except wh.StopRule as e:
-            s.notes.append(f"stop rule after: {e}")
-            rc = 3
-            break
-        if s.status != "done":
-            rc = 1
-            break
+        return RUNNERS[name](ctx)
+
+    def status_of(res: Mapping[str, Any]) -> str:
+        if ctx.step == "deploy" and res.get("ok") and mode != "local":
+            mark_app(st, APP_DEPLOYED)
+        return "done" if res.get("ok") else "failed"
+
+    def on_error(name: str, att: wh.Attempt, exc: BaseException) -> None:
+        att.report_error = mode != "local"  # unknown spend: charged its bound or budget
+        if name in ("deploy", "run") and mode != "local":
+            mark_app(st, APP_STOPPED)  # not known to be live: the next pass deploys
+
+    rc = rb.run_steps(
+        st, [n for n in STEPS if n in selected], state_path=spath, ctx=ctx, run=run,
+        projection=lambda name: projections_now()[name], decide=decide,
+        check_after=lambda name: wh.check_after(st, name, caps=c, global_cap=gcap),
+        refresh=refresh, skip=skip, refuse=refuse, status_of=status_of, on_error=on_error,
+        attempt_kw=lambda name: {"slack_s": CLIENT_SLACK_S})
     if mode == "fake-modal" and st.step("report").status == "done" and not args.keep:
         st.step("report").notes += cleanup_fake_modal(ctx)
     wh.save_state(st, spath)

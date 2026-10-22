@@ -76,20 +76,25 @@ with ``config.receipts.unpinned_message`` (``plan_app`` refuses it too, review 1
 **Spend.** Every attempt of a step is kept (:class:`Attempt`); a step's spend is the sum over its
 attempts, so a retry adds instead of overwriting. Tracked cost is container-seconds x list $/h
 (``flora report`` for the jobs, the lab's own wall time), and while a step runs a heartbeat stores
-``elapsed x the step's peak $/s`` so a killed process leaves its spend behind. An attempt that was
-killed, or whose ``flora report`` failed, is charged the most it was allowed to spend (its
-budget) until billing, read again before every step for **every** app seen so far, is at least
-:data:`BILLING_LAG_S` past it. An attempt that failed **before it noted any app** started
-nothing and is charged $0 (review 10 L1). The global figure is ``max(sum of charged attempts,
-billed delta of all apps)``; the global cap is checked on it.
+``elapsed x the step's peak $/s`` so a killed process leaves its spend behind. Each attempt runs
+its own app (:func:`app_name`), so billing is attributed per attempt. An attempt that was
+killed, or whose ``flora report`` failed, is held until billing covers it (the watermark of the
+billing rows' ``interval_start``, read again before every step for **every** app seen so far).
+Until then it is charged its peak $/s over the time it ran plus its stop slack when its stop
+was confirmed, else its budget (``_runbook.Attempt.bounded_usd``). An attempt that failed
+**before it noted any app** started nothing and is charged $0 (review 10 L1). The global figure
+is ``max(sum of charged attempts, billed delta of all apps)``; the global cap is checked on it.
 
-**Stop rules.** Before a step: its **upper** projection (upper rate quantiles, every cold start,
-the scale-down tail and :data:`CLIENT_SLACK_S` per app) must fit its cap and the global cap minus
-the cumulative spend. During a step: GPU wall time is bounded by ``(remaining step cap - slack x
-$/s) / $/s`` (``flora run --budget`` plus a client-side deadline that cancels the job and stops
-the app; lab and conversion calls get the same deadline as their timeout). After a step:
-tracked/billed spend over the step cap or the global cap stops the runbook. The dry run prints
-nominal and upper costs per step.
+**Stop rules** (``scripts/_runbook.py``: one ``budget_for`` and one ``decide`` for the stop rule,
+the attempt's budget, its in-step deadlines, the dry run and ``--status``). An attempt may spend
+``min(step cap, global cap - spent - the upper projections of the plan's later steps)``: the step
+cap is a per-attempt ceiling. Before a step its **upper** projection (upper rate quantiles,
+every cold start, the scale-down tail and :data:`CLIENT_SLACK_S` per app) must fit that. During
+a step GPU wall time is bounded by ``(budget - slack x $/s) / $/s`` (``flora run --budget`` plus
+a client-side deadline that cancels the job and stops the app; lab and conversion calls get the
+same deadline as their timeout). After a step: the attempt's spend over its cap, or the total
+over the global cap, stops the runbook. The dry run prints nominal and upper costs per step and
+the decision a run takes; ``--status`` adds the holds, who approved the cap and the next command.
 
 **State** is ``reports/wave-h/state.json`` (git-ignored: it names private episodes). Per job it
 records what ``scripts/wave_h_finalize.py`` reads: ``state``, ``spend``, ``video_s``, ``cfg``,
@@ -288,7 +293,7 @@ MERGE_EXPECTED_S, MERGE_MAX_S = 300, 1200  # v2: FP64 merge, "a few minutes" (te
 EQUIV_EXPECTED_S, EQUIV_MAX_S = 240, 600  # v1: 142 s + image start on one L40S
 IDLE_AFTER_JOB_S = 30  # last receipt -> compose -> `modal app stop`
 CLIENT_SLACK_S = rb.CLIENT_SLACK_S  # per app: `flora run` timeout, then cancel + app stop
-BILLING_LAG_S = rb.BILLING_LAG_S  # Modal billing covers complete hours only
+BILLING_LAG_S = rb.BILLING_LAG_S  # a state without a billing watermark: the old lag rule
 HEARTBEAT_S = rb.HEARTBEAT_S
 ORACLE_DETERMINISM = "nvidia"  # Fix-Cert: oracle and noise run in NVIDIA's default mode
 NOISE_JOB = JOB  # the oracle job (f) repeats
@@ -957,7 +962,7 @@ class Ctx:
         return episodes_in(self.manifest, self.spec.episodes)
 
     def reserve(self, step: str) -> dict[str, float]:
-        return reserve_for(self.st, self.plan_steps, step, self.projections)
+        return reserve_for(self.st, self.plan_steps, step, self.projections, self.caps)
 
     def budget_of(self, step: str, **kw: Any) -> Budget:
         """The running attempt's budget: the same rule as the stop rule before it."""
@@ -2101,17 +2106,7 @@ STEP_SLACK_S = {"tempseg": LAB_SLACK_S, "preflight": LAB_SLACK_S, "lab": LAB_SLA
 STEP_HARD_TIMEOUT_S = {"lab": 2 * LAB_TIMEOUT_S}  # two calls, one after the other
 
 
-def stop_killed(st: State, run: Callable[..., Any] | None = None,
-                out: Callable[[str], None] = print) -> None:
-    """Stop, by id, the apps a killed run may have left up (``modal app stop <name>`` finds no
-    ephemeral app). A confirmed stop bounds the attempt's charge (``Attempt.bounded_usd``)."""
-    for a in st.killed_unstopped():
-        if rb.stop_apps(a.apps, a.app_ids, run=run):
-            a.stopped_at = time.time()
-            out(f"stopped {', '.join(a.app_ids or a.apps)} (left by a killed run)")
-        else:
-            out(f"could not confirm {', '.join(a.app_ids or a.apps)} stopped (left by a killed "
-                "run): it stays charged its budget until billing covers it")
+stop_killed = rb.stop_killed
 
 
 def held_lines(st: State) -> list[str]:
@@ -2134,9 +2129,7 @@ def approver() -> str:
         return "unknown"
 
 
-def note_stop(s: StepState, text: str) -> None:
-    """A step's stop-rule note replaces the one before it (the notes never go stale)."""
-    s.notes = [n for n in s.notes if not n.startswith("stop rule")] + [text]
+note_stop = rb.note_stop
 
 
 def simulate_run_start(st: State, *, out: Callable[[str], None] = print) -> None:
@@ -2340,74 +2333,24 @@ def main(argv: list[str] | None = None) -> int:
     os.chdir(args.work)  # relative input.path is hashed against the cwd: plan where flora runs
     ctx = Ctx(st, manifest, args.work, state_path=args.state, global_cap=gcap, spec=spec,
               caps=caps, plan_steps=PLANS[args.plan], projections=projections)
-    rc = 0
-    for name in PLANS[args.plan]:
-        if args.only and name != args.only:
-            continue
-        s = st.step(name)
-        if s.status == "done":
-            print(f"skip {name}: done")
-            continue
-        refresh_billing(st)  # every app seen so far, before the step (H3)
-        p = projections[name]
-        s.projected_usd, s.projected_upper_usd = p.usd, p.usd_upper
-        d = decide(st, args.plan, name, projections, only=args.only)
-        if not d.runs:
-            s.status, rc = "stopped", 3
-            note_stop(s, f"stop rule before: {d.message}")
-            print(f"{d.action} {name}: {d.message}" + (f"\n  next: {d.command}" if d.command
-                                                          else ""))
-            break
-        att = Attempt(started=time.time(), rate_usd_per_s=p.peak_usd_per_s,
-                      budget_usd=d.budget.usd, slack_s=STEP_SLACK_S.get(name, CLIENT_SLACK_S),
-                      hard_timeout_s=STEP_HARD_TIMEOUT_S.get(name))
-        s.attempts.append(att)
-        s.status = "running"
-        ctx.step = name
-        save_state(st, args.state)
-        try:
-            with Heartbeat(st, att, args.state):
-                res = runner(args.plan, name)(ctx)
-            s.result = res
-            att.tracked_usd = round(float(res.get("tracked_usd") or 0.0), 4)
-            att.report_error = bool(res.get("report_error"))
-            att.status = s.status = ("done" if res.get("ok") else
-                                     "needs_pin" if res.get("needs_pin") else "failed")
-        except StopRule as e:  # an in-step stop rule raised before any app started
-            att.status = s.status = "stopped"
-            att.tracked_usd = 0.0
-            att.notes.append(f"stop rule: {e}")
-            note_stop(s, f"stop rule before: {e}")
-            rc = 3
-        except Exception as e:  # noqa: BLE001 - recorded; the runbook stops
-            att.status = s.status = "failed"
-            if att.apps:
-                att.report_error = True  # what it spent is unknown: charged its budget
-            else:  # L1: failed before it started any app: nothing to charge
-                att.tracked_usd = 0.0
-                att.notes.append("failed before any app started: charged $0")
-            att.notes.append(f"error: {e!r}")
-        att.finished = time.time()
-        for a in s.result.get("apps", ()):
-            if a not in att.apps:
-                att.apps.append(a)
-        refresh_billing(st)
-        save_state(st, args.state)
-        try:
-            check_after(st, name, caps=caps, global_cap=gcap)
-        except StopRule as e:
-            note_stop(s, f"stop rule after: {e}")
-            rc = 3
-            break
-        if s.status == "stopped":
-            break
+    def after(name: str, s: StepState) -> int | None:
         if s.status == "needs_pin":
             print(pin_instructions(s.result))
-            rc = NEEDS_PIN
-            break
-        if s.status != "done":
-            rc = 1
-            break
+            return NEEDS_PIN
+        return None
+
+    rc = rb.run_steps(
+        st, [n for n in PLANS[args.plan] if not args.only or n == args.only],
+        state_path=args.state, ctx=ctx, run=lambda name, c: runner(args.plan, name)(c),
+        projection=projections.__getitem__,
+        decide=lambda name, p: decide(st, args.plan, name, projections, only=args.only),
+        check_after=lambda name: check_after(st, name, caps=caps, global_cap=gcap),
+        refresh=lambda s: refresh_billing(s),  # looked up per call (tests patch it)
+        attempt_kw=lambda name: {"slack_s": STEP_SLACK_S.get(name, CLIENT_SLACK_S),
+                                 "hard_timeout_s": STEP_HARD_TIMEOUT_S.get(name)},
+        status_of=lambda res: ("done" if res.get("ok") else
+                               "needs_pin" if res.get("needs_pin") else "failed"),
+        after=after)
     save_state(st, args.state)
     report.parent.mkdir(parents=True, exist_ok=True)
     report.write_text(render_report(st, projections, plan=args.plan))

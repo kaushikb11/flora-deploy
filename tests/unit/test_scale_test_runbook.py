@@ -136,9 +136,12 @@ def test_stop_rule_uses_the_global_cap_minus_cumulative_spend(offline, tmp_path,
     wh.save_state(st, state)
     assert sc.main(["--yes-spend", "--state", str(state), "--work", str(tmp_path / "w")]) == 3
     st = wh.load_state(state)
-    assert st.step("run").status == "stopped"
-    assert "global budget left" in st.step("run").notes[-1]
-    assert "run" not in offline and "report" not in offline
+    # the $1.00 left cannot carry the run, so nothing is deployed for it either: the global cap
+    # keeps the run's upper projection back from the steps before it
+    assert st.step("deploy").status == "stopped" and not st.step("deploy").attempts
+    assert "global budget left" in st.step("deploy").notes[-1]
+    assert "binding: reserve for run" in st.step("deploy").notes[-1]
+    assert offline == ["plan"] and st.step("run").status == "pending"
 
 
 def test_spend_after_a_step_over_its_cap_stops_the_runbook(offline, tmp_path, monkeypatch):

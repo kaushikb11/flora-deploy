@@ -22,6 +22,7 @@ uv run python scripts/wave_h.py --dry-run --offline # ... without reading the go
 uv run python scripts/wave_h.py --yes-spend         # step 0; exits 4 with the pin to make
 #   pin the digest (one line in src/flora_deploy/config/pins.py), commit, then:
 uv run python scripts/wave_h.py --yes-spend         # step 0 done at $0, then (a), then (d)
+uv run python scripts/wave_h.py --status            # spend, holds, cap, the next decision
 uv run python scripts/wave_h.py --report            # rewrite reports/wave-h/runbook.md
 uv run python scripts/wave_h.py --plan full --dry-run  # every v1 step (cannot certify)
 uv run python scripts/wave_h.py --plan certified --dry-run  # the certified run (golden/v2)
@@ -211,16 +212,36 @@ Container-seconds come from `planner/rates.json`: startup + video-s × container
 
 ## Stop rules
 
-- **Before a step:** its **upper** projection must fit its cap and the plan's global cap minus
-  the cumulative spend. Otherwise the runbook stops (exit 3) and records why.
-- **During a GPU step:** the affordable wall time is (remaining step cap − slack × $/s) ÷ $/s,
-  so the deadline plus the slack never exceeds the cap. It is enforced three ways:
+The state, the billing reads, the stop rules and the step loop live in `scripts/_runbook.py`.
+`wave_h.py`, `scale_test.py` and `rubric_smoke.py` all use it.
+
+- **One budget rule** (`budget_for`). An attempt of a step may spend
+  `min(attempt cap, global cap − spent so far − reserve)`. The step's cap is a **per-attempt**
+  ceiling: earlier attempts count against the global cap, not against the cap. The reserve is
+  the upper projections of the plan's later steps that are not done yet, each at most its own
+  cap. The global cap holds that much back for them. The stop rule before a step, the
+  attempt's budget and its in-step deadlines all use this one rule. Every message names the
+  term that binds: `attempt cap`, `global left` or `reserve for <steps>`.
+- **One decision** (`decide`). Before a step the runbook takes one of four actions:
+  - `run` (with that budget);
+  - `done` (skipped);
+  - `stop`: the upper projection does not fit. The runbook exits 3 and records why, and when
+    the global term binds it prints the `--global-cap` that would fit. Raising the cap is the
+    user's decision.
+  - `wait`: the step only fails to fit because held attempts are charged more than they
+    tracked. It fits once billing covers them, and the runbook prints when, in UTC.
+  The dry run's `rule` column, `--status` and `--yes-spend` all take this same decision.
+- **During a GPU step:** the affordable wall time is (budget − slack × $/s) ÷ $/s, so the
+  deadline plus the slack never exceeds the budget. It is enforced three ways:
   - as `flora run --budget` (the job's own budget gate);
   - as a client-side deadline that cancels the job;
   - as the timeout of each lab and conversion call.
 
-  Every app is stopped (`modal app stop`) once its job ends.
-- **After a step:** the step's spend is checked against its cap, and the cumulative figure
+  A lab call that the budget cannot carry to its expected length is a stop rule raised before
+  the lab app starts, not a skip inside a running app. Every app is stopped once its job ends:
+  a deployed app by its name, an ephemeral app by its id (`modal app stop <name>` only finds
+  deployed apps).
+- **After a step:** the attempt's spend is checked against its cap, and the cumulative figure
   against the global cap.
 - **The lab (d2) runs only against (d)'s `done` job.** If the job failed or was cut short,
   (d) ends `failed` with `lab: not run: ...`, and the lab step refuses to run before any app
@@ -233,16 +254,48 @@ Container-seconds come from `planner/rates.json`: startup + video-s × container
   instead of overwriting them.
 - **Kills leave a record.** While a step runs, a heartbeat stores elapsed × the step's peak $/s
   every 30 s. A process killed mid-step therefore leaves its spend behind. The next
-  `--yes-spend` marks the attempt `killed`, stops its apps and retries the step.
-- **Unknown spend is charged at budget.** A killed attempt, or one whose `flora report` failed,
-  is charged its whole budget until billing has been read at least an hour after it. An attempt
-  that failed before it noted any app (a refusal on the CPU, such as an unpinned weight)
-  started nothing and is charged $0 (review 10 L1).
-- **Billing is re-read before every step and after it, for every app seen so far.** A step's
-  billed delta covers only the apps no other step used. (f) reuses (b)'s app, and the lab app is
-  shared by (a) and (d); those count in the global billed total only.
+  `--yes-spend` marks the attempt `killed`, stops its apps **by id** (its recorded ids, or the
+  live apps `modal app list --json` shows under its names) and retries the step.
+- **Every attempt has its own app.** Each run is named `flora-wh-<run>-<step>-a<n>` (with
+  `-merge` / `-equivalence` for step 0's two apps), through `App.run(name=...)` or `modal run
+  -n`. Billing reports cost per app name, so each attempt's spend is its own, and the app's id
+  is recorded when it starts. The deployed (d) app keeps the factory's name; it belongs to (d)
+  alone.
+- **Billing has a watermark.** Modal's hourly billing rows carry `interval_start`. The latest
+  billed hour's end is the watermark (`billed_through`): billing is complete up to it. A state
+  from before the watermark falls back to the old rule: billing complete an hour before its
+  last read.
+- **Unknown spend is bounded when the end is known.** A killed attempt, or one whose
+  `flora report` failed, is held until the watermark passes its end. Until then it is charged:
+  - when its stop was confirmed (the `with app.run()` block exited, or a stop by id returned
+    0): its peak $/s over the time it ran, plus its stop slack (60 s for lab and conversion
+    calls, 240 s for a deployed job);
+  - when its containers' hard timeout is known (the lab: two 20-minute calls): the same up to
+    that timeout;
+  - otherwise its whole budget.
+
+  The charge is never more than the budget. Each hold prints when it should clear: the end of
+  its billing hour plus 15 minutes, in UTC. Today's crashed lab attempt (tracked $0.72) is
+  charged about $0.84 this way, not its $2.35 budget. An attempt that failed before it noted
+  any app (a refusal on the CPU, such as an unpinned weight) started nothing and is charged $0
+  (review 10 L1).
+- **Billing is re-read before every step and after it, for every app seen so far.** Once settled,
+  an attempt is charged the larger of tracked and its own apps' billed cost over the hours it
+  ran. Each billed hour of an app goes to the attempt with that app that started last. So an
+  app two attempts share (scale test's deploy and run, a legacy shared name) is reconciled
+  separately, and the later attempt carries the shared hour. A step's billed delta still covers
+  only the apps no other step used.
 - **The global figure** is max(Σ per step max(charged attempts, billed delta), the global billed
   delta).
+- **Read-only previews.** `--dry-run` and `--status` decide on a copy of the state, and the state
+  file stays byte-identical. Before deciding they do what a run does first: read billing
+  (except with `--offline`), treat a running attempt whose heartbeat is older than 90 s as
+  killed, and take its apps as stopped. `--status` shows:
+  - the spend;
+  - the held attempts and when they clear;
+  - the cap in force, and who approved a `--global-cap` and when;
+  - each step's latest error (notes are kept per attempt, so old errors do not pile up);
+  - the next decision, with its command.
 
 ## State and report
 

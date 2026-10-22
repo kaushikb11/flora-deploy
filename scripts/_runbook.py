@@ -311,17 +311,22 @@ class Budget:
 
 
 def reserve_for(st: State, steps: Sequence[str], step: str,
-                projections: Mapping[str, Any] | None) -> dict[str, float]:
-    """The upper projections of the plan's steps after ``step`` that are not done yet: what the
-    global cap keeps for them."""
+                projections: Mapping[str, Any] | None,
+                caps: Mapping[str, float] | None = None) -> dict[str, float]:
+    """The upper projections of the plan's steps after ``step`` that are not done yet (each at
+    most its attempt cap: a step over its cap never runs), what the global cap keeps for
+    them."""
     if not projections or step not in steps:
         return {}
     out = {}
     for s in steps[list(steps).index(step) + 1:]:
         p = projections.get(s)
-        if p is not None and (st.steps.get(s) or StepState()).status != "done" \
-                and p.usd_upper > 0:
-            out[s] = round(float(p.usd_upper), 4)
+        if p is None or (st.steps.get(s) or StepState()).status == "done":
+            continue
+        up = float(p.usd_upper) if caps is None or s not in caps else min(float(p.usd_upper),
+                                                                          float(caps[s]))
+        if up > 0:
+            out[s] = round(up, 4)
     return out
 
 
@@ -449,15 +454,16 @@ class Decision:
 
 
 def decide(st: State, steps: Sequence[str], step: str, projections: Mapping[str, Any], *,
-           caps: Mapping[str, float], global_cap: float) -> Decision:
+           caps: Mapping[str, float], global_cap: float, redo: bool = False) -> Decision:
     """The one decision the dry run, ``--status`` and a real run all take for ``step`` (of the
-    plan's ``steps``) on the state as it is."""
+    plan's ``steps``) on the state as it is. ``redo``: a done step that runs again (scale
+    test's redeploy)."""
     s = st.steps.get(step) or StepState()
-    if s.status == "done":
+    if s.status == "done" and not redo:
         return Decision(step, "done", message=f"{step}: done")
     proj = projections[step]
     b = budget_for(st, step, caps=caps, global_cap=global_cap,
-                   reserve=reserve_for(st, steps, step, projections))
+                   reserve=reserve_for(st, steps, step, projections, caps))
     reasons = [f"{n} attempt {i} charged ${a.charged(st.watermark):.2f} (tracked "
                f"${a.tracked_usd:.2f}): {'killed' if a.status == 'killed' else 'unreported'}, "
                f"held until billing covers it, about {utc(a.hold_clears_at())}"
@@ -583,24 +589,23 @@ def _attempt_hours(a: Attempt) -> tuple[float, float]:
     return hour_floor(a.started), hour_floor(a.settle_point)
 
 
-def attempt_billed(st: State, a: Attempt, rows: Iterable[tuple]) -> float | None:
-    """The billed cost of ``a``'s own apps over the hours it ran, from the hourly ``rows``. None
-    when it started no app, is still running, or shares an app with another attempt in an
-    overlapping hour (a legacy shared name: its step and the global total still count it)."""
-    keys = _attempt_keys(a)
-    if not keys or a.status == "running":
-        return None
-    lo, hi = _attempt_hours(a)
-    for s in st.steps.values():
-        for b in s.attempts:
-            if b is a or not (keys & _attempt_keys(b)):
-                continue
-            blo, bhi = _attempt_hours(b)
-            if blo <= hi and lo <= bhi:
-                return None
-    return round(sum(cost for oid, name, t, cost in rows
-                     if (oid in a.app_ids or name in a.apps) and t is not None and lo <= t <= hi),
-                 4)
+def attribute_rows(st: State, rows: Iterable[tuple]) -> dict[int, float]:
+    """Per attempt (keyed by ``id()``) that started an app: the billed cost of its apps over the
+    hours it ran, from the hourly ``rows``. Each row goes to one attempt: of those with that
+    app (by id or name) active in that hour, the one that started last. An app two attempts
+    share (scale_test's deploy and run, a legacy shared name) is then reconciled apart:
+    the earlier attempt keeps its tracked cost, and the later one is charged the shared hour.
+    That over-charges the later one, which errs on the safe side."""
+    atts = [a for s in st.steps.values() for a in s.attempts if _attempt_keys(a)]
+    got = {id(a): 0.0 for a in atts}
+    for oid, name, t, cost in rows:
+        if t is None:
+            continue
+        cands = [a for a in atts if (oid in a.app_ids or name in a.apps)
+                 and _attempt_hours(a)[0] <= t <= _attempt_hours(a)[1]]
+        if cands:
+            got[id(max(cands, key=lambda a: a.started))] += cost
+    return got
 
 
 def billed_delta(st: State, apps: Iterable[str], now: Mapping[str, float]) -> float:
@@ -612,7 +617,7 @@ def refresh_billing(st: State, *, now: Mapping[str, float],
     """Apply a billing read (``now``: billed cost per app; a :class:`Billing` also carries its
     rows and watermark) to every app seen so far (H3): the global billed total, per step the
     billed delta of the apps only that step used (shared apps count globally only), and with
-    rows, per attempt the billed cost of its own apps (:func:`attempt_billed`) and the state's
+    rows, per attempt the billed cost of its own apps (:func:`attribute_rows`) and the state's
     watermark (:attr:`State.billed_through`)."""
     st.billed_total = billed_delta(st, st.apps_seen, now)
     owners: dict[str, set[str]] = {}
@@ -623,9 +628,11 @@ def refresh_billing(st: State, *, now: Mapping[str, float],
         mine = [a for a in s.apps if owners.get(a) == {name}]
         s.billed_usd = billed_delta(st, mine, now) if mine else s.billed_usd
     if isinstance(now, Billing):
+        got = attribute_rows(st, now.rows)
         for s in st.steps.values():
             for a in s.attempts:
-                a.billed_usd = attempt_billed(st, a, now.rows)
+                a.billed_usd = (round(got[id(a)], 4) if id(a) in got and a.status != "running"
+                                else None)
         if now.through is not None:
             st.billed_through = max(now.through, st.billed_through or now.through)
     st.billed_at = clock()
@@ -661,3 +668,130 @@ class Heartbeat:
     def __exit__(self, *exc: Any) -> None:
         self._stop.set()
         self._thread.join(timeout=5)
+
+
+def stop_killed(st: State, run: Callable[..., Any] | None = None,
+                out: Callable[[str], None] = print) -> None:
+    """Stop, by id, the apps a killed run may have left up (``modal app stop <name>`` finds no
+    ephemeral app). A confirmed stop bounds the attempt's charge (``Attempt.bounded_usd``)."""
+    for a in st.killed_unstopped():
+        if stop_apps(a.apps, a.app_ids, run=run):
+            a.stopped_at = time.time()
+            out(f"stopped {', '.join(a.app_ids or a.apps)} (left by a killed run)")
+        else:
+            out(f"could not confirm {', '.join(a.app_ids or a.apps)} stopped (left by a killed "
+                "run): it stays charged its budget until billing covers it")
+
+
+# ---------------------------------------------------------------------------------------------
+# The step loop (wave_h.py, scale_test.py and rubric_smoke.py run their steps through it)
+
+
+def note_stop(s: StepState, text: str) -> None:
+    """A step's stop-rule note replaces the one before it (the notes never go stale)."""
+    s.notes = [n for n in s.notes if not n.startswith("stop rule")] + [text]
+
+
+def charge_unknown_if_started(name: str, att: Attempt, exc: BaseException) -> None:
+    """The default for a runner that raised: unknown spend (charged its bound or budget) if it
+    noted an app, else nothing started and it is charged $0 (review 10 L1)."""
+    if att.apps or att.app_ids:
+        att.report_error = True
+    else:
+        att.tracked_usd = 0.0
+        att.notes.append("failed before any app started: charged $0")
+
+
+def _status_of(res: Mapping[str, Any]) -> str:
+    return "done" if res.get("ok") else "failed"
+
+
+def run_steps(st: State, steps: Iterable[str], *, state_path: Path, ctx: Any,
+              run: Callable[[str, Any], Mapping[str, Any]], projection: Callable[[str], Any],
+              decide: Callable[[str, Any], Decision], check_after: Callable[[str], None],
+              refresh: Callable[[State], Any] | None = None,
+              skip: Callable[[str, StepState], str | None] | None = None,
+              refuse: Callable[[str, StepState], str | None] | None = None,
+              attempt_kw: Callable[[str], Mapping[str, Any]] | None = None,
+              status_of: Callable[[Mapping[str, Any]], str] = _status_of,
+              on_error: Callable[[str, Attempt, BaseException], None] = (
+                  charge_unknown_if_started),
+              after: Callable[[str, StepState], int | None] | None = None,
+              keep_going: Callable[[str], bool] | None = None,
+              out: Callable[[str], None] = print) -> int:
+    """Run ``steps`` in order, each under the same rules: skip a done step (``skip`` says why
+    another is skipped), re-read billing (``refresh``), take :func:`decide`'s verdict (a stop
+    or wait ends the run, exit 3), start an attempt with the decision's budget and a heartbeat,
+    record its result (``status_of``) or its error (``on_error``), re-read billing, then the
+    stop rule after it (``check_after``). ``refuse``: a reason to refuse a step after its
+    decision (exit 1); ``after``: an exit code that ends the run after a step (e.g. a pin);
+    ``keep_going``: steps whose failure does not end the run. Returns the exit code."""
+    rc = 0
+    for name in steps:
+        s = st.step(name)
+        why = skip(name, s) if skip else ("done" if s.status == "done" else None)
+        if why:
+            out(f"skip {name}: {why}")
+            continue
+        if refresh is not None:
+            refresh(st)  # every app seen so far, before the step (H3)
+        p = projection(name)
+        s.projected_usd, s.projected_upper_usd = p.usd, p.usd_upper
+        d = decide(name, p)
+        if not d.runs:
+            s.status, rc = "stopped", 3
+            note_stop(s, f"stop rule before: {d.message}")
+            out(f"{d.action} {name}: {d.message}" + (f"\n  next: {d.command}" if d.command
+                                                     else ""))
+            break
+        if refuse is not None and (no := refuse(name, s)):
+            s.notes.append(f"refused: {no}")
+            out(f"refuse {name}: {no}")
+            rc = 1
+            break
+        att = Attempt(started=time.time(), rate_usd_per_s=p.peak_usd_per_s,
+                      budget_usd=d.budget.usd, **(attempt_kw(name) if attempt_kw else {}))
+        s.attempts.append(att)
+        s.status = "running"
+        ctx.step = name
+        save_state(st, state_path)
+        try:
+            with Heartbeat(st, att, state_path):
+                res = run(name, ctx)
+            s.result = dict(res)
+            att.tracked_usd = round(float(res.get("tracked_usd") or 0.0), 4)
+            att.report_error = bool(res.get("report_error"))
+            att.status = s.status = status_of(res)
+        except StopRule as e:  # an in-step stop rule raised before any app started
+            att.status = s.status = "stopped"
+            att.tracked_usd = 0.0
+            att.notes.append(f"stop rule: {e}")
+            note_stop(s, f"stop rule before: {e}")
+            rc = 3
+        except Exception as e:  # noqa: BLE001 - recorded; the runbook stops
+            att.status = s.status = "failed"
+            on_error(name, att, e)
+            att.notes.append(f"error: {e!r}")
+        att.finished = time.time()
+        for a in s.result.get("apps", ()):
+            if a not in att.apps:
+                att.apps.append(a)
+        if refresh is not None:
+            refresh(st)
+        save_state(st, state_path)
+        try:
+            check_after(name)
+        except StopRule as e:
+            note_stop(s, f"stop rule after: {e}")
+            rc = 3
+            break
+        if s.status == "stopped":
+            break
+        if after is not None and (code := after(name, s)) is not None:
+            rc = code
+            break
+        if s.status != "done":
+            rc = 1
+            if not (keep_going and keep_going(name)):
+                break
+    return rc
