@@ -56,6 +56,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -697,6 +698,31 @@ def overall_verdict(outcomes: Sequence[Mapping[str, Any]]) -> str:
     return "certified"
 
 
+def run_plan(st: wh.State) -> str:
+    """The plan the state was run under (it is not stored): ``full`` when a step only that plan
+    runs was started, else the default ``balanced-only``."""
+    for name in wh.deferred_steps(wh.DEFAULT_PLAN):
+        s = st.steps.get(name)
+        if s is not None and (s.attempts or s.status != "pending"):
+            return "full"
+    return wh.DEFAULT_PLAN
+
+
+def global_cap(st: wh.State) -> float:
+    """The global cap the run was gated on: ``wave_h.plan_global_cap`` for the state's plan,
+    from the upper projection the runbook stored on each step before it ran it. A step it never
+    reached is priced as the runbook prices it (offline manifest, today's rates)."""
+    plan = run_plan(st)
+    projections: dict[str, Any] = {}
+    for name in wh.PLANS[plan]:
+        s = st.steps.get(name)
+        if s is not None and s.projected_upper_usd is not None:
+            projections[name] = SimpleNamespace(usd_upper=s.projected_upper_usd)
+        else:
+            projections[name] = wh.project(name, wh.offline_manifest(wh.DURATION_HEADROOM))
+    return wh.plan_global_cap(plan, projections)
+
+
 @dataclass
 class Findings:
     st: wh.State
@@ -726,7 +752,7 @@ def render_report(f: Findings) -> str:
          "step used (`scripts/spend.py`).", ""]
     L += table(["step", "status", "attempts", "cap", "tracked", "charged", "billed", "billing"],
                f.billing)
-    L += ["", f"Total: **{usd(st.spent)}** of the {usd(wh.GLOBAL_CAP_USD)} global cap "
+    L += ["", f"Total: **{usd(st.spent)}** of the {usd(global_cap(st))} global cap "
           f"(billed total {usd(st.billed_total)}, billing read {utc(st.billed_at)})."]
     if f.warnings:
         L += ["", "Warnings:", *[f"- {w}" for w in f.warnings]]
@@ -938,7 +964,8 @@ def analyze(paths: Paths, *, derived: Mapping[str, str] | None = None, cert_tmp:
 
 
 def print_findings(f: Findings, out=print) -> None:
-    out(f"Wave H-lite run {f.st.run_id}: spent {usd(f.st.spent)} of {usd(wh.GLOBAL_CAP_USD)}")
+    out(f"Wave H-lite run {f.st.run_id} (plan {run_plan(f.st)}): spent {usd(f.st.spent)} of "
+        f"{usd(global_cap(f.st))}")
     for w in f.warnings:
         out(f"  WARNING {w}")
     if f.rates_ok:

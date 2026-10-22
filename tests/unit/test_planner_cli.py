@@ -106,11 +106,43 @@ def test_estimate_placeholder_and_rates(cfg):
     assert "segcap" in r.output and "measured" in r.output
 
 
-def test_plan_labels_unmeasured_rates_estimate(cfg):
-    r = runner.invoke(app, ["plan", "-c", str(cfg), *ARGS], env={"COLUMNS": "250"})
+def _rates_file(tmp_path, status: str):
+    """The shipped rates.json with the balanced slot rows set here (placeholder, or measured
+    n=1 ±50%), so the labels are tested whatever the shipped slot holds today."""
+    from importlib import resources
+
+    from flora_deploy.planner.rates import MEASURED_SLOTS
+
+    d = json.loads(resources.files("flora_deploy.planner").joinpath("rates.json").read_text())
+    for r in d["rates"]:
+        if (r["preset"], r["kind"]) in MEASURED_SLOTS:
+            r.update(status=status, uncertainty=1.0, n=None, source=None)
+            if status == "measured":
+                r.update(uncertainty=0.5, n=1, source="test run")
+    p = tmp_path / f"rates-{status}.json"
+    p.write_text(json.dumps(d))
+    return p
+
+
+def test_plan_labels_unmeasured_rates_estimate(cfg, tmp_path):
+    rates = _rates_file(tmp_path, "placeholder")
+    r = runner.invoke(app, ["plan", "-c", str(cfg), *ARGS, "--rates", str(rates)],
+                      env={"COLUMNS": "250"})
     assert r.exit_code == 0, r.output
     row = next(ln for ln in r.output.splitlines() if "balanced x1" in ln)
     assert "estimate" in row and "measured" not in row
-    d = json.loads(runner.invoke(app, ["plan", "-c", str(cfg), *ARGS, "--json"]).output)
+    d = json.loads(runner.invoke(app, ["plan", "-c", str(cfg), *ARGS, "--json", "--rates",
+                                       str(rates)]).output)
     labels = {o["preset"]: o["rates"] for o in d["options"] if not o["requires"]}
     assert labels == {"balanced": "estimate (placeholder)", "exact": "measured"}
+    # once measured (n=1), the row says so, with its sample count and band, not "estimate"
+    rates = _rates_file(tmp_path, "measured")
+    r = runner.invoke(app, ["plan", "-c", str(cfg), *ARGS, "--rates", str(rates)],
+                      env={"COLUMNS": "250"})
+    assert r.exit_code == 0, r.output
+    row = next(ln for ln in r.output.splitlines() if "balanced x1" in ln)
+    assert "measured (n=1, ±50%)" in row and "estimate" not in row
+    d = json.loads(runner.invoke(app, ["plan", "-c", str(cfg), *ARGS, "--json", "--rates",
+                                       str(rates)]).output)
+    labels = {o["preset"]: o["rates"] for o in d["options"] if not o["requires"]}
+    assert labels == {"balanced": "measured (n=1, ±50%)", "exact": "measured"}

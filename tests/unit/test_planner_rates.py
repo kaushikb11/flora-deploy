@@ -79,11 +79,34 @@ def test_lookup_rules(table):
         table.rate("exact", "segment", 1)
 
 
+def _startup_table(*rows: dict) -> RateTable:
+    base = {"uncertainty": 0.5, "status": "projected", "provenance": "x", "date": "d"}
+    return RateTable.from_dict({"schema": 1, "startup": [{**base, **r} for r in rows]},
+                               source="t")
+
+
 def test_startup_lookup(table):
     assert table.startup_for("exact", "segcap").startup_s == 103
     assert table.startup_for("exact", "reward.dense").startup_s == 229
-    assert table.startup_for("balanced", "segment").startup_s == 130
+    # the shipped table: a per-kind balanced row (once measured) beats the balanced "*" row
+    for kind in ("segment", "caption"):
+        own = [e for e in table.startup if e.preset == "balanced" and e.kind == kind]
+        wild = [e for e in table.startup if e.preset == "balanced" and e.kind == "*"]
+        assert table.startup_for("balanced", kind) == (own or wild)[0]
     assert table.startup_for("balanced", "reward.terminal").startup_s == 229  # kind beats preset
+    # the lookup rules on a table built here (independent of today's numbers)
+    star = {"preset": "balanced", "kind": "*", "startup_s": 130}
+    rew = {"preset": "*", "kind": "reward.*", "startup_s": 229}
+    seg = {"preset": "balanced", "kind": "segment", "startup_s": 300, "status": "measured"}
+    t = _startup_table(star, rew)
+    assert t.startup_for("balanced", "segment").startup_s == 130  # "*" kind of the preset
+    assert t.startup_for("balanced", "caption").startup_s == 130
+    assert t.startup_for("balanced", "reward.terminal").startup_s == 229  # kind beats preset
+    t2 = _startup_table(star, rew, seg)
+    assert t2.startup_for("balanced", "segment").startup_s == 300  # exact kind beats "*"
+    assert t2.startup_for("balanced", "caption").startup_s == 130  # others keep the "*" row
+    none = _startup_table().startup_for("balanced", "segment")
+    assert none.startup_s == 0 and none.status == "placeholder"
 
 
 def test_bad_files(tmp_path):

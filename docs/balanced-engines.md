@@ -273,12 +273,12 @@ That is ≈ $0.6 for L40S and ≈ $1.2 for H100, ≈ $1.8–2.4 in total, within
 ## Results
 
 <!-- wave-h:results (owned by scripts/wave_h_finalize.py) -->
-| Item | Result |
+| Item | Result (Wave H-lite, 2026-10-22; `docs/wave-h-report.md`) |
 |---|---|
-| L0 in-engine (ids, grid vs HF) | **not run** (Gate C already passed this on 127 requests through the same `vllm_prompt`; the in-engine re-check is pending) |
-| Segments / captions end to end on golden episodes | **not run** |
-| Throughput, $/video-h vs `exact` (≈ $25–40 / video-h, `docs/perf-1.md`) | **not measured**; PLAN's ≈4× cheaper is still an estimate |
-| Gate A (dt_bias FP32 vs bf16) | **not measured** |
+| L0 in-engine (ids, grid vs HF) | tempseg: missing; captioner: missing |
+| Segments / captions end to end on golden episodes | 1 `balanced` job(s) through `flora deploy` / `flora run` (run `102207184317`); certificate **deferred** |
+| Throughput, $/video-h vs `exact` | **$5.62/video-h** ±50%, list prices |
+| Gate A (dt_bias FP32 vs bf16) | tempseg: max None, mean None, greedy 0/0; recommendation: plugin **off** |
 <!-- /wave-h:results -->
 
 **Recommendation for Gate A until it is measured:** ship with the plugin **off**, the default.

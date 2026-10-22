@@ -39,6 +39,32 @@ def one_rate_table(rate=4.0, startup=100.0, u=0.0) -> RateTable:
                      "date": "2026-10-21"}]}, source="test")
 
 
+def shipped_with_balanced(status: str) -> RateTable:
+    """The shipped rates.json with its balanced segment/caption slot rows (and per-kind balanced
+    startup rows) replaced by ones built here: ``placeholder`` (the rows as they stood before
+    Wave H-lite) or ``measured`` with n=1, ±50%. Keeps these tests independent of whether the
+    shipped slot is measured today."""
+    import json
+    from importlib import resources
+
+    from flora_deploy.planner.rates import MEASURED_SLOTS
+
+    d = json.loads(resources.files("flora_deploy.planner").joinpath("rates.json").read_text())
+    rate = {"segment": 0.5, "caption": 1.0}
+    rows = []
+    for preset, kind in MEASURED_SLOTS:
+        row = {"preset": preset, "kind": kind, "cameras": "*", "concurrency": 1,
+               "container_s_per_video_s": rate[kind], "uncertainty": 1.0,
+               "status": "placeholder", "provenance": "test placeholder", "date": "2026-10-21"}
+        if status == "measured":
+            row.update(uncertainty=0.5, status="measured", source="test run", n=1,
+                       provenance="test measurement")
+        rows.append(row)
+    d["rates"] = [r for r in d["rates"] if (r["preset"], r["kind"]) not in MEASURED_SLOTS] + rows
+    d["startup"] = [s for s in d["startup"] if s["preset"] != "balanced" or s["kind"] == "*"]
+    return RateTable.from_dict(d, source="test")
+
+
 def test_hand_calc_single_kind():
     table = one_rate_table()
     wl = WorkloadSummary.from_hours(10, episodes=1000)  # 36,000 video-s -> 144,000 container-s
@@ -100,7 +126,18 @@ def test_options_deterministic_and_bounded():
     assert best is not None and best.name == "exact x4" and best.certification == "reference"
     bal = next(o for o in a if o.preset == "balanced")
     assert bal.certification == "needs certificates"
-    assert any("placeholder" in f for f in bal.flags)
+    # a placeholder warning exactly when the shipped balanced rates are placeholders
+    assert any("placeholder" in f for f in bal.flags) == (bal.rate_status == "placeholder")
+    # placeholder-priced: flagged; measured: not, and the option list is the same
+    for status, flagged in (("placeholder", True), ("measured", False)):
+        t = shipped_with_balanced(status)
+        opts = plan_options(req, table=t)
+        assert opts == plan_options(req, table=t)
+        assert [o.name for o in opts] == [o.name for o in a]
+        assert recommended(opts).name == "exact x4"
+        tb = next(o for o in opts if o.preset == "balanced")
+        assert tb.certification == "needs certificates" and tb.rate_status == status
+        assert any("placeholder" in f for f in tb.flags) is flagged, (status, tb.flags)
 
 
 def test_recommended_never_picks_a_projection_and_prefers_measured():
@@ -205,9 +242,15 @@ def test_placeholder_rates_are_labelled_estimate():
     from flora_deploy.planner.options import DEFAULT_PRESETS, rates_label
 
     assert DEFAULT_PRESETS[0] == "balanced" and "exact" in DEFAULT_PRESETS
-    opts = plan_options(PlanRequest(WorkloadSummary.from_hours(100), max_gpus=10))
+    req = PlanRequest(WorkloadSummary.from_hours(100), max_gpus=10)
+    opts = plan_options(req, table=shipped_with_balanced("placeholder"))
     bal = next(o for o in opts if o.preset == "balanced")
     assert bal.rate_status == "placeholder" and rates_label(bal) == "estimate (placeholder)"
+    assert rates_label(next(o for o in opts if o.name == "exact x4")) == "measured"
+    # a measured slot with n=1 shows as a measurement with its sample count and band
+    opts = plan_options(req, table=shipped_with_balanced("measured"))
+    bal = next(o for o in opts if o.preset == "balanced")
+    assert bal.rate_status == "measured" and rates_label(bal) == "measured (n=1, ±50%)"
     assert rates_label(next(o for o in opts if o.name == "exact x4")) == "measured"
 
 
@@ -215,15 +258,31 @@ def test_never_recommends_an_unavailable_option():
     """Review 6 M2: exact over budget used to make the uncertified, placeholder-priced and
     factory-refused ``balanced`` the recommendation."""
     req = PlanRequest(WorkloadSummary.from_hours(10), budget_usd=80, max_gpus=10)
-    opts = plan_options(req)
-    bal = [o for o in opts if o.preset == "balanced"]
-    assert bal, "balanced must still be shown"
-    for o in bal:
-        why = " ".join(o.unavailable)
-        assert "uncertified" in why and "placeholder" in why, why  # deployable since P1b-1
-        assert any(f.startswith("unavailable:") for f in o.flags)
-    best = recommended(opts)
-    assert best is None or (best.preset == "exact" and not best.unavailable)
+    rubric = replace(req, stages=("segment", "caption", "reward.rubric"))
+    cases = [  # (request, table, expected placeholder kinds)
+        (req, shipped_with_balanced("placeholder"), {"segment", "caption"}),
+        (req, shipped_with_balanced("measured"), set()),
+        (rubric, shipped_with_balanced("measured"), {"reward.rubric"}),  # still a placeholder
+        (req, None, None), (rubric, None, None)]  # the shipped table, whatever it holds today
+    for r, table, kinds in cases:
+        opts = plan_options(r, table=table)
+        bal = [o for o in opts if o.preset == "balanced"]
+        assert bal, "balanced must still be shown"
+        for o in bal:
+            why = " ".join(o.unavailable)
+            # uncertified, whatever its rates: never recommendable without certificates
+            assert "uncertified" in why, why  # deployable since P1b-1
+            assert any(f.startswith("unavailable:") for f in o.flags)
+            ph = {k.kind for k in o.kinds if k.rate_status == "placeholder"}
+            if kinds is not None:
+                assert ph == kinds, (ph, kinds)
+            # the placeholder reason exactly when (and naming exactly what) is placeholder-priced
+            assert ("placeholder" in why) == bool(ph), why
+            if ph:
+                assert why.count("priced from placeholder rates") == 1
+                assert all(k in why for k in ph), why
+        best = recommended(opts)
+        assert best is None or (best.preset == "exact" and not best.unavailable)
 
 
 def test_exact_segcap_is_available():

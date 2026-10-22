@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "updated": "2026-10-21",
+  "updated": "2026-10-22",
   "units": {
     "container_s_per_video_s": "seconds of one container of the kind's pool per second of episode video, amortized over `concurrency` episodes in flight per container",
     "startup_s": "seconds from container start to ready (@modal.enter), paid once per container",
@@ -177,30 +177,32 @@
       "kind": "segment",
       "cameras": "*",
       "concurrency": 1,
-      "container_s_per_video_s": 0.5,
-      "uncertainty": 1.0,
-      "status": "placeholder",
-      "image": null,
+      "container_s_per_video_s": 0.367,
+      "uncertainty": 0.5,
+      "status": "measured",
+      "image": "img_vllm (vllm 0.24.0)",
       "requires": [],
       "excludes": [],
-      "provenance": "not measured (vLLM TempSeg lands in P1b-1); jobs.manifest.DEFAULT_RATES",
-      "source": null,
-      "date": "2026-10-21"
+      "provenance": "Wave H-lite run 102207184317, `preset: balanced` deployed with flora deploy/run: n=1 job(s) (178.2 video s) on L40S, busy container-s per video-s 0.367 from one job: no range, so the error band is ±50%; excludes @enter (startup row) and idle (docs/wave-h-report.md (Wave H-lite run 102207184317))",
+      "source": "docs/wave-h-report.md (Wave H-lite run 102207184317)",
+      "date": "2026-10-22",
+      "n": 1
     },
     {
       "preset": "balanced",
       "kind": "caption",
       "cameras": "*",
       "concurrency": 1,
-      "container_s_per_video_s": 1.0,
-      "uncertainty": 1.0,
-      "status": "placeholder",
-      "image": null,
+      "container_s_per_video_s": 0.906,
+      "uncertainty": 0.5,
+      "status": "measured",
+      "image": "img_vllm (vllm 0.24.0)",
       "requires": [],
       "excludes": [],
-      "provenance": "not measured (vLLM Captioner lands in P1b-1); jobs.manifest.DEFAULT_RATES",
-      "source": null,
-      "date": "2026-10-21"
+      "provenance": "Wave H-lite run 102207184317, `preset: balanced` deployed with flora deploy/run: n=1 job(s) (178.2 video s) on H100, busy container-s per video-s 0.906 from one job: no range, so the error band is ±50%; excludes @enter (startup row) and idle (docs/wave-h-report.md (Wave H-lite run 102207184317))",
+      "source": "docs/wave-h-report.md (Wave H-lite run 102207184317)",
+      "date": "2026-10-22",
+      "n": 1
     }
   ],
   "startup": [
@@ -221,6 +223,28 @@
       "status": "measured",
       "provenance": "WS-H round 2 run B, fresh H100! container with warm compile cache + prefetch: 229 s; cold cache 318 s; no recipe ~930 s (docs/rewarder-smoke.md, docs/cold-start.md)",
       "date": "2026-10-21"
+    },
+    {
+      "preset": "balanced",
+      "kind": "segment",
+      "startup_s": 300.5,
+      "uncertainty": 0.5,
+      "status": "measured",
+      "n": 1,
+      "provenance": "Wave H-lite run 102207184317: spawn to first attempt of n=1 fresh L40S container(s), 300 s, one container: no range, so the error band is ±50% (docs/wave-h-report.md (Wave H-lite run 102207184317))",
+      "date": "2026-10-22",
+      "source": "docs/wave-h-report.md (Wave H-lite run 102207184317)"
+    },
+    {
+      "preset": "balanced",
+      "kind": "caption",
+      "startup_s": 325.0,
+      "uncertainty": 0.5,
+      "status": "measured",
+      "n": 1,
+      "provenance": "Wave H-lite run 102207184317: spawn to first attempt of n=1 fresh H100 container(s), 325 s, one container: no range, so the error band is ±50% (docs/wave-h-report.md (Wave H-lite run 102207184317))",
+      "date": "2026-10-22",
+      "source": "docs/wave-h-report.md (Wave H-lite run 102207184317)"
     },
     {
       "preset": "balanced",

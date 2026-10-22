@@ -26,6 +26,38 @@ wh = _load("wave_h")
 h0 = sys.modules["h0_rehearsal"]
 
 
+def _pre_run_table():
+    """The rate table the runbook's caps were set against (before the 2026-10-22 run): the
+    shipped rates.json with the balanced segment/caption slot rows as the placeholders they were
+    (0.5 / 1.0 container-s per video-s, ±100%) and only the projected balanced ``*`` startup
+    row. The caps (:data:`wave_h.CAPS_USD`) are a pre-run plan, so they are checked against the
+    numbers they were planned from, not against whatever the slot holds today."""
+    from importlib import resources
+
+    from flora_deploy.planner.rates import MEASURED_SLOTS, RateTable
+
+    d = json.loads(resources.files("flora_deploy.planner").joinpath("rates.json").read_text())
+    rate = {"segment": 0.5, "caption": 1.0}
+    d["rates"] = [r for r in d["rates"] if (r["preset"], r["kind"]) not in MEASURED_SLOTS] + [
+        {"preset": p, "kind": k, "cameras": "*", "concurrency": 1,
+         "container_s_per_video_s": rate[k], "uncertainty": 1.0, "status": "placeholder",
+         "provenance": "pre-run placeholder", "date": "2026-10-21"} for p, k in MEASURED_SLOTS]
+    d["startup"] = [e for e in d["startup"] if e["preset"] != "balanced" or e["kind"] == "*"]
+    assert any(e["preset"] == "balanced" and e["startup_s"] == 130 for e in d["startup"])
+    return RateTable.from_dict(d, source="pre-run rates")
+
+
+@pytest.fixture(autouse=True)
+def pre_run_rates(monkeypatch):
+    """``wave_h`` loads the shipped table (``RateTable.load()``); price it on the pre-run one."""
+    from flora_deploy.planner.rates import RateTable
+
+    table, real = _pre_run_table(), RateTable.load
+    monkeypatch.setattr(RateTable, "load", staticmethod(
+        lambda path=None: table if path is None else real(path)))
+    return table
+
+
 def _manifest() -> dict:
     """The golden durations the runbook prices: the selection's expected durations plus the
     caps' headroom (golden manifest v1, numbers only)."""

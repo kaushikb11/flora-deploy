@@ -9,6 +9,7 @@ import json
 import shutil
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -567,3 +568,43 @@ def test_a_wrong_gpu_worker_refuses_its_jobs_rates(tmp_path, capsys):
     j["containers"].pop(0)
     _save(root, st)
     assert run(root, capsys=capsys)[0] == 0
+
+
+def test_global_cap_is_the_state_plans_cap_not_the_full_plans(tmp_path, capsys):
+    """A balanced-only run was gated on its own cap: the sum of the upper projections the
+    runbook stored per step, rounded up to $0.10 (``wave_h.plan_global_cap``), not
+    ``GLOBAL_CAP_USD`` (the full plan's)."""
+    st = wh.State(run_id="r", created=T0, billing_since="2026-10-13")
+    for name, up in (("tempseg", 0.7189), ("preflight", 0.0053), ("balanced", 3.6646)):
+        st.step(name).status = "done"
+        st.step(name).projected_upper_usd = up
+    assert fin.run_plan(st) == "balanced-only"
+    assert fin.global_cap(st) == 4.40 != wh.GLOBAL_CAP_USD
+    # the same relationship as the runbook: cap = upper sum rounded up to $0.10
+    ps = {n: SimpleNamespace(usd_upper=st.steps[n].projected_upper_usd)
+          for n in wh.PLANS["balanced-only"]}
+    assert fin.global_cap(st) == wh.plan_global_cap("balanced-only", ps)
+    # a step the run never reached is priced as the runbook prices it
+    st2 = wh.State(run_id="r", created=T0, billing_since="2026-10-13")
+    st2.step("tempseg").projected_upper_usd = 0.7189
+    up = 0.7189 + sum(wh.project(n, wh.offline_manifest(wh.DURATION_HEADROOM)).usd_upper
+                      for n in ("preflight", "balanced"))
+    assert up <= fin.global_cap(st2) < up + 0.1 + 1e-9
+    # a started full-plan step: the full plan's cap
+    st.step("exact_e2e").attempts.append(_attempt(T0, 0.1, []))
+    assert fin.run_plan(st) == "full" and fin.global_cap(st) == wh.GLOBAL_CAP_USD
+
+    # end to end: the report and the summary line name the plan's cap
+    root = build(tmp_path)
+    path = root / "reports/wave-h/state.json"
+    d = json.loads(path.read_text())
+    for name in wh.deferred_steps("balanced-only"):
+        d["steps"].pop(name)
+    for name, up in (("tempseg", 0.7189), ("preflight", 0.0053), ("balanced", 3.6646)):
+        d["steps"][name]["projected_upper_usd"] = up
+    path.write_text(json.dumps(d))
+    rc, out = run(root, "--write", capsys=capsys)
+    assert rc == 0, out
+    assert "(plan balanced-only)" in out and "of $4.40" in out and "$6.50" not in out
+    rep = (root / "docs/wave-h-report.md").read_text()
+    assert "of the $4.40 global cap" in rep and "$6.50" not in rep

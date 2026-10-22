@@ -104,6 +104,9 @@ GPU produced it. Field reference: [`docs/output-format.md`](docs/output-format.m
 a finished job actually spent. Segmentation runs on an L40S, captioning and rewards on H100s.
 
 <!-- wave-h:cost -->
+Measured in Wave H-lite (2026-10-22): `balanced` costs about **$5.62 per video-hour** (±50%)
+at Modal list prices for segmentation + captioning. Rewards and the cold
+start of each container are extra; details in `docs/wave-h-report.md`.
 <!-- /wave-h:cost -->
 
 ## While a job runs
