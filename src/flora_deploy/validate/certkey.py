@@ -429,6 +429,9 @@ def policy_problems(cert: Mapping[str, Any]) -> list[str]:
             if v is None or means.get(m) is None:
                 out.append(f"{pool} {m}: not evaluable")
                 continue
+            if not (math.isfinite(float(v)) and math.isfinite(float(means[m]))):
+                out.append(f"{pool} {m}: not finite")
+                continue
             t = metric_threshold(m, means[m], tol, slack.get(m, 0.0))
             if float(v) > t + 1e-12:
                 out.append(f"{pool} {m}: {v} > {t}")

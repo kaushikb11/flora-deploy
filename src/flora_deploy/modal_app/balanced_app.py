@@ -257,7 +257,9 @@ def prepare_cache(kind: str, spec: Any, model_content: str | None,
         local = local_root / f"{engine_kind}-unkeyed"
         cc.reset_local(local)
         key = cc.CacheKey({"engine_kind": engine_kind, "dtbias_fp32": False, "gpu": "unknown"})
-        return cc.WorkerCache(key, local, cc.CacheStatus("cold", "unkeyed", reason=str(e)[:500]),
+        # forced cold still records cold:forced (the witness's evidence; review 14 W3)
+        why = cc.FORCED_COLD if mode == "off" else str(e)[:500]
+        return cc.WorkerCache(key, local, cc.CacheStatus("cold", "unkeyed", reason=why),
                               publish_enabled=False, log=log)
     local = local_root / key.name
     if mode == "off":

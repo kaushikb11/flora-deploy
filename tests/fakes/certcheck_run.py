@@ -284,6 +284,8 @@ def build(tmp: Path, opts: Options | None = None, *,
                     caps = balanced_captions(i, o, len(b))
                     if o.witness_drift == "caption":
                         caps = ["then " + c for c in caps]
+                    if o.witness_drift == "nan" and j == 0:  # one boundary not finite
+                        b = [b[0], (b[1][0], float("nan")), *b[2:]]
                     r = record("balanced", stage, e, b, caps)
                 r["provenance"]["compile_cache"] = o.witness_cache
                 r["provenance"]["engine_preemptions"] = 0

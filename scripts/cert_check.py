@@ -272,8 +272,20 @@ def _intervals(rec: Mapping[str, Any]) -> list[tuple[float, float]]:
     return [(float(s["start_s"]), float(s["end_s"])) for s in rec.get("segments") or ()]
 
 
+def finite(x: float | None) -> bool:
+    """``None`` (not evaluable) or a finite number: a NaN or inf metric is a failed check."""
+    return x is None or math.isfinite(x)
+
+
+def _bounds_finite(*sides: Sequence[tuple[float, float]]) -> bool:
+    return all(math.isfinite(s) and math.isfinite(e) for xs in sides for s, e in xs)
+
+
 def seg_episode(a: Mapping[str, Any], b: Mapping[str, Any]) -> dict[str, float | None]:
     A, B = _intervals(a), _intervals(b)
+    if not _bounds_finite(A, B):  # a NaN / inf boundary: the interval metrics are not finite
+        return {**dict.fromkeys(METRICS_V2["segment"], math.nan),
+                "count_mismatch": 1.0 if len(A) != len(B) else 0.0}
     if not A and not B:
         return dict.fromkeys(METRICS_V2["segment"], 0.0)
     P = alignment(A, B)
@@ -293,6 +305,9 @@ def cap_episode(a: Mapping[str, Any], b: Mapping[str, Any]) -> dict[str, float |
     slots = max(len(A), len(B))
     if slots == 0:
         return {"caption_mismatch": 0.0, "caption_edit_distance": 0.0, "count_mismatch": 0.0}
+    if not _bounds_finite(A, B):
+        return {"caption_mismatch": math.nan, "caption_edit_distance": math.nan,
+                "count_mismatch": 1.0 if len(A) != len(B) else 0.0}
     P = alignment(A, B)
     sa, sb = a["segments"], b["segments"]
     same, dist = 0, 0.0
@@ -593,6 +608,7 @@ def _compare_block(check: str, item: str, got: Mapping[str, Any] | None,
             bad.append(f"{k} {got.get(k)} != {v}")
     gm = got.get("means") or {}
     for m, v in want_means.items():
+        v = v if finite(v) else None  # the certificate records a NaN / inf mean as null
         if not close(gm.get(m), v):
             bad.append(f"{m} {gm.get(m)} != {v}")
     if set(gm) - set(want_means):
@@ -752,8 +768,11 @@ def check_pass_rule(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
                     "; ".join(fl) or "equal to docs/certification.md"))
 
     # thresholds and checks
+    noise_bad = {m for m in rc.names
+                 if rc.noise_means is not None and not finite(rc.noise_means.get(m))}
     want_t = {m: (threshold(m, rc.noise_means[m], tol, slack.get(m, 0.0), v)
-                  if rc.noise_means is not None and rc.noise_means.get(m) is not None else None)
+                  if rc.noise_means is not None and rc.noise_means.get(m) is not None
+                  and m not in noise_bad else None)
               for m in rc.names}
     tb = [f"{m} {(pm.get(m) or {}).get('threshold')} != {t}" for m, t in want_t.items()
           if not close((pm.get(m) or {}).get("threshold"), t)]
@@ -766,11 +785,16 @@ def check_pass_rule(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
         blocks[WITNESS_CLASS] = rc.witness_means or {}
     union = v == "3" and "count_mismatch" in rc.names
     want_checks = {}
+    non_finite = set()  # a NaN / inf mean (or its noise floor): a failed check
     for cls, mm in blocks.items():
         for m in rc.names:
             if union and m == "count_mismatch":
                 continue
             val, t = mm.get(m), want_t[m]
+            if not finite(val) or m in noise_bad:
+                non_finite.add((cls, m))
+                want_checks[(cls, m)] = (val if finite(val) else None, t, False)
+                continue
             want_checks[(cls, m)] = (val, t, None if val is None or t is None
                                      else bool(val <= t + 1e-12))
     flips = count_flips(run, rc) if union else None
@@ -798,8 +822,10 @@ def check_pass_rule(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
                 cb.append(f"union count_mismatch: {g.get('flips')} of {g.get('n')} allowed "
                           f"{g.get('allowed')} != {u['flips']} of {u['n']}")
     failing = [f"{c} {m}" for (c, m), (_, _, ok) in want_checks.items() if ok is False]
+    nf = ", ".join(f"{c} {m}" for c, m in sorted(non_finite))
     rows.append(Row(C, f"{stage} checks", FAIL if cb else PASS,
                     "; ".join(cb) or (f"{len(want_checks)} agree"
+                                      + (f"; not finite (NaN/inf): {nf}" if nf else "")
                                       + (f"; failing: {', '.join(failing)}" if failing else ""))))
 
     # the count-flip tolerance (user decision): one episode in ten may differ in count
@@ -836,8 +862,10 @@ def check_pass_rule(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
     # reasons and verdict
     l0 = l0_status(run, stage, cert)
     failures, prov = set(), set()
-    if any(ok is False for *_, ok in want_checks.values()):
+    if any(ok is False and k not in non_finite for k, (*_, ok) in want_checks.items()):
         failures.add("divergence_above_noise_floor")
+    if non_finite:
+        failures.add("non_finite_metric")
     if l0["status"] == "fail":
         failures.add("l0_failed")
     nz_n = len(rc.noise) if rc.noise is not None else None
@@ -1269,7 +1297,8 @@ def our_strings(run: Run, stage: str, cert: Mapping[str, Any]) -> set[str]:
     allowed |= {"divergence_above_noise_floor", "l0_failed", "no_noise_run",
                 "too_few_noise_samples", "too_few_samples", "incomplete_coverage", "no_l0",
                 "stale_l0", "metric_not_evaluable", "engine_preempted", "preemptions_unknown",
-                "too_few_witness_samples", "witness_not_forced_cold", "no_witness"}
+                "too_few_witness_samples", "witness_not_forced_cold", "no_witness",
+                "non_finite_metric"}
 
     def walk(o: Any) -> None:
         if isinstance(o, str):

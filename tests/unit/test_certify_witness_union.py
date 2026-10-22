@@ -22,10 +22,12 @@ def uids(n):
     return [f"u{i}" for i in range(n)]
 
 
-def stage_recs(stage, preset, ids, *, split=(), shift=0.0, captions=None, **kw):
+def stage_recs(stage, preset, ids, *, split=(), shift=0.0, captions=None, nan=(), **kw):
     out = []
     for u in ids:
         b = SPLIT if u in split else [(s + shift, e + shift) for s, e in BOUNDS]
+        if u in nan:  # one boundary not finite (review 14 W2)
+            b = [b[0], (b[1][0], float("nan")), *b[2:]]
         caps = (captions or CAPS)[:len(b)] if stage == "caption" else None
         out.append(rec(u, stage, preset, segments=segs(b, caps), **kw))
     return out
@@ -42,7 +44,7 @@ def certify_case(case: Case, stage: str):
     cache = "warm:k:" + "f" * 16 if case.drift == "warm" else "cold:forced"
     witness = None if case.drift == "absent" else stage_recs(
         stage, "balanced", wit_ids, split=wit_split, shift=shift, captions=wcaps,
-        compile_cache=cache)
+        nan=wit_ids[:1] if case.drift == "nan" else (), compile_cache=cache)
     return C.certify_stage(
         stage, exact=stage_recs(stage, "exact", main),
         balanced=stage_recs(stage, "balanced", main, split=main_split),
@@ -74,7 +76,7 @@ def test_witness_union_cases(case):
     elif case.verdict == "provisional":
         assert c["reasons"] == list(case.reasons) and not c["unlocks"]
     else:
-        assert "divergence_above_noise_floor" in c["reasons"]
+        assert set(case.reasons or ("divergence_above_noise_floor",)) <= set(c["reasons"])
 
 
 def test_two_in_eighteen_is_the_rounding_rule():
