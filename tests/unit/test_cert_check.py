@@ -9,13 +9,15 @@ Two halves:
   real generator writes: a good run passes every row, and each check has a fixture that breaks
   exactly what it guards.
 
-The current rule is generator version 3 (the count-flip tolerance, spares, cold witness,
-preemption and cache evidence). Under a version-2 generator the good run fails exactly the rows
-that rule adds (:data:`GAPS`), which is what the checker must say about such a certificate.
+The current rule is generator version 4: version 3's (the count-flip tolerance, spares, cold
+witness, preemption and cache evidence) with a stage-isolated caption certificate (the candidate
+captions the oracle's own segments; every Captioner call input-identical; the e2e metrics
+reported only). Version 3 is retired.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import random
@@ -35,15 +37,9 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import cert_check as cc  # noqa: E402
 
-V3 = R.VERSION == "3"
 STAGES = ("segment", "caption")
-GAPS = set() if V3 else {
-    *(f"2 pass rule | {s} count-flip tolerance" for s in STAGES),
-    *(f"4 evidence | {s} certificate states the caches" for s in STAGES)}
-# The good run has one count flip in 12 episodes (rule 3 passes it); a version-2 generator
-# fails it, so its good run has none.
-BASE = R.Options(flips=1 if V3 else 0)
-needs_v3 = pytest.mark.skipif(not V3, reason="the current code's generator predates rule 3")
+# The good run has one count flip in 12 episodes (the count-flip rule passes it).
+BASE = R.Options(flips=1)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -220,17 +216,29 @@ def assert_fail(rows, *items):
 
 def test_good_run_passes_every_row(base):
     rows = base.run()
-    assert R.failing(rows) == GAPS, [(r.item, r.detail) for r in rows if r.status == cc.FAIL]
+    assert R.failing(rows) == set(), [(r.item, r.detail) for r in rows if r.status == cc.FAIL]
     checks = {r.check for r in rows}
     assert {"1 metrics", "2 pass rule", "3 coverage", "4 evidence", "5 freeze lock",
             "6 leakage", "7 spend"} <= checks
     by = R.by_item(rows)
     assert by["5 freeze lock | tests/unit/test_certificate_drift.py"].status == cc.PASS
-    if V3:
-        assert by["2 pass rule | segment count-flip tolerance"].detail.startswith(
-            "1 of 18 episodes differ in count (1 of 12 human, 0 of 6 cold-witness); "
-            "threshold 0.1 allows 2")
-        assert by["1 metrics | segment oracle vs cold witness"].status == cc.PASS
+    assert by["2 pass rule | segment count-flip tolerance"].detail.startswith(
+        "1 of 18 episodes differ in count (1 of 12 human, 0 of 6 cold-witness); "
+        "threshold 0.1 allows 2")
+    assert by["1 metrics | segment oracle vs cold witness"].status == cc.PASS
+    # v4 caption: stage-isolated, recomputed row for row; nothing reported gates
+    for item in ("1 metrics | caption segments are the oracle's",
+                 "1 metrics | caption oracle digests", "1 metrics | caption input identity",
+                 "1 metrics | caption reported (not gated)",
+                 "1 metrics | caption oracle vs cold witness",
+                 "2 pass rule | caption stage-isolated scoring",
+                 "2 pass rule | caption reported metrics never gate",
+                 "2 pass rule | caption count-flip tolerance"):
+        assert by[item].status == cc.PASS, by[item]
+    assert by["1 metrics | caption input identity"].detail.startswith(
+        "36 of 36 candidate calls input-identical, 18 of 18 witness calls")
+    assert "families" in by["1 metrics | caption reported (not gated)"].detail
+    assert "certified" in by["2 pass rule | caption verdict"].detail
 
 
 def test_cli_table_json_and_exit_code(base, capsys):
@@ -239,21 +247,21 @@ def test_cli_table_json_and_exit_code(base, capsys):
             str(base.inp.nv_root)]
     code = cc.main([*args, "--json"])
     out = json.loads(capsys.readouterr().out)
-    assert code == (0 if V3 else 1) and out["ok"] is V3
+    assert code == 0 and out["ok"] is True
     assert {r["status"] for r in out["rows"]} <= {cc.PASS, cc.FAIL}
     assert cc.main(args) == code
     text = capsys.readouterr().out
     assert text.startswith("| check | item | result | detail |")
-    assert ("Overall: PASS" if V3 else "Overall: FAIL") in text
+    assert "Overall: PASS" in text
 
 
 def test_missing_inputs_fail(tmp_path, fake):
-    fake.records("balanced", "caption").unlink()
+    fake.records("isolated", "caption").unlink()  # v4: the caption candidate is J2
     for p in fake.cert_dir.glob("*.json"):
         if p.name.startswith("cert_") and json.loads(p.read_text())["stage"] == "segment":
             p.unlink()
     rows = rows_of(fake)
-    assert_fail(rows, "0 inputs | balanced caption records", "0 inputs | segment certificate")
+    assert_fail(rows, "0 inputs | isolated caption records", "0 inputs | segment certificate")
     empty = cc.check_all(cc.Inputs(run_root=tmp_path / "nothing", cert_dir=tmp_path / "none",
                                    lab_dir=tmp_path / "none", report=tmp_path / "none.md"))
     inputs = {r.item: r.status for r in empty if r.check == "0 inputs"}
@@ -294,7 +302,6 @@ def test_records_changed_after_certifying(fake):
     assert_fail(rows_of(fake), "1 metrics | segment oracle vs balanced")
 
 
-@needs_v3
 def test_witness_metrics_mismatch(fake):
     fake.edit_cert("segment", lambda c: c["metrics"]["witness"].update(unpaired=3))
     assert_fail(rows_of(fake), "1 metrics | segment oracle vs cold witness")
@@ -303,6 +310,235 @@ def test_witness_metrics_mismatch(fake):
 def test_similarity_hook_cannot_be_recomputed(fake):
     fake.edit_cert("caption", lambda c: c["metrics"].update(similarity_hook="mod:fn"))
     assert_fail(rows_of(fake), "1 metrics | caption similarity")
+
+
+# 1. metrics: the stage-isolated caption (generator v4)
+
+
+def _with_caption(r, i, text):
+    segments = list(r.segments)
+    segments[i] = dataclasses.replace(segments[i], caption=text)
+    return dataclasses.replace(r, segments=tuple(segments))
+
+
+def _dicts(records):
+    return {r.uid: json.loads(r.to_json()) for r in records}
+
+
+@pytest.mark.parametrize("variant", ["identical", "differing", "noisy", "witness_drift"])
+def test_isolated_recompute_agrees_with_generator(tmp_path, variant):
+    """Synthetic v4 records (``tests/fakes/certrecords.isolated``) certified by the generator:
+    the checker's independent recompute gives the same isolated means, slots, noise pairs,
+    input identity, segments_from and reported block."""
+    from tests.fakes import certrecords as CR
+
+    exact = CR.caption_set("exact", 12)
+    bal = CR.caption_set("balanced", 12)
+    noise = CR.caption_set("exact", 8)
+    if variant in ("differing", "noisy", "witness_drift"):
+        bal[2] = _with_caption(bal[2], 1, "lift it")
+        bal[5] = _with_caption(_with_caption(bal[5], 0, "a!"), 2, "")
+    if variant == "noisy":  # a moved boundary (not input-identical), a count flip, a differing row
+        noise[0] = CR.rec("u0", "caption", "exact", segments=CR.segs(
+            [(0.0, 2.1), (2.1, 5.0), (5.0, 9.0)], ["x", "y", "c"]))
+        noise[1] = CR.rec("u1", "caption", "exact", segments=CR.segs(
+            [(0.0, 2.0), (2.0, 3.5), (3.5, 5.0), (5.0, 9.0)], ["a", "q", "r", "c"]))
+        noise[2] = _with_caption(noise[2], 2, "cc")
+        noise[3] = CR.rec("u3", "caption", "exact", segments=CR.segs([(0.3, 9.0)], ["q"]))
+    wit = CR.cold_witness(bal)
+    if variant == "witness_drift":
+        wit = [_with_caption(r, 0, "then a") for r in wit]
+    e2e = [CR.rec(f"u{i}", "caption", "balanced", segments=CR.segs(
+        [(0.0, 2.0), (2.0, 5.0), (5.0, 7.0), (7.0, 9.0)] if i == 11 else CR.BOUNDS,
+        ["a", "b", "c", "d"] if i == 11 else ["a", "b", "c"])) for i in range(12)]
+    bal, wit, extra = CR.isolated(exact, bal, wit, noise, directory=tmp_path)
+    fam = {f"u{i}": "n-egodex" if i < 6 else "x-wgo" for i in range(12)}
+    cert = CY.certify_stage("caption", exact=exact, balanced=bal, noise=noise, witness=wit,
+                            engine_spec=CR.key("balanced", "caption", "H100!"), gpu="H100!",
+                            l0=CR.lab_for("caption"), generated_at="2026-10-23T00:00:00Z",
+                            reported_e2e=e2e, families=fam, **extra)
+    assert cert["generator"]["version"] == "4"
+    ref, cand, nz, w = _dicts(exact), _dicts(bal), _dicts(noise), _dicts(wit)
+    iso = cc.isolate(ref, cand, nz, w, extra["digests"],
+                     Path(extra["oracle_segments"]).read_bytes())
+    assert iso.ok, iso.problems
+    names = cc.metric_names("caption", "4")
+    m = cert["metrics"]
+    assert m["candidate"]["yam"] == {"n": len(iso.cand), "slots": iso.slots["candidate"],
+                                     "means": cc.plain_means(iso.cand, names)}
+    assert m["noise"]["n"] == len(iso.noise) and m["noise"]["pairs"] == iso.slots["noise"]
+    assert m["noise"]["means"] == cc.plain_means(iso.noise, names)
+    assert m["witness"]["means"] == cc.plain_means(iso.witness, names)
+    assert m["witness"]["slots"] == iso.slots["witness"]
+    assert cert["segments_from"] == iso.segments_from
+    for side in ("candidate", "witness"):
+        got = dict(cert["input_identity"][side])
+        assert {k: got.pop(k) for k in ("stage_hash", "oracle_stage_hash")}
+        assert got == iso.identity[side]
+    want = cc.reported_block(ref, cand, nz, iso, cert["thresholds"], e2e=_dicts(e2e),
+                             repeat=None, repeat_digests=None, families=fam)
+    assert cc.tree_diff(m["reported"], want) == [], (m["reported"], want)
+    if variant == "noisy":
+        # u0: rows 0 and 1 moved (not input-identical), u3: no pair (out of n), u1 counts
+        assert len(iso.noise_pairs["u0"]) == 1 and "u3" not in iso.noise
+        assert "u1" in iso.noise and m["noise"]["means"]["caption_mismatch"] > 0
+    if variant == "witness_drift":
+        assert cert["verdict"] == "fail"
+
+
+def test_isolated_problems_are_refusals():
+    """Each case the generator refuses: the checker reports it as a problem."""
+    from tests.fakes import certrecords as CR
+
+    exact, bal = CR.caption_set("exact", 12), CR.caption_set("balanced", 12)
+    bal, _, extra = CR.isolated(exact, bal)
+    ref, cand = _dicts(exact), _dicts(bal)
+    data = Path(extra["oracle_segments"]).read_bytes()
+    dig = extra["digests"]
+    assert cc.isolate(ref, cand, None, None, dig, data).ok
+
+    def problems(c=cand, d=dig, pinned=data):
+        return cc.isolate(ref, c, None, None, d, pinned).problems
+
+    moved = json.loads(json.dumps(cand))
+    moved["u4"]["segments"][1]["end_s"] += 2e-6
+    assert problems(c=moved)["segments"]
+    other = json.loads(json.dumps(cand))
+    other["u0"]["provenance"]["segments_from"]["sha256"] = "0" * 64
+    assert problems(c=other)["segments"]
+    assert problems(pinned=None)["segments"] and problems(pinned=data + b"\n ")["segments"]
+    d = json.loads(json.dumps(dig))
+    d["balanced"]["u3"][0] = "f" * 64  # a digest mismatch
+    assert problems(d=d)["identity"]
+    d = json.loads(json.dumps(dig))
+    d["balanced"]["u3"][0] = None  # None vs a digest is a mismatch too
+    assert problems(d=d)["identity"]
+    d = json.loads(json.dumps(dig))
+    d["exact"]["u2"][1] = None  # a captioned oracle row without its digest
+    assert problems(d=d)["oracle digests"]
+    assert problems(d={k: v for k, v in dig.items() if k != "exact"})["oracle digests"]
+
+
+def test_digest_mismatch_fails(fake):
+    def mismatch(d):
+        uid = sorted(d)[0]
+        d[uid][1] = "f" * 64
+
+    fake.edit_digests("balanced", mismatch)
+    rows = rows_of(fake)
+    assert_fail(rows, "1 metrics | caption input identity", "2 pass rule | caption publishable")
+    assert "1 of 36 Captioner calls" in rows["1 metrics | caption input identity"].detail
+
+
+def test_digest_none_vs_digest_fails(fake):
+    fake.edit_digests("witness", lambda d: d[sorted(d)[0]].__setitem__(0, None))
+    assert_fail(rows_of(fake), "1 metrics | caption input identity")
+
+
+def test_digests_missing_fail(fake):
+    fake.digests("exact").unlink()
+    assert_fail(rows_of(fake), "1 metrics | caption oracle digests")
+    rows = rows_of(fake, digests={"exact": fake.root / "nowhere.json"})
+    assert_fail(rows, "0 inputs | records")
+
+
+def test_caption_rows_not_the_oracles(fake):
+    def shift(rows):
+        rows[3]["segments"][2]["start_s"] += 0.01
+
+    fake.edit_records("isolated", "caption", shift)
+    rows = rows_of(fake)
+    assert_fail(rows, "1 metrics | caption segments are the oracle's")
+    row = rows["1 metrics | caption segments are the oracle's"]
+    assert "rows are not the oracle's" in row.detail
+
+
+def test_oracle_segment_file_changed(fake):
+    with fake.oracle_segments.open("a", encoding="utf-8") as fh:
+        fh.write("\n")
+    assert_fail(rows_of(fake), "1 metrics | caption segments are the oracle's")
+
+
+def test_scoring_missing_fails(fake):
+    fake.edit_cert("caption", lambda c: c.pop("scoring"))
+    assert_fail(rows_of(fake), "2 pass rule | caption stage-isolated scoring")
+
+
+def test_reported_metric_gating_fails(fake):
+    """The e2e count_mismatch (reported only) edited into the gate: a check, a threshold and the
+    verdict. Every row that guards the exclusion fails."""
+    def gate(c):
+        e2e = c["metrics"]["reported"]["e2e"]
+        t = e2e["would_be_thresholds"]["count_mismatch"]
+        v = e2e["means"]["count_mismatch"]
+        c["checks"].append({"class": "human", "metric": "count_mismatch", "value": v,
+                            "threshold": t, "pass": v <= t})
+        c["thresholds"]["per_metric"]["count_mismatch"] = {
+            "slack": 0.0, "floor": 0.05, "absolute_floor": 0.1, "cap": None,
+            "over": "all", "threshold": t}
+
+    fake.edit_cert("caption", gate)
+    rows = rows_of(fake)
+    assert_fail(rows, "2 pass rule | caption reported metrics never gate",
+                "2 pass rule | caption checks", "2 pass rule | caption count-flip tolerance",
+                "2 pass rule | caption floors and caps")
+    assert "count_mismatch" in rows["2 pass rule | caption reported metrics never gate"].detail
+
+
+def test_reported_mean_moved_into_the_candidate_fails(fake):
+    def move(c):
+        c["metrics"]["candidate"]["human"]["means"]["count_mismatch"] = \
+            c["metrics"]["reported"]["e2e"]["means"]["count_mismatch"]
+
+    fake.edit_cert("caption", move)
+    assert_fail(rows_of(fake), "2 pass rule | caption reported metrics never gate",
+                "1 metrics | caption oracle vs balanced")
+
+
+def test_reported_block_misstated_or_unmarked(fake):
+    fake.edit_cert("caption", lambda c: c["metrics"]["reported"]["e2e"].update(
+        reported_only=False))
+    rows = rows_of(fake)
+    assert_fail(rows, "2 pass rule | caption reported metrics never gate",
+                "1 metrics | caption reported (not gated)")
+
+
+def test_caption_witness_drift_is_a_recomputed_fail(tmp_path):
+    rows = R.by_item(build(tmp_path, iso_witness_drift=True).run())
+    for item in ("checks", "verdict", "reported metrics never gate"):
+        assert rows[f"2 pass rule | caption {item}"].status == cc.PASS
+    assert rows["2 pass rule | caption verdict"].detail.startswith("fail")
+    assert "cold-witness caption_mismatch" in rows["2 pass rule | caption checks"].detail
+    assert_fail(rows, "2 pass rule | caption publishable")
+
+
+def test_retired_generator_version_fails(fake):
+    fake.edit_cert("segment", lambda c: c["generator"].update(version="3"))
+    rows = rows_of(fake)
+    assert_fail(rows, "3 coverage | segment generator version",
+                "2 pass rule | segment count-flip tolerance")
+    assert "retired" in rows["3 coverage | segment generator version"].detail
+    fake.edit_cert("caption", lambda c: c["generator"].update(version="3"))
+    assert_fail(rows_of(fake), "3 coverage | caption generator version",
+                "2 pass rule | caption stage-isolated scoring")
+
+
+def test_cli_takes_the_v4_caption_evidence(base, capsys):
+    args = ["--run-root", str(base.root), "--cert-dir", str(base.cert_dir), "--lab-dir",
+            str(base.inp.lab_dir), "--report", str(base.inp.report), "--nv-root",
+            str(base.inp.nv_root), "--oracle-segments", str(base.oracle_segments),
+            "--reported-e2e", str(base.records("balanced", "caption")),
+            "--families", str(base.root / "families.json"), "--json"]
+    for side in ("exact", "noise", "balanced", "witness"):
+        args += ["--digests", f"{side}={base.digests(side)}"]
+    assert cc.main(args) == 0, capsys.readouterr().out
+    capsys.readouterr()
+    assert cc.main([*args, "--digests", f"balanced={base.digests('noise')}"]) == 1
+    out = json.loads(capsys.readouterr().out)
+    bad = {r["item"] for r in out["rows"] if r["status"] == cc.FAIL}
+    assert "caption input identity" in bad
+    with pytest.raises(SystemExit):
+        cc.main([*args, "--digests", "nonsense"])
 
 
 # 2. pass rule
@@ -337,7 +573,6 @@ def test_check_and_verdict_tampered(fake):
                 "2 pass rule | caption publishable")
 
 
-@needs_v3
 def test_one_count_flip_in_ten_passes_two_fail(tmp_path):
     """Over the union: 2 in 12 + 6 witness episodes pass (rounded half up), 3 in 18 fail."""
     two = R.by_item(build(tmp_path, flips=2).run())
@@ -350,7 +585,6 @@ def test_one_count_flip_in_ten_passes_two_fail(tmp_path):
     assert_fail(three, "2 pass rule | segment publishable")
 
 
-@needs_v3
 @pytest.mark.parametrize("case", WC.CASES, ids=WC.CASE_IDS)
 def test_witness_union_cases(tmp_path, case):
     """The table the generator is tested on (tests/unit/test_certify_witness_union.py): count
@@ -389,7 +623,6 @@ def test_witness_union_cases(tmp_path, case):
         assert_fail(rows, f"2 pass rule | {s} publishable")
 
 
-@needs_v3
 def test_union_count_flips_misstated(fake):
     def hide_witness_flip(c):
         c["metrics"]["count_flips"]["groups"]["cold-witness"]["flips"] = 1
@@ -402,7 +635,6 @@ def test_union_count_flips_misstated(fake):
                 "2 pass rule | segment checks")
 
 
-@needs_v3
 def test_count_flip_rule_loosened_or_tightened(fake):
     def old_rule(c):
         pm = c["thresholds"]["per_metric"]["count_mismatch"]
@@ -418,7 +650,6 @@ def test_count_flip_rule_loosened_or_tightened(fake):
                 "2 pass rule | segment floors and caps", "2 pass rule | segment thresholds")
 
 
-@needs_v3
 def test_too_few_samples_is_provisional(tmp_path):
     f = build(tmp_path, episodes=R.EPISODES[:8], noise=R.NOISE_IDS[:5], flips=0)
     rows = R.by_item(f.run())
@@ -460,8 +691,8 @@ def test_balanced_stage_hash_and_key(fake):
             r["provenance"]["cert_key"]["vllm_engine"]["engine_kwargs"]["max_num_seqs"] = 7
 
     fake.edit_records("balanced", "segment", other_hash)
-    fake.edit_records("balanced", "caption", other_key)
-    fake.edit_records("witness", "caption", other_key)
+    fake.edit_records("isolated", "caption", other_key)
+    fake.edit_records("isolated_witness", "caption", other_key)
     rows = rows_of(fake)
     assert_fail(rows, "3 coverage | segment one balanced stage hash",
                 "3 coverage | caption cert_key is the current code's")
@@ -507,7 +738,6 @@ def test_no_forced_cold_container(tmp_path):
     assert_fail(nowit, "4 evidence | caption forced-cold container")
 
 
-@needs_v3
 def test_cache_counts_misstated(fake):
     fake.edit_cert("segment", lambda c: c["compile_cache"].update(covers=[R.WARM]))
     assert_fail(rows_of(fake), "4 evidence | segment certificate states the caches")
@@ -521,7 +751,6 @@ def test_preemption_after_certifying_fails(fake):
     assert_fail(rows_of(fake), "4 evidence | segment preemptions")
 
 
-@needs_v3
 def test_preempted_run_is_provisional_not_publishable(tmp_path):
     rows = R.by_item(build(tmp_path, preemptions=3).run())
     assert rows["4 evidence | segment preemptions"].status == cc.PASS  # stated: provisional
@@ -535,8 +764,7 @@ def test_lab_engine_hash_stale(tmp_path):
     rows = R.by_item(build(tmp_path, lab_hash="0" * 64).run())
     assert_fail(rows, "4 evidence | segment lab engine-settings hash",
                 "4 evidence | caption lab engine-settings hash")
-    if V3:
-        assert "stale_l0" in rows["2 pass rule | segment verdict"].detail
+    assert "stale_l0" in rows["2 pass rule | segment verdict"].detail
 
 
 def test_lab_missing_or_without_gate_a(fake):
@@ -658,7 +886,7 @@ def test_hex_id_run_scans_clean(hex_base):
     """No false positive: its certificates carry sha256 digests of these uids, cert keys and
     stage hashes, none of which is an episode id."""
     rows = hex_base.run()
-    assert R.failing(rows) == GAPS, [(r.item, r.detail) for r in rows if r.status == cc.FAIL]
+    assert R.failing(rows) == set(), [(r.item, r.detail) for r in rows if r.status == cc.FAIL]
     assert not {i for i in R.failing(rows) if i.startswith("6 leakage")}
 
 
