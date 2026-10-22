@@ -5,12 +5,12 @@
 
 | Profile | Episodes | Video | Containers | Chaos | Cost, nominal / upper | Wall, nominal / upper |
 |---|---|---|---|---|---|---|
-| **`lite`** (the default) | the first 32 | 802 s = 0.22 h | 2 × L40S + 2 × H100! | none | **$2.77 / $6.32** | 15 / 23 min |
-| `full` | all 128 | 3,529 s = 0.98 h | 2 × L40S + 3 × H100! | 2 preemptions, 1 orchestrator kill | $11.49 / $19.30 | 36 / 57 min |
+| **`lite`** (the default) | the first 32 | 802 s = 0.22 h | 2 × L40S + 2 × H100! | none | **$2.85 / $6.40** | 16 / 23 min |
+| `full` | all 128 | 3,529 s = 0.98 h | 2 × L40S + 3 × H100! | 2 preemptions, 1 orchestrator kill | $11.67 / $19.46 | 36 / 57 min |
 
 Both are prepared but **have not been run on Modal**. Only the local fake-models variant has
 run. `lite` is the default because only about $10–15 of the project budget (default $50) is
-left after the certified run, and the full test's upper projection ($19.30) no longer fits.
+left after the certified run, and the full test's upper projection ($19.46) no longer fits.
 The project budget is one setting, `FLORA_PROJECT_BUDGET_USD` (default `50`), read by
 `scripts/spend.py` (where `--budget` overrides it), the `cert_preflight.py` budget check and
 the `wave_h.py --global-cap` ceiling.
@@ -117,26 +117,26 @@ on the exact 6 + 9 shards:
 | index (3 CPU units; *placeholder* 120 s / 600 s each) | $0.10 | $0.01 | $0.03 | $0.01 | $0.03 |
 | plan | $0 | $0 | $0 | $0 | $0 |
 | deploy (image builds; *placeholder*) | $0.10 | $0.00 | $0.01 | $0.00 | $0.01 |
-| run | **$6.30** | **$2.76** | **$6.28** | $2.12 | $5.40 |
+| run | **$6.40** | **$2.85** | **$6.36** | $2.03 | $5.29 |
 | report | $0 | $0 | $0 | $0 | $0 |
-| **total** | global **$6.50** | **$2.77** | **$6.32** | $2.13 | $5.44 |
-| wall (run) | | 15 min | 23 min | 12 min | 18 min |
+| **total** | global **$6.60** | **$2.85** | **$6.40** | $2.04 | $5.33 |
+| wall (run) | | 16 min | 23 min | 11 min | 17 min |
 
-How the run's nominal $2.76 breaks down:
+How the run's nominal $2.85 breaks down:
 
 | Pool | Item | Cost |
 |---|---|---|
-| `segment` | 2 cold starts (300 s each) | $0.45 |
-| `segment` | work (294 container-s) | $0.22 |
+| `segment` | 2 cold starts (295 s each) | $0.45 |
+| `segment` | work (274 container-s) | $0.21 |
 | `segment` | 2 drained tails | $0.05 |
-| `caption` | 2 cold starts (325 s each; one is the pre-warm) | $0.92 |
-| `caption` | work (726 container-s) | $1.03 |
-| `caption` | 2 drained tails | $0.09 |
+| `caption` | 2 cold starts (373 s each; one is the pre-warm) | $1.06 |
+| `caption` | work (685 container-s) | $0.97 |
+| `caption` | 2 drained tails | $0.12 |
 | orchestrator | | $0.00 |
 
-At this size **cold starts are half the cost** ($1.37 of $2.76). That is why a warm compile
-cache saves $0.64, and why criterion 18 records which cache each shard used. The upper figure
-is dominated by the idle tails ($2.34 of $6.28): it charges every container the full 300 s
+At this size **cold starts are half the cost** ($1.50 of $2.85). That is why a warm compile
+cache saves $0.82, and why criterion 18 records which cache each shard used. The upper figure
+is dominated by the idle tails ($2.34 of $6.36): it charges every container the full 300 s
 scale-down window plus 240 s of client slack, because whether Modal applies the lowered window
 to an already-idle container is not yet confirmed on a live job. Criterion 16 measures exactly
 that, so after this run the upper bound can come down.
@@ -147,25 +147,25 @@ that, so after this run the upper bound can come down.
 
 | Episodes | Video-h | seg × cap | Shards seg / cap | Nominal | Upper | Wall | Wall (upper) | Peak seg / cap |
 |---|---|---|---|---|---|---|---|---|
-| 16 | 0.118 | 1 × 2 | 2 / 5 | $1.91 | $4.68 | 13 min | 19 min | 1 / 2 |
-| 16 | 0.118 | 2 × 2 | 2 / 5 | $2.53 | $5.43 | 13 min | 19 min | 2 / **1** |
-| 16 | 0.118 | 2 × 3 | 2 / 5 | $3.41 | $6.88 | 13 min | 19 min | 2 / **1** |
-| 32 | 0.223 | 1 × 2 | 6 / 9 | $2.48 | $5.58 | 15 min | 23 min | 1 / 2 |
-| **32** | **0.223** | **2 × 2** | **6 / 9** | **$2.77** | **$6.32** | **15 min** | **23 min** | **2 / 2** |
-| 32 | 0.223 | 2 × 3 | 6 / 9 | $3.32 | $7.78 | 15 min | 22 min | 2 / 3 |
-| 48 | 0.354 | 1 × 2 | 9 / 14 | $3.23 | $6.70 | 19 min | 28 min | 1 / 2 |
-| 48 | 0.354 | 2 × 2 | 9 / 14 | $3.55 | $7.45 | 19 min | 29 min | 2 / 2 |
-| 48 | 0.354 | 2 × 3 | 9 / 14 | $4.07 | $8.90 | 17 min | 25 min | 2 / 3 |
+| 16 | 0.118 | 1 × 2 | 2 / 5 | $2.37 | $4.82 | 12 min | 18 min | 1 / **1** |
+| 16 | 0.118 | 2 × 2 | 2 / 5 | $2.62 | $5.56 | 12 min | 18 min | 2 / **1** |
+| 16 | 0.118 | 2 × 3 | 2 / 5 | $3.57 | $7.11 | 12 min | 18 min | 2 / **1** |
+| 32 | 0.223 | 1 × 2 | 6 / 9 | $2.56 | $5.66 | 15 min | 23 min | 1 / 2 |
+| **32** | **0.223** | **2 × 2** | **6 / 9** | **$2.85** | **$6.40** | **16 min** | **23 min** | **2 / 2** |
+| 32 | 0.223 | 2 × 3 | 6 / 9 | $3.47 | $7.96 | 15 min | 22 min | 2 / 3 |
+| 48 | 0.354 | 1 × 2 | 9 / 14 | $3.28 | $6.72 | 19 min | 28 min | 1 / 2 |
+| 48 | 0.354 | 2 × 2 | 9 / 14 | $3.54 | $7.46 | 19 min | 28 min | 2 / 2 |
+| 48 | 0.354 | 2 × 3 | 9 / 14 | $4.10 | $9.02 | 17 min | 25 min | 2 / 3 |
 
 **Recommendation: 32 episodes on 2 × L40S + 2 × H100!** (`recommend_size`). It is the largest
 size that:
 - has at least 2 containers in each pool, and both pools reach them in the schedule (16
   episodes give only 2 segment shards, so the second caption container never starts);
 - gives every container at least 2 shards, so each one is a rate sample, and the pools overlap;
-- stays within **$7 at the upper projection** (48 episodes on 2 × 2 needs $7.45).
+- stays within **$7 at the upper projection** (48 episodes on 2 × 2 needs $7.46).
 
 1 × 2 is $0.29 cheaper but cannot measure segment with two containers. 2 × 3 adds a third
-caption cold start and $1.46 of upper for no new kind of evidence.
+caption cold start and $1.56 of upper for no new kind of evidence.
 
 ### Feeding the rates back (`--finalize`)
 
@@ -225,7 +225,7 @@ v3.0. Both profiles use it; lite takes its first 32 episodes.
 |---|---|
 | Episodes | 128 |
 | Frames | 105,877 at 30 fps = **3,529 s = 0.980 video-hours** |
-| Episode length | 3.1–78.3 s (median 13.7 s), every one under NVIDIA's 120 s cap |
+| Episode length | 3.1–78.3 s (median 12.7 s, from the pinned per-episode frame counts), every one under NVIDIA's 120 s cap |
 | Video | one view (`observation.images.camera`), AV1 1920×1080 CFR, in 13 concatenated MP4s (2.4 GB; 3.0 GB with parquet) |
 | Task text | 11 tasks (`meta/tasks.parquet`), so `episode_instruction: dataset_task` works |
 | License | CC-BY-NC-ND-4.0. Outputs stay on the private Volume and the report holds numbers only. |
@@ -255,7 +255,7 @@ video into equal shards; only the real mode packs lite's exact shards.
 
 | | |
 |---|---|
-| Preset | `balanced`, `allow_uncertified: true` (no certificates yet) |
+| Preset | `balanced`, `allow_uncertified: true` (`segment` is certified for `human` on the L40S; `caption` is not, so the opt-in is still needed) |
 | Stages | `segment`, `caption` |
 | `segment` pool | **2 × L40S** (8 cores, 48 GiB; $2.71/h) |
 | `caption` pool | **3 × H100!** (8 cores, 96 GiB; $5.10/h) |
@@ -297,17 +297,20 @@ After the job ends, the script times `flora compose`, runs `modal app stop`, the
 The dry run prices each container class at its own pinned list price (`jobs.budget`): L40S
 workers at $2.71/h, H100 workers at $5.10/h, and the orchestrator at the preemptible CPU rate
 (0.125 cores, 0.25 GiB). `planner/rates.json` supplies the work rates and startups. The
-`balanced` rows are **measured**, from the first `balanced` GPU run (run 102207184317,
-[`wave-h-report.md`](wave-h-report.md)):
+`balanced` rows are **measured**, from the certified run (run 10221548f1b8, one 12-episode
+job, 3.9 min of video, [`wave-h-report.md`](wave-h-report.md)). `planner/rates.json` is the source of truth and
+[`costs.md`](costs.md) has the generated tables; the values the projections below use
+(2026-10-22):
 
 | Kind | GPU | Work (container-s per video-s) | Cold startup | Warm startup |
 |---|---|---|---|---|
-| `segment` | L40S | **0.367**, measured, n=1, ±50% | **300.5 s**, measured, n=1, ±50% | 150 s, *placeholder*, ±60% |
-| `caption` | H100! | **0.906**, measured, n=1, ±50% | **325 s**, measured, n=1, ±50% | 180 s, *placeholder*, ±60% |
+| `segment` | L40S | **0.342**, measured, n=1, ±50% | **295 s**, measured, n=1, ±50% | 150 s, *placeholder*, ±60% |
+| `caption` | H100! | **0.854**, measured, n=1, ±50% | **373 s**, measured, n=1, ±50% | 180 s, *placeholder*, ±60% |
 
-The work rates were measured before batch fill (`engines/batch_policy.py`), so they can only
-overstate the work. Criterion 8 compares the run against them, and criterion 19 measures how
-full the batches actually are.
+Batch fill (`engines/batch_policy.py`, 74ae89f) was already deployed when these rates were
+measured, but a 12-episode job (3.9 min of video) is too small to fill a batch. A large job's
+batches can fill, so its work rates may come out lower. Criterion 8 compares the run against these rates, and
+criterion 19 measures how full the batches actually are.
 
 **The warm variant** (`--assume-warm`) prices a run whose compile cache is already published
 for each pool's key (`engines/compile_cache.py`). It uses the `compile_cache: warm` startup row
@@ -353,10 +356,10 @@ confirmed on a live job (criterion 16 measures it), and the full 660 s reconcile
 | index (13 CPU units; **placeholder** 120 s / 600 s each) | $0.20 | $0.03 | $0.14 | $0.03 | $0.14 |
 | plan | $0 | $0 | $0 | $0 | $0 |
 | deploy (image builds; **placeholder**) | $0.10 | $0.00 | $0.01 | $0.00 | $0.01 |
-| run | **$19.20** | **$11.46** | **$19.15** | **$9.47** | **$16.70** |
+| run | **$19.40** | **$11.65** | **$19.31** | **$9.13** | **$16.17** |
 | report | $0 | $0 | $0 | $0 | $0 |
-| **total** | global **$19.50** | **$11.49** | **$19.30** | **$9.50** | **$16.84** |
-| wall (run) | | 36 min | 57 min | 31 min | 50 min |
+| **total** | global **$19.70** | **$11.67** | **$19.46** | **$9.16** | **$16.31** |
+| wall (run) | | 36 min | 57 min | 30 min | 49 min |
 
 The caps are derived, not chosen. Each step's cap is its cold upper projection rounded up to
 $0.10, and the global cap is their sum. `scripts/scale_test.py --dry-run` prints the current
@@ -365,8 +368,8 @@ the rate table; these are from 2026-10-22.
 
 The old estimate, from placeholder rates at 3 + 2, was $9.58 nominal and $19.49 upper. The new
 nominal is higher for three reasons:
-- the measured startups are 300–325 s, not the projected 130 s;
-- the work rates are still within the old placeholder band (0.367 against 0.5, 0.906 against
+- the measured startups are 295–373 s, not the projected 130 s;
+- the work rates are still within the old placeholder band (0.342 against 0.5, 0.854 against
   1.0);
 - the third caption container adds one more cold start and one more reconciler-gap restart.
 
@@ -377,25 +380,25 @@ How the full run's nominal cost breaks down (cold, 2 + 3):
 | Pool | Item | Cost |
 |---|---|---|
 | `segment` | 2 cold starts | $0.45 |
-| `segment` | work (1,295 container-s) | $0.98 |
+| `segment` | work (1,207 container-s) | $0.91 |
 | `segment` | 2 drained tails (17 s each) | $0.03 |
-| `segment` | preemption | $0.29 |
-| `caption` | 3 cold starts (one of them the pre-warm) | $1.38 |
-| `caption` | work (3,198 container-s) | $4.53 |
-| `caption` | tails (one container runs out of shards about 5 minutes before the last one ends) | $0.53 |
-| `caption` | preemption | $0.61 |
-| `caption` | reconciler gap (3 × idle 300 s + restart) | $2.65 |
+| `segment` | preemption | $0.28 |
+| `caption` | 3 cold starts (one of them the pre-warm) | $1.58 |
+| `caption` | work (3,014 container-s) | $4.27 |
+| `caption` | tails (one container runs out of shards several minutes before the last one ends) | $0.60 |
+| `caption` | preemption | $0.67 |
+| `caption` | reconciler gap (3 × idle 300 s + restart) | $2.86 |
 | orchestrator | | $0.01 |
 
-About $3.60 of the $11.46 is chaos: the two preemptions and the orchestrator kill. Without
-chaos, the same schedule costs $7.89 and takes 31 minutes.
+About $3.80 of the $11.65 is chaos: the two preemptions and the orchestrator kill. Without
+chaos, the same schedule costs $7.83 and takes 30 minutes.
 
 - **Fake-modal:** $0.10 nominal / $0.34 upper for full (caps $0.50 global). That is 5 CPU
   worker containers (2 cores, 12 GiB, $0.19/h) whose fake rate and startup are
   **placeholders**, plus the orchestrator. Lite's fake-modal rehearsal is $0.02 nominal /
   $0.16 upper (caps $0.30 global), on 178 synthetic clips and 4 CPU worker containers.
 - **Caps:** each is the upper projection rounded up to $0.10 per step. The script also prints
-  the unrounded upper numbers (`honest caps`, global $19.40 for full, $6.40 for lite). They are
+  the unrounded upper numbers (`honest caps`, global $19.55 for full, $6.50 for lite). They are
   proposals. Raising them, or approving the spend, is the user's decision.
 - **Retries:** an attempt that is killed or unreported is charged its whole budget until billing
   is an hour past it. A retry soon after such an attempt is therefore refused by design (see
@@ -410,13 +413,13 @@ test:
 
 | Option | Containers | Cost (range) | Wall |
 |---|---|---|---|
-| `balanced x1` | 2 × L40S + 3 × H100! | $7.44 ($4.99–$11.10) | 0.39 h |
+| `balanced x1` | 2 × L40S + 3 × H100! | $7.30 ($4.90–$10.91) | 0.38 h |
 | `exact x4` | 5 × H200 | $36.63 ($26.97–$49.93) | 1.28 h (infeasible) |
 | `exact x8 +long_lived_container` | 5 × H200 | $14.89 ($9.25–$24.06) | 0.52 h (at risk; a projection, never recommended) |
 
 `flora plan` charges each container the same 17 s drained tail as the script. It is cheaper
-than the script's $11.46 because it does not model client slack or the chaos actions. Its $7.44
-is close to the script's $7.89 without chaos. Measuring that gap is part of the point.
+than the script's $11.65 because it does not model client slack or the chaos actions. Its $7.30
+is close to the script's $7.83 without chaos. Measuring that gap is part of the point.
 
 ## Pool sizing
 
@@ -426,63 +429,64 @@ start.
 
 | seg × cap | Nominal | Upper | Wall | Wall (upper) | No chaos | Wall (no chaos) | Utilization seg / cap | Idle share |
 |---|---|---|---|---|---|---|---|---|
-| 1 × 1 | $8.02 | $13.27 | 66 min | 102 min | $6.22 | 61 min | 0.80 / 0.90 | 0.006 |
-| 1 × 2 | $9.61 | $15.84 | 45 min | 71 min | $6.92 | 40 min | 0.80 / 0.79 | 0.040 |
-| 1 × 3 | $11.19 | $18.42 | 38 min | 60 min | $7.62 | 33 min | 0.80 / 0.71 | 0.067 |
-| 1 × 4 | $12.93 | $21.49 | 36 min | 56 min | $8.48 | 30 min | 0.80 / 0.62 | 0.067 |
-| 2 × 1 | $8.26 | $14.02 | 66 min | 102 min | $6.46 | 61 min | 0.67 / 0.90 | 0.008 |
-| 2 × 2 | $9.79 | $16.58 | 44 min | 68 min | $7.11 | 38 min | 0.67 / 0.80 | 0.033 |
-| **2 × 3** | **$11.46** | **$19.15** | **36 min** | **57 min** | **$7.89** | **31 min** | **0.67 / 0.70** | **0.071** |
-| 2 × 4 | $12.90 | $21.72 | 33 min | 52 min | $8.45 | 27 min | 0.67 / 0.65 | 0.077 |
-| 3 × 1 | $8.63 | $14.76 | 66 min | 102 min | $6.82 | 61 min | 0.54 / 0.90 | 0.027 |
-| 3 × 2 (earlier layout) | $10.15 | $17.33 | 44 min | 68 min | $7.47 | 38 min | 0.54 / 0.80 | 0.049 |
-| 3 × 3 | $11.82 | $19.90 | 36 min | 57 min | $8.25 | 31 min | 0.54 / 0.70 | 0.084 |
-| 3 × 4 | $13.49 | $22.46 | 33 min | 52 min | $9.04 | 27 min | 0.54 / 0.63 | 0.113 |
-| 4 × 1 | $8.74 | $15.51 | 66 min | 102 min | $6.94 | 61 min | 0.51 / 0.90 | 0.011 |
-| 4 × 2 | $10.27 | $18.08 | 44 min | 68 min | $7.58 | 38 min | 0.51 / 0.80 | 0.034 |
-| 4 × 3 | $11.94 | $20.64 | 36 min | 57 min | $8.37 | 31 min | 0.51 / 0.70 | 0.070 |
-| 4 × 4 | $13.61 | $23.21 | 33 min | 52 min | $9.16 | 27 min | 0.51 / 0.63 | 0.099 |
+| 1 × 1 | $7.88 | $13.03 | 63 min | 98 min | $5.96 | 58 min | 0.79 / 0.89 | 0.006 |
+| 1 × 2 | $9.49 | $15.80 | 43 min | 67 min | $6.63 | 38 min | 0.79 / 0.78 | 0.026 |
+| 1 × 3 | $11.11 | $18.57 | 36 min | 57 min | $7.29 | 31 min | 0.79 / 0.69 | 0.042 |
+| 1 × 4 | $12.91 | $21.45 | 34 min | 54 min | $8.14 | 29 min | 0.79 / 0.61 | 0.069 |
+| 2 × 1 | $8.11 | $13.77 | 63 min | 98 min | $6.20 | 58 min | 0.66 / 0.89 | 0.008 |
+| 2 × 2 | $9.86 | $16.54 | 43 min | 67 min | $6.99 | 37 min | 0.66 / 0.76 | 0.045 |
+| **2 × 3** | **$11.65** | **$19.31** | **36 min** | **57 min** | **$7.83** | **30 min** | **0.66 / 0.66** | **0.080** |
+| 2 × 4 | $13.22 | $22.08 | 33 min | 52 min | $8.45 | 27 min | 0.66 / 0.60 | 0.085 |
+| 3 × 1 | $8.46 | $14.51 | 63 min | 98 min | $6.55 | 58 min | 0.53 / 0.89 | 0.027 |
+| 3 × 2 (earlier layout) | $10.21 | $17.28 | 43 min | 67 min | $7.34 | 37 min | 0.53 / 0.76 | 0.060 |
+| 3 × 3 | $11.99 | $20.05 | 36 min | 57 min | $8.18 | 30 min | 0.53 / 0.66 | 0.092 |
+| 3 × 4 | $13.78 | $22.82 | 33 min | 52 min | $9.01 | 27 min | 0.53 / 0.59 | 0.118 |
+| 4 × 1 | $8.58 | $15.25 | 63 min | 98 min | $6.67 | 58 min | 0.49 / 0.89 | 0.011 |
+| 4 × 2 | $10.33 | $18.02 | 43 min | 67 min | $7.46 | 37 min | 0.49 / 0.76 | 0.046 |
+| 4 × 3 | $12.12 | $20.79 | 36 min | 57 min | $8.30 | 30 min | 0.49 / 0.66 | 0.078 |
+| 4 × 4 | $13.90 | $23.56 | 33 min | 52 min | $9.13 | 27 min | 0.49 / 0.59 | 0.105 |
 
 "Nominal", "Upper" and "Wall" are for the run step with chaos. "No chaos" is the bare schedule.
 Utilization is busy ÷ whole container life, including the cold start and the tail. Idle share
 is the tail cost ÷ pool cost, without chaos. With a warm start (placeholder 150 s / 180 s),
-every row is $0.84–$2.62 cheaper and 2.5–5 minutes shorter, and the recommendation does not
-change (2 × 3 warm: $9.47 / $16.70, 31 / 50 min).
+every row is $1.04–$3.27 cheaper and 2–6 minutes shorter. The warm recommendation is 2 × 2
+($7.95 / $14.16, 37 / 59 min); the cold one, which sets the caps, is 2 × 3 (2 × 3 warm: $9.13
+/ $16.17, 30 / 49 min).
 
 **What the table shows:**
-- **`caption` is the bottleneck.** It needs 0.906 container-s per video-s, against 0.367 for
+- **`caption` is the bottleneck.** It needs 0.854 container-s per video-s, against 0.342 for
   segment, which is 2.5× as much on a container that costs 1.9× as much. The wall clock is set
-  by the caption pool size: 66, 44, 36 and 33 minutes for 1, 2, 3 and 4 caption containers
-  (a single segment container adds 1–3 minutes).
+  by the caption pool size: 63, 43, 36 and 33 minutes for 1, 2, 3 and 4 caption containers
+  (a single segment container adds 0–1 minutes).
 - **Segment containers beyond 1 buy almost no wall time.** Each extra segment container adds a
-  300 s cold start (about $0.23) and a 17 s drained tail. Even one segment container stays
+  295 s cold start (about $0.22) and a 17 s drained tail. Even one segment container stays
   ahead of 3 caption containers. The earlier 3 × 2 layout is dominated by 2 × 2: it has the
-  same 44 minutes and costs $0.36 more.
-- **Startup amortization.** Each container pays 300–325 s once. Against 1,295 s of segment work
-  and 3,198 s of caption work, cold starts are about a third of segment's cost and a fifth of
-  caption's at 2 × 3 without chaos. That is why whole-life utilization of segment is only 0.67,
+  same 43 minutes and costs $0.35 more.
+- **Startup amortization.** Each container pays 295–373 s once. Against 1,207 s of segment work
+  and 3,014 s of caption work, cold starts are about a third of segment's cost and a quarter of
+  caption's at 2 × 3 without chaos. That is why whole-life utilization of segment is only 0.66,
   even though segment never waits between shards.
 - **Pipelining.** With the caption pre-warm, the first caption starts at the first segment
-  receipt in every row (0 s). Without it, it would start one caption cold start (325 s) later.
+  receipt in every row (0 s). Without it, it would start one caption cold start (373 s) later.
   Segment is ahead, so the caption pool never waits on segment work ("idle between shards" is
   0 s). The overlap is the whole segment window.
 - **Tails are small.** The drain caps the tail after a pool's last shard at 17 s per container.
   The idle share that remains is caption containers that run out of shards a few minutes
   before the pool's last one ends (they keep the deployed 300 s window while the pool has work).
 - **Chaos scales with the caption pool.** The reconciler gap costs 300 s of idle plus one
-  restart per caption container, about $0.88 each. That is why 2 × 3 costs $1.67 more than
-  2 × 2 with chaos, but only $0.78 more without it.
+  restart per caption container, about $0.95 each. That is why 2 × 3 costs $1.79 more than
+  2 × 2 with chaos, but only $0.84 more without it.
 
 **Recommendation for full: 2 × L40S + 3 × H100!** (`recommend`). This is the cheapest size that:
 - has at least 2 containers per pool, because the test is about autoscaling several
   containers;
-- finishes within 60 minutes even at the upper rates (57 minutes, against 68 for 2 × 2). Both
+- finishes within 60 minutes even at the upper rates (57 minutes, against 67 for 2 × 2). Both
   rates are n=1 at ±50%, so the upper wall is the honest one;
 - reaches every pool's size in the schedule, so criterion 3 can pass.
 
-It costs $1.67 (17%) more than the cheapest multi-container option (2 × 2), and cuts the
-nominal wall from 44 to 36 minutes. `flora plan` independently picks the same 2 + 3. The
-cheapest size within the hour, 1 × 3 at $11.19, was rejected because a one-container segment
+It costs $1.79 (18%) more than the cheapest multi-container option (2 × 2), and cuts the
+nominal wall from 43 to 36 minutes. `flora plan` independently picks the same 2 + 3. The
+cheapest size within the hour, 1 × 3 at $11.11, was rejected because a one-container segment
 pool cannot test segment autoscaling.
 
 ## Success criteria
@@ -514,11 +518,11 @@ current rates, full at 2 + 3 and lite at 2 + 2.
 | 1 | End state | `done` | the final `flora status` state | the job system survives scale plus chaos; it gates the first public release |
 | 2 | Lost or duplicate records | 0 (compose `missing` + conflicts) | `job.summary()` | correctness of retry, dedupe and compose at 8 + 15 shards (lite: 6 + 9) |
 | 3 | Each pool reaches `max_containers` | full: segment 2, caption 3; lite: 2 and 2 | peak concurrency from `modal container list` samples | whether the factory's `max_containers` is honoured, i.e. whether the planner's container counts can be trusted |
-| 4 | Time to peak concurrency, from the run start | *derived*: full: segment ≤ 150 s, caption ≤ 844 s; lite: segment ≤ 150 s, caption ≤ 733 s (upper schedule + a poll + 120 s launch margin); a pool that never reaches its size fails | container samples and the run start | whether `min_containers` / warm pools are needed for short jobs |
+| 4 | Time to peak concurrency, from the run start | *derived*: full: segment ≤ 150 s, caption ≤ 819 s; lite: segment ≤ 150 s, caption ≤ 716 s (upper schedule + a poll + 120 s launch margin); a pool that never reaches its size fails | container samples and the run start | whether `min_containers` / warm pools are needed for short jobs |
 | 5 | Utilization while holding work, per pool | ≥ 0.60 busy ÷ container-seconds, from each container's first shard start to its last shard end | attempt markers and receipts | the release goal of ">60% GPU utilization while busy"; the pool ratio and shard size |
-| 6 | Pipelining: first caption start after the first segment receipt | *derived*: ≤ 608 s (upper caption cold start + 120 s), and overlap > 0 | attempt markers and receipts | whether `depends_on` per shard (not per stage) works; the wall-time model in `flora plan` |
+| 6 | Pipelining: first caption start after the first segment receipt | *derived*: ≤ 679 s (upper caption cold start + 120 s), and overlap > 0 | attempt markers and receipts | whether `depends_on` per shard (not per stage) works; the wall-time model in `flora plan` |
 | 7 | Spend within the upper projection | actual ≤ upper | tracked spend, or the billed delta once it lands | whether the stop rules and caps are safe at scale |
-| 8 | Spend vs the nominal projection | \|actual ÷ nominal − 1\| ≤ 0.5 | as 7 | whether the measured `balanced` rows hold at n > 1 (they were n=1, and measured before batch fill) |
+| 8 | Spend vs the nominal projection | \|actual ÷ nominal − 1\| ≤ 0.5 | as 7 | whether the measured `balanced` rows hold at n > 1 (they were n=1, on a job too small to fill batches) |
 | 9 | Idle / scale-down share of pool cost | ≤ 0.15, leaving out tails that began while the killed orchestrator was down | container samples, receipts, and the kill and revive times | whether the job-aware drain (`jobs/pools.py`) actually ends the tail on a live job |
 | 10 | Preemption recovered | each pool has a `preempted` start, and its shard still ends with a receipt from a later attempt; **lite: n.a.** | attempt markers and receipts | spot instances are safe for `balanced` |
 | 11 | Orchestrator revived by the reconciler | kill fired, revived by the reconciler (not the `flora resume` fallback) within 660 s, and the job ends `done`; **lite: n.a.** | the first spawn or adoption in a ledger after the kill | whether the reconciler cron is mandatory in `flora deploy`; continuation semantics |
