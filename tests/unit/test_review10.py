@@ -272,8 +272,9 @@ def fake_stack(monkeypatch, tmp_path, tempseg_pinned):
         class Job:
             stage = stage_name
 
-            def __init__(self, st, info, inputs):
+            def __init__(self, st, info, inputs, segments=None):
                 self.st, self.info, self.inputs = st, info, inputs
+                self.segments = segments
 
         return Job
 

@@ -377,6 +377,11 @@ flora certify [OPTIONS]
 | `--out-dir` |  | Where to write certificates (default: the package registry; a failed one is written only with --out-dir). |
 | `--json` | off | Print the certificates as JSON. |
 | `--generated-at` |  | Certificate time YYYY-MM-DDTHH:MM:SSZ (default: now). Pass the run's own time to make re-certifying the same records reproduce the same certificate id. |
+| `--digests` |  | Per-row Captioner input digests SIDE=PATH, JSON {uid: [hex\|null per row]} (repeatable; SIDE: exact, noise, balanced, witness, repeat). Caption needs exact, balanced (and noise / witness when given). |
+| `--oracle-segments` |  | Caption: the staged oracle segment JSONL the isolated candidate captioned (byte-identical to the pinned file). |
+| `--reported-e2e` |  | Caption: the stack's end-to-end caption records, JSONL (reported only). |
+| `--reported-repeat` |  | Caption: another exact repeat's caption records, JSONL, with --digests repeat= (reported only). |
+| `--families` |  | Caption: JSON {uid: label} (label [a-z0-9_.-]{1,32}) for the reported family split. |
 
 ### `flora estimate`
 
