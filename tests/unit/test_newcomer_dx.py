@@ -343,32 +343,37 @@ def test_cost_block_is_plain_and_busy_only():
 # Second cold walk (2026-10-22): the README's own-data path before anything exists on Modal
 
 
-def test_index_local_refuses_a_missing_volume_before_downloading(tmp_path, monkeypatch):
-    """`flora index --local` on the default (volume://) sink, before `flora deploy`: one clear
-    refusal with the command that fixes it, instead of a failed receipt per episode and a
-    traceback. Nothing is downloaded."""
-    from types import SimpleNamespace
-
+def test_index_local_creates_a_missing_volume_before_downloading(tmp_path, monkeypatch):
+    """`flora index --local` on the default (volume://) sink, before `flora deploy`: the store is
+    opened with ``create=True`` in the config's environment, before anything is downloaded, so
+    the Volume exists for the receipts (as `flora deploy` would make it). The doctor, README and
+    this path agree: nothing to create by hand."""
     import flora_deploy.export.results as res
     import flora_deploy.jobs.indexing as indexing
 
-    class NotFoundError(Exception):  # modal.exception.NotFoundError, matched by name
+    seen: list[tuple[str, dict]] = []
+
+    class Stop(Exception):
         pass
 
-    class Vol:
-        def hydrate(self):
-            raise NotFoundError("Volume 'flora-results' not found in environment 'main'")
+    def opened(uri, **kw):
+        seen.append((uri, kw))
+        return object()
 
-    monkeypatch.setattr(res, "store_from_uri", lambda uri, **kw: SimpleNamespace(volume=Vol()))
-    monkeypatch.setattr(indexing, "open_dataset",
-                        lambda *a, **k: pytest.fail("downloaded before the Volume check"))
+    def download(*a, **k):
+        assert seen, "downloaded before the store (and its Volume) was opened"
+        raise Stop
+
+    monkeypatch.setattr(res, "store_from_uri", opened)
+    monkeypatch.setattr(indexing, "open_dataset", download)
     cfg = _write(tmp_path, template_text("local_demo"))
+    (tmp_path / "videos").mkdir()
     r = runner.invoke(app, ["index", "--local", "-c", str(cfg)], env={"COLUMNS": "200"})
-    assert r.exit_code == 2, r.output
-    out = " ".join(r.output.split())
-    assert "Volume 'flora-results'" in out and "does not exist yet" in out
-    assert "modal volume create flora-results --version 2" in out
-    assert "Traceback" not in r.output
+    assert isinstance(r.exception, Stop), r.output
+    assert seen == [("modal-volume://flora-results/local-demo",
+                     {"environment": "main", "create": True})], seen
+    readme = " ".join((ROOT / "README.md").read_text().split())
+    assert "create the Volume first" not in readme and "is created" in readme
 
 
 def test_results_without_a_run_says_so(tmp_path):
@@ -415,7 +420,8 @@ def test_doctor_fixes_name_commands_not_repo_paths(tmp_path):
     p = write_cfg(tmp_path, **{"s3://my-bucket/flora/lerobot-small":
                                "volume://flora-results/lerobot-small"})
     c = by_name(d.run_checks(p, FakeProbes(volume="missing")))
-    assert "`flora index --local` needs it first" in c["store.volume"].fix
+    vol = c["store.volume"]
+    assert "with or without --local" in vol.message and "modal volume create" in vol.fix
 
 
 def test_cli_docs_keep_code_spans_literal():

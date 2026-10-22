@@ -389,9 +389,10 @@ def check_store(p: Probes, cfg: Any) -> list[Check]:
             out.append(Check("store.volume", "pass", f"Volume {name!r} exists"))
         elif r == "missing":  # nothing to set up: deploy makes it (create_if_missing)
             return [Check("store.volume", "pass", f"Volume {name!r} does not exist yet in "
-                          f"environment {env!r}; `flora deploy` creates it (so does `flora index`)",
-                          f"`flora index --local` needs it first; create it now (free): "
-                          f"modal volume create {name} --version 2 --env {env}")]
+                          f"environment {env!r}; `flora deploy` creates it, and so does `flora "
+                          "index` (with or without --local)",
+                          f"or create it now (free): modal volume create {name} --version 2 "
+                          f"--env {env}")]
         else:
             out.append(Check("store.volume", "warn", f"could not look up the Volume ({r})",
                              "check `modal volume list`"))

@@ -54,8 +54,8 @@ def expected_error(exc: BaseException) -> str | None:
         if name == "NotFoundError":
             vol = re.search(r"Volume '([^']+)' not found", msg)
             if vol:
-                return (f"{msg}. Create it with `modal volume create {vol.group(1)}` (`flora "
-                        "deploy` also creates it), or pass --store file:///some/dir")
+                return (f"{msg}. Create it with `modal volume create {vol.group(1)} --version "
+                        "2` (`flora deploy` also creates it), or pass --store file:///some/dir")
             if re.search(r"\b(App|Function|Cls)\b", msg):
                 return f"{msg}. Run `flora deploy` first"
             return msg

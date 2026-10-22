@@ -66,8 +66,7 @@ flora results caption      # or segment, reward.terminal, reward.dense
 estimated cost, and builds nothing.
 
 `flora index --local` scans on your machine for free instead, but still writes its receipts to
-`output.sink`. With a Modal Volume sink, create the Volume first (`flora doctor` prints the
-command) or run plain `flora index` once, which creates it.
+`output.sink` (a Modal Volume sink that does not exist yet is created, as `flora deploy` would).
 
 `flora run` stops before it would exceed your budget, and `flora resume` picks up where a stopped
 or interrupted job left off. GPUs start when the job starts and scale to zero when it ends (about
@@ -112,7 +111,8 @@ dataset has several cameras, map them under `input.cameras`; the template shows 
 ## Using the labels
 
 Write each stage to a file first, e.g. `flora results caption --format parquet --out
-caption.parquet`. Then, with `pip install pandas pyarrow`:
+caption.parquet`. pandas is not a flora-deploy dependency: install it where you read the files
+(`pip install pandas pyarrow`).
 
 ```python
 import pandas as pd
@@ -122,8 +122,7 @@ scores = pd.read_parquet("terminal.parquet")       # flora results reward.termin
 labels = captions.merge(scores[["uid", "terminal_score"]], on="uid")
 ```
 
-pandas is not a flora-deploy dependency: install it (`pip install pandas`) where you read the
-files. `caption.parquet` has one row per subtask and `terminal.parquet` one per episode, so the
+`caption.parquet` has one row per subtask and `terminal.parquet` one per episode, so the
 merge repeats each episode's score on its subtasks.
 
 Training on LeRobot? `flora export --to lerobot --out labeled/ --allow-uncertified` writes the
