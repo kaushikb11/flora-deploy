@@ -14,8 +14,9 @@ Not the factory: this lab runs the engines and stages directly, on a few golden 
     shared top-k at every position up to the first divergence, and greedy agreement.
 
 Each engine runs in its own child process (``python -c ...``) so the plugin variant gets a fresh
-engine-core with the plugin env, and GPU memory is released between them. Child results and the
-Gate A requests go through ``/tmp`` in the container; the TempSeg run also writes its segment
+engine-core with the plugin env, and GPU memory is released between them. Child args (a JSON
+file, never argv), results and the Gate A requests go through ``/tmp`` in the container; the
+TempSeg run also writes its segment
 rows to ``flora-golden:balanced-lab/<run>/segments.json`` (private Volume) for the caption run.
 
 A baseline run that sends zero requests (no episode ran) returns ``error`` and
@@ -299,11 +300,23 @@ def gate_a_compare(base: list[dict], patched: list[dict]) -> dict:
             "mean_abs_dlogit": round(sum(deltas) / len(deltas), 6) if deltas else None}
 
 
+CHILD_CODE = ("import json,sys,pathlib; from flora_deploy.modal_app.balanced_lab import child; "
+              "child(json.loads(pathlib.Path(sys.argv[1]).read_text()))")
+
+
+def child_argv(args: dict) -> list[str]:
+    """The child's command line. ``args`` go through a JSON file next to ``args['out']`` (its
+    path in argv), never inline: with the deployed job's segments one argv string passed
+    Linux's 128 KiB per-argument limit (E2BIG, 2026-10-22 captioner lab)."""
+    path = Path(args["out"]).with_suffix(".args.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(args))
+    return [sys.executable, "-c", CHILD_CODE, str(path)]
+
+
 def _run_child(args: dict, env: dict[str, str]) -> dict:
-    code = ("import json,sys; from flora_deploy.modal_app.balanced_lab import child; "
-            "child(json.loads(sys.argv[1]))")
     t = time.time()
-    p = subprocess.run([sys.executable, "-c", code, json.dumps(args)], env={**os.environ, **env},
+    p = subprocess.run(child_argv(args), env={**os.environ, **env},
                        capture_output=True, text=True)
     if p.returncode != 0:
         return {"error": f"child exit {p.returncode}", "stderr_tail": p.stderr[-6000:],
