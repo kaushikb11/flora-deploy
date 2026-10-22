@@ -355,7 +355,8 @@ def test_witness_union_cases(tmp_path, case):
     flips over the union of the candidate's and the witness's episodes, witness means alone."""
     opts = {"episodes": R.EPISODES[:case.main], "flips": case.main_flips,
             "witness_flips": case.witness_flips,
-            "witness_drift": case.drift if case.drift in ("boundary", "caption") else None,
+            "witness_drift": case.drift if case.drift in ("boundary", "caption", "nan")
+            else None,
             "witness": case.drift != "absent"}
     if case.drift == "warm":
         opts["witness_cache"] = R.WARM

@@ -220,8 +220,20 @@ def align(ref: Sequence[Segment], cand: Sequence[Segment]) -> list[tuple[int, in
     return pairs[::-1]
 
 
+def finite(x: float | None) -> bool:
+    """``None`` (not evaluable) or a finite number: a NaN or inf metric never certifies."""
+    return x is None or math.isfinite(x)
+
+
+def _bounds_finite(*sides: Sequence[Segment]) -> bool:
+    return all(math.isfinite(s.start_s) and math.isfinite(s.end_s) for xs in sides for s in xs)
+
+
 def segment_metrics(ref: StageRecord, cand: StageRecord) -> dict[str, float | None]:
     a, b = ref.segments, cand.segments
+    if not _bounds_finite(a, b):  # a NaN / inf boundary: every interval metric is not finite
+        return {"iou_divergence": math.nan, "boundary_error_s": math.nan,
+                "count_mismatch": float(len(a) != len(b)), "label_disagreement": math.nan}
     if not a and not b:
         return {"iou_divergence": 0.0, "boundary_error_s": 0.0, "count_mismatch": 0.0,
                 "label_disagreement": 0.0}
@@ -266,6 +278,12 @@ def caption_metrics(ref: StageRecord, cand: StageRecord,
                                         "count_mismatch": 0.0}
         if similarity is not None:
             out[SIMILARITY_METRIC] = 0.0
+        return out
+    if not _bounds_finite(a, b):  # the alignment is undefined: not finite
+        out = {"caption_mismatch": math.nan, "caption_edit_distance": math.nan,
+               "count_mismatch": float(len(a) != len(b))}
+        if similarity is not None:
+            out[SIMILARITY_METRIC] = math.nan
         return out
     pairs = align(a, b)
     unmatched = slots - len(pairs)
@@ -669,18 +687,27 @@ def certify_stage(
                          "absolute_floor": ABSOLUTE_FLOOR.get(m, 0.0),
                          "cap": ABSOLUTE_CAPS.get(m), "over": metric_basis(stage, m),
                          "threshold": metric_threshold(m, base, th.tolerance, slack)
-                         if base is not None else None}
+                         if base is not None and finite(base) else None}
     blocks = dict(candidate)
     if witness_block is not None:
         blocks[WITNESS_CLASS] = witness_block
     checks = []
+    non_finite = []  # (class, metric): a NaN / inf mean (its own or its noise floor's) fails
     for c, block in blocks.items():
         for m in names:
             if m == COUNT_METRIC:  # over the union, below
                 continue
             v, t = block["means"][m], per_metric[m]["threshold"]
+            if not finite(v) or not finite(noise_means.get(m)):
+                non_finite.append((c, m))
+                checks.append({"class": c, "metric": m, "value": v if finite(v) else None,
+                               "threshold": t, "pass": False})
+                continue
             ok = None if v is None or t is None else bool(v <= t + 1e-12)
             checks.append({"class": c, "metric": m, "value": v, "threshold": t, "pass": ok})
+    for blk in (*candidate.values(), witness_block, noise_block):  # JSON has no NaN
+        if blk is not None:
+            blk["means"] = {m: v if finite(v) else None for m, v in blk["means"].items()}
     # The count-flip check: over the union of the candidate's and the witness's episodes (a
     # witness episode is a sample of its own), flips <= threshold x n rounded half up.
     count_flips = None
@@ -710,8 +737,11 @@ def certify_stage(
                                 if (r.provenance.engine_preemptions or 0) > 0),
                "unknown": sum(1 for r in engine_recs if r.provenance.engine_preemptions is None)}
     failures, provisional = [], []
-    if any(ch["pass"] is False for ch in checks):
+    if any(ch["pass"] is False and (ch["class"], ch["metric"]) not in non_finite
+           for ch in checks):
         failures.append("divergence_above_noise_floor")
+    if non_finite:
+        failures.append("non_finite_metric")
     if l0s["status"] == "fail":
         failures.append("l0_failed")
     if nz is None:
