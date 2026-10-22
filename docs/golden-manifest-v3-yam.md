@@ -17,8 +17,9 @@ stay on the Volume (`golden/v3-yam/<pool>/<dataset>/<slug>/record.json`,
 
 ## Why these 12 episodes
 
-`flora certify` needs at least 10 candidate episodes per pool, every oracle episode labelled,
-and a noise run of at least 5 of them (`docs/certification.md`). Certificates are per (preset,
+`flora certify` needs at least 10 candidate episodes per pool, at most 2 oracle episodes without
+a candidate record, and at least 5 noise episodes paired with the oracle
+(`docs/certification.md`). Certificates are per (preset,
 kind, GPU, embodiment), so the human certificate from golden/v2 does not cover `yam`. v1 has 9
 `yam` episodes. v3-yam has **12**: 10 for the certificate plus 2 spares.
 
@@ -76,7 +77,9 @@ The selection's `noise_subset` names the 5 episodes the noise run repeats:
 `manirewardbench_yam/stack_plates_000003`, `stack_the_plates_000002` and
 `take_out_the_chewing_gum_000002`, 72.2 s in all. It mixes all three sources (ALOHA AV1 at 50
 fps, RoboCOIN 720p AV1, ManiRewardBench H.264 at 10 fps), so the noise floor is not measured on
-one source only.
+one source only. The certified run repeats one spare as well, the first other `yam` episode
+(`aloha_static_towel/000000`; 6 episodes, 81.1 s), so one noise episode lost on the oracle or
+the noise side still leaves 5.
 
 ## Verification
 
@@ -122,7 +125,8 @@ from the index pass.
 
 Rough certified-run prices, on the same rates and three-view scaling as yam (12 episodes, 5 of
 them for noise, lab already done, hypothetical durations at the short end of each dataset,
-+10% headroom). Nominal / upper:
++10% headroom). They were priced before (d) gained its forced-cold job on the noise episodes
+and the noise run its spare, so they understate (d) and (f). Nominal / upper:
 
 | Pool | Video s | (b) oracle | (f) noise | (d) balanced | Total |
 |---|---|---|---|---|---|

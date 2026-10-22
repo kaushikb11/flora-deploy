@@ -16,6 +16,7 @@ from __future__ import annotations
 
 WORKER_EXTENSION = "flora_deploy.engines.worker_ext.FloraWorkerExtension"
 GDN_DTYPES_RPC = "flora_gdn_dtypes"
+KV_LAYOUT_RPC = "flora_kv_cache_layout"
 GDN_PARAMS = ("dt_bias", "A_log")
 
 
@@ -30,9 +31,21 @@ def gdn_dtype_counts(model) -> dict[str, int]:
     return counts
 
 
+def kv_layout(kv_cache_config) -> dict:
+    """vLLM 0.24's ``KVCacheConfig`` (``model_runner.kv_cache_config``) as msgpack-native data:
+    ``{"num_blocks", "groups": [{"spec": <KVCacheSpec class name>, "block_size", "layers"}]}``."""
+    groups = [{"spec": type(g.kv_cache_spec).__name__,
+               "block_size": int(g.kv_cache_spec.block_size),
+               "layers": len(g.layer_names)} for g in kv_cache_config.kv_cache_groups]
+    return {"num_blocks": int(kv_cache_config.num_blocks), "groups": groups}
+
+
 class FloraWorkerExtension:
     """Mixed into vLLM's GPU worker; methods are prefixed ``flora_`` (vLLM refuses an extension
     attribute the worker class already has)."""
 
     def flora_gdn_dtypes(self) -> dict[str, int]:
         return gdn_dtype_counts(self.model_runner.model)  # type: ignore[attr-defined]
+
+    def flora_kv_cache_layout(self) -> dict:
+        return kv_layout(self.model_runner.kv_cache_config)  # type: ignore[attr-defined]

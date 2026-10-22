@@ -355,6 +355,7 @@ flora certify [OPTIONS]
 | `--balanced` | required | Candidate records on the same episodes, JSONL. |
 | `--config`, `-c` | `flora.yaml` | The candidate run's flora.yaml (preset, pools, modes). |
 | `--noise` |  | The exact run repeated on a subset of its episodes, JSONL: the noise floor. |
+| `--witness` |  | Candidate records from one container forced cold (FLORA_COMPILE_CACHE=off), JSONL: the cold witness, checked like the candidate (docs/certification.md). |
 | `--l0` |  | balanced_lab result JSON (the in-engine input and dt_bias checks), repeatable (one per model kind). |
 | `--stage` |  | Stage(s) to certify (default: every certifiable stage in the candidate records). |
 | `--gpu` |  | GPU type certified (default: the config's pool GPU for the stage). |

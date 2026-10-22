@@ -48,7 +48,8 @@ def test_certified_plan_runs_b_f_d_then_certify_on_golden_v2():
     assert wh.PLANS[wh.CERTIFIED] == ("exact_e2e", "noise", "balanced", "lab", "certify")
     assert SPEC.golden == "golden/v2" and SPEC.shared_data
     assert len(SPEC.episodes) >= 12 and len(set(SPEC.episodes)) == len(SPEC.episodes)
-    assert len(SPEC.noise) == wh.MIN_NOISE_EPISODES and set(SPEC.noise) < set(SPEC.episodes)
+    assert len(SPEC.noise) == wh.MIN_NOISE_EPISODES + wh.NOISE_SPARES
+    assert set(SPEC.noise) < set(SPEC.episodes)
     assert set(wh.EPISODES) <= set(SPEC.episodes)  # v1's six are kept
     assert SPEC.lab_episodes == wh.EPISODES
     assert SPEC.state != wh.STATE and SPEC.state.parent == wh.CERT_ROOT
@@ -133,10 +134,10 @@ def test_noise_index_check(tmp_path):
     dur = wh.durations(m)
     p = tmp_path / "summary.json"
     want = sum(dur[g] for g in SPEC.noise)
-    p.write_text(json.dumps({"counts": {"episodes": 5}, "video_s": want}))
+    p.write_text(json.dumps({"counts": {"episodes": len(SPEC.noise)}, "video_s": want}))
     assert wh.noise_index_problems(p, m, SPEC) == ""
     p.write_text(json.dumps({"counts": {"episodes": 12}, "video_s": want * 3}))
-    assert "not the 5 noise episodes" in wh.noise_index_problems(p, m, SPEC)
+    assert f"not the {len(SPEC.noise)} noise episodes" in wh.noise_index_problems(p, m, SPEC)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -144,11 +145,15 @@ def test_noise_index_check(tmp_path):
 
 
 def _lab(kind: str, gpu: str, ok: bool = True) -> dict:
+    from flora_deploy.engines.offline_llm import normalize_gpu
+    from tests.fakes.certrecords import lab_hashes
+
     return {"kind": kind, "baseline": {"gpu": gpu, "l0": [
         {"key": f"k{i}", "ids_equal": ok, "render_ids_equal": True, "grid_equal": True}
         for i in range(6)]},
         "gate_a": {"requests": 6, "greedy_identical": 6, "positions": 120,
-                   "max_abs_dlogit": 0.1, "mean_abs_dlogit": 0.01, "first_divergence": []}}
+                   "max_abs_dlogit": 0.1, "mean_abs_dlogit": 0.01, "first_divergence": []},
+        "engine_hashes": lab_hashes(kind, normalize_gpu(gpu))}
 
 
 def _labs(d: Path, ok: bool = True) -> Path:
@@ -188,13 +193,15 @@ def _uid(g: str) -> str:
     return episode_uid(wh.CERT_DATA, SPEC.local_id(g))
 
 
-def _records(ids, preset: str, stage: str, *, shift: float = 0.0, noise_ref: bool = False):
+def _records(ids, preset: str, stage: str, *, shift: float = 0.0, noise_ref: bool = False,
+             **kw):
     out = []
-    for i, g in enumerate(ids):
+    for g in ids:
+        i = SPEC.episodes.index(g)  # captions follow the episode, not its place in the file
         caps = [f"c{i}-{j}" for j in range(len(BOUNDS))] if stage == "caption" else None
         r = rec(_uid(g), stage, preset, embodiment="human", fp=None, gpu=None,
                 segments=segs([(s + shift, e + shift) for s, e in BOUNDS], caps),
-                audit_ref=(f"noise-{i}" if noise_ref else None))
+                audit_ref=(f"noise-{i}" if noise_ref else None), **kw)
         out.append(r)
     return out
 
@@ -209,9 +216,11 @@ def _job(step: str, cfg: Path | None) -> dict:
             "containers": [], "video_hours": {"done": 0.06}, "cfg": str(cfg) if cfg else None}
 
 
-def certified_world(tmp_path: Path, *, noise_n: int = 5, shift: float = 0.01):
-    """A certified-plan state after (b), (f), (d): the records under the plan's records dir,
-    the balanced job's real-format config, the lab JSON."""
+def certified_world(tmp_path: Path, *, noise_n: int | None = None, shift: float = 0.01,
+                    witness: bool = True):
+    """A certified-plan state after (b), (f), (d): the records under the plan's records dir
+    (the cold witness's too, unless ``witness=False``), the balanced job's real-format config,
+    the lab JSON."""
     from dataclasses import replace
 
     spec = replace(SPEC, state=tmp_path / "state.json", work=tmp_path / "work",
@@ -229,11 +238,18 @@ def certified_world(tmp_path: Path, *, noise_n: int = 5, shift: float = 0.01):
         s.result = {"jobs": {wh.JOB: _job(step, cfg if step == "balanced" else None)}}
         if step == "balanced":
             s.result["derived_content"] = dict(CONTENT)
+            if witness:
+                s.result["witness_jobs"] = {wh.JOB: {**_job("cold", cfg),
+                                                     "compile_cache": "off"}}
         s.attempts.append(wh.Attempt(started=T0 + i * 1000, status="done",
                                      finished=T0 + i * 1000 + 900, tracked_usd=0.5))
     wh.save_state(st, spec.state)
     noise = SPEC.noise[:noise_n]
     for stage in wh.CERT_STAGES:
+        if witness:
+            _jsonl(spec.records / "witness" / wh.JOB / f"{stage}.jsonl",
+                   _records(SPEC.noise, "balanced", stage, shift=shift,
+                            compile_cache="cold:forced"))
         _jsonl(spec.records / "exact" / wh.JOB / f"{stage}.jsonl",
                _records(SPEC.episodes, "exact", stage))
         _jsonl(spec.records / "noise" / wh.JOB / f"{stage}.jsonl",
@@ -270,7 +286,7 @@ def test_certify_step_comes_out_certified_when_the_numbers_agree(tmp_path, no_fe
     for stage in wh.CERT_STAGES:
         v = res["stages"][stage]
         assert v["verdict"] == "certified" and v["reasons"] == [], v
-        assert v["episodes"] == len(SPEC.episodes) and v["noise_episodes"] == 5
+        assert v["episodes"] == len(SPEC.episodes) and v["noise_episodes"] == len(SPEC.noise)
     certs = [json.loads(p.read_text()) for p in (ctx.work / "certify").glob("cert_*.json")]
     assert {c["stage"] for c in certs} == set(wh.CERT_STAGES)
     for c in certs:
@@ -350,5 +366,5 @@ def test_certified_balanced_step_prices_cold_from_the_merged_rate_table(capsys):
     st = wh.State("r", 0.0, "x")
     wh.print_plan(st, wh.plan_projections(wh.CERTIFIED, man), manifest=man, plan=wh.CERTIFIED)
     out = capsys.readouterr().out
-    assert "batch-fill engine limits" in out and "max_num_seqs 64" in out
+    assert "batch-fill engine limits" in out and "max_num_seqs 48" in out
     assert "never write it back" not in out

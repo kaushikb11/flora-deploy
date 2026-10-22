@@ -29,6 +29,7 @@ from tests.fakes.certrecords import (
     L0_PASS,
     STAGE_SETS,
     key,
+    lab_for,
     prov,
     rec,
     segment_set,
@@ -258,7 +259,7 @@ def _write_stage(tmp_path, cfg, stage, *, noise=True, content=CONTENT, stamp=STA
     mk = STAGE_SETS[stage]
     gpu = {"segment": "L40S"}.get(stage, "H100!")
     modes = kind_modes(cfg, stage)
-    lab = {**L0_PASS, "kind": C.L0_STAGES.get(stage, "x")}
+    lab = lab_for(stage)
     doc = key("balanced", stage, gpu, fp=None, modes=modes, content=content)
     C.write_certificate(C.certify_stage(
         stage, exact=mk("exact", 10, fp=None), balanced=mk("balanced", 10, fp=None, modes=modes),
@@ -363,7 +364,7 @@ def test_certificate_never_contains_a_record_string(seed):
     bal = [_random_record(rng, u, stage, "balanced") for u in uids if rng.random() < 0.9] or [
         _random_record(rng, uids[0], stage, "balanced")]
     nz = [_random_record(rng, u, stage, "exact") for u in uids[:2]]
-    lab = {**L0_PASS, "kind": C.L0_STAGES.get(stage, "x")}
+    lab = lab_for(stage)
     gpu = {"segment": "L40S"}.get(stage, "H100!")
     cert = C.certify_stage(stage, exact=ex, balanced=bal, noise=nz,
                            engine_spec=key("balanced", stage, gpu), gpu=gpu,

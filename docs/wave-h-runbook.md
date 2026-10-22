@@ -71,7 +71,7 @@ One job means **one app per stage**: one cold start per pool for (d). `flora cer
 noise episodes to be a subset of the oracle's and the stage hash to match
 (`docs/certification.md`, "Binding checks"). In `--plan full` the noise run (f) repeats (b)'s
 job on all six episodes, because a new data dir holding a subset would hash differently. The
-certified run instead re-indexes (b)'s own data dir with `flora index --limit 5` (same stage
+certified run instead re-indexes (b)'s own data dir with `flora index --limit 6` (same stage
 hash; see "The certified run"). Each of (b) and (f) is one H200 cold start.
 
 Every job is staged the same way:
@@ -219,7 +219,7 @@ for `balanced/tempseg`, `balanced/captioner` and `balanced/tempseg-dtbias`;
 `balanced/captioner-dtbias` was cut off mid-compile.
 
 **Batch fill.** (d) runs the batch-fill engine limits and batch policy, and the dry run says so:
-TempSeg on the L40S with `max_num_seqs` 64 and 64 episodes per batcher, the Captioner on the
+TempSeg on the L40S with `max_num_seqs` 48 and 64 episodes per batcher, the Captioner on the
 H100 with `max_num_seqs` 16 and 32 episodes per batcher. Its rates were measured before batch
 fill, so they can only overstate it.
 
@@ -396,27 +396,31 @@ uv run python scripts/wave_h.py --plan certified --yes-spend --only noise # one 
 | Requirement | How the plan meets it |
 |---|---|
 | at least 10 candidate episodes of the pool | 12 golden/v2 `human` episodes (`docs/golden-manifest-v2.md`): 10 plus 2 spares, all run. (b) and (d) refuse before any app unless all 12 are staged (and the selection has at least 10, with a noise subset of at least 5 inside it) |
-| every oracle episode labelled (coverage 1.0) | (d) runs exactly (b)'s episodes |
+| at most 2 oracle episodes unlabelled by the candidate (the spares) | (d) runs exactly (b)'s episodes; every paired episode counts, none is chosen |
 | oracle and candidate uids pair | **every job stages one data dir**, `cert-human`. Episode uids are `<data dir>--<episode id>`, and `--plan full` staged one dir per step, so its uids never paired and every certificate it could make had coverage 0 |
-| a noise run of at least 5 of the oracle's episodes, same stage hash, key, GPU and determinism | (f) re-indexes **(b)'s own config and data dir** with `flora index --limit 5`. The stage hash covers the config and the whole input dir, not the index, so it is (b)'s. The five noise episodes (`noise_subset` in the selection) are named `n-<id>` and the rest `x-<id>`, so they sort first. Before any app starts, (f) checks that the index holds exactly those five (count and video seconds). Same H200, `nvidia` mode, a new job id |
-| L0 passing for `segment` and `caption` | the lab's JSON (d2). It is **skipped when already done**: `balanced-<kind>.json` with L0 rows that all pass, Gate A requests, no error, and the pool's GPU (`lab_already_done`). L0 is per model kind, not per episode. Otherwise (d2) runs against (d)'s job on the golden/v1 six (its deadlines were measured on them) |
+| a noise run pairing at least 5 of the oracle's episodes, same stage hash, key, GPU and determinism | (f) re-indexes **(b)'s own config and data dir** with `flora index --limit 6`. The stage hash covers the config and the whole input dir, not the index, so it is (b)'s. The six noise episodes (`noise_subset` in the selection plus one spare) are named `n-<id>` and the rest `x-<id>`, so they sort first. Before any app starts, (f) checks that the index holds exactly those six (count and video seconds). Same H200, `nvidia` mode, a new job id |
+| L0 passing for `segment` and `caption`, under the candidate's engine settings | the lab's JSON (d2). It is **skipped only when already done for the current engine settings**: `balanced-<kind>.json` with L0 rows that all pass, Gate A requests, no error, the pool's GPU and the `engine_hashes` of today's engines (`lab_already_done`). The lab files from before batch fill carry no hash, so the certified run runs (d2) again, priced. L0 is per model kind, not per episode. (d2) runs against (d)'s job on the golden/v1 six (its deadlines were measured on them) |
+| no preempted engine record; evidence for warm and cold compiles | the engine limits fit a full batch of worst-case requests; every record carries `engine_preemptions` and `compile_cache`. (d) ends with the **cold witness**: (d)'s config re-indexed to the 6 noise episodes and run with `FLORA_COMPILE_CACHE=off` (one container per kind forced cold); (e) passes it as `--witness` and needs it |
 | the candidate key equals this checkout's | (e) certifies with the derived content digests (d)'s workers verified, from the commit that ran (d) |
 
 ### Steps, in order
 
 | Step | What | GPU | Stop rule (cap) | Nominal | Upper |
 |---|---|---|---|---|---|
-| b | exact oracle, 12 episodes, 235.9 s, `nvidia` mode, one app | H200 | $4.00 | $2.59 | $3.97 |
-| f | noise: 5 of (b)'s episodes, 84.4 s, (b)'s config and data dir, new job id | H200 | $1.95 | $1.06 | $1.90 |
-| d | `balanced` via the real `flora deploy` / `flora run`, the 12 episodes | L40S + H100 | $2.40 | $1.35 | $2.39 |
-| d2 | lab L0 + Gate A, **skipped at $0 when already done** | L40S, then H100 | $2.35 (or $0) | $1.74 (or $0) | $2.31 (or $0) |
+| b | exact oracle, 12 episodes, 250.2 s, `nvidia` mode, one app | H200 | $4.20 | $2.74 | $4.17 |
+| f | noise: 6 of (b)'s episodes, 102.3 s, (b)'s config and data dir, new job id | H200 | $2.15 | $1.24 | $2.15 |
+| d | `balanced` via the real `flora deploy` / `flora run`, the 12 episodes, then the forced-cold job on the 6 noise episodes | L40S + H100 | $4.55 | $2.50 | $4.51 |
+| d2 | lab L0 + Gate A, **skipped at $0 when already done for the current engine settings** | L40S, then H100 | $2.35 (or $0) | $1.74 (or $0) | $2.31 (or $0) |
 | e | `flora certify` per stage, then `scripts/wave_h_finalize.py --write` | CPU | $0 | $0 | $0 |
-| | **total, lab runs** | | global **$10.60** | **$6.75** | **$10.58** |
-| | **total, lab already done** | | global **$8.30** | **$5.00** | **$8.27** |
+| | **total, lab runs** | | global **$13.20** | **$8.23** | **$13.13** |
+| | **total, lab already done** | | global **$10.90** | **$6.48** | **$10.83** |
 
-These numbers come from the dry run on the **staged** manifest (`--plan certified --dry-run`,
-staged durations). The offline dry run (`--offline`, expected durations +10%: 250.2 s and
-86.2 s) prints slightly higher figures: b $4.20, f $1.95, d $2.45, lab $0, global $8.60.
+These numbers come from the offline dry run (`--plan certified --dry-run --offline`, expected
+durations +10%). The dry run on the staged manifest uses the staged durations (about 5% shorter
+in all), so it prints slightly lower figures. (d) costs more than a single job because the
+forced-cold job pays one more cold compile per pool. The lab files written before the
+engine-settings hash was recorded carry no hash, so today's certified run runs (d2), and the
+"lab runs" total applies.
 
 - **Caps.** Each step's cap is its own upper projection rounded up to $0.05 (`plan_caps`), and
   the global cap is the sum of the upper projections rounded up to $0.10 (`plan_global_cap`).
@@ -472,7 +476,8 @@ So **(d) is rerun on the 12 episodes.** It is about $1.35 nominal, and is priced
 
 Certificates are per embodiment, so the human run does not cover robot data. `--plan certified
 --embodiment yam` runs the same steps on golden/v3-yam (`docs/golden-manifest-v3-yam.md`: 12
-three-view episodes, 220.2 s, noise subset 5 episodes, 72.2 s). `--embodiment human` is the
+three-view episodes, 218.0 s, noise subset 6 episodes, 81.1 s: the selection's 5 plus one
+spare). `--embodiment human` is the
 default, and its dry run is byte-identical to the one before the flag existed.
 
 ```
@@ -485,10 +490,13 @@ uv run python scripts/wave_h.py --plan certified --embodiment yam --dry-run
 | golden set | golden/v2 | golden/v3-yam |
 | data dir (uids `<dir>--<id>`) | `cert-human` | `cert-yam` |
 | state, work dir, records | `reports/wave-h/certified/` | `reports/wave-h/certified-yam/` |
-| (b) oracle, nominal / upper | $2.59 / $3.97 | $3.11 / $4.67 |
-| (f) noise | $1.06 / $1.90 | $1.16 / $2.04 |
-| (d) balanced | $1.35 / $2.39 | $1.53 / $2.68 |
-| total, lab already done (global cap) | $5.00 / $8.27 ($8.30) | $5.81 / $9.38 ($9.40) |
+| (b) oracle, nominal / upper | $2.74 / $4.17 | $3.37 / $5.02 |
+| (f) noise | $1.24 / $2.15 | $1.39 / $2.34 |
+| (d) balanced, with the forced-cold job | $2.50 / $4.51 | $2.79 / $4.93 |
+| total, lab runs (global cap) | $8.23 / $13.13 ($13.20) | $9.29 / $14.60 ($14.70) |
+| total, lab already done (global cap) | $6.48 / $10.83 ($10.90) | $7.55 / $12.29 ($12.30) |
+
+These are offline dry-run figures (expected durations +10%).
 
 - **Separate runs.** Each embodiment has its own state file, so the two runs never collide and
   resume independently. `--state` pointing at the other embodiment's state is refused. Caps are
@@ -506,7 +514,8 @@ uv run python scripts/wave_h.py --plan certified --embodiment yam --dry-run
 - **The 1-view lab prompts are not short.** The Captioner lab's 4.4k-7k-token requests (2-3
   videos each) were human single-view captions: NVIDIA's single-view caption prompt carries
   several clips. Only TempSeg is ~1.8k for 1-view.
-- **Lab (d2).** L0 is per model kind, so the human lab evidence is reused ($0), as for human.
+- **Lab (d2).** L0 is per model kind, so the human lab evidence is reused ($0) when it was
+  measured under the current engine settings, as for human.
   It does not exercise three-view balanced requests; Gate C covered three-view rendering
   against vLLM on golden yam media. If the evidence is missing, the lab runs on yam's first six
   episodes, priced at the human lab's measured times.
@@ -531,7 +540,7 @@ agree, both stages come out **`certified`** (not provisional), with coverage 1.0
 episodes, and `wave_h_finalize.py --write` is called. With 4 noise episodes they come out
 `provisional` (`too_few_noise_samples`), and a 0.6 s boundary shift is a `fail`; neither writes
 anything. The test also checks:
-- that the noise subset is exactly what `--limit 5` indexes;
+- that the noise subset is exactly what `--limit 6` indexes;
 - that the oracle's and balanced's uids pair;
 - the caps and the "lab already done" skip.
 

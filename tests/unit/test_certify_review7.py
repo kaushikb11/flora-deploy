@@ -144,8 +144,10 @@ def test_h2_oracle_must_be_one_run_and_noise_a_subset_not_a_copy():
     two = [*segment_set("exact", 6), *segment_set("exact", 6, start=6, config_hash="f" * 64)]
     with pytest.raises(C.CertifyError, match="one stage hash"):
         seg_cert(exact=two)
-    with pytest.raises(C.CertifyError, match="subset"):
-        seg_cert(noise=segment_set("exact", 5, start=20))
+    # noise episodes the oracle did not label are not paired (review 13 S3-3): none left here
+    c = seg_cert(noise=segment_set("exact", 5, start=20))
+    assert c["metrics"]["noise"]["n"] == 0 and c["metrics"]["noise"]["unpaired"] == 5
+    assert "too_few_noise_samples" in c["reasons"]
     ex = [replace(r, audit_ref=f"audit/{r.uid}") for r in segment_set("exact", 12)]
     with pytest.raises(C.CertifyError, match="copies"):
         seg_cert(exact=ex, noise=ex[:5])
@@ -170,7 +172,7 @@ def test_h2_determinism_mode_must_match_and_is_recorded():
     {"slack": {"expected_score_abs_delta": 4.0}},  # P6
     {"slack": {"score_mismatch": 1.0}},
     {"min_samples": 1}, {"min_noise_samples": 1},  # P6b
-    {"min_coverage": 0.5},
+    {"max_missing": 3}, {"max_missing": -1},
     {"slack": {"made_up": 0.0}},
 ])
 def test_h3_knobs_outside_policy_are_refused(kw):
@@ -304,10 +306,8 @@ def test_h7_config_validation_and_plan_app_agree_on_reward_certificates(tmp_path
         balanced=terminal_set("balanced", 10, score=1, es=1.0, modes=modes, **gpu_kw),
         noise=terminal_set("exact", 5, **gpu_kw), gpu=gpu, generated_at="2026-10-23T00:00:00Z",
         engine_spec=key("balanced", "reward.terminal", gpu, fp=None, modes=modes)), cdir)
-    # the rewards are the reference by identity (exact's own engine): a fail does not apply
-    assert plan_app(cfg, store="s3://b/x")
-    # ... until the stack diverges from exact's: then the newer fail decides
-    monkeypatch.setattr(certkey, "reference_identical", lambda *a, **k: False)
+    # the rewards are the reference by identity (exact's own engine), but a fail measured under
+    # the very key overrides that (review 13 S3-7): the newer fail decides
     with pytest.raises(DeployError, match="Gate certificate"):
         plan_app(cfg, store="s3://b/x")
 

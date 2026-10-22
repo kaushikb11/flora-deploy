@@ -58,6 +58,10 @@ def certify(
     noise: Annotated[Path | None, typer.Option(
         help="The exact run repeated on a subset of its episodes, JSONL: the noise floor.")
     ] = None,
+    witness: Annotated[Path | None, typer.Option(
+        help="Candidate records from one container forced cold (FLORA_COMPILE_CACHE=off), "
+             "JSONL: the cold witness, checked like the candidate (docs/certification.md).")
+    ] = None,
     l0: Annotated[list[Path] | None, typer.Option(
         help="balanced_lab result JSON (the in-engine input and dt_bias checks), repeatable "
              "(one per model kind).")
@@ -113,6 +117,7 @@ def certify(
     try:
         ex, bal = C.read_records(exact), C.read_records(balanced)
         nz = C.read_records(noise) if noise else None
+        wit = C.read_records(witness) if witness else None
         labs = [json.loads(p.read_text(encoding="utf-8")) for p in l0 or ()]
         slacks = {k: float(v) for k, v in _pairs(slack, "--slack").items()}
     except (OSError, ValueError) as e:
@@ -144,7 +149,7 @@ def certify(
             raise _fail(f"{st}: {e} (pass --derived-content NAME=SHA256)") from None
         try:
             cert = C.certify_stage(
-                st, exact=ex, balanced=bal, noise=nz, engine_spec=doc, gpu=g,
+                st, exact=ex, balanced=bal, noise=nz, witness=wit, engine_spec=doc, gpu=g,
                 preset=cfg.preset, kind=kind, l0=lab_by_kind.get(C.L0_STAGES.get(st)),
                 thresholds=th, similarity=sim, similarity_name=similarity,
                 generated_at=generated_at)

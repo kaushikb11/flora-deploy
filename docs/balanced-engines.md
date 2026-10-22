@@ -186,7 +186,7 @@ processor cache to be off.
 | `mm_processor_kwargs` | `{"fps": 4, "max_frames": 128}` | `{"fps": 8, "max_frames": 40}` |
 | `limit_mm_per_prompt` | `{"image": 0, "video": 3}` | same |
 | `max_model_len` | 32768 | 32768 |
-| `max_num_seqs` / `max_num_batched_tokens` / `gpu_memory_utilization` | L40S 64 / 16384 / 0.90; A100-80GB 48; H100 48; H200 64 | H100 16 / 16384 / 0.90; H200 32 |
+| `max_num_seqs` / `max_num_batched_tokens` / `gpu_memory_utilization` | L40S 48 / 16384 / 0.90; A100-80GB 48; H100 48; H200 64 (on L40S a full batch of worst-case 5.1k-token requests fits in the cache: room for 55) | H100 16 / 16384 / 0.90 (worst case 10.75k tokens: room for 18); H200 32 |
 | `seed` | 0 | 0 |
 | sampling | greedy, 1024 tokens, `stop_token_ids=[<|im_end|>]` | greedy, 512 tokens, `stop_token_ids=[<|im_end|>]` |
 
@@ -198,8 +198,9 @@ Notes:
 - Forbidden arguments: quantization, LoRA, KV/Mamba dtype overrides, `renderer_num_workers` and
   `tokenizer_mode`.
 - The limits are checked at build: `check_mamba_blocks` fails the engine if `max_num_seqs`
-  exceeds the Mamba cache blocks vLLM allocated (#49064). TempSeg on the L40S was raised to 64
-  for batch fill; the H100 Captioner stays at 16 until a measured run shows a higher value holds.
+  exceeds the Mamba cache blocks vLLM allocated (#49064). TempSeg on the L40S runs 48: 64 would
+  not fit a full batch of worst-case requests (room for 55). The H100 Captioner stays at 16 (room
+  for 18) until a measured run shows a higher value holds.
 - `logprobs_mode` / `max_logprobs` are settable only for the `dt_bias` drift check (Gate A). They change what
   the engine *returns* for logprob requests, not greedy outputs.
 - The startup recipe follows `docs/cold-start.md`: a t=0 `warm.start_prefetch`, then a keyed

@@ -17,10 +17,13 @@ no NVIDIA material here.
 
 ## Why 12 episodes
 
-`flora certify` needs at least 10 candidate episodes per pool and every oracle episode labelled
+`flora certify` needs at least 10 candidate episodes per pool, at most 2 oracle episodes without
+a candidate record, and at least 5 noise episodes paired with the oracle
 (`docs/certification.md`). v1 has only 7 `human` episodes, and Wave H-lite step (d) ran 6 of
 them. v2 has **12**: 10 for the certificate plus 2 spares, so a failure or exclusion at run time
-still leaves 10. The certified run sends all 12 to the oracle and to `balanced`.
+still leaves 10. The certified run sends all 12 to the oracle and to `balanced`, and repeats 6 in
+the noise run: the selection's 5 `noise_subset` episodes plus one spare (the first other
+`human` episode), so one noise episode lost on the oracle or the noise side still leaves 5.
 
 - **Kept from v1: the 6 episodes step (d) ran.** Their selection entries and datasets are
   byte-for-byte the v1 ones, so they have the same selection digest. Staging re-cut them under

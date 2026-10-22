@@ -27,10 +27,10 @@ def test_engine_kwargs_are_explicit_and_valid():
     assert kw["max_model_len"] == 32768
     assert kw["limit_mm_per_prompt"] == {"image": 0, "video": 3}
     assert kw["mm_processor_kwargs"] == {"fps": 4, "max_frames": 128}
-    assert (kw["max_num_seqs"], kw["max_num_batched_tokens"]) == (64, 16384)
+    assert (kw["max_num_seqs"], kw["max_num_batched_tokens"]) == (48, 16384)
     cap = spec("captioner", "H100!").engine_kwargs()
     assert cap["mm_processor_kwargs"] == {"fps": 8, "max_frames": 40}
-    assert (cap["max_num_seqs"], cap["max_num_batched_tokens"]) == (24, 16384)
+    assert (cap["max_num_seqs"], cap["max_num_batched_tokens"]) == (16, 16384)
 
 
 @pytest.mark.parametrize(("key", "value"), [
@@ -95,7 +95,7 @@ def test_label_and_hash_view():
     assert spec(dtbias_fp32=True).label == "vllm-0.24.0-offline+dtbias"
     h = s.hashed()
     assert "gpu" not in h and "model" not in h["engine_kwargs"]
-    assert h["engine_kwargs"]["max_num_seqs"] == 64  # batching changes numerics: hashed
+    assert h["engine_kwargs"]["max_num_seqs"] == 48  # batching changes numerics: hashed
 
 
 def test_nvidia_sampling_is_greedy_eos_only():
@@ -222,12 +222,29 @@ def test_dead_engine_classifies_as_cuda_fatal():
 
 
 
+class MambaSpec(SimpleNamespace):
+    """``vllm.v1.kv_cache_interface.MambaSpec`` (the extension reads the class name)."""
+
+
+class FullAttentionSpec(SimpleNamespace):
+    pass
+
+
+def kv_cache_config(num_blocks=100_000, block_size=528):
+    """``vllm.v1.kv_cache_interface.KVCacheConfig`` of a 3:1 GDN:attention hybrid."""
+    groups = [SimpleNamespace(layer_names=[f"l{i}.{g}" for i in range(8)],
+                              kv_cache_spec=cls(block_size=block_size))
+              for g, cls in enumerate((MambaSpec, MambaSpec, MambaSpec, FullAttentionSpec))]
+    return SimpleNamespace(num_blocks=num_blocks, kv_cache_groups=groups)
+
+
 class _GpuWorker:
     """vLLM's GPU worker as far as the extension sees it."""
 
-    def __init__(self, params):
+    def __init__(self, params, kv=None):
         self.model_runner = SimpleNamespace(
-            model=SimpleNamespace(named_parameters=lambda: iter(params)))
+            model=SimpleNamespace(named_parameters=lambda: iter(params)),
+            kv_cache_config=kv or kv_cache_config())
 
 
 class RpcLLM(FakeLLM):
@@ -326,6 +343,8 @@ def test_engine_build_installs_the_worker_extension(monkeypatch):
     s = spec()
     eng = O.OfflineEngine(s, params_cls=Params)
     assert built["worker_extension_cls"] == WORKER_EXTENSION
+    assert built["disable_log_stats"] is False  # the preemption counter (review 13 B1)
+    assert "disable_log_stats" not in s.as_json()["engine_kwargs"]
     assert eng.gdn_dtypes["workers"][0]["dt_bias:bfloat16"] == 48
     assert "worker_extension_cls" not in s.as_json()["engine_kwargs"]
 
@@ -341,27 +360,107 @@ def test_extra_state_under_vision_tower_fails_preflight():
         O.check_extra_state(bad)
 
 
-def _blocks_llm(n):
-    from types import SimpleNamespace
+def _layout(num_blocks, mamba=3, attention=1, block_size=528):
+    """What ``flora_kv_cache_layout`` returns: vLLM 0.24's ``KVCacheConfig`` as plain data."""
+    groups = ([{"spec": "MambaSpec", "block_size": block_size, "layers": 8}] * mamba
+              + [{"spec": "FullAttentionSpec", "block_size": block_size, "layers": 8}]
+              * attention)
+    return {"num_blocks": num_blocks, "groups": groups}
 
-    cache = SimpleNamespace(num_gpu_blocks=n)
-    return SimpleNamespace(llm_engine=SimpleNamespace(
-        vllm_config=SimpleNamespace(cache_config=cache)))
+
+class _LayoutLLM:
+    def __init__(self, layout, frontend=None):
+        self.layout, self.frontend = layout, frontend
+        if frontend is not None:
+            self.llm_engine = SimpleNamespace(vllm_config=SimpleNamespace(
+                cache_config=SimpleNamespace(num_gpu_blocks=frontend)))
+
+    def collective_rpc(self, method, timeout=None, args=(), kwargs=None):
+        from flora_deploy.engines.worker_ext import KV_LAYOUT_RPC
+
+        assert method == KV_LAYOUT_RPC
+        if isinstance(self.layout, Exception):
+            raise self.layout
+        return [self.layout]
 
 
-def test_batch_fill_engine_limits():
-    """WP1c: TempSeg/L40S 64, Captioner/H100 24; one prefill chunk size everywhere."""
-    assert O.GPU_LIMITS[("tempseg", "L40S")].max_num_seqs == 64
-    assert O.GPU_LIMITS[("captioner", "H100")].max_num_seqs == 24
+def test_engine_limits_fit_the_worst_case_request():
+    """Review 13 B1: the limits must fit the worst-case request (prompt + budget) in the KV
+    memory left after the weights, so a full batch never preempts. Captioner/H100 is back to
+    the lab-validated 16; TempSeg/L40S at 64 does not fit (about 55), so it is 48."""
+    assert O.GPU_LIMITS[("tempseg", "L40S")].max_num_seqs == 48
+    assert O.GPU_LIMITS[("captioner", "H100")].max_num_seqs == 16
     assert {lim.max_num_batched_tokens for lim in O.GPU_LIMITS.values()} == {16384}
+    assert O.worst_case_fit("tempseg", "L40S") == 55
+    assert O.worst_case_fit("captioner", "H100") == 18
+    for kind, gpu in O.KV_FIT:
+        assert O.GPU_LIMITS[(kind, gpu)].max_num_seqs <= O.worst_case_fit(kind, gpu), (kind, gpu)
 
 
-def test_max_num_seqs_over_mamba_blocks_fails_fast():
-    s = spec()  # tempseg L40S: 64 sequences
-    assert O.check_mamba_blocks(s, _blocks_llm(400)) == {
-        "num_gpu_blocks": 400, "max_num_seqs": 64, "checked": True}
-    assert O.check_mamba_blocks(s, _blocks_llm(64))["checked"]
+def test_block_check_uses_the_worst_case_per_sequence_need():
+    """Review 13 B2: a hybrid sequence holds one block per Mamba group plus
+    ceil(L / block_size) per attention group, for the worst-case L."""
+    s = spec()  # tempseg L40S: 48 sequences, worst case 5120 tokens
+    per_seq = 3 + -(-O.WORST_CASE_TOKENS["tempseg"] // 528)
+    need = 48 * per_seq
+    got = O.check_mamba_blocks(s, _LayoutLLM(_layout(need)))
+    assert got["checked"] and got["blocks_per_seq"] == per_seq and got["needed"] == need
+    assert got["num_gpu_blocks"] == need and got["worst_case_tokens"] == 5120
     with pytest.raises(O.EngineVerifyError, match="49064"):
-        O.check_mamba_blocks(s, _blocks_llm(63))
-    assert O.check_mamba_blocks(s, object()) == {
-        "num_gpu_blocks": None, "max_num_seqs": 64, "checked": False}
+        O.check_mamba_blocks(s, _LayoutLLM(_layout(need - 1)))
+    # the old bound (blocks >= seqs) passed 64 blocks for 64 sequences; this does not
+    with pytest.raises(O.EngineVerifyError):
+        O.check_mamba_blocks(s, _LayoutLLM(_layout(64)))
+    # the smaller of the worker's and the frontend's count decides
+    with pytest.raises(O.EngineVerifyError):
+        O.check_mamba_blocks(s, _LayoutLLM(_layout(need), frontend=need - 1))
+
+
+@pytest.mark.parametrize("llm", [
+    object(),  # no rpc at all
+    _LayoutLLM(RuntimeError("no such method")),
+    _LayoutLLM({"num_blocks": None, "groups": []}),
+    _LayoutLLM({"num_blocks": 10_000, "groups": []}),  # no groups: need unknown
+    _LayoutLLM({"num_blocks": 10_000, "groups": [{"spec": "WeirdSpec", "block_size": 16}]}),
+])
+def test_block_check_fails_closed_when_it_cannot_read_the_cache(llm):
+    with pytest.raises(O.EngineVerifyError, match="cannot check"):
+        O.check_mamba_blocks(spec(), llm)
+
+
+class _MetricsLLM(FakeLLM):
+    """vLLM 0.24's ``LLM.get_metrics()``: ``vllm.v1.metrics.reader`` Counter/Gauge objects."""
+
+    def __init__(self, values):
+        super().__init__()
+        self.values = values
+
+    def get_metrics(self):
+        if isinstance(self.values, Exception):
+            raise self.values
+        return [SimpleNamespace(name=n, value=v, labels={"engine": str(i)})
+                for i, (n, v) in enumerate(self.values)]
+
+
+def test_preemptions_come_from_the_engine_metrics():
+    """Review 13 B1: preempted sequences recompute through the chunked-prefill kernel, a path
+    no certificate measured; the engine's ``vllm:num_preemptions`` counter says it happened."""
+    eng = O.OfflineEngine(spec(), _MetricsLLM([("vllm:num_preemptions", 0.0),
+                                               ("vllm:kv_cache_usage_perc", 0.4)]),
+                          params_cls=Params)
+    assert eng.preemptions() == 0
+    eng.llm.values = [("vllm:num_preemptions", 2.0), ("vllm:num_preemptions", 1.0)]
+    assert eng.preemptions() == 3  # summed over engines
+    assert eng.audit()["preemptions"] == 3
+    for bad in ([("vllm:kv_cache_usage_perc", 0.4)], RuntimeError("stats off")):
+        eng.llm.values = bad
+        assert eng.preemptions() is None  # unknown, never 0
+    assert O.OfflineEngine(spec(), FakeLLM(), params_cls=Params).preemptions() is None
+
+
+def test_worker_extension_reports_the_kv_cache_layout():
+    """The block check reads vLLM's own ``KVCacheConfig`` inside the engine process, by name."""
+    got = O.check_mamba_blocks(spec(), RpcLLM())
+    assert got["checked"] and got["num_gpu_blocks"] == 100_000
+    assert [g["spec"] for g in got["groups"]] == ["MambaSpec"] * 3 + ["FullAttentionSpec"]
+    assert got["blocks_per_seq"] == 3 + 10  # ceil(5120 / 528) attention blocks

@@ -25,7 +25,7 @@ from flora_deploy.config.hashing import kind_modes
 from flora_deploy.config.schema import ConfigError, parse_config
 from flora_deploy.validate import certify as C
 from flora_deploy.validate import certkey
-from tests.fakes.certrecords import L0_PASS, STAGE_SETS, key, rec, segs
+from tests.fakes.certrecords import STAGE_SETS, key, lab_for, rec, segs
 from tests.unit.test_wave_h_finalize import REPO, fin
 
 runner = CliRunner()
@@ -63,7 +63,7 @@ def write_cert(cert_dir: Path, stage: str, embodiment: str = "human", *, noise: 
     gpu = {"segment": "L40S"}.get(stage, "H100!")
     modes = kind_modes(cfg, stage)
     doc = key("balanced", stage, gpu, fp=None, modes=modes, content=content())
-    lab = {**L0_PASS, "kind": C.L0_STAGES.get(stage, "x")}
+    lab = lab_for(stage)
     cert = C.certify_stage(
         stage, exact=mk("exact", 10, fp=None, embodiment=embodiment),
         balanced=mk("balanced", 10, fp=None, cert_key=doc, embodiment=embodiment),
@@ -357,3 +357,34 @@ def test_any_divergence_from_exact_is_not_the_reference(monkeypatch):
     assert not certkey.reference_identical("balanced", kind, "H100!", modes=modes)
     with pytest.raises(ConfigError, match="no accuracy certificate for reward.terminal on H100!"):
         parse_config(config(stages=REWARDS))
+
+
+def test_a_matching_fail_certificate_overrides_reference_by_identity(registry):
+    """Review 13 S3-7: a ``fail`` measured under the very key the identity argument covers
+    revokes it; the kind then needs a certificate like any other."""
+    from tests.fakes.certrecords import terminal_set
+
+    kind = "reward.terminal"
+    modes = modes_of()
+    pools = parse_config(config(stages=REWARDS)).pools()
+    assert kind in certkey.reference_kinds("balanced", pools, embodiment="yam", modes=modes)
+    doc = key("balanced", kind, "H100!", fp=None, modes=modes[kind], content=content())
+    cert = C.certify_stage(
+        kind, exact=terminal_set("exact", 10, fp=None, embodiment="yam"),
+        balanced=terminal_set("balanced", 10, score=2, es=2.0, fp=None, cert_key=doc,
+                              embodiment="yam"),
+        noise=terminal_set("exact", 5, fp=None, embodiment="yam"), engine_spec=doc,
+        gpu="H100!", generated_at=STAMP)
+    assert cert["verdict"] == "fail"
+    C.write_certificate(cert, registry)
+    ref = certkey.reference_kinds("balanced", pools, embodiment="yam", modes=modes)
+    assert kind not in ref and "reward.dense" in ref
+    st = certkey.status("balanced", pools, embodiment="yam", modes=modes)
+    assert st[kind] == {"gpu": "H100!", "status": "fail", "certificate": cert["id"]}
+    assert st["reward.dense"]["status"] == "reference"
+    from flora_deploy.config.presets import find_certificates
+
+    found = find_certificates("balanced", pools, modes=modes, embodiment="yam")
+    assert kind not in found and found["reward.dense"].verdict == "reference"
+    # another embodiment's pool has no matching fail: still the reference there
+    assert kind in certkey.reference_kinds("balanced", pools, embodiment="dex", modes=modes)

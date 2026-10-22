@@ -47,7 +47,10 @@ GPU and plugin flag only), else the engine compiles cold. A build that fails on 
 is retried once cold (:func:`build_engine`). A container that compiled publishes its cache
 once, after its first shard ran generates (``WorkerCache.maybe_publish``: a ``modal.Dict``
 lease, upload through the Volume client API, manifest last; ``FLORA_COMPILE_CACHE_PUBLISH=0``
-turns it off).
+turns it off). ``FLORA_COMPILE_CACHE=off`` forces the container cold (no seed, no publish). The
+cache a container ran (``CacheStatus.identity``) is in its startup facts, each shard's audit row
+and every record's ``provenance.compile_cache``: a warm start replays the publisher's Inductor
+autotune picks, so it is not output-neutral (``engines.compile_cache``, "Determinism").
 
 ``run_shard`` is the ``workers.ShardWorker`` contract (``max_inputs`` is 1: the runner runs a
 shard's episodes concurrently inside one input). ``@modal.exit`` flushes and marks a running
@@ -74,6 +77,11 @@ from flora_deploy.modal_app.factory import DERIVED_RECEIPTS_ENV
 LOCAL_CACHE = Path("/tmp/flora-cache/balanced")
 ENGINE_KINDS = {"segment": "tempseg", "caption": "captioner"}
 PUBLISH_ENV = "FLORA_COMPILE_CACHE_PUBLISH"  # "0": never publish (default: publish once)
+# "on" (default): seed a verified cache (else the lab's, else cold) and publish once; "off":
+# force this container cold, no seed and no publish (review 13 W1: a certified run's one
+# independent cold compile). Forwarded from the deploying process (factory._recipe_env).
+COMPILE_CACHE_ENV = "FLORA_COMPILE_CACHE"
+COMPILE_CACHE_MODES = ("on", "off")
 # The GPU each unkeyed lab cache (``balanced_lab.GPUS``, ``flora-cache:/balanced/<kind>``) was
 # compiled on: vLLM's AOT key has no GPU factor, so another GPU never seeds from it.
 LEGACY_LAB_GPUS = {"tempseg": "L40S", "captioner": "H100"}
@@ -236,6 +244,9 @@ def prepare_cache(kind: str, spec: Any, model_content: str | None,
     from flora_deploy.workers_impl.reward import default_container_id
 
     engine_kind = ENGINE_KINDS[kind]
+    mode = env.get(COMPILE_CACHE_ENV) or "on"
+    if mode not in COMPILE_CACHE_MODES:  # a typo must not silently mean "on"
+        raise ValueError(f"{COMPILE_CACHE_ENV}={mode!r}: use one of {COMPILE_CACHE_MODES}")
     try:
         image_fp = image_fp or _image_fp(env)
         if not image_fp:
@@ -249,6 +260,11 @@ def prepare_cache(kind: str, spec: Any, model_content: str | None,
         return cc.WorkerCache(key, local, cc.CacheStatus("cold", "unkeyed", reason=str(e)[:500]),
                               publish_enabled=False, log=log)
     local = local_root / key.name
+    if mode == "off":
+        cc.reset_local(local)
+        log(f"compile cache {key.name}: {cc.FORCED_COLD}; compiling cold, not publishing")
+        return cc.WorkerCache(key, local, cc.CacheStatus("cold", key.name, reason=cc.FORCED_COLD),
+                              publish_enabled=False, log=log)
     status = cc.seed(key, mount, local, log=log)
     plugin = "-dtbias" if spec.dtbias_fp32 else ""
     legacy = Path(mount) / "balanced" / f"{engine_kind}{plugin}"

@@ -28,10 +28,24 @@ Per stage, every metric below is a *divergence* (0 = identical; definitions in
   ``|delta|`` when a side is constant), ``length_mismatch``.
 
 Pass rule, per (stage, embodiment pool) and metric: ``mean(balanced vs exact) <= min(cap,
-tolerance x max(noise, floor) + slack)`` (``certkey.metric_threshold``; knobs bounded by
-``certkey.POLICY``). Verdict: ``fail`` if any check fails or a present L0 fails; else
-``provisional`` if there is no noise run, too few samples (per pool, or in the noise run),
-incomplete coverage, or (video stages) no L0; else ``certified``.
+max(absolute_floor, tolerance x max(noise, floor) + slack))`` (``certkey.metric_threshold``;
+knobs and floors bounded by ``certkey.POLICY``). ``count_mismatch`` is averaged over every
+episode (absolute floor 10%: about one episode in ten may differ in subtask count); the other
+segment / caption metrics over the episodes whose counts agree (:data:`COUNT_CONDITIONED`).
+
+**Which episodes** (review 13 S3-3): every episode both sides labelled, never a chosen subset.
+The candidate is paired with the oracle (at most ``max_missing`` oracle episodes may lack a
+candidate record: the spares), the noise run with the oracle (noise episodes the oracle did not
+label are dropped, so a spare noise episode fills in), and so is the optional **cold witness**
+(``witness``: balanced records of one container forced cold, ``FLORA_COMPILE_CACHE=off``,
+checked against the same thresholds).
+
+Verdict: ``fail`` if any check fails or a present L0 fails; else ``provisional`` if there is no
+noise run, too few samples (per pool, in the noise run or in the witness), too many missing
+episodes, (video stages) no L0 or an L0 measured under other engine settings (``stale_l0``), a
+candidate or witness record whose engine preempted while it ran (``engine_preempted``) or that
+does not say (``preemptions_unknown``), or a witness not forced cold; else ``certified``. The
+certificate states the compile caches its evidence ran (``compile_cache``).
 
 The certificate holds metrics only: no record string ever goes in (no captions, prompts,
 rationales, ids, dataset names). Episode ids are sha256-hashed. The record values carried are
@@ -54,22 +68,25 @@ from flora_deploy.validate.certkey import (
     _HEX64,
     _STAMP,
     ABSOLUTE_CAPS,
+    ABSOLUTE_FLOOR,
     CERT_DIR,
     CERT_SCHEMA,
     FAKE_CERTIFICATES,
     GENERATOR,
+    MAX_MISSING,
     MIN_NOISE_SAMPLES_FLOOR,
     MIN_SAMPLES_FLOOR,
     NOISE_FLOOR,
     canonical,
     certificate_id,
     document_problems,
+    engine_settings_hash,
     metric_threshold,
     sha256_hex,
     threshold_problems,
 )
 
-CERTIFY_VERSION = "2"
+CERTIFY_VERSION = "3"
 # Provenance every record must carry to be certified against (docs/certification.md).
 REQUIRED_PROVENANCE = ("config_hash", "gpu", "embodiment", "cert_key")
 EMBODIMENTS = ("human", "yam", "yam32", "dex", "tianji")  # config.schema.Embodiment
@@ -79,13 +96,20 @@ Similarity = Callable[[str, str], float]
 
 STAGE_METRICS: dict[str, tuple[str, ...]] = {
     "segment": ("iou_divergence", "boundary_error_s", "count_mismatch", "label_disagreement"),
-    "caption": ("caption_mismatch", "caption_edit_distance"),
+    "caption": ("caption_mismatch", "caption_edit_distance", "count_mismatch"),
     "reward.terminal": ("expected_score_abs_delta", "score_mismatch"),
     "reward.dense": ("per_step_abs_delta", "rank_divergence", "length_mismatch"),
 }
 SIMILARITY_METRIC = "caption_similarity_divergence"
-# Stages whose balanced engine differs from exact's, so L0 input parity must be shown.
+# Stages whose balanced engine differs from exact's, so L0 input parity must be shown. Their
+# records also carry the compile cache and the engine's preemptions (records.Provenance).
 L0_STAGES = {"segment": "tempseg", "caption": "captioner"}
+# Stages whose other metrics are averaged over the episodes with equal subtask counts: an
+# episode whose count differs is bounded by ``count_mismatch`` (absolute floor 10%) alone, and
+# its interval / caption pairing is not meaningful.
+COUNT_CONDITIONED = ("segment", "caption")
+WITNESS_CLASS = "cold-witness"
+FORCED_COLD = "cold:forced"  # engines.compile_cache.CacheStatus.identity of a forced container
 
 
 class CertifyError(ValueError):
@@ -107,18 +131,18 @@ class Thresholds:
     tolerance: float = 1.5  # PLAN.md §4: <= 1.5x oracle noise
     min_samples: int = MIN_SAMPLES_FLOOR  # balanced-vs-exact episodes per (stage, pool)
     min_noise_samples: int = MIN_NOISE_SAMPLES_FLOOR  # exact-vs-exact episodes per stage
-    min_coverage: float = 1.0  # share of exact episodes the balanced run labelled
+    max_missing: int = MAX_MISSING  # oracle episodes without a candidate record (the spares)
     slack: Mapping[str, float] = field(default_factory=dict)  # metric -> absolute slack
 
     def __post_init__(self) -> None:
         bad = threshold_problems(self.tolerance, self.min_samples, self.min_noise_samples,
-                                 self.min_coverage, self.slack)
+                                 self.max_missing, self.slack)
         if bad:
             raise CertifyError("thresholds outside policy (certkey.POLICY): " + "; ".join(bad))
 
     def as_dict(self) -> dict[str, Any]:
         return {"tolerance": self.tolerance, "min_samples": self.min_samples,
-                "min_noise_samples": self.min_noise_samples, "min_coverage": self.min_coverage,
+                "min_noise_samples": self.min_noise_samples, "max_missing": self.max_missing,
                 "slack": {k: float(v) for k, v in sorted(self.slack.items())}}
 
 
@@ -230,7 +254,8 @@ def caption_metrics(ref: StageRecord, cand: StageRecord,
     a, b = ref.segments, cand.segments
     slots = max(len(a), len(b))
     if not slots:
-        out: dict[str, float | None] = {"caption_mismatch": 0.0, "caption_edit_distance": 0.0}
+        out: dict[str, float | None] = {"caption_mismatch": 0.0, "caption_edit_distance": 0.0,
+                                        "count_mismatch": 0.0}
         if similarity is not None:
             out[SIMILARITY_METRIC] = 0.0
         return out
@@ -241,6 +266,7 @@ def caption_metrics(ref: StageRecord, cand: StageRecord,
         "caption_mismatch": 1.0 - sum(x == y for x, y in texts) / slots,
         "caption_edit_distance": (sum(normalized_edit_distance(x, y) for x, y in texts)
                                   + unmatched) / slots,
+        "count_mismatch": float(len(a) != len(b)),
     }
     if similarity is not None:
         sims = [min(1.0, max(0.0, float(similarity(x, y)))) for x, y in texts]
@@ -325,6 +351,21 @@ def _mean(values: Iterable[float | None]) -> float | None:
     return sum(xs) / len(xs) if xs else None
 
 
+def metric_basis(stage: str, metric: str) -> str:
+    """The episodes a metric's mean is over: ``all`` or ``count_matched``."""
+    return ("count_matched" if stage in COUNT_CONDITIONED and metric != "count_mismatch"
+            else "all")
+
+
+def stage_means(stage: str, per_ep: Mapping[str, Mapping[str, float | None]],
+                names: Sequence[str]) -> dict[str, float | None]:
+    """Per metric, the mean over :func:`metric_basis`'s episodes."""
+    matched = [u for u in per_ep if not per_ep[u].get("count_mismatch")]
+    return {m: _r(_mean(per_ep[u][m] for u in (matched if metric_basis(stage, m)
+                                                  == "count_matched" else per_ep)))
+            for m in names}
+
+
 def _r(x: float | None) -> float | None:
     return None if x is None else round(float(x), 6)
 
@@ -344,8 +385,12 @@ def compare(stage: str, ref: Mapping[str, StageRecord], cand: Mapping[str, Stage
 # L0 / Gate A (balanced_lab output)
 
 
-def l0_summary(stage: str, lab: Mapping[str, Any] | None, gpu: str) -> dict[str, Any]:
-    """``{"status": pass|fail|missing|not_applicable, ...counts}`` from a balanced_lab result."""
+def l0_summary(stage: str, lab: Mapping[str, Any] | None, gpu: str,
+               engine_hash: str | None = None) -> dict[str, Any]:
+    """``{"status": pass|fail|stale|missing|not_applicable, ...counts}`` from a balanced_lab
+    result. ``engine_hash``: ``certkey.engine_settings_hash`` of the candidate's vLLM engine;
+    a lab that did not record that hash for its baseline engine (another ``max_num_seqs``, say,
+    or a lab from before the hash) is ``stale`` (review 13 S3-1)."""
     if stage not in L0_STAGES:
         return {"status": "not_applicable"}  # rewards: the same NVIDIA vLLM engine as exact
     if lab is None:
@@ -364,9 +409,14 @@ def l0_summary(stage: str, lab: Mapping[str, Any] | None, gpu: str) -> dict[str,
 
     ok = all(r.get("ids_equal") is True and r.get("grid_equal") is True
              and r.get("render_ids_equal", True) is True for r in rows)
-    return {"status": "pass" if ok else "fail", "requests": len(rows),
+    got = (lab.get("engine_hashes") or {}).get("baseline")
+    lab_hash = got if isinstance(got, str) and _HEX64.match(got) else None
+    status = "pass" if ok else "fail"
+    if ok and engine_hash is not None and lab_hash != engine_hash:
+        status = "stale"
+    return {"status": status, "requests": len(rows),
             "ids_equal": count("ids_equal"), "render_ids_equal": count("render_ids_equal"),
-            "grid_equal": count("grid_equal")}
+            "grid_equal": count("grid_equal"), "engine_hash": lab_hash}
 
 
 def gate_a_summary(lab: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -485,12 +535,28 @@ def now_stamp() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _cache_counts(records: Iterable[StageRecord]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for r in records:
+        k = r.provenance.compile_cache or "unknown"
+        out[k] = out.get(k, 0) + 1
+    return dict(sorted(out.items()))
+
+
+def _paired(side: Mapping[str, StageRecord], ref: Mapping[str, StageRecord]
+            ) -> tuple[dict[str, StageRecord], int]:
+    """``side`` restricted to the oracle's episodes, and how many were dropped."""
+    kept = {u: r for u, r in side.items() if u in ref}
+    return kept, len(side) - len(kept)
+
+
 def certify_stage(
     stage: str,
     *,
     exact: Iterable[StageRecord],
     balanced: Iterable[StageRecord],
     noise: Iterable[StageRecord] | None = None,
+    witness: Iterable[StageRecord] | None = None,
     engine_spec: Mapping[str, Any],
     gpu: str,
     preset: str = "balanced",
@@ -506,6 +572,7 @@ def certify_stage(
     ``engine_spec``: ``validate.certkey.key_document`` of the stack as this checkout would run
     it. The candidate records' own key (``provenance.cert_key``) must equal it; the
     certificate's key is the records'. The embodiment pool comes from the records.
+    ``witness``: the cold witness (module docstring), the same stack as the candidate.
     ``generated_at``: ``YYYY-MM-DDTHH:MM:SSZ`` (default: now); the newest certificate for a key
     decides (``certkey.matching``)."""
     from flora_deploy import __version__
@@ -517,6 +584,7 @@ def certify_stage(
     ref = _index(exact, stage, "exact", "exact")
     cand = _index(balanced, stage, "balanced", preset)
     nz = _index(noise, stage, "noise", "exact") if noise is not None else None
+    wit = _index(witness, stage, "witness", preset) if witness is not None else None
     if not ref:
         raise CertifyError(f"no exact {stage} records")
     if not cand:
@@ -536,53 +604,81 @@ def certify_stage(
     if b["gpu"] != normalized_gpu(gpu, "certified GPU"):
         raise CertifyError(f"{preset} {stage} records were not produced on {gpu}")
     # H2: the oracle is one exact run; the noise run repeats it (same stack, stage hash, GPU,
-    # determinism mode) on a subset of its episodes.
+    # determinism mode) on some of its episodes: those the oracle labelled are paired.
     o = bind(ref, stage, "exact")
     if o["embodiment"] != b["embodiment"]:
         raise CertifyError(f"exact and {preset} {stage} records are for different embodiments")
+    unpaired = 0
     if nz is not None:
         n = bind(nz, stage, "noise")
         for what in ("stage_hash", "key", "gpu", "determinism"):
             if n[what] != o[what]:
                 raise CertifyError(f"noise {stage} records differ from the oracle's in {what}: "
                                    "the noise run must repeat the oracle run")
-        if not set(nz) <= set(ref):
-            raise CertifyError(f"noise {stage} episodes are not a subset of the oracle's")
-        if any(r.audit_ref and r.audit_ref == ref[u].audit_ref for u, r in nz.items()):
+        if any(r.audit_ref and u in ref and r.audit_ref == ref[u].audit_ref
+               for u, r in nz.items()):
             raise CertifyError(f"noise {stage} records are copies of the oracle's (audit_ref)")
+        nz, unpaired = _paired(nz, ref)
+    wit_unpaired = 0
+    if wit is not None:
+        w = bind(wit, stage, "witness")
+        for what in ("key", "stage_hash", "gpu", "embodiment"):
+            if w[what] != b[what]:
+                raise CertifyError(f"witness {stage} records differ from the candidate's in "
+                                   f"{what}: the witness must be the same stack, forced cold")
+        wit, wit_unpaired = _paired(wit, ref)
     names = metric_names(stage, similarity)
     pool = b["embodiment"]
 
     per_ep = compare(stage, ref, cand, similarity)
-    candidate = ({pool: {"n": len(per_ep), "means": {
-        m: _r(_mean(per_ep[u][m] for u in per_ep)) for m in names}}} if per_ep else {})
+    matched = sum(1 for u in per_ep if not per_ep[u].get("count_mismatch"))
+    candidate = ({pool: {"n": len(per_ep), "count_matched": matched,
+                         "means": stage_means(stage, per_ep, names)}} if per_ep else {})
     coverage = len(per_ep) / len(ref)
+    missing = len(set(ref) - set(cand))
 
     noise_block = None
     noise_means: dict[str, float | None] = {}
     if nz is not None:
         nz_ep = compare(stage, ref, nz, similarity)
-        noise_means = {m: _r(_mean(nz_ep[u][m] for u in nz_ep)) for m in names}
-        noise_block = {"n": len(nz_ep), "means": noise_means,
+        noise_means = stage_means(stage, nz_ep, names)
+        noise_block = {"n": len(nz_ep), "means": noise_means, "unpaired": unpaired,
                        "episodes": {k: v for k, v in episode_set(nz_ep).items()
                                     if k != "uid_sha256"}}
+    witness_block = None
+    if wit is not None:
+        w_ep = compare(stage, ref, wit, similarity)
+        witness_block = {"n": len(w_ep), "means": stage_means(stage, w_ep, names),
+                         "unpaired": wit_unpaired,
+                         "episodes": {k: v for k, v in episode_set(w_ep).items()
+                                      if k != "uid_sha256"}}
 
     per_metric = {}
     for m in names:
         slack = float(th.slack.get(m, 0.0))
         base = noise_means.get(m) if nz is not None else None
         per_metric[m] = {"slack": slack, "floor": NOISE_FLOOR.get(m, 0.0),
-                         "cap": ABSOLUTE_CAPS.get(m),
+                         "absolute_floor": ABSOLUTE_FLOOR.get(m, 0.0),
+                         "cap": ABSOLUTE_CAPS.get(m), "over": metric_basis(stage, m),
                          "threshold": metric_threshold(m, base, th.tolerance, slack)
                          if base is not None else None}
+    blocks = dict(candidate)
+    if witness_block is not None:
+        blocks[WITNESS_CLASS] = witness_block
     checks = []
-    for c, block in candidate.items():
+    for c, block in blocks.items():
         for m in names:
             v, t = block["means"][m], per_metric[m]["threshold"]
             ok = None if v is None or t is None else bool(v <= t + 1e-12)
             checks.append({"class": c, "metric": m, "value": v, "threshold": t, "pass": ok})
 
-    l0s = l0_summary(stage, l0, gpu)
+    vllm = b["doc"].get("vllm_engine")
+    l0s = l0_summary(stage, l0, gpu,
+                     engine_settings_hash(vllm) if stage in L0_STAGES and vllm else None)
+    engine_recs = [*cand.values(), *((wit or {}).values())] if stage in L0_STAGES else []
+    preempt = {"preempted": sum(1 for r in engine_recs
+                                if (r.provenance.engine_preemptions or 0) > 0),
+               "unknown": sum(1 for r in engine_recs if r.provenance.engine_preemptions is None)}
     failures, provisional = [], []
     if any(ch["pass"] is False for ch in checks):
         failures.append("divergence_above_noise_floor")
@@ -594,14 +690,29 @@ def certify_stage(
         provisional.append("too_few_noise_samples")
     if any(blk["n"] < th.min_samples for blk in candidate.values()) or not candidate:
         provisional.append("too_few_samples")
-    if coverage < th.min_coverage:
+    if missing > th.max_missing:
         provisional.append("incomplete_coverage")
     if l0s["status"] == "missing":
         provisional.append("no_l0")
+    if l0s["status"] == "stale":
+        provisional.append("stale_l0")
     if nz is not None and any(ch["pass"] is None for ch in checks):
         provisional.append("metric_not_evaluable")
+    if preempt["preempted"]:
+        provisional.append("engine_preempted")
+    if preempt["unknown"]:
+        provisional.append("preemptions_unknown")
+    if witness_block is not None:
+        if witness_block["n"] < th.min_noise_samples:
+            provisional.append("too_few_witness_samples")
+        if any(r.provenance.compile_cache != FORCED_COLD for r in wit.values()):
+            provisional.append("witness_not_forced_cold")
     verdict = "fail" if failures else ("provisional" if provisional else "certified")
 
+    caches: dict[str, Any] = {"candidate": _cache_counts(cand.values())}
+    if wit is not None:
+        caches["witness"] = _cache_counts(wit.values())
+    caches["covers"] = sorted({k for v in caches.values() for k in v})
     doc = b["doc"]
     eng = doc.get("engine") or {}
     body: dict[str, Any] = {
@@ -630,13 +741,21 @@ def certify_stage(
         "oracle": {"stage_hash": o["stage_hash"], "engine_spec_hash": o["key"],
                    "gpu": o["gpu"], "determinism": o["determinism"]},
         "episodes": episode_set(per_ep),
-        "metrics": {"candidate": candidate, "noise": noise_block, "coverage": _r(coverage),
+        "metrics": {"candidate": candidate, "noise": noise_block, "witness": witness_block,
+                    "coverage": _r(coverage), "missing": missing,
                     "similarity_hook": similarity_name if similarity else None},
-        "thresholds": {**th.as_dict(), "per_metric": per_metric},
+        "thresholds": {**th.as_dict(),
+                       "noise_floor": {m: NOISE_FLOOR.get(m, 0.0) for m in names},
+                       "absolute_floor": {m: ABSOLUTE_FLOOR[m] for m in names
+                                          if m in ABSOLUTE_FLOOR},
+                       "per_metric": per_metric},
         "checks": checks,
         "l0": l0s,
         "gate_a": gate_a_summary(l0),
     }
+    if stage in L0_STAGES:
+        body["preemptions"] = preempt
+        body["compile_cache"] = caches
     body["id"] = certificate_id(body)
     return body
 

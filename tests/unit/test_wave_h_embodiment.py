@@ -98,7 +98,8 @@ def test_yam_spec_has_its_own_episodes_data_dir_and_state():
     assert YAM.name == HUMAN.name == wh.CERTIFIED and YAM.shared_data
     assert YAM.golden == "golden/v3-yam" and YAM.embodiment == "yam"
     assert len(YAM.episodes) >= wh.MIN_CERT_EPISODES
-    assert set(YAM.noise) < set(YAM.episodes) and len(YAM.noise) == wh.MIN_NOISE_EPISODES
+    assert set(YAM.noise) < set(YAM.episodes)
+    assert len(YAM.noise) == wh.MIN_NOISE_EPISODES + wh.NOISE_SPARES  # the selection's 5 + a spare
     assert wh.balanced_episodes(_manifest(YAM), YAM) == YAM.episodes
     # nothing shared with the human run: state, work dir, records, report, data dir (uids)
     for attr in ("state", "work", "records", "report"):
@@ -274,7 +275,8 @@ def test_yam_certify_step_does_not_run_finalize(tmp_path):
             pass
 
         def certify_all(self, paths, st, out_dir, *, derived):
-            return [{"stage": s, "cert": {"verdict": "certified", "metrics": {}}}
+            return [{"stage": s, "cert": {"verdict": "certified",
+                                          "metrics": {"witness": {"n": len(YAM.noise)}}}}
                     for s in wh.CERT_STAGES]
 
         def derived_content_used(self, st):

@@ -155,7 +155,7 @@ so they are not copied here.
 
 - `exact`: nothing (the reference by construction).
 - `balanced` / `segment` / `L40S` and `balanced` / `caption` / `H100!`: the `vllm-offline`
-  engine on `img_vllm`, with `max_num_seqs` 64 (TempSeg on the L40S) and 16 (Captioner on the
+  engine on `img_vllm`, with `max_num_seqs` 48 (TempSeg on the L40S) and 16 (Captioner on the
   H100), `max_num_batched_tokens` 16384 and `gpu_memory_utilization` 0.9; the TempSeg or
   Captioner NVIDIA pins; the `tempseg_merged` or `captioner_bf16` derived digest; and a cert
   logic digest over the 61 modules of the `common` + `vllm-video` groups (`engines/batch_policy.py`

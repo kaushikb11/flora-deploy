@@ -79,6 +79,8 @@ CERT_STAGES = ("segment", "caption")
 DEFERRED = "deferred to the certified run"
 LAB_KINDS = {"segment": "tempseg", "caption": "captioner"}
 SETS = {"exact": "exact_e2e", "noise": "noise", "balanced": "balanced"}
+# (d)'s cold witness (review 13 W1): its jobs are under the balanced step's "witness_jobs"
+WITNESS = ("witness", "balanced", "witness_jobs")
 BLOCK_RESULTS = "results"
 BLOCK_COST = "cost"
 MISSING_HELP = {
@@ -86,11 +88,20 @@ MISSING_HELP = {
     "no_noise_run": "a noise run: the oracle repeated on at least {min_noise} of these "
                     "episodes (none for this pool)",
     "too_few_noise_samples": "at least {min_noise} noise-run episodes (has {noise_n})",
-    "incomplete_coverage": "every oracle episode labelled (coverage {coverage})",
+    "incomplete_coverage": "at most {max_missing} oracle episodes without a candidate "
+                           "record (missing {missing})",
     "no_l0": "the L0 JSON of {lab} (input parity on the captured requests)",
     "metric_not_evaluable": "every metric evaluable ({metrics} had no value)",
     "divergence_above_noise_floor": "every check within its threshold (failing: {failing})",
     "l0_failed": "L0 passing on every captured request",
+    "stale_l0": "the L0 JSON of {lab} measured under the current engine settings (re-run the "
+                "lab: its engine hash is not the candidate's)",
+    "engine_preempted": "no candidate record whose engine preempted while it ran "
+                        "({preempted} did; lower max_num_seqs)",
+    "preemptions_unknown": "the engine's preemption count on every candidate record "
+                           "({unknown} without)",
+    "too_few_witness_samples": "at least {min_noise} cold-witness episodes (has {witness_n})",
+    "witness_not_forced_cold": "a cold witness whose records are all compile_cache cold:forced",
 }
 
 
@@ -162,9 +173,9 @@ def run_stamp(st: wh.State) -> float:
     return max(stamps) if stamps else float(st.created)
 
 
-def jobs_of(st: wh.State, step: str) -> dict[str, dict[str, Any]]:
+def jobs_of(st: wh.State, step: str, key: str = "jobs") -> dict[str, dict[str, Any]]:
     s = st.steps.get(step)
-    return dict((s.result.get("jobs") if s else None) or {})
+    return dict((s.result.get(key) if s else None) or {})
 
 
 # ---------------------------------------------------------------------------------------------
@@ -449,13 +460,16 @@ def lab_result(paths: Paths, st: wh.State, kind: str) -> dict[str, Any] | None:
               if n in st.steps and st.steps[n].result.get("kinds", {}).get(kind)), None)
     if not k or not (k.get("l0") or k.get("gate_a")):
         return None
-    return {"kind": kind, "baseline": {"l0": k.get("l0") or []}, "gate_a": k.get("gate_a")}
+    return {"kind": kind, "baseline": {"l0": k.get("l0") or []}, "gate_a": k.get("gate_a"),
+            "engine_hashes": k.get("engine_hashes")}
 
 
 def l0_for_certify(lab: Mapping[str, Any] | None, kind: str, gpu: str) -> dict[str, Any] | None:
-    """What ``flora certify --l0`` reads (kind, the pool GPU, L0 rows, Gate A), without the
-    lab's episode rows. The lab records ``nvidia-smi``'s name; it is checked against the pool
-    GPU here and replaced by it, since ``certify.l0_summary`` compares the strings."""
+    """What ``flora certify --l0`` reads (kind, the pool GPU, L0 rows, Gate A, the engine
+    settings hashes the lab recorded per engine it built), without the lab's episode rows. The
+    lab records ``nvidia-smi``'s name; it is checked against the pool GPU here and replaced by
+    it, since ``certify.l0_summary`` compares the strings. ``certify.l0_summary`` calls a lab
+    whose baseline hash is not the candidate's engine ``stale`` (review 13 S3-1)."""
     if lab is None:
         return None
     from flora_deploy.engines.offline_llm import EngineArgsError, normalize_gpu
@@ -469,9 +483,9 @@ def l0_for_certify(lab: Mapping[str, Any] | None, kind: str, gpu: str) -> dict[s
             same = str(lab_gpu) == gpu
         if not same:
             return {"kind": kind, "baseline": {"gpu": str(lab_gpu), "l0": base.get("l0") or []},
-                    "gate_a": lab.get("gate_a")}
+                    "gate_a": lab.get("gate_a"), "engine_hashes": lab.get("engine_hashes")}
     return {"kind": lab.get("kind") or kind, "baseline": {"gpu": gpu, "l0": base.get("l0") or []},
-            "gate_a": lab.get("gate_a")}
+            "gate_a": lab.get("gate_a"), "engine_hashes": lab.get("engine_hashes")}
 
 
 def record_path(paths: Paths, side: str, job: str, stage: str) -> Path:
@@ -495,6 +509,7 @@ def certify_all(paths: Paths, st: wh.State, out_dir: Path, *, derived: Mapping[s
     outcomes = []
     bal_jobs = jobs_of(st, "balanced")
     noise_jobs = jobs_of(st, "noise")
+    witness_jobs = jobs_of(st, WITNESS[1], WITNESS[2])
     tmp = out_dir / "l0"
     tmp.mkdir(parents=True, exist_ok=True)
     for job in sorted(bal_jobs):
@@ -521,6 +536,9 @@ def certify_all(paths: Paths, st: wh.State, out_dir: Path, *, derived: Mapping[s
             nz = record_path(paths, "noise", job, stage)
             if job in noise_jobs and nz.exists():
                 args += ["--noise", str(nz)]
+            wit = record_path(paths, WITNESS[0], job, stage)
+            if job in witness_jobs and wit.exists():
+                args += ["--witness", str(wit)]
             kind = LAB_KINDS[stage]
             lab = l0_for_certify(lab_result(paths, st, kind), kind, pool_gpu("balanced", stage))
             if lab is not None:
@@ -563,9 +581,14 @@ def missing_for_certified(cert: Mapping[str, Any]) -> list[str]:
     cand = (cert.get("metrics") or {}).get("candidate") or {}
     n = sum(b.get("n", 0) for b in cand.values())
     noise = (cert.get("metrics") or {}).get("noise") or {}
+    metrics = cert.get("metrics") or {}
+    pre = cert.get("preemptions") or {}
     ctx = {"min_samples": th.get("min_samples"), "min_noise": th.get("min_noise_samples"),
            "n": n, "noise_n": noise.get("n", 0),
-           "coverage": (cert.get("metrics") or {}).get("coverage"),
+           "coverage": metrics.get("coverage"), "missing": metrics.get("missing"),
+           "max_missing": th.get("max_missing"),
+           "witness_n": (metrics.get("witness") or {}).get("n", 0),
+           "preempted": pre.get("preempted"), "unknown": pre.get("unknown"),
            "lab": LAB_KINDS.get(cert.get("stage"), "-"),
            "metrics": ", ".join(c["metric"] for c in cert.get("checks", [])
                                 if c.get("pass") is None) or "-",
@@ -1077,8 +1100,9 @@ def fetch_records(paths: Paths, st: wh.State, run: Callable[..., Any] = subproce
     import h0_rehearsal as h0
 
     store = f"modal-volume://{wh.STORE_VOLUME}/{st.run_id}"
-    for side, step in SETS.items():
-        for job, r in sorted(jobs_of(st, step).items()):
+    sets = [(side, step, "jobs") for side, step in SETS.items()] + [WITNESS]
+    for side, step, key in sets:
+        for job, r in sorted(jobs_of(st, step, key).items()):
             if "job_id" not in r:
                 continue
             for stage in CERT_STAGES:
@@ -1140,6 +1164,19 @@ def analyze(paths: Paths, *, derived: Mapping[str, str] | None = None, cert_tmp:
     return f, outputs, certs
 
 
+def engine_facts_line(cert: Mapping[str, Any]) -> str | None:
+    """What the engines did under a certificate's evidence (review 13 B1 / W1): records whose
+    engine preempted or could not say, and the compile caches the records ran. Numbers and
+    cache identities only."""
+    pre, cc = cert.get("preemptions"), cert.get("compile_cache")
+    if pre is None and cc is None:
+        return None
+    pre = pre or {}
+    return (f"{cert.get('stage')}: engine preemptions: {pre.get('preempted', '?')} preempted / "
+            f"{pre.get('unknown', '?')} unknown record(s); compile caches: "
+            + ", ".join((cc or {}).get("covers") or ["unknown"]))
+
+
 def print_findings(f: Findings, out=print) -> None:
     out(f"Wave H-lite run {f.st.run_id} (plan {run_plan(f.st)}): spent {usd(f.st.spent)} of "
         f"{usd(global_cap(f.st))}")
@@ -1163,6 +1200,9 @@ def print_findings(f: Findings, out=print) -> None:
     out(f"  certificate verdict: {overall_verdict(f.outcomes)}")
     for r in rows:
         out(f"    {r[0]} {r[1]} {r[2]}: {r[3]} (episodes {r[4]}, noise {r[5]}) {r[6]}")
+    for o in f.outcomes:
+        if o.get("cert") and (line := engine_facts_line(o["cert"])):
+            out(f"    {line}")
     if missing:
         out("  missing for certified:")
         for m in missing:
