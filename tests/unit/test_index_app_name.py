@@ -104,7 +104,7 @@ def _load(name: str):
 
 def test_scale_test_real_index_uses_its_own_app_name(monkeypatch, tmp_path):
     sc = sys.modules.get("scale_test") or _load("scale_test")
-    wh = sys.modules["wave_h"]
+    wh = sc.wh  # the module scale_test calls: sys.modules["wave_h"] may be another copy
     st = wh.State("1022130531d5", 0.0, "2026-10-22")
     ctx = sc.Ctx("real", st, tmp_path, tmp_path / "state.json", 0.0, step="index")
     st.step("index").attempts += [wh.Attempt(started=0.0, status="failed"),
