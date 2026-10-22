@@ -161,7 +161,7 @@ def deploy(
         "--dry-run", help="Print the plan; do not contact Modal.")] = False,
     as_json: Annotated[bool, typer.Option("--json", help="Print the plan as JSON.")] = False,
     fake_models: Annotated[bool, typer.Option(
-        "--fake-models", help="Rehearsal app: fake engines on CPU workers (no GPU, no weights; "
+        "--fake-models", help="Test app: fake engines on CPU workers (no GPU, no weights; "
                               "hashed apart from real outputs).")] = False,
 ) -> None:
     """Deploy the config's Modal app (one app per config; workers scale from zero)."""

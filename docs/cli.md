@@ -8,17 +8,20 @@ point elsewhere).
 
 ## Where the job and the store come from
 
-The job commands (`flora status`, `logs`, `cancel`, `resume`, `report` and `results`) take the job
-id as an optional argument (`--job` for `results`) and the store as an optional `--store`:
+The job commands (`flora status`, `logs`, `cancel`, `resume`, `report`, `results` and `export`)
+take the job id as an optional argument (`--job` for `results` and `export`) and the store as an
+optional `--store`:
 
 | | Default | Override |
 |---|---|---|
-| job id | the config's `project` | the `JOB` argument (`results`: `--job`) |
+| job id | the config's `project` | the `JOB` argument (`results`, `export`: `--job`) |
 | store | `output.sink`, then `flora-local-store/` (1) | `--store URI`, `FLORA_STORE` |
 | config | `./flora.yaml` | `--config PATH` |
 
 (1) The config's `output.sink` (`volume://x` is the Modal Volume `x`), then the local store
 that `flora run --local` writes, `flora-local-store/` next to `flora.yaml`, when it exists.
+Client commands read `modal-volume://`, `s3://` and local stores; `gs://` and `r2://` are not
+supported (for R2 or GCS, use `s3://` with their S3 endpoint in `AWS_ENDPOINT_URL`).
 
 Fake-models runs (`--fake-models`, and every `--local` run) use the job id `<project>.fake`, so
 they never mix with real jobs. With the job id left to its default, a command uses the real run;
@@ -35,10 +38,13 @@ it from there when you give no `--index` or `--video-hours`.
 |---|---|
 | 0 | done (or still running: `status`, `run --detach`) |
 | 1 | failed |
-| 2 | refused, or a usage error (bad config or arguments, job not found, internal error) |
+| 2 | refused, or a usage error (bad config or arguments, job not found, internal error) (1) |
 | 3 | completed with some episodes excluded (`completed_with_errors`) |
 | 4 | stopped by the budget (`budget_stopped`) |
 | 5 | cancelled or stopped (local runs: also interrupted, or the job's lease is held) |
+
+(1) Also `flora export` refusing uncertified or fake-models records without
+`--allow-uncertified` / `--allow-fake`.
 
 130 means interrupted with Ctrl-C.
 
@@ -94,7 +100,7 @@ flora prepare [OPTIONS]
 
 ### `flora index`
 
-Index a dataset: per-episode receipts (probe-equivalent, envelope, eligibility).
+Index a dataset: per-episode receipts (video probe, envelope, eligibility).
 
 ```
 flora index [OPTIONS]
@@ -107,7 +113,7 @@ flora index [OPTIONS]
 | `--job` |  | Job id (default: project). |
 | `--store` (env `FLORA_STORE`) |  | Job store: file:///dir, s3://bucket[/prefix], modal-volume://name[/prefix] (default: from output.sink). |
 | `--limit` |  | Index only the first N episodes. |
-| `--decode`, `--no-decode` |  | Decode-mode index of oracle-eligible cameras (default: on for preset exact). |
+| `--decode`, `--no-decode` |  | Decode-check the cameras that can be certified against NVIDIA's reference (default: on for preset exact). |
 | `--max-episodes-per-unit` | `64` | Episodes per work unit (a source file is never split). |
 | `--work` |  | --local: where Hub files are downloaded (default: input.stage_to or ~/.cache/flora-deploy/datasets). |
 | `--force`, `--no-force` | --no-force | Re-index episodes that have receipts. |
@@ -133,7 +139,7 @@ flora plan [OPTIONS]
 | `--index` |  | Workload summary JSON (default: the summary.json `flora index` wrote next to the config). |
 | `--max-gpus` |  | GPU cap (default: modal.max_gpus) |
 | `--rates` |  | rates.json to use instead of the shipped one. |
-| `--live-prices`, `--no-live-prices` | --no-live-prices | Read prices from Workspace.billing.rates() (needs Modal credentials). |
+| `--live-prices`, `--no-live-prices` | --no-live-prices | Read live prices from your Modal workspace (needs Modal credentials). |
 | `--write` |  | Write option N (1-based) into the config. |
 | `--json` | off | Print options as JSON. |
 | `--check-cache` | off | Price balanced pools whose compile cache is published on flora-cache (needs Modal credentials) with the warm startup row. |
@@ -164,7 +170,7 @@ flora deploy [OPTIONS]
 | Argument / option | Default | |
 |---|---|---|
 | `--config`, `-c` | `flora.yaml` | flora.yaml |
-| `--store` (env `FLORA_STORE`) |  | Job store seen by containers: modal-volume://name[/path] or s3\|r2\|gs://bucket[/prefix] (default: output.sink). |
+| `--store` (env `FLORA_STORE`) |  | Job store seen by containers: modal-volume://name[/path] or s3://bucket[/prefix] (default: output.sink). |
 | `--bucket-secret` | `flora-bucket` | Modal Secret holding the bucket credentials. |
 | `--receipt` |  | Derived-weight receipt NAME=HASH (repeatable): overrides weights.derived, which `flora prepare` records in flora.yaml. |
 | `--allow-uncertified` | off | Deploy even if a stage has no accuracy certificate for this config (its records say certified: false). |
@@ -174,7 +180,7 @@ flora deploy [OPTIONS]
 | `--emit` |  | Write the equivalent standalone script here instead of deploying. |
 | `--dry-run` | off | Print the plan; do not contact Modal. |
 | `--json` | off | Print the plan as JSON. |
-| `--fake-models` | off | Rehearsal app: fake engines on CPU workers (no GPU, no weights; hashed apart from real outputs). |
+| `--fake-models` | off | Test app: fake engines on CPU workers (no GPU, no weights; hashed apart from real outputs). |
 
 ### `flora run`
 
@@ -235,7 +241,7 @@ Job and store default from `flora.yaml` ([above](#where-the-job-and-the-store-co
 | Argument / option | Default | |
 |---|---|---|
 | `JOB` |  | Job id (default: the config's project; its fake-models run &lt;project&gt;.fake when there is no real one). |
-| `--kind` |  | orchestrator, or a shard kind (segcap, reward.terminal, ...). |
+| `--kind` |  | orchestrator, or a worker kind (segment, caption, segcap, reward.terminal, ...). |
 | `--follow`, `-f` | off | Stream new lines. |
 | `--tail`, `-n` | `100` | Lines per call (not with -f). |
 | `--store` (env `FLORA_STORE`) |  | Job store: modal-volume://name[/path], s3://bucket[/prefix], file:///dir or a directory (default: the config's output.sink, then &lt;config dir&gt;/flora-local-store). |
@@ -345,18 +351,18 @@ flora certify [OPTIONS]
 
 | Argument / option | Default | |
 |---|---|---|
-| `--exact` | required | exact (oracle) records, JSONL. |
+| `--exact` | required | Records of the exact reference run, JSONL. |
 | `--balanced` | required | Candidate records on the same episodes, JSONL. |
 | `--config`, `-c` | `flora.yaml` | The candidate run's flora.yaml (preset, pools, modes). |
-| `--noise` |  | The oracle run repeated on a subset of its episodes, JSONL: the noise floor. |
-| `--l0` |  | balanced_lab result JSON (L0 / Gate A), repeatable (one per model kind). |
+| `--noise` |  | The exact run repeated on a subset of its episodes, JSONL: the noise floor. |
+| `--l0` |  | balanced_lab result JSON (the in-engine input and dt_bias checks), repeatable (one per model kind). |
 | `--stage` |  | Stage(s) to certify (default: every certifiable stage in the candidate records). |
 | `--gpu` |  | GPU type certified (default: the config's pool GPU for the stage). |
 | `--tolerance` | `1.5` | Allowed multiple of the noise floor, in [1, 2]. |
 | `--min-samples` | `10` | Episodes needed per (stage, embodiment pool); at least 10. |
 | `--min-noise-samples` | `5` | Noise-run episodes per stage; at least 5. |
 | `--slack` |  | Absolute slack METRIC=VALUE added to the threshold (repeatable; default 0; at most the metric's noise floor). |
-| `--derived-content` |  | Derived-weight content digest NAME=SHA256 (DerivedPin.content_sha256) of the weights the candidate ran with (repeatable; required for segment/caption). |
+| `--derived-content` |  | Derived-weight content digest NAME=SHA256 (its pinned content digest) of the weights the candidate ran with (repeatable; required for segment/caption). |
 | `--similarity` |  | Optional caption text-similarity hook module:function -&gt; [0,1] (off by default). |
 | `--out-dir` |  | Where to write certificates (default: the package registry; a failed one is written only with --out-dir). |
 | `--json` | off | Print the certificates as JSON. |
@@ -378,10 +384,12 @@ Write a job's labels into a copy of its LeRobot dataset (the source is never mod
 flora export [OPTIONS]
 ```
 
+Job and store default from `flora.yaml` ([above](#where-the-job-and-the-store-come-from)).
+
 | Argument / option | Default | |
 |---|---|---|
 | `--out` | required | New directory for the labeled copy. |
-| `--job` |  | Job id (default: the config's project). |
+| `--job` |  | Job id (default: the config's project; its fake-models run when there is no real one). |
 | `--store` (env `FLORA_STORE`) |  | Job store: file:///dir (or a path), s3://bucket[/prefix], modal-volume://name (default: the config's output.sink, then &lt;config dir&gt;/flora-local-store). |
 | `--config`, `-c` | `flora.yaml` | flora.yaml (finds the store and Modal environment). |
 | `--env` (env `MODAL_ENVIRONMENT`) |  | Modal environment of a modal-volume store. |

@@ -21,7 +21,9 @@ from flora_deploy.cli.run import ConfigOpt, EnvOpt, JobArg, StoreOpt, fail, open
 def logs(
     job: JobArg = None,
     kind: Annotated[str | None, typer.Option(
-        "--kind", help="orchestrator, or a shard kind (segcap, reward.terminal, ...).")] = None,
+        "--kind",
+        help="orchestrator, or a worker kind (segment, caption, segcap, reward.terminal, ...)."
+    )] = None,
     follow: Annotated[bool, typer.Option("--follow", "-f", help="Stream new lines.")] = False,
     tail: Annotated[int, typer.Option("--tail", "-n", help="Lines per call (not with -f).")
                     ] = 100,

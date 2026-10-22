@@ -50,16 +50,17 @@ def _similarity(spec: str | None):
 
 @app.command()
 def certify(
-    exact: Annotated[Path, typer.Option(help="exact (oracle) records, JSONL.")],
+    exact: Annotated[Path, typer.Option(help="Records of the exact reference run, JSONL.")],
     balanced: Annotated[Path, typer.Option(help="Candidate records on the same episodes, JSONL.")],
     config: Annotated[Path, typer.Option(
         "--config", "-c", help="The candidate run's flora.yaml (preset, pools, modes).")
     ] = Path("flora.yaml"),
     noise: Annotated[Path | None, typer.Option(
-        help="The oracle run repeated on a subset of its episodes, JSONL: the noise floor.")
+        help="The exact run repeated on a subset of its episodes, JSONL: the noise floor.")
     ] = None,
     l0: Annotated[list[Path] | None, typer.Option(
-        help="balanced_lab result JSON (L0 / Gate A), repeatable (one per model kind).")
+        help="balanced_lab result JSON (the in-engine input and dt_bias checks), repeatable "
+             "(one per model kind).")
     ] = None,
     stage: Annotated[list[str] | None, typer.Option(
         help="Stage(s) to certify (default: every certifiable stage in the candidate records).")
@@ -76,7 +77,7 @@ def certify(
         help="Absolute slack METRIC=VALUE added to the threshold (repeatable; default 0; at "
              "most the metric's noise floor).")] = None,
     derived_content: Annotated[list[str] | None, typer.Option(
-        help="Derived-weight content digest NAME=SHA256 (DerivedPin.content_sha256) of the "
+        help="Derived-weight content digest NAME=SHA256 (its pinned content digest) of the "
              "weights the candidate ran with (repeatable; required for segment/caption).")
     ] = None,
     similarity: Annotated[str | None, typer.Option(

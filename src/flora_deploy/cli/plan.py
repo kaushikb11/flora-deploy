@@ -227,7 +227,7 @@ def plan(
     rates_file: Annotated[Path | None, typer.Option(
         "--rates", help="rates.json to use instead of the shipped one.")] = None,
     live_prices: Annotated[bool, typer.Option(
-        help="Read prices from Workspace.billing.rates() (needs Modal credentials).")] = False,
+        help="Read live prices from your Modal workspace (needs Modal credentials).")] = False,
     write: Annotated[int | None, typer.Option(
         help="Write option N (1-based) into the config.")] = None,
     as_json: Annotated[bool, typer.Option("--json", help="Print options as JSON.")] = False,

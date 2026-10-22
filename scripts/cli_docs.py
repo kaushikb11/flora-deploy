@@ -19,7 +19,7 @@ DOC = Path(__file__).resolve().parents[1] / "docs" / "cli.md"
 ORDER = ["init", "doctor", "prepare", "index", "plan", "estimate", "deploy", "run", "status",
          "logs", "cancel", "resume", "report", "results", "compose", "certify", "version"]
 
-JOB_SCOPED = {"status", "logs", "cancel", "resume", "report", "results"}
+JOB_SCOPED = {"status", "logs", "cancel", "resume", "report", "results", "export"}
 
 HEADER = """\
 # `flora` command reference
@@ -32,17 +32,20 @@ point elsewhere).
 
 ## Where the job and the store come from
 
-The job commands (`flora status`, `logs`, `cancel`, `resume`, `report` and `results`) take the job
-id as an optional argument (`--job` for `results`) and the store as an optional `--store`:
+The job commands (`flora status`, `logs`, `cancel`, `resume`, `report`, `results` and `export`)
+take the job id as an optional argument (`--job` for `results` and `export`) and the store as an
+optional `--store`:
 
 | | Default | Override |
 |---|---|---|
-| job id | the config's `project` | the `JOB` argument (`results`: `--job`) |
+| job id | the config's `project` | the `JOB` argument (`results`, `export`: `--job`) |
 | store | `output.sink`, then `flora-local-store/` (1) | `--store URI`, `FLORA_STORE` |
 | config | `./flora.yaml` | `--config PATH` |
 
 (1) The config's `output.sink` (`volume://x` is the Modal Volume `x`), then the local store
 that `flora run --local` writes, `flora-local-store/` next to `flora.yaml`, when it exists.
+Client commands read `modal-volume://`, `s3://` and local stores; `gs://` and `r2://` are not
+supported (for R2 or GCS, use `s3://` with their S3 endpoint in `AWS_ENDPOINT_URL`).
 
 Fake-models runs (`--fake-models`, and every `--local` run) use the job id `<project>.fake`, so
 they never mix with real jobs. With the job id left to its default, a command uses the real run;
@@ -59,10 +62,13 @@ it from there when you give no `--index` or `--video-hours`.
 |---|---|
 | 0 | done (or still running: `status`, `run --detach`) |
 | 1 | failed |
-| 2 | refused, or a usage error (bad config or arguments, job not found, internal error) |
+| 2 | refused, or a usage error (bad config or arguments, job not found, internal error) (1) |
 | 3 | completed with some episodes excluded (`completed_with_errors`) |
 | 4 | stopped by the budget (`budget_stopped`) |
 | 5 | cancelled or stopped (local runs: also interrupted, or the job's lease is held) |
+
+(1) Also `flora export` refusing uncertified or fake-models records without
+`--allow-uncertified` / `--allow-fake`.
 
 130 means interrupted with Ctrl-C.
 

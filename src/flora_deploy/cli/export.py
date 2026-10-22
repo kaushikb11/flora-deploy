@@ -23,7 +23,8 @@ def _fail(msg: str, code: int = 2) -> typer.Exit:
 def export_cmd(
     out: Annotated[Path, typer.Option("--out", help="New directory for the labeled copy.")],
     job: Annotated[str | None, typer.Option(
-        "--job", help="Job id (default: the config's project).", show_default=False)] = None,
+        "--job", help="Job id (default: the config's project; its fake-models run when there is no "
+                "real one).", show_default=False)] = None,
     store: JobStoreOpt = None,
     config: ConfigOpt = Path("flora.yaml"),
     env: EnvOpt = None,
