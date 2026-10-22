@@ -36,6 +36,8 @@ Accuracy certificates: none yet, so `balanced` segmentation and captioning recor
 Rewards run NVIDIA's own engine, as `exact` does, and need none.
 <!-- /wave-h:certified -->
 
+What flora-deploy doesn't do yet, and what is still an estimate: [`docs/limitations.md`](docs/limitations.md).
+
 **You need:**
 - A [Modal](https://modal.com) account. Run `modal setup` once.
 - Nothing to request on [Hugging Face](https://huggingface.co): the `nvidia/Flora-*` model
