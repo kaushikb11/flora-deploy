@@ -886,6 +886,13 @@ def require_tempseg_pin(ctx: Ctx) -> dict[str, Any]:
     return row
 
 
+def _gdn_pass(status: Any) -> bool:
+    """NVIDIA's ``verify_gdn`` reports ``PASS`` or a qualified pass such as
+    ``PASS_NATIVE_GDN_FP32_CHECKPOINT_VALUES``; anything else is a failure."""
+    v = str(status).upper()
+    return v == "PASS" or v.startswith("PASS_")
+
+
 def equivalence_ok(res: Mapping[str, Any]) -> tuple[bool, dict[str, Any]]:
     """``convert_app.tempseg_equivalence``: every window has identical inputs and greedy ids,
     ``verify_gdn`` passes on B, and the merged files verify (docs/tempseg-merge.md)."""
@@ -904,7 +911,8 @@ def equivalence_ok(res: Mapping[str, Any]) -> tuple[bool, dict[str, Any]]:
         "total_s": res.get("total_s"),
     }
     ok = (bool(wins) and summary["inputs_identical"] and summary["ids_identical"]
-          and all(str(v).upper() == "PASS" for v in gdn.values()) and summary["verify_merged"])
+          and bool(gdn) and all(_gdn_pass(v) for v in gdn.values())
+          and summary["verify_merged"])
     return ok, summary
 
 
@@ -943,6 +951,14 @@ def run_tempseg(ctx: Ctx) -> dict[str, Any]:
             and prev.get("equivalence_ok")):  # already built and checked: never rebuild
         return {**prev, "ok": False, "needs_pin": True, "tracked_usd": 0.0, "apps": [],
                 "built": False, "pin_mismatch": pinned}
+    saved = ctx.work / "tempseg-equivalence.json"
+    if (prev.get("content_sha256") and row.get("content_sha256") == prev["content_sha256"]
+            and saved.is_file()):  # same build already checked on the GPU: re-score, no re-run
+        ok, summary = equivalence_ok(json.loads(saved.read_text()))
+        if ok:
+            return {**prev, "equivalence": {**summary, "rescored": True}, "equivalence_ok": True,
+                    "ok": False, "needs_pin": True, "error": None, "tracked_usd": 0.0,
+                    "apps": [], "built": False}
     target = str(ROOT / "src" / "flora_deploy" / "modal_app" / "convert_app.py") + "::tempseg"
     spent = 0.0
     ctx.note_app(TEMPSEG_APP)
