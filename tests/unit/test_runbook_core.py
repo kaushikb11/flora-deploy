@@ -277,3 +277,18 @@ def test_the_next_run_stops_a_killed_attempts_apps_and_bounds_it():
     assert a.stopped_at is not None and a.charged(None) == pytest.approx(0.001 * (1200 + 60))
     lines = wh.held_lines(st)
     assert len(lines) == 1 and "lab attempt 1" in lines[0] and lines[0].endswith("UTC")
+
+
+# --- WP4: one app name per step and attempt ----------------------------------------------------
+
+
+def test_every_attempt_of_every_step_has_its_own_app_name():
+    names = {wh.app_name("102207184317", s, n) for s in wh.STEPS for n in (1, 2, 12)}
+    assert len(names) == 3 * len(wh.STEPS)
+    assert wh.app_name("102207184317", "exact_e2e", 3) == "flora-wh-102207184317-exact-e2e-a3"
+    assert max(len(n) + len("-equivalence") for n in names) < 64  # Modal's name limit
+    st = wh.State("102207184317", 0.0, "x")
+    ctx = wh.Ctx(st, {}, Path("."), step="lab")
+    st.step("lab").attempts += [wh.Attempt(0.0, "failed"), wh.Attempt(1.0)]
+    assert ctx.app_name() == "flora-wh-102207184317-lab-a2"
+    assert ctx.app_name("merge") == "flora-wh-102207184317-lab-a2-merge"

@@ -579,9 +579,14 @@ def test_step0_builds_checks_reports_the_digest_and_stops_for_the_pin(tmp_path):
     assert res["needs_pin"] and not res["ok"] and res["content_sha256"] == "e" * 64
     runs = [c for c in ctx.cmds if c[:2] == ["modal", "run"]]
     assert [c[c.index("--step") + 1] for c in runs] == ["merge", "equivalence"]
-    assert runs[0][2].endswith("convert_app.py::tempseg")
-    assert ["modal", "app", "stop", "--yes", wh.TEMPSEG_APP] in ctx.cmds
-    assert st.step("tempseg").current.apps == [wh.TEMPSEG_APP]  # noted before it spent
+    names = ["flora-wh-r-tempseg-a1-merge", "flora-wh-r-tempseg-a1-equivalence"]
+    assert [c[:4] for c in runs] == [["modal", "run", "-n", n] for n in names]  # own names
+    assert runs[0][4].endswith("convert_app.py::tempseg")
+    # each app looked up by its name and stopped (the fake lists none: stopped by name too)
+    assert ["modal", "app", "list", "--json"] in ctx.cmds
+    assert all(["modal", "app", "stop", "--yes", n] in ctx.cmds for n in names)
+    assert ["modal", "app", "stop", "--yes", wh.TEMPSEG_APP] not in ctx.cmds
+    assert st.step("tempseg").current.apps == names  # noted before they spent
     assert "e" * 64 in wh.pin_instructions(res) and "DERIVED_PINS" in wh.pin_instructions(res)
     # re-run before pinning: never rebuilds what it already reported
     st.step("tempseg").result = res

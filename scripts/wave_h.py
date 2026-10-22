@@ -948,6 +948,12 @@ class Ctx:
             cur.stopped_at = None
             save_state(self.st, self.state_path)
 
+    def app_name(self, part: str = "") -> str:
+        """This attempt's own app name (:func:`app_name`), ``part`` appended for a step that
+        starts more than one app (step 0: merge, then equivalence)."""
+        n = max(1, len(self.st.step(self.step).attempts))
+        return app_name(self.st.run_id, self.step, n) + (f"-{part}" if part else "")
+
     def note_app_id(self, app_id: str | None) -> None:
         """Record a started app's id (``ap-...``): it is stopped and billed by id."""
         cur = self.st.step(self.step).current if self.step else None
@@ -1049,20 +1055,28 @@ def equivalence_ok(res: Mapping[str, Any]) -> tuple[bool, dict[str, Any]]:
     return ok, summary
 
 
-def _modal_run(ctx: Ctx, target: str, args: list[str], *, limit: float, out: Path
-               ) -> tuple[dict[str, Any] | None, float, str | None]:
-    """``modal run <target> <args> --out <out>`` with a client deadline; the app is stopped
-    after it either way. Returns (result JSON, wall s, error)."""
+def _modal_run(ctx: Ctx, target: str, args: list[str], *, limit: float, out: Path,
+               name: str) -> tuple[dict[str, Any] | None, float, str | None]:
+    """``modal run -n <name> <target> <args> --out <out>`` with a client deadline: the run's
+    own app name (billing reports it as the app's description). The app is then stopped by
+    id (``modal app stop <name>`` finds no ephemeral app) either way, and its id recorded.
+    Returns (result JSON, wall s, error)."""
     t0 = time.time()
     err = None
+    ctx.note_app(name)
     try:
-        ctx.sh(["modal", "run", target, *args, "--out", str(out)], timeout=limit, check=True)
+        ctx.sh(["modal", "run", "-n", name, target, *args, "--out", str(out)], timeout=limit,
+               check=True)
     except subprocess.TimeoutExpired:
         err = f"client deadline {limit:.0f} s"
     except RuntimeError as e:
         err = str(e)
     finally:
-        if rb.stop_apps([TEMPSEG_APP], run=_sh_runner(ctx)):
+        run = _sh_runner(ctx)
+        ids = rb.app_ids_named(name, rb.list_apps(run) or [])
+        for i in ids:
+            ctx.note_app_id(i)
+        if rb.stop_apps([name], ids, run=run):
             ctx.confirm_stop()
     wall = time.time() - t0
     try:
@@ -1102,15 +1116,16 @@ def run_tempseg(ctx: Ctx) -> dict[str, Any]:
                     "apps": [], "built": False}
     target = str(ROOT / "src" / "flora_deploy" / "modal_app" / "convert_app.py") + "::tempseg"
     spent = 0.0
-    ctx.note_app(TEMPSEG_APP)
-    out: dict[str, Any] = {"apps": [TEMPSEG_APP], "built": True}
+    names = {"merge": ctx.app_name("merge"), "equivalence": ctx.app_name("equivalence")}
+    ctx.note_app(names["merge"])
+    out: dict[str, Any] = {"apps": [names["merge"]], "built": True}
     rdir = ctx.work
     limit = min(MERGE_MAX_S, ctx.deadline_s("tempseg", MERGE, slack_s=LAB_SLACK_S))
     if limit < 120:
         return {**out, "ok": False, "error": f"budget left allows {limit:.0f} s",
                 "tracked_usd": 0.0}
     merge, wall, err = _modal_run(ctx, target, ["--step", "merge", "--force"], limit=limit,
-                                  out=rdir / "tempseg-merge.json")
+                                  out=rdir / "tempseg-merge.json", name=names["merge"])
     spent += MERGE.usd_per_s() * wall
     out["merge"] = {"wall_s": round(wall, 1), "error": err,
                     "receipt": (merge or {}).get("receipt_sha256")}
@@ -1121,8 +1136,9 @@ def run_tempseg(ctx: Ctx) -> dict[str, Any]:
     if limit < 120:
         return {**out, "ok": False, "error": f"budget left allows {limit:.0f} s for the "
                 "equivalence check", "tracked_usd": spent}
+    out["apps"].append(names["equivalence"])
     eq, wall, err = _modal_run(ctx, target, ["--step", "equivalence"], limit=limit,
-                               out=rdir / "tempseg-equivalence.json")
+                               out=rdir / "tempseg-equivalence.json", name=names["equivalence"])
     spent += EQUIV.usd_per_s() * wall
     ok, summary = equivalence_ok(eq or {}) if not err else (False, {"error": err})
     out.update(equivalence={**summary, "wall_s": round(wall, 1)}, equivalence_ok=ok)
@@ -1166,14 +1182,13 @@ def run_preflight(ctx: Ctx) -> dict[str, Any]:
 
     require_tempseg_pin(ctx)
     t0 = time.time()
-    ctx.note_app("flora-balanced-lab")
-    with modal.enable_output(), lab.app.run():
+    name = ctx.app_name()
+    with _lab_app(ctx, lab, modal, name):
         out = lab.preflight.remote()
-    ctx.confirm_stop()
     wall = time.time() - t0
     ok = all(out.get(k, {}).get("receipt") for k in ("tempseg", "captioner"))
     return {"ok": ok, "wall_s": round(wall, 1), "tracked_usd": PREFLIGHT.usd_per_s() * wall,
-            "apps": ["flora-balanced-lab"],
+            "apps": [name],
             "facts": {k: {kk: v.get(kk) for kk in ("receipt", "eos_token",
                                                     "extra_state_prefixes")}
                       for k, v in out.items() if isinstance(v, dict)}}
@@ -1558,10 +1573,21 @@ def lab_reuse(st: State, spec: PlanSpec | None = None) -> tuple[str, ...]:
 
 
 @contextlib.contextmanager
-def _lab_app(lab: Any, modal: Any):
-    """``lab.app.run()`` with Modal's output on; the app is stopped when the block exits."""
-    with modal.enable_output(), lab.app.run():
-        yield
+def _lab_app(ctx: Ctx, lab: Any, modal: Any, name: str):
+    """``lab.app.run(name=name)`` (Modal's output on): the attempt's own app name, which
+    billing reports as its description, noted before it can spend, and its app id once it
+    runs. The app stops when the block exits, which is recorded as a confirmed stop."""
+    ctx.note_app(name)
+    raised: BaseException | None = None
+    with modal.enable_output(), lab.app.run(name=name):
+        ctx.note_app_id(getattr(lab.app, "app_id", None))
+        try:
+            yield
+        except BaseException as e:  # noqa: BLE001 - re-raised once the app has stopped
+            raised = e
+    ctx.confirm_stop()  # reached only when app.run()'s exit (the app's stop) did not raise
+    if raised is not None:
+        raise raised
 
 
 def _lab_kind_summary(res: Mapping[str, Any], wall: float, usd: float) -> dict[str, Any]:
@@ -1624,10 +1650,11 @@ def run_lab(ctx: Ctx, *, missing: Callable[[Iterable[str]], list[str]] | None = 
         out["note"] = f"no lab container started; charged $0; {NO_EVIDENCE}"
         return {"ok": False, **out, "tracked_usd": 0.0, "apps": []}
     spent = 0.0
+    name = ctx.app_name()
 
     def persist() -> None:  # each kind's summary lands in the state as soon as it returns
         ctx.st.step("lab").result = {"ok": False, "partial": True, **out, "tracked_usd": spent,
-                                     "apps": ["flora-balanced-lab"] if todo else []}
+                                     "apps": [name] if todo else []}
         save_state(ctx.st, ctx.state_path)
 
     for kind in LAB:
@@ -1645,11 +1672,9 @@ def run_lab(ctx: Ctx, *, missing: Callable[[Iterable[str]], list[str]] | None = 
 
     rdir = LAB_OUT
     rdir.mkdir(parents=True, exist_ok=True)
-    ctx.note_app("flora-balanced-lab")  # only now: a precondition failure above charged $0
     fns = {"tempseg": lab.run_tempseg, "captioner": lab.run_captioner}
-    with contextlib.ExitStack() as stopped:
-        stopped.callback(ctx.confirm_stop)  # runs once the app's block below has exited
-        stopped.enter_context(_lab_app(lab, modal))
+    # the app is noted only now: a precondition failure above charged $0
+    with _lab_app(ctx, lab, modal, name):
         for kind in todo:
             fn, c = fns[kind], LAB[kind]
             limit = min(LAB_DEADLINE_S[kind],
@@ -1690,7 +1715,7 @@ def run_lab(ctx: Ctx, *, missing: Callable[[Iterable[str]], list[str]] | None = 
     if bad:
         out["error"] = "; ".join(f"{k}: {v}" for k, v in bad.items())
     return {"ok": not bad and len(out["kinds"]) == 2, **out, "tracked_usd": spent,
-            "apps": ["flora-balanced-lab"]}
+            "apps": [name]}
 
 
 def _job_rows(ctx: Ctx, step: str) -> dict[str, dict[str, list[dict]]]:
@@ -2017,6 +2042,12 @@ def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
             f"least ${honest['global']:.2f} (per step: "
             + ", ".join(f"{s} ${honest[s]:.2f}" for s in steps) + "); the runbook stops at the "
             "first step whose upper projection no longer fits the cap left")
+
+
+def app_name(run_id: str, step: str, attempt: int) -> str:
+    """The app name of one attempt of one step: ``flora-wh-<run>-<step>-a<n>`` (Modal's
+    billing reports it per app, so each attempt's spend is its own)."""
+    return f"flora-wh-{run_id}-{step.replace('_', '-')}-a{attempt}"
 
 
 # Per step: stop -> container gone (the lab and conversion calls end with their client timeout;
