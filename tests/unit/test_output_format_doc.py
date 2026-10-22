@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import fields
 from pathlib import Path
-from typing import get_args
+from typing import get_args, get_type_hints
 
 import pytest
 
@@ -91,3 +91,17 @@ def test_stage_files_in_layout():
     text = DOC.read_text(encoding="utf-8")
     for stage in ("segment", "caption", *REWARD_COLS):
         assert f"{stage}.jsonl" in text and f"{stage}.parquet" in text
+
+
+def test_exclusion_kinds_documented():
+    """Every ``EpisodeError.kind`` is in the error table, and each excused kind is a listed
+    exclusion reason (``infra`` is a diagnostic, never an exclusion)."""
+    kinds = get_args(get_type_hints(EpisodeError)["kind"])
+    assert "missing_task" in kinds
+    text = DOC.read_text(encoding="utf-8")
+    exclusions = text.split("## Exclusions", 1)[1].split("Error files are JSONL", 1)[0]
+    (row,) = [line for line in text.splitlines() if line.startswith("| `kind` | string |")]
+    for kind in kinds:
+        assert f"`{kind}`" in row, kind
+        if kind != "infra":
+            assert f"* `{kind}`:" in exclusions, kind

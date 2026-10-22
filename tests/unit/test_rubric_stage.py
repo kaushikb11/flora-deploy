@@ -296,6 +296,41 @@ def test_worker_runs_rubric_shards_stamped_and_crashes_are_marked(tmp_path):
     assert all(r["provenance"]["cert_key"] == {"k": 1} for r in recs)
 
 
+def test_rubric_shard_excludes_only_a_missing_task_episode(tmp_path):
+    from flora_deploy.jobs import progress as P
+    from tests.fakes.modal import FakeStore
+    from tests.unit.test_reward_worker import (
+        CFG,
+        JOB,
+        Clock,
+        all_errors,
+        ep,
+        jf_of,
+        setup,
+        tshard,
+        uid,
+    )
+
+    cams = {"main": "/v/m.mp4", "left_wrist": "/v/l.mp4", "right_wrist": "/v/r.mp4"}
+    store = FakeStore()
+    shard = tshard(["a", "notask", "b"], sid="reward.rubric-00000", kind="reward.rubric")
+    m = setup(store, [ep("a", cams=cams), ep("notask", task="", cams=cams),
+                      ep("b", cams=cams)], [shard])
+    s = RewardWorkerSettings(local_dir=str(tmp_path / "c1"), container_id="c1", gpu="H100",
+                             models={"rewarder": "7d"}, rubric=RUBRIC, media_root="/v")
+    llm = CountingLLM()
+    receipt = RewardShardRunner(store, RewardEngine(llm, "PROC"), nv_with(), s,
+                                call_id=lambda: "fc", clock=Clock()).run_shard(
+        JOB, shard.shard_id, CFG)
+    assert receipt.episodes_done == (uid("a"), uid("b"))
+    assert receipt.episodes_failed == (uid("notask"),)
+    assert [(e.uid, e.kind, e.stage) for e in all_errors(store, shard)] == [
+        (uid("notask"), "missing_task", "reward.rubric")]
+    assert len(llm.batches) == 2  # one generate per remaining episode
+    prog = P.derive(jf_of(store), m, limit=3)
+    assert prog.complete and prog.exclusions()["reward.rubric"]["excluded"] == 1
+
+
 def test_rubric_runner_refuses_other_kinds(tmp_path):
     from tests.fakes.modal import FakeStore
     from tests.unit.test_reward_worker import CFG, JOB, Clock, ep, setup, tshard

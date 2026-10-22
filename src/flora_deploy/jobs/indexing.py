@@ -560,6 +560,42 @@ def index_one(job: IndexJob, ep: Mapping[str, Any], files: DatasetFiles, scans: 
     return rec
 
 
+MISSING_TASK = "missing_task"  # the exclusion of an episode with no task text (reward stages)
+
+
+def receipt_task(rec: Mapping[str, Any]) -> str | None:
+    """The task text an index receipt gives the reward prompts, before any fallback.
+
+    A ``flora_index_receipt_v1`` receipt's resolved ``instruction_text`` wins when it has one
+    (:meth:`IndexJob.instruction_for`: the fixed text or the dataset task); otherwise its
+    ``task`` for the ``dataset_task`` source and ``None`` for ``fixed`` / ``none`` (older
+    receipts). Any other layout (plain ``EpisodeIndex`` JSON) gives its ``task``."""
+    task = rec.get("task")
+    if rec.get("schema") == RECEIPT_SCHEMA:
+        if rec.get("instruction_text"):
+            return str(rec["instruction_text"])
+        if rec.get("instruction", "dataset_task") != "dataset_task":
+            return None
+    return None if task is None else str(task)
+
+
+def episode_task(task: str | None, default_task: str | None = None) -> str | None:
+    """The task text reward prompts use: ``task``, else ``default_task`` (the configured fixed
+    instruction), else ``None`` when neither has non-blank text. The one rule the planner
+    (``jobs.planning``) and the reward worker (``workers_impl.reward``) share, so an episode
+    without task text is excluded alike on Modal and locally."""
+    for text in (task, default_task):
+        if text is not None and str(text).strip():
+            return str(text)
+    return None
+
+
+def missing_task_message(uid: str) -> str:
+    return (f"episode {uid!r} has no task text and no fixed episode_instruction is set; "
+            "NVIDIA's reward prompts need one (use episode_instruction.source dataset_task "
+            "with tasks, or fixed + text)")
+
+
 def receipt_bytes(rec: Mapping[str, Any]) -> bytes:
     return json.dumps(rec, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
 
