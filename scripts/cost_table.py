@@ -38,11 +38,12 @@ SMALL_JOB_H, SMALL_JOBS = 0.05, 10  # the batching example: ten small jobs vs on
 CAMERA_SIZES = (1.0, 100.0)  # video-hours of the 1-view vs 3-view table
 CAMERA_LAYOUTS = (1, 3)
 
-# Batch fill (episodes prepared outside the micro-batcher, larger batches) is merged but not
-# measured on a GPU. These busy rates are the cost model's estimate of a filled batch at
-# steady state (GPU-bound, >= 16 episodes per shard); a job too small to fill a batch gains
-# nothing. Not a measurement: shown as an estimate, and only while it is below the measured row
-# (once a measurement includes batch fill, the row drops out by itself).
+# Batch fill (episodes prepared outside the micro-batcher, larger batches) is deployed and was
+# on when the balanced rows were measured, but that job was too small to fill a batch. These
+# busy rates are the cost model's estimate of a filled batch at steady state (GPU-bound, >= 16
+# episodes per shard); a job too small to fill a batch gains nothing. Not a measurement: shown
+# as an estimate, and only while it is below the measured row (once a job large enough to fill
+# batches is measured, the row drops out by itself).
 BATCH_FILL_ESTIMATE = {"segment": 0.20, "caption": 0.55}
 BATCH_FILL_UNCERTAINTY = 0.5
 BATCH_FILL_MIN_EPISODES = 16
@@ -187,6 +188,17 @@ def basis(table, kinds: tuple[str, ...]) -> str:
     return "\n".join(parts)
 
 
+def single_job(table, kinds: tuple[str, ...] = SEGCAP) -> bool:
+    """Whether any of ``kinds``' busy rates rests on one measured job (n=1): a figure for a
+    large job is then an extrapolation, not a measurement at that scale."""
+    return any(table.rate(PRESET, k, 1, 1).status == "measured"
+               and table.rate(PRESET, k, 1, 1).n == 1 for k in kinds)
+
+
+SCALE_CAVEAT = ("projected from rates measured on one small job; not yet confirmed at scale "
+                "([scale test](scale-test.md))")
+
+
 def table_md(head: list[str], rows: list[list[str]]) -> str:
     out = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
     out += ["| " + " | ".join(r) + " |" for r in rows]
@@ -207,16 +219,19 @@ def block_short(table) -> str:
     t = table_md(["Video-hours", "Episodes", "Segment + caption, per video-hour", "Job",
                   "Wall-clock", "+ rewards, per video-hour", "Job"], rows)
     lines = [f"- {b}" for b in basis(table, SEGCAP + REWARDS).splitlines()]
+    big = [size(v) for v in SIZES if v >= 10]
+    scale = (f" The {' and '.join(big)} video-hour rows are {SCALE_CAVEAT}."
+             if single_job(table) and big else "")
     return (t + "\n\nOne container per stage, cold starts, Modal list prices. Bold: the "
             "estimate; in brackets: its range from the error bands below. Rewards are "
-            "terminal + dense (`reward.rubric` is not measured yet). What each rate rests "
-            "on:\n\n" + "\n".join(lines) + "\n")
+            f"terminal + dense (`reward.rubric` is not measured yet).{scale} What each rate "
+            "rests on:\n\n" + "\n".join(lines) + "\n")
 
 
 def block_busy(table) -> str:
     return (f"**{usd(busy_per_video_h(SEGCAP, table))} per video-hour** "
             f"(segment + caption; {usd(busy_per_video_h(SEGCAP + REWARDS, table))} with "
-            "rewards)\n")
+            "rewards)" + (f", {SCALE_CAVEAT}" if single_job(table) else "") + "\n")
 
 
 def block_breakdown(table) -> str:
@@ -235,14 +250,15 @@ def block_breakdown(table) -> str:
                       "Total per video-hour"], rows)
             + f"\n\nIdle at the end is an estimate ({POOL_END_TAIL_S:.0f} s per container), "
             "not yet confirmed on a live job. Everything else comes from the measured rates "
-            "above.\n")
+            "above" + ("; for segment and caption that is one small job, so the large rows "
+                       "are an extrapolation" if single_job(table) else "") + ".\n")
 
 
 def block_levers(table) -> str:
     fill = batch_fill_table(table)
-    head = ["Video-hours", "Today (cold)", "Warm start"]
+    head = ["Video-hours", "Measured rates (cold)", "Warm start"]
     if fill is not None:
-        head += ["Batch fill", "Both"]
+        head += ["Full batches", "Both"]
     rows = []
     for v in LEVER_SIZES:
         today = price(v, SEGCAP, table=table)
@@ -254,7 +270,9 @@ def block_levers(table) -> str:
                 row += [per_h(price(v, SEGCAP, table=fill)),
                         per_h(price(v, SEGCAP, table=fill, assume_warm=True))]
         rows.append(row)
-    notes = ["Today: the measured rates and cold startups above.",
+    notes = ["Measured rates: the rates and cold startups above. Batch fill is on by default "
+             "and was on when they were measured, but the measuring job was too small to fill "
+             "a batch.",
              "Warm start: " + "; ".join(
                  f"{k} startup {st.startup_s:.0f} s, {_status(st)}"
                  for k in SEGCAP if (st := table.startup_for(PRESET, k, warm=True)))
@@ -264,10 +282,11 @@ def block_levers(table) -> str:
     if fill is not None:
         rates = ", ".join(f"{k} {BATCH_FILL_ESTIMATE[k]} container-s per video-s"
                           for k in SEGCAP)
-        notes.append(f"Batch fill: an estimate, not measured ({rates}, "
+        notes.append(f"Full batches: what batch fill should reach on a job big enough to fill "
+                     f"its batches; an estimate, not measured ({rates}, "
                      f"{band(BATCH_FILL_UNCERTAINTY)}, for jobs of at least "
-                     f"{BATCH_FILL_MIN_EPISODES} episodes; it can be smaller when preparing "
-                     "frames is the bottleneck rather than the GPU).")
+                     f"{BATCH_FILL_MIN_EPISODES} episodes; the gain can be smaller when "
+                     "preparing frames is the bottleneck rather than the GPU).")
     return table_md(head, rows) + "\n\n" + "\n".join(f"- {n}" for n in notes) + "\n"
 
 
