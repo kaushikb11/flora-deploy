@@ -30,7 +30,7 @@ Certification sets are staged for `human` ([v2](golden-manifest-v2.md)) and `yam
 A certificate is a statistical claim about the episodes it was measured on: `balanced` differs
 from `exact` no more than 1.5 times as much as `exact` differs from itself between two runs
 (NVIDIA's pipeline is not bit-for-bit repeatable on a GPU). It is not a promise of identical output.
-For example, `balanced` may split up to 7.5% of episodes into a different number of subtasks (more
+For example, `balanced` may split up to 10.0% of episodes into a different number of subtasks (more
 when NVIDIA's own two runs disagree more often); each certificate records its exact thresholds.
 It covers only the embodiment, GPU and software it was measured on. Details:
 [`certification.md`](certification.md).
