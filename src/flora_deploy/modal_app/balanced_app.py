@@ -519,6 +519,15 @@ def _start(kind: str) -> tuple[Any, dict]:
         print(f"balanced {kind} worker refused: {e}", flush=True)
         return (RefusedRunner(e.store, str(e), call_id=modal.current_function_call_id),
                 {"kind": kind, "refused": str(e)})
+    except BaseException as exc:  # no shard ever starts here: tell the orchestrator why
+        from flora_deploy.jobs.attempts import record_startup_failure
+        from flora_deploy.modal_app.workers_app import store_from_env
+
+        try:
+            record_startup_failure(store_from_env(), exc)
+        except Exception:  # noqa: BLE001 - the store itself is broken: nowhere to write it
+            pass
+        raise
 
 
 class SegmentWorker:

@@ -258,6 +258,40 @@ def reward_settings_from_env(env: Mapping[str, str] = os.environ, *,
     )
 
 
+def record_start_failure(exc: BaseException, store: Any = None,
+                         env: Mapping[str, str] | None = None) -> str | None:
+    """Record why this job worker could not start (``jobs.attempts.record_startup_failure``):
+    no shard ever starts on it, so no attempt marker would say so. Best effort, never raises:
+    the startup error is the one to surface. Not a job worker (no job store): nothing."""
+    from flora_deploy.jobs.attempts import record_startup_failure
+
+    env = os.environ if env is None else env
+    if not (env.get("FLORA_STORE_KIND") or env.get("FLORA_STORE")):
+        return None
+    if store is None:
+        try:
+            store = store_from_env(env)
+        except Exception:  # noqa: BLE001 - the store itself is broken: nowhere to write it
+            return None
+    return record_startup_failure(store, exc, env=env)
+
+
+def startup_guard(enter: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap a worker's ``@modal.enter`` body: a failure is recorded for the orchestrator
+    (:func:`record_start_failure`, the store from ``self.store`` when set), then re-raised."""
+    import functools
+
+    @functools.wraps(enter)
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return enter(self, *args, **kwargs)
+        except BaseException as exc:
+            record_start_failure(exc, getattr(self, "store", None))
+            raise
+
+    return wrapped
+
+
 def _die(exc: BaseException) -> None:
     """After a CUDA fault (or GPU OOM) the engine is unusable: replace the container. The
     runner has already written the attempt marker with the error and ``crashed=True``
@@ -271,6 +305,7 @@ class RewardWorker:
     """``workers.ShardWorker`` for ``reward.terminal`` / ``reward.dense`` shards."""
 
     @modal.enter()
+    @startup_guard
     def start(self) -> None:
         env = os.environ
         try:
@@ -302,6 +337,7 @@ class RubricWorker:
     """``workers.ShardWorker`` for ``reward.rubric`` shards (module docstring)."""
 
     @modal.enter()
+    @startup_guard
     def start(self) -> None:
         from flora_deploy.workers_impl.certstamp import with_stamps
 
@@ -638,6 +674,7 @@ class FakeSegcapWorker:
     real store and media root, ``local.engines.FakeSegcapEngine`` at the model boundary."""
 
     @modal.enter()
+    @startup_guard
     def start(self) -> None:
         self.store, self.preflight = fake_preflight()
         self.hook = FakeFaultHook(self.store)
