@@ -15,8 +15,9 @@ the per-episode job and the engine are scripted (``WorkerEnv.script``):
   thread, as a long ``llm.generate`` round would (review 6 M4). The runner must flush and mark
   without waiting for that round.
 
-Episodes run one at a time (``max_inflight_episodes=1``, flush after every episode), so every
-episode before the interrupted one is finished and flushed, as the preemption check expects.
+Episodes run one at a time (``max_inflight_episodes=1``, ``prefetch_episodes=1``, flush after
+every episode), so every episode before the interrupted one is finished and flushed, as the
+preemption check expects. The job runs in two phases, as the real jobs do.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from flora_deploy.workers_impl.segment import (
     BalancedShardRunner,
     BalancedWorkerSettings,
     EpisodeOutcome,
+    gates_of,
 )
 from tests.conformance.worker_suite import WorkerSpec
 from tests.fakes import fake_nvidia
@@ -61,14 +63,18 @@ class ScriptedEngine:
 
 class ScriptedJob:
     nv = None
+    phased = True  # two phases (workers_impl.segment.EpisodeGates), as the real jobs
 
     def __init__(self, stage: str, nv_fail):
         self.stage = stage
         self.nv_fail = set(nv_fail)
 
     async def run(self, ref, batcher, ctx):
-        out = await batcher.generate(VllmRequest(prompt=f"<{ref.uid}>", videos=(), key=ref.uid),
-                                     Sampling(max_tokens=8))
+        gates = gates_of(ctx)
+        async with gates.prep():
+            req = VllmRequest(prompt=f"<{ref.uid}>", videos=(), key=ref.uid)
+        async with gates.infer(batcher):
+            out = await batcher.generate(req, Sampling(max_tokens=8))
         assert out.ok
         if ref.uid in self.nv_fail:
             fake_nvidia.nvidia_raise(fake_nvidia.InputError(
@@ -90,7 +96,8 @@ class ScriptedJob:
 
 class Worker:
     def __init__(self, env, kind: str):
-        settings = BalancedWorkerSettings(max_inflight_episodes=1, flush_every=1, max_wait_s=5.0,
+        settings = BalancedWorkerSettings(max_inflight_episodes=1, prefetch_episodes=1,
+                                          flush_every=1, max_wait_s=5.0,
                                           container_id=env.container_id, gpu="L40S",
                                           local_dir=tempfile.mkdtemp(prefix="flora-balanced-"))
         self.runner = BalancedShardRunner(

@@ -112,6 +112,7 @@ OUTPUT_MODULES: dict[str, tuple[str, ...]] = {
         "engines/base.py",
         "engines/offline_llm.py",  # every engine argument and NVIDIA's sampling
         "engines/microbatch.py",  # batch composition changes numerics
+        "engines/batch_policy.py",  # episodes per batcher, max_wait_s: batch composition
         "engines/patches/__init__.py",
         "engines/patches/dt_bias_fp32.py",  # gated FP32 dt_bias (Gate A)
         "engines/worker_ext.py",  # mixed into vLLM's workers; the GDN dtype check (conservative)

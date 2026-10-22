@@ -9,8 +9,10 @@ fake workers alike:
   by its registered parity test; :func:`apply_accel` applies only registered patches.
   ``active.episode()`` binds a per-episode cache / decoder scope to the coroutine's context
   (``asyncio.to_thread`` copies it), so overlapping episodes each get their own scope, released
-  when that episode ends. ``tests/nvlink/test_balanced_accel.py`` checks that every model
-  request is byte-identical with and without the patches.
+  when that episode ends. The scope wraps the whole ``job.run``, so it covers both phases of
+  a two-phase episode (``workers_impl.segment.EpisodeGates``: the probe before the batcher's
+  episode, inference inside it). ``tests/nvlink/test_balanced_accel.py`` checks that every
+  model request is byte-identical with and without the patches, and on both paths.
 * :class:`StampedJob` stamps each record with the certification provenance
   (``workers_impl.certstamp``).
 """

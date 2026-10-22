@@ -373,3 +373,128 @@ def test_abandoned_generate_never_overlaps_the_next_batcher():
     asyncio.run(first())
     asyncio.run(second())
     assert eng.max_concurrent == 1
+
+
+# --- two-phase episodes (WP1a: workers_impl.segment.EpisodeGates) ----------------------------
+
+
+async def phased(mb, gates, name: str, n: int, *, prep=None, infer_hold=None, log=None):
+    """One episode in two phases: ``prep`` (an awaitable factory) under ``gates.prep()``,
+    then ``n`` calls under ``gates.infer(mb)``."""
+    with gates.slot():
+        async with gates.prep():
+            if log is not None:
+                log.append(("prep", name, gates.preparing, gates.inferring))
+            if prep is not None:
+                await prep()
+        async with gates.infer(mb):
+            if log is not None:
+                log.append(("infer", name, gates.preparing, gates.inferring))
+            if infer_hold is not None:
+                await infer_hold()
+            res = await mb.generate_many([req(f"{name}.{i}") for i in range(n)], [SP] * n)
+            return [decode(c) for c in res]
+
+
+def test_preparing_episode_does_not_hold_a_round_back():
+    """A long CPU preparation (NVIDIA's probe) runs outside the batcher's episode: the round of
+    the episode that is already inferring fires at once (all blocked), not after max_wait_s."""
+    from flora_deploy.workers_impl.segment import EpisodeGates
+
+    eng = EchoEngine()
+
+    async def main():
+        gates = EpisodeGates(prefetch=4, infer=4)
+        release = asyncio.Event()
+        async with MicroBatcher(eng, max_wait_s=30) as mb:
+            slow = asyncio.ensure_future(phased(mb, gates, "slow", 1, prep=release.wait))
+            t0 = time.perf_counter()
+            fast = await phased(mb, gates, "fast", 2)
+            waited = time.perf_counter() - t0
+            assert not slow.done() and mb.live == 0  # slow is preparing, not live
+            release.set()
+            return fast, await slow, waited, dict(mb.stats.triggers)
+
+    fast, slow, waited, triggers = asyncio.run(main())
+    assert fast == ["fast.0", "fast.1"] and slow == ["slow.0"]
+    assert waited < 5, waited  # not the 30 s max_wait_s
+    assert eng.batches == [["fast.0", "fast.1"], ["slow.0"]]
+    assert triggers == {"all_blocked": 2}
+
+
+def test_prefetch_is_bounded():
+    """At most ``prefetch`` episodes hold a prep slot (preparing, or prepared and waiting for
+    inference), at most ``infer`` are inferring; all of them finish."""
+    from flora_deploy.workers_impl.segment import EpisodeGates
+
+    eng = EchoEngine()
+    log: list = []
+
+    async def main():
+        gates = EpisodeGates(prefetch=2, infer=1)
+
+        async def prep():
+            await asyncio.sleep(0.001)
+
+        async def hold():
+            await asyncio.sleep(0.01)
+
+        async with MicroBatcher(eng, max_wait_s=30) as mb:
+            outs = await asyncio.gather(*(phased(mb, gates, f"e{i}", 1, prep=prep,
+                                                 infer_hold=hold, log=log)
+                                          for i in range(8)))
+        return outs, gates
+
+    outs, gates = asyncio.run(main())
+    assert outs == [[f"e{i}.0"] for i in range(8)]
+    assert max(p for _w, _n, p, _i in log) <= 2
+    assert max(i for _w, _n, _p, i in log) <= 1
+    assert gates.as_json() == {"prefetch": 2, "infer": 1, "peak_preparing": 2,
+                               "peak_inferring": 1, "peak_admitted": 3}
+    assert gates.preparing == gates.inferring == 0  # everything released
+
+
+def test_all_blocked_fires_when_every_inferring_episode_is_blocked():
+    """Three inferring episodes submit while two more are still preparing: one round of three,
+    by the all-blocked trigger; the preparing ones form the next round."""
+    from flora_deploy.workers_impl.segment import EpisodeGates
+
+    eng = EchoEngine()
+
+    async def main():
+        gates = EpisodeGates(prefetch=8, infer=8)
+        release = asyncio.Event()
+        async with MicroBatcher(eng, max_wait_s=30) as mb:
+            late = [asyncio.ensure_future(phased(mb, gates, f"late{i}", 1, prep=release.wait))
+                    for i in range(2)]
+            early = await asyncio.gather(*(phased(mb, gates, f"early{i}", 1)
+                                           for i in range(3)))
+            release.set()
+            return early, await asyncio.gather(*late), mb.stats
+
+    early, late, stats = asyncio.run(main())
+    assert early == [["early0.0"], ["early1.0"], ["early2.0"]]
+    assert late == [["late0.0"], ["late1.0"]]
+    assert eng.batches == [["early0.0", "early1.0", "early2.0"], ["late0.0", "late1.0"]]
+    assert stats.triggers == {"all_blocked": 2}
+
+
+def test_failed_preparation_releases_its_slot():
+    from flora_deploy.workers_impl.segment import EpisodeGates
+
+    eng = EchoEngine()
+
+    async def main():
+        gates = EpisodeGates(prefetch=1, infer=1)
+
+        async def boom():
+            raise ValueError("probe failed")
+
+        async with MicroBatcher(eng, max_wait_s=30) as mb:
+            with pytest.raises(ValueError):
+                await phased(mb, gates, "bad", 1, prep=boom)
+            ok = await phased(mb, gates, "ok", 1)
+        return ok, gates
+
+    ok, gates = asyncio.run(main())
+    assert ok == ["ok.0"] and gates.preparing == 0
