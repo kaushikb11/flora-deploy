@@ -31,19 +31,20 @@ FIXTURE = {
     "output": {"sink": "s3://b/p"},
 }
 
-# Source digest of each logic group (main at e9fdc4e).
+# Source digest of each logic group (feat/caption-recert: the v4 caption re-certification,
+# the worker startup-failure markers, the envelope fix and balanced certification).
 LOGIC_PINS = {
-    "common": "eeae36a4bac1784f470cfa710cb518542f1d498b218cbdc3e8426d6eec8045a4",
-    "nvidia-hf": "13a1affd795b7c5530c2842ed0305108b8bfc7c40d3acd16bd73f8629caf3998",
-    "vllm-video": "b9b743f6438600b5be9bffebd466b371a590c49382ff009da34c17ca16f790b4",
-    "reward": "3a172f70424f27547c66c2e96b6943163f4ca12ed521caaf4cccff55896c9dc1",
-    "rubric": "ea090cd9ea807fc456374da0f5b1208870a945f5e619b849431d229d75478720",
+    "common": "a06f85b7e962d2310b12917029bf1fd93761723b753e886ff3aa9716006bfa7d",
+    "nvidia-hf": "9aa60b3e17d1b02f2c11a7885c58178b8ff4fe4906737738b2672366c8844cef",
+    "vllm-video": "de285d9c0250721a480bc00b1bac12b990cf594b46a5bd34d0be4fc8c11089b0",
+    "reward": "5714c300ce363c12e14506dd17d7b63fdab48f7560f8d661f53b0f225af90518",
+    "rubric": "96e6658314ff638b9b1f56018a75bdede9172ee66552c7523bc31c4de8554353",
 }
 
 STAGE_PINS = {
-    "segcap": "3dc67ab28186008f570693f8c12881bc04aba94e4920764b276d31b305ad6696",
-    "reward.terminal": "7ca57c13c4ece9924c39436eb1d0c1d8af9c8384e4b50aa9a7c1e523e18e04d9",
-    "reward.dense": "199acca1b398025f5fcecfc960b59a4dba5c9e8b8f599d60be39fd8888b35041",
+    "segcap": "aed033db4929c5c619c243772b412bf3ef99079ebfc1123d069406807a57daf9",
+    "reward.terminal": "6f7d44e0c3e31ee3208eac6858b33a3f1cdec93ce19fe31f66cd81dbb560b79e",
+    "reward.dense": "e02e55d441f109ef2aca099b0d36b972900220de5079bd1da56c377b77e5eed3",
 }
 
 
