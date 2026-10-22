@@ -116,6 +116,60 @@ def test_calls_cost_sweep_containers_and_scaledown():
     assert calls_cost([], s, UNIT, T0) == 0.0
 
 
+def test_calls_cost_back_to_back_shards_pay_only_the_gap():
+    # one container takes shard after shard, ~2 s apart: Modal bills the 2 s gaps, not a
+    # 300 s window per shard (the fake-modal rehearsal's overcount)
+    s = settings(max_inputs=1)
+    calls = [CallRecord(f"c{i}", f"s{i}", "segcap", T0 + i * 102, T0 + i * 102 + 100)
+             for i in range(5)]
+    end = T0 + 4 * 102 + 100
+    got = calls_cost(calls, s, UNIT, end + 1000, scaledown_s=300)
+    assert got == pytest.approx(5 * 100 + 4 * 2 + 300)  # work + four 2 s gaps + one final tail
+    # a call spawned at the very instant another ends reuses its container: no tail at all
+    touching = [CallRecord("a", "x", "segcap", T0, T0 + 100),
+                CallRecord("b", "y", "segcap", T0 + 100, T0 + 200)]
+    assert calls_cost(touching, s, UNIT, T0 + 1000, scaledown_s=300) == pytest.approx(500)
+
+
+def test_calls_cost_long_gap_pays_the_window_once():
+    s = settings(max_inputs=1)
+    calls = [CallRecord("a", "x", "segcap", T0, T0 + 100),
+             CallRecord("b", "y", "segcap", T0 + 1000, T0 + 1100)]
+    # the gap (900 s) outlasts the window: 300 s idle, then a cold container for b
+    assert calls_cost(calls, s, UNIT, T0 + 5000, scaledown_s=300) == pytest.approx(
+        100 + 300 + 100 + 300)
+    # a gap just under the window: billed the gap only
+    calls = [CallRecord("a", "x", "segcap", T0, T0 + 100),
+             CallRecord("b", "y", "segcap", T0 + 350, T0 + 450)]
+    assert calls_cost(calls, s, UNIT, T0 + 5000, scaledown_s=300) == pytest.approx(
+        100 + 250 + 100 + 300)
+
+
+def test_calls_cost_final_tail_and_concurrent_containers():
+    s = settings(max_inputs=1)
+    one = [CallRecord("a", "x", "segcap", T0, T0 + 100)]
+    # still idle at now: the whole window is charged at once (committed), never more
+    assert calls_cost(one, s, UNIT, T0 + 101, scaledown_s=300) == pytest.approx(400)
+    assert calls_cost(one, s, UNIT, T0 + 9999, scaledown_s=300) == pytest.approx(400)
+    # two containers, one goes idle and is reused 5 s later; the other runs on
+    calls = [CallRecord("a", "x", "segcap", T0, T0 + 100),
+             CallRecord("b", "y", "segcap", T0, T0 + 300),
+             CallRecord("c", "z", "segcap", T0 + 105, T0 + 200)]
+    assert calls_cost(calls, s, UNIT, T0 + 9999, scaledown_s=60) == pytest.approx(
+        100 + 300 + 5 + 95 + 60 + 60)  # c's container idles 200->260, b's 300->360
+
+
+def test_overspend_uses_the_gap_billed_spend():
+    # back-to-back history worth $508 + $300 tail at the old model's 300 s per shard would be
+    # $1,708: the hard cap must not cancel a job that is well inside its $1,000 budget
+    calls = tuple(CallRecord(f"c{i}", f"segcap-{i:05d}", "segcap", T0 + i * 102,
+                             T0 + i * 102 + 100) for i in range(5)) + (
+        CallRecord("live", "segcap-00005", "segcap", T0 + 510),)
+    g = gate(1000.0, n=6, clock=lambda: T0 + 520, scaledown_s=300)
+    assert g.overspend(BudgetState(T0 + 520, calls)) == []
+    assert g.last_overspend["spend_usd"] == pytest.approx(5 * 100 + 5 * 2 + 10)
+
+
 class HidingStore(FakeStore):
     """A listing that forgets files (an eventually consistent list can do that between
     replicas); get/exists by path still work."""

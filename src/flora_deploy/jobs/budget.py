@@ -346,9 +346,14 @@ def calls_cost(calls: Iterable[CallRecord], settings: RunSettings, rates: Rates,
     """Spawn-time spend estimate, independent of container receipts.
 
     Per kind, a sweep over call intervals ``[spawned_at, ended_at or now]``: at every instant the
-    kind runs ``ceil(live calls / max_inputs)`` containers, each billed at the pool rate, plus
-    ``scaledown_s`` of idle time every time a container goes away (Modal keeps it for its
-    ``scaledown_window``). A container never starts before its call is spawned and the
+    kind runs ``ceil(live calls / max_inputs)`` containers, each billed at the pool rate. A
+    container that goes idle is billed the way Modal bills it: Modal keeps it for its
+    ``scaledown_window`` (``scaledown_s``) and routes the next input to it, so its idle time is
+    ``min(gap, scaledown_s)`` -- the gap until the kind needs another container (the ~2 s before a
+    worker takes its next shard costs 2 s, not a whole window), or the whole window when no call
+    comes in time. A container still idle at ``now`` is charged its whole remaining window at
+    once (committed: Modal bills it unless a call arrives). A container never starts before
+    its call is spawned and the
     orchestrator sees a call end only after it ended, so this over- rather than under-counts the
     containers of the calls it knows (it cannot see orphan calls; receipts and billing can).
 
@@ -373,21 +378,33 @@ def calls_cost(calls: Iterable[CallRecord], settings: RunSettings, rates: Rates,
         pool = settings.pools[kind]  # type: ignore[index]
         mi = max(pool.max_inputs, 1)
         per_s = pool_rate(rates, settings, kind)
-        ev.sort(key=lambda e: (e[0], -e[1]))  # starts before ends at the same instant
-        ev.append((now, 0))
-        n = 0
-        last = ev[0][0]
-        kind_drains = tuple((drains or {}).get(kind, ()))
+        # one step per instant: a call ending as the next one starts hands it its container
+        steps: dict[float, int] = {}
         for t, d in ev:
+            steps[t] = steps.get(t, 0) + d
+        steps.setdefault(now, 0)
+        n = 0
+        last = min(steps)
+        kind_drains = tuple((drains or {}).get(kind, ()))
+        idle: list[tuple[float, float]] = []  # (idle since, scaledown at), most recent last
+        for t in sorted(steps):
             containers = max(math.ceil(n / mi), warm)
             total += (t - last) * containers * per_s
-            n += d
+            expired = [c for c in idle if c[1] <= t]  # scaled down before t: whole tail
+            total += sum(end - t0 for t0, end in expired) * per_s
+            idle = [c for c in idle if c[1] > t]
+            n += steps[t]
             after = max(math.ceil(n / mi), warm)
-            if after < containers:
+            if after < containers:  # containers going idle: billed until reused or scaled down
                 tail = (idle_tail_s(t, scaledown_s, kind_drains, drained_s) if kind_drains
                         else scaledown_s)
-                total += (containers - after) * tail * per_s
+                idle.extend([(t, t + tail)] * (containers - after))
+            elif after > containers:  # the new calls land on idle (warm) containers first
+                for _ in range(min(after - containers, len(idle))):
+                    t0, _end = idle.pop()
+                    total += (t - t0) * per_s  # gap < scaledown window: only the gap
             last = t
+        total += sum(end - t0 for t0, end in idle) * per_s  # still idle at now: whole tail
     for kind, (t0, t1) in (prewarms or {}).items():
         if kind in settings.pools:
             end = now if t1 is None else min(t1, now)
