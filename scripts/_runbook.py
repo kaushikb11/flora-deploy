@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -32,8 +32,10 @@ HEARTBEAT_S = 30.0
 CLIENT_SLACK_S = 240  # per app: client timeout margin, then cancel + app stop
 # A state from before the cap override was scoped to a plan: the plan it was set on.
 LEGACY_CAP_PLAN = "balanced-only"
-# ``--max-parallel``'s default: at most this many steps run at once (the GPU pool cap the plans
-# are sized to: the certified plan's widest point, (b)'s H200 beside (d)'s L40S + H100, is 3).
+# ``--max-parallel``'s default: at most this many steps run at once. It counts steps, not GPUs:
+# the certified plan's three independent steps (b), (f) and (d) hold 4 GPUs at once, (b)'s and
+# (f)'s H200 (one app each) beside (d)'s L40S + H100. GPUs are capped across apps by
+# ``gpu_caps`` (``wave_h.py --max-gpus``), not by this.
 DEFAULT_MAX_PARALLEL = 3
 
 
@@ -244,20 +246,20 @@ class State:
                 "plan": self.plan, "billed_through": self.billed_through,
                 "cap_override_by": self.cap_override_by,
                 "cap_override_at": self.cap_override_at,
-                "steps": {k: asdict(v) for k, v in self.steps.items()}}
+                "steps": {k: _step_json(v) for k, v in self.steps.items()}}
 
     @classmethod
     def from_json(cls, d: Mapping[str, Any]) -> State:
         steps = {}
         for k, v in d.get("steps", {}).items():
             v = dict(v)
-            atts = [Attempt(**a) for a in v.pop("attempts", [])]
+            atts = [Attempt(**_known(Attempt, a)) for a in v.pop("attempts", [])]
             legacy = float(v.pop("tracked_usd", 0.0) or 0.0)  # pre-attempts state files
             started, finished = v.pop("started", None), v.pop("finished", None)
             if legacy and not atts:
                 atts = [Attempt(started=started or 0.0, finished=finished, tracked_usd=legacy,
                                 status=v.get("status", "failed"))]
-            steps[k] = StepState(**{**v, "attempts": atts})
+            steps[k] = StepState(**{**_known(StepState, v), "attempts": atts})
         return cls(d["run_id"], d["created"], d["billing_since"],
                    dict(d.get("billing_baseline", {})), steps, d.get("billed_total"),
                    d.get("billed_at"), d.get("cap_override"), d.get("cap_override_plan"),
@@ -295,6 +297,28 @@ class State:
             if s.status == "running" and (hit or stale_before is None):
                 s.status = "failed"
         return sorted(set(apps))
+
+
+# Attempt fields added after state files were already in use: left out of the JSON while unset,
+# so a state a sequential run writes stays loadable by code from before them (review 15 M2;
+# that code builds ``Attempt(**a)`` and fails on any key it does not know).
+_OMIT_UNSET = ("reserved_usd",)
+
+
+def _step_json(s: StepState) -> dict[str, Any]:
+    d = asdict(s)
+    for a in d["attempts"]:
+        for k in _OMIT_UNSET:
+            if a.get(k) is None:
+                a.pop(k, None)
+    return d
+
+
+def _known(cls: type, d: Mapping[str, Any]) -> dict[str, Any]:
+    """``d`` without the keys ``cls`` has no field for: a state written by newer code loads
+    (its extra fields dropped) instead of failing on an unexpected keyword."""
+    names = {f.name for f in fields(cls)}
+    return {k: v for k, v in d.items() if k in names}
 
 
 def new_state() -> State:
@@ -829,7 +853,9 @@ def run_steps(st: State, steps: Iterable[str], *, state_path: Path, ctx: Any,
               keep_going: Callable[[str], bool] | None = None,
               out: Callable[[str], None] = print,
               deps: Mapping[str, Sequence[str]] | None = None,
-              max_parallel: int = 1) -> int:
+              max_parallel: int = 1,
+              gpus: Mapping[str, Mapping[str, int]] | None = None,
+              gpu_caps: Mapping[str, int] | None = None) -> int:
     """Run ``steps`` in order, each under the same rules: skip a done step (``skip`` says why
     another is skipped), re-read billing (``refresh``), take :func:`decide`'s verdict (a stop
     or wait ends the run, exit 3), start an attempt with the decision's budget and a heartbeat,
@@ -839,7 +865,8 @@ def run_steps(st: State, steps: Iterable[str], *, state_path: Path, ctx: Any,
     ``keep_going``: steps whose failure does not end the run. Returns the exit code.
 
     ``max_parallel`` > 1 runs independent steps at once (:func:`run_parallel`, ``deps``: the
-    steps each one needs done first). 1 (the default) is the sequential loop below, unchanged.
+    steps each one needs done first; ``gpus`` / ``gpu_caps``: :func:`gpu_wait`). 1 (the
+    default) is the sequential loop below, unchanged.
     """
     if max_parallel > 1:
         return run_parallel(st, steps, state_path=state_path, ctx=ctx, run=run,
@@ -847,7 +874,7 @@ def run_steps(st: State, steps: Iterable[str], *, state_path: Path, ctx: Any,
                             refresh=refresh, skip=skip, refuse=refuse, attempt_kw=attempt_kw,
                             status_of=status_of, on_error=on_error, after=after,
                             keep_going=keep_going, out=out, deps=deps or {},
-                            max_parallel=max_parallel)
+                            max_parallel=max_parallel, gpus=gpus, gpu_caps=gpu_caps)
     rc = 0
     for name in steps:
         s = st.step(name)
@@ -959,6 +986,27 @@ def deps_within(name: str, deps: Mapping[str, Sequence[str]], selected: Iterable
     return [d for d in deps.get(name, ()) if d in sel]
 
 
+def gpu_wait(name: str, running: Iterable[str], gpus: Mapping[str, Mapping[str, int]],
+             caps: Mapping[str, int]) -> str | None:
+    """Why ``name`` must wait for a running step to free GPUs, or None if it fits.
+
+    ``gpus``: per step, the GPUs it holds at once, by type (``{"H200": 1}``). ``caps``: the
+    most held at once across every running step's apps, per type, and ``"total"`` over all
+    types. (A Modal app's ``max_gpus`` caps that app only; nothing else caps GPUs across apps.)
+    With nothing running a step always fits: waiting would never end."""
+    need, running = gpus.get(name) or {}, list(running)
+    if not need or not running:
+        return None
+    held: dict[str, int] = {}
+    for n in running:
+        for t, k in (gpus.get(n) or {}).items():
+            held[t] = held.get(t, 0) + k
+    use = {**{t: held.get(t, 0) + k for t, k in need.items()},
+           "total": sum(held.values()) + sum(need.values())}
+    over = [f"{t} {use[t]} > {caps[t]}" for t in sorted(use) if t in caps and use[t] > caps[t]]
+    return f"GPU cap ({', '.join(over)})" if over else None
+
+
 def run_parallel(st: State, steps: Iterable[str], *, state_path: Path, ctx: Any,
                  run: Callable[[str, Any], Mapping[str, Any]],
                  projection: Callable[[str], Any], decide: Callable[[str, Any], Decision],
@@ -974,7 +1022,9 @@ def run_parallel(st: State, steps: Iterable[str], *, state_path: Path, ctx: Any,
                  keep_going: Callable[[str], bool] | None = None,
                  out: Callable[[str], None] = print,
                  deps: Mapping[str, Sequence[str]] | None = None,
-                 max_parallel: int = DEFAULT_MAX_PARALLEL) -> int:
+                 max_parallel: int = DEFAULT_MAX_PARALLEL,
+                 gpus: Mapping[str, Mapping[str, int]] | None = None,
+                 gpu_caps: Mapping[str, int] | None = None) -> int:
     """:func:`run_steps` with up to ``max_parallel`` steps at once, each in its own thread
     with its own copy of ``ctx`` (``ctx.step`` its name), heartbeat and ``[<step>]`` log
     prefix. A step starts once every step it needs (``deps``) is done or skipped, in plan
@@ -984,7 +1034,10 @@ def run_parallel(st: State, steps: Iterable[str], *, state_path: Path, ctx: Any,
     end and is decided again; refused with none running, it stops the run (exit 3), as
     sequentially. What ends a sequential run (a stop rule, a refusal, ``after``, a failure not
     in ``keep_going``) starts no further step here; the running ones finish and are recorded.
-    A step whose dependency failed or stopped is not started. Returns the exit code."""
+    A step whose dependency failed or stopped is not started. ``gpus`` / ``gpu_caps``: a step
+    that would take the running steps over a GPU cap (:func:`gpu_wait`) waits for one of them
+    to end, and a later independent step may start meanwhile; with none running it starts (its
+    own app's ``max_gpus`` bounds it). Returns the exit code."""
     deps = deps or {}
     order = list(steps)
     for name in order:  # every StepState exists before a thread reads the state
@@ -996,6 +1049,7 @@ def run_parallel(st: State, steps: Iterable[str], *, state_path: Path, ctx: Any,
     codes: dict[str, int] = {}
     finished: queue.Queue[str] = queue.Queue()
     waiting: set[str] = set()
+    gpu_waiting: set[str] = set()
     rc, halted = 0, False
     log = StepLog(sys.stdout)
 
@@ -1086,8 +1140,16 @@ def run_parallel(st: State, steps: Iterable[str], *, state_path: Path, ctx: Any,
                         out(f"blocked {name}: needs " + ", ".join(
                             f"{d} ({ended[d]})" for d in bad))
                         continue
-                    if all(d in resolved for d in need):
-                        start(name)
+                    if not all(d in resolved for d in need):
+                        continue
+                    if gpus and gpu_caps and (
+                            why := gpu_wait(name, running, gpus, gpu_caps)):
+                        if name not in gpu_waiting:
+                            gpu_waiting.add(name)
+                            out(f"wait {name}: {why} (started when {', '.join(running)} "
+                                "ends)")
+                        continue
+                    start(name)
             st.queued = set(pending)
             if not running:
                 break

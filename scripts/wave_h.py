@@ -43,7 +43,10 @@ global cap``), and its in-step deadlines use that reservation alone; on finish t
 reservation becomes its tracked, then billed, spend. A step refused only while others run
 waits for one to end. ``--max-parallel 1`` is the sequential run, unchanged. (e) certifies the
 finished steps' jobs only (:func:`finished_view`). The dry run prints the expected wall-clock
-both ways; ``--status`` the running steps and their reservations.
+both ways; ``--status`` the running steps and their reservations. ``--max-parallel`` counts
+steps, not GPUs: b, f and d hold **4 GPUs** at once, 2 of them H200 (:data:`CERT_GPUS`);
+``--max-gpus`` caps the GPUs held across the running steps' apps (default 4, the peak; e.g.
+``--max-gpus H200=1`` runs f after b).
 
 ``--embodiment`` (``certified`` only; default ``human``) picks the certified plan's embodiment
 (:data:`CERT_SPECS`): ``yam`` runs the same steps on golden/v3-yam (12 three-view episodes,
@@ -201,6 +204,26 @@ PLANS: dict[str, tuple[str, ...]] = {
 CERT_DEPS: dict[str, tuple[str, ...]] = {
     "exact_e2e": (), "noise": (), "balanced": (), "lab": ("balanced",),
     "certify": ("exact_e2e", "noise", "balanced", "lab")}
+# The GPUs each certified step holds at once (``--max-gpus``; ``_runbook.gpu_wait``): (b) and
+# (f) one H200 container each (``max_containers: 1``, one app each), (d) its two pools at once
+# (L40S segment + H100 caption, one container each; the cold witness runs after), (d2) one GPU
+# at a time (L40S, then H100), (e) none. With b, f and d at once the peak is 4 GPUs, 2 of them
+# H200. A Modal app's ``max_gpus`` caps that app only, and ``--max-parallel`` counts steps.
+CERT_GPUS: dict[str, dict[str, int]] = {
+    "exact_e2e": {"H200": 1}, "noise": {"H200": 1}, "balanced": {"L40S": 1, "H100": 1},
+    "lab": {"L40S": 1}, "certify": {}}
+DEFAULT_MAX_GPUS = 4  # the certified plan's peak: the default never holds a step back
+
+
+def parse_gpu_caps(specs: Sequence[str] | None) -> dict[str, int]:
+    """``--max-gpus`` values (``N`` for the total, ``TYPE=N`` per GPU type) -> caps."""
+    caps = {"total": DEFAULT_MAX_GPUS}
+    for spec in specs or ():
+        kind, _, n = spec.rpartition("=")
+        if not n.isdigit() or int(n) < 1:
+            raise ValueError(f"--max-gpus {spec!r}: want N or TYPE=N with N >= 1")
+        caps[kind.strip() or "total"] = int(n)
+    return caps
 
 
 def plan_deps(plan: str) -> dict[str, tuple[str, ...]]:
@@ -2812,12 +2835,24 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--work", type=Path, default=None)
     ap.add_argument("--max-parallel", type=int, default=rb.DEFAULT_MAX_PARALLEL, metavar="N",
                     help="certified: run up to N independent steps at once (default "
-                         f"{rb.DEFAULT_MAX_PARALLEL}: the GPU pool cap; b and d at once, f after "
-                         "b, d2 after d, e last); each reserves its budget against the global "
-                         "cap while it runs. 1: one after the other, as before")
+                         f"{rb.DEFAULT_MAX_PARALLEL}: b, f and d at once, d2 after d, e last); "
+                         "each reserves its budget against the global cap while it runs. It "
+                         "counts steps, not GPUs: b, f and d hold 4 GPUs at once (2x H200, "
+                         "L40S, H100); see --max-gpus. 1: one after the other, as before")
+    ap.add_argument("--max-gpus", action="append", metavar="N|TYPE=N", default=None,
+                    help="certified, with --max-parallel > 1: the most GPUs held at once across "
+                         f"every running step's apps (default {DEFAULT_MAX_GPUS}, the peak); "
+                         "TYPE=N caps one GPU type, e.g. --max-gpus H200=1 runs f after b (for "
+                         "a workspace that would queue a second H200, which eats into f's "
+                         "in-step deadline). A step that does not fit waits for one to end. "
+                         "Repeatable")
     args = ap.parse_args(argv)
     if args.max_parallel < 1:
         ap.error("--max-parallel must be at least 1")
+    try:
+        args.gpu_caps = parse_gpu_caps(args.max_gpus)
+    except ValueError as e:
+        ap.error(str(e))
     try:
         spec = spec_for(args.plan, args.embodiment)
     except KeyError:
@@ -2938,7 +2973,8 @@ def main(argv: list[str] | None = None) -> int:
         status_of=lambda res: ("done" if res.get("ok") else
                                "needs_pin" if res.get("needs_pin") else "failed"),
         after=after, deps=plan_deps(args.plan),
-        max_parallel=max_parallel_for(args.plan, args.only, args.max_parallel))
+        max_parallel=max_parallel_for(args.plan, args.only, args.max_parallel),
+        gpus=CERT_GPUS if args.plan == CERTIFIED else None, gpu_caps=args.gpu_caps)
     save_state(st, args.state)
     report.parent.mkdir(parents=True, exist_ok=True)
     report.write_text(render_report(st, projections, plan=args.plan, spec=spec))

@@ -440,6 +440,16 @@ engine-settings hash was recorded carry no hash, so today's certified run runs (
   wall-clock both ways (offline: 91 min one at a time, 49 min with `--max-parallel 3`; with d2
   already done, 65 and 29 min); `--status` lists the running steps and their reservations.
   `--max-parallel 1` is the sequential run, unchanged.
+- **GPUs at once.** `--max-parallel` counts steps, not GPUs. With b, f and d running, the run
+  holds **4 GPUs: 2x H200** (b and f, one container each, each in its own app) plus d's L40S
+  and H100. Each app's `max_gpus: 4` caps that app only. `--max-gpus` caps the GPUs held
+  across every running step's apps (`wave_h.CERT_GPUS`): `N` for the total (default 4, the
+  peak, so it never holds a step back) or `TYPE=N` for one type. A step that does not fit
+  waits for a running one to end, and a later independent step may start in the meantime.
+  Before a parallel run, confirm the workspace runs two H200s at once. If it would queue the
+  second one, that queue time counts against f's in-step deadline, so pass
+  `--max-gpus H200=1`: f then starts when b ends (d still runs beside b). The dry run's
+  wall-clock estimate does not model `--max-gpus`.
 - **Caps.** Each step's cap is its own upper projection rounded up to $0.05 (`plan_caps`), and
   the global cap is the sum of the upper projections rounded up to $0.10 (`plan_global_cap`).
   Both are derived from the measured rates and printed by the dry run. `--global-cap` can only

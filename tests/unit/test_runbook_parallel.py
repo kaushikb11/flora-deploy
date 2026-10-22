@@ -565,3 +565,155 @@ def test_scale_test_is_one_chain_its_wall_is_its_schedule():
     walls = {n: projs[n].wall_s() for n in st_.STEPS}
     chain = rb.chain(st_.STEPS)
     assert rb.wall_clock(st_.STEPS, chain, walls, 3) == rb.wall_clock(st_.STEPS, chain, walls)
+
+
+# ---------------------------------------------------------------------------------------------
+# State compatibility with the code before ``--max-parallel`` (review 15 M2)
+
+# The Attempt / StepState fields of the runbook before ``--max-parallel`` (e9fdc4e). That code
+# loads a state with ``Attempt(**a)`` and ``StepState(**{**v, "attempts": atts})``.
+OLD_ATTEMPT = ("started", "status", "finished", "heartbeat", "rate_usd_per_s", "budget_usd",
+               "tracked_usd", "apps", "report_error", "notes", "app_ids", "billed_usd",
+               "stopped_at", "slack_s", "hard_timeout_s")
+OLD_STEP = ("status", "projected_usd", "projected_upper_usd", "billed_usd", "attempts", "notes",
+            "result")
+
+
+def _old_load(d: dict) -> dict:
+    """The old ``State.from_json`` step loading, on dataclasses with the old fields only."""
+    import dataclasses
+
+    old_a = dataclasses.make_dataclass(
+        "OldAttempt", [("started", float)] + [(f, object, None) for f in OLD_ATTEMPT[1:]])
+    old_s = dataclasses.make_dataclass("OldStep", [(f, object, None) for f in OLD_STEP])
+    steps = {}
+    for k, v in d["steps"].items():
+        v = dict(v)
+        atts = [old_a(**a) for a in v.pop("attempts", [])]
+        steps[k] = old_s(**{**v, "attempts": atts})
+    return steps
+
+
+def test_the_old_loader_replica_rejects_reserved_usd():
+    # the crash review 15 M2 found, so the replica below is faithful
+    with pytest.raises(TypeError, match="reserved_usd"):
+        _old_load({"steps": {"a": {"attempts": [{"started": 1.0, "reserved_usd": None}]}}})
+
+
+def test_a_sequential_state_loads_in_the_old_code(tmp_path):
+    st = rb.State("r", 0.0, "x")
+    assert _run(st, tmp_path / "s.json", Fake(), max_parallel=1) == 0
+    saved = json.loads((tmp_path / "s.json").read_text())
+    for s in saved["steps"].values():
+        assert set(s) <= set(OLD_STEP)
+        for a in s["attempts"]:
+            assert "reserved_usd" not in a and set(a) <= set(OLD_ATTEMPT)
+    steps = _old_load(saved)
+    assert {n: s.status for n, s in steps.items()} == {n: "done" for n in CERT}
+    # and it round-trips in the new code
+    back = rb.State.from_json(saved)
+    assert back.to_json() == st.to_json()
+    assert all(x.reserved_usd is None for s in back.steps.values() for x in s.attempts)
+
+
+def test_a_parallel_reservation_is_kept_including_zero():
+    st = rb.State("r", 0.0, "x")
+    st.step("a").attempts.append(rb.Attempt(started=1.0, budget_usd=2.0, reserved_usd=2.0))
+    st.step("e").attempts.append(rb.Attempt(started=1.0, budget_usd=0.0, reserved_usd=0.0))
+    d = json.loads(json.dumps(st.to_json()))
+    assert d["steps"]["a"]["attempts"][0]["reserved_usd"] == 2.0
+    assert d["steps"]["e"]["attempts"][0]["reserved_usd"] == 0.0  # a reservation, not unset
+    back = rb.State.from_json(d)
+    assert back.step("a").attempts[0].reserved_usd == 2.0
+    assert back.step("e").attempts[0].reserved_usd == 0.0
+
+
+def test_an_old_state_loads_in_the_new_code():
+    old = {"run_id": "r", "created": 0.0, "billing_since": "x", "billing_baseline": {},
+           "steps": {"exact_e2e": {
+               "status": "done", "projected_usd": 3.0, "projected_upper_usd": 4.0,
+               "billed_usd": None, "notes": [], "result": {"ok": True},
+               "attempts": [{"started": 1.0, "status": "done", "finished": 2.0,
+                             "heartbeat": 2.0, "rate_usd_per_s": 0.001, "budget_usd": 4.2,
+                             "tracked_usd": 1.5, "apps": ["a"], "report_error": False,
+                             "notes": [], "app_ids": ["ap-1"], "billed_usd": None,
+                             "stopped_at": 2.0, "slack_s": None, "hard_timeout_s": None}]}}}
+    st = rb.State.from_json(old)
+    a = st.step("exact_e2e").attempts[0]
+    assert a.reserved_usd is None and a.tracked_usd == 1.5 and a.status == "done"
+    assert st.to_json()["steps"] == old["steps"]  # re-saved unchanged: still old-loadable
+
+
+def test_unknown_keys_from_newer_code_are_ignored():
+    d = {"run_id": "r", "created": 0.0, "billing_since": "x",
+         "steps": {"a": {"status": "done", "from_the_future": 1,
+                         "attempts": [{"started": 1.0, "status": "done", "later_field": "x"}]}}}
+    st = rb.State.from_json(d)
+    assert st.step("a").status == "done" and st.step("a").attempts[0].status == "done"
+
+
+# ---------------------------------------------------------------------------------------------
+# GPUs across apps (review 15 M3): --max-parallel counts steps; --max-gpus caps GPUs
+
+
+def _gpus_held(run, gpus) -> int:
+    return max((sum(sum(gpus[n].values()) for n in active) for _, _, active in run.log),
+               default=0)
+
+
+def test_peak_is_4_gpus_2_h200_and_the_default_cap_holds_nothing_back(tmp_path):
+    caps = wh.parse_gpu_caps(None)
+    assert caps == {"total": 4}
+    b, f, d = (wh.CERT_GPUS[n] for n in ("exact_e2e", "noise", "balanced"))
+    assert sum(sum(x.values()) for x in (b, f, d)) == 4
+    assert b.get("H200", 0) + f.get("H200", 0) == 2
+    run = Fake(gate=("exact_e2e", "noise", "balanced"))  # all three must overlap
+    st = rb.State("r", 0.0, "x")
+    assert _run(st, tmp_path / "s.json", run, gpus=wh.CERT_GPUS, gpu_caps=caps) == 0
+    assert run.peak == 3 and _gpus_held(run, wh.CERT_GPUS) == 4
+
+
+def test_h200_cap_runs_f_after_b_with_d_beside_b(tmp_path):
+    msgs: list[str] = []
+    run = Fake(gate=("exact_e2e", "balanced"))  # b and d must overlap
+    st = rb.State("r", 0.0, "x")
+    rc = _run(st, tmp_path / "s.json", run, out=msgs.append, gpus=wh.CERT_GPUS,
+              gpu_caps=wh.parse_gpu_caps(["H200=1"]))
+    assert rc == 0 and all(st.step(n).status == "done" for n in CERT)
+    assert run.started_after_end("noise", "exact_e2e")
+    assert not any({"exact_e2e", "noise"} <= active for _, _, active in run.log)
+    assert any(m.startswith("wait noise: GPU cap (H200 2 > 1)") for m in msgs), msgs
+    assert sum(m.startswith("wait noise") for m in msgs) == 1  # said once
+
+
+def test_total_gpu_cap_holds_the_running_steps_under_it(tmp_path):
+    run = Fake()
+    st = rb.State("r", 0.0, "x")
+    assert _run(st, tmp_path / "s.json", run, gpus=wh.CERT_GPUS,
+                gpu_caps=wh.parse_gpu_caps(["3"])) == 0
+    assert all(st.step(n).status == "done" for n in CERT)
+    assert _gpus_held(run, wh.CERT_GPUS) <= 3
+
+
+def test_a_step_over_the_cap_alone_still_starts(tmp_path):
+    assert rb.gpu_wait("balanced", [], wh.CERT_GPUS, {"total": 1}) is None
+    run, st = Fake(), rb.State("r", 0.0, "x")
+    assert _run(st, tmp_path / "s.json", run, gpus=wh.CERT_GPUS, gpu_caps={"total": 1}) == 0
+    assert all(st.step(n).status == "done" for n in CERT) and run.peak == 1
+    assert rb.gpu_wait("balanced", ["noise"], wh.CERT_GPUS, {"total": 2}) == (
+        "GPU cap (total 3 > 2)")
+    assert rb.gpu_wait("certify", ["balanced"], wh.CERT_GPUS, {"total": 1}) is None
+
+
+def test_parse_gpu_caps_and_the_help_text(capsys):
+    assert wh.parse_gpu_caps(["H200=1", "5"]) == {"total": 5, "H200": 1}
+    for bad in ("0", "H200=", "x", "H200=-1"):
+        with pytest.raises(ValueError):
+            wh.parse_gpu_caps([bad])
+    with pytest.raises(SystemExit):
+        wh.main(["--help"])
+    text = " ".join(capsys.readouterr().out.split())
+    par = text.split("--max-parallel N")[-1].split("--max-gpus N|TYPE=N")[0]
+    assert "f after b" not in par and "b, f and d at once" in par
+    assert "4 GPUs at once (2x H200, L40S, H100)" in par
+    assert "--max-gpus H200=1 runs f after b" in text
