@@ -11,7 +11,8 @@ The prose of ``docs/costs.md`` is edited by hand; only the blocks between
 ``tests/unit/test_cost_docs.py`` fails when the doc differs from :func:`render`, and
 ``scripts/wave_h_finalize.py`` regenerates it whenever it rewrites ``rates.json``.
 
-Workloads come from ``WorkloadSummary.from_hours`` (1-view episodes of one minute), on the
+Workloads come from ``WorkloadSummary.from_hours`` (1-view episodes of one minute, except the
+``cameras`` block's 3-view rows, priced with ``rates.json`` ``camera_scaling``), on the
 ``balanced`` preset's default pools.
 """
 
@@ -34,6 +35,8 @@ LEVER_SIZES = (0.05, 1.0, 100.0)
 GPU_CAPS = (4, 10)  # `modal.max_gpus` values for the "more GPUs" table (templates: 4)
 GPU_SIZES = (0.5, 10.0, 100.0)
 SMALL_JOB_H, SMALL_JOBS = 0.05, 10  # the batching example: ten small jobs vs one
+CAMERA_SIZES = (1.0, 100.0)  # video-hours of the 1-view vs 3-view table
+CAMERA_LAYOUTS = (1, 3)
 
 # Batch fill (episodes prepared outside the micro-batcher, larger batches) is merged but not
 # measured on a GPU. These busy rates are the cost model's estimate of a filled batch at
@@ -72,7 +75,7 @@ class Priced:
 
 
 def price(video_h: float, stages: tuple[str, ...], *, table=None, max_gpus: int | None = None,
-          assume_warm: bool = False) -> Priced:
+          assume_warm: bool = False, cameras: int = 1) -> Priced:
     """One ``balanced`` job of ``video_h`` hours, as ``flora plan`` prices it. ``max_gpus``
     ``None``: one container per pool (the templates' ``max_containers: 1``)."""
     from flora_deploy.config.presets import get_preset, shard_kinds_for
@@ -91,7 +94,8 @@ def price(video_h: float, stages: tuple[str, ...], *, table=None, max_gpus: int 
     spec = get_preset(PRESET)
     kinds = shard_kinds_for(spec, stages)  # type: ignore[arg-type]
     base = sum(spec.pools[k].gpu_count for k in kinds)
-    req = PlanRequest(workload=WorkloadSummary.from_hours(video_h), stages=stages,  # type: ignore[arg-type]
+    req = PlanRequest(workload=WorkloadSummary.from_hours(video_h, cameras=cameras),
+                      stages=stages,  # type: ignore[arg-type]
                       presets=(PRESET,), max_gpus=max_gpus or base, assume_warm=assume_warm)
     o = build_option(req, table, rates, PRESET, 1)
     busy = startup = idle = 0.0
@@ -290,6 +294,30 @@ def block_batching(table) -> str:
             f"**{usd(one.cost)}** (segment + caption, one container per stage).\n")
 
 
+def block_cameras(table) -> str:
+    """1-view vs 3-view (yam-style) episodes: the 3-view rows use ``camera_scaling``."""
+    head = ["Cameras per episode"] + [f"{size(v)} video-hour{'s' * (v != 1)}, per video-hour"
+                                      for v in CAMERA_SIZES]
+    rows = []
+    for c in CAMERA_LAYOUTS:
+        rows.append([f"{c}"] + [per_h(price(v, SEGCAP, table=table, cameras=c))
+                                for v in CAMERA_SIZES])
+    cs = table.camera_scaling
+    if cs is None:
+        note = "No `camera_scaling` table: 3-view episodes are priced at the 1-view rates."
+    else:
+        f = cs.factors(3)
+        what = ", ".join(f"`{k}` x{f[k]:.2f}" for k in SEGCAP if k in f)
+        state = ("an estimate, not measured on 3-view episodes" if cs.status == "estimate"
+                 else "measured")
+        note = (f"3-view GPU work is the 1-view rate times {what}: {state} ({cs.source}, "
+                f"{cs.date}). Only the share of the work spent generating text grows with the "
+                "longer three-view prompt; decoding and frame preparation are kept at 1x. "
+                "`flora plan` applies the same multipliers and says so.")
+    return (table_md(head, rows) + "\n\nSegment + caption, one container per stage, cold "
+            "starts. " + note + "\n")
+
+
 def block_prices(table) -> str:
     from flora_deploy.config.presets import get_preset
     from flora_deploy.jobs.budget import pinned_rates
@@ -322,6 +350,7 @@ BLOCKS: dict[str, Callable] = {
     "levers": block_levers,
     "gpus": block_gpus,
     "batching": block_batching,
+    "cameras": block_cameras,
     "prices": block_prices,
 }
 

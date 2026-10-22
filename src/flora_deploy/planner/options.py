@@ -5,7 +5,10 @@ Model, per option (one preset at one episode concurrency per container):
 
 * work per shard kind = Σ over workload groups of video seconds × the kind's rate for that
   group's camera count (``rates.json``), in container-seconds; with uncertainty ``u`` the range
-  is ``mid / (1 + u)`` .. ``mid × (1 + u)`` (rates are positive, so the bar is multiplicative);
+  is ``mid / (1 + u)`` .. ``mid × (1 + u)`` (rates are positive, so the bar is multiplicative).
+  A group whose camera layout the rate was not measured on is scaled by ``rates.json``
+  ``camera_scaling`` (``planner.rates.CameraScaling``): each layout is priced on its own, then
+  summed, and the option carries a flag naming the multipliers and the table's status;
 * containers per kind are allocated greedily: start with one each, then repeatedly add one to
   the kind that finishes last, until every kind meets the deadline (or, with no deadline, until
   the GPU cap or the per-kind episode cap stops it). Kinds run in parallel (reward shards do not
@@ -90,6 +93,11 @@ def rates_label(option: PlanOption) -> str:
     """How to present an option's numbers: ``measured`` only when every rate it rests on was
     measured; otherwise ``estimate (<worst status>)``, so placeholder or projected rates are
     never shown as measurements."""
+    cams = f" + camera scaling ({option.camera_scaling})" if option.camera_scaling else ""
+    return _rates_label(option) + cams
+
+
+def _rates_label(option: PlanOption) -> str:
     if option.rate_status != "measured":
         return f"estimate ({option.rate_status})"
     notes = [k.rate_samples for k in option.kinds if k.rate_samples]
@@ -186,6 +194,8 @@ class KindPlan:
     rate_provenance: str
     rate_samples: str = ""  # measured rates: "n=1, ±50%" (planner/rates.json `n`)
     startup_cache: str = "cold"  # "warm": priced with a published compile cache's startup
+    # rates.json camera_scaling applied to this kind: "3-view x2.556" per scaled layout
+    camera_scale: str = ""
 
 
 @dataclass(frozen=True)
@@ -211,6 +221,8 @@ class PlanOption:
     # Uncertified, but the config opted in (``allow_uncertified: true``): runnable, and
     # ``recommended`` ranks it on cost like a certified option.
     uncertified_allowed: bool = False
+    # rates.json ``camera_scaling.status`` when a multi-view group was scaled by it, else "".
+    camera_scaling: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         """``asdict``, with each kind's concurrency labelled as it is deployed (review 8a R7,
@@ -275,6 +287,8 @@ class _Kind:
     samples: str = ""  # "n=1, ±50%" for a measured rate that names its sample count
     startup_cache: str = "cold"
     startup_status: str = "measured"
+    camera_scale: tuple[tuple[int, float], ...] = ()  # (layout, multiplier) applied
+    unscaled: tuple[int, ...] = ()  # multi-view layouts priced at a rate of another layout, 1x
 
     def finish(self, which: int = 1, n: int | None = None) -> float:
         return self.startup[which] + self.work[which] / (n or self.n)
@@ -290,10 +304,17 @@ def _kinds(req: PlanRequest, table: RateTable, rates: Rates, preset: str, conc: 
         worst, prov, used_c = "measured", [], 1
         needs: set[str] = set()
         notes: list[str] = []
-        for g in req.workload.groups:
+        scaled: dict[int, float] = {}
+        unscaled: set[int] = set()
+        for g in req.workload.groups:  # each camera layout priced on its own, then summed
             e = table.rate(preset, kind, g.cameras, conc, features)
             needs.update(e.requires)
-            w = g.video_s * e.container_s_per_video_s
+            f = table.camera_factor(kind, g.cameras, e)
+            if f != 1.0:
+                scaled[g.cameras] = f
+            elif g.cameras > 1 and e.cameras != g.cameras:
+                unscaled.add(g.cameras)
+            w = g.video_s * e.container_s_per_video_s * f
             lo += w / (1 + e.uncertainty)
             mid += w
             hi += w * (1 + e.uncertainty)
@@ -314,7 +335,8 @@ def _kinds(req: PlanRequest, table: RateTable, rates: Rates, preset: str, conc: 
                          rates.pool_per_second(pool), worst, " | ".join(prov),
                          requires=tuple(sorted(needs)), samples="; ".join(notes),
                          startup_cache="warm" if st.compile_cache == "warm" else "cold",
-                         startup_status=st.status))
+                         startup_status=st.status, camera_scale=tuple(sorted(scaled.items())),
+                         unscaled=tuple(sorted(unscaled))))
     return out
 
 
@@ -405,6 +427,21 @@ def build_option(req: PlanRequest, table: RateTable, rates: Rates, preset: str, 
         what = ("placeholder rates (not measured yet)" if worst == "placeholder"
                 else "includes projected (unconfirmed) rates")
         flags.append(f"warning: {what}: {', '.join(unmeasured)}")
+    cam_status = ""
+    if any(k.camera_scale for k in kinds) and table.camera_scaling is not None:
+        cs = table.camera_scaling
+        cam_status = cs.status
+        what = "; ".join(f"{c}-view " + ", ".join(
+            f"{k.kind} x{f:.2f}" for k in kinds for c2, f in k.camera_scale if c2 == c)
+            for c in sorted({c for k in kinds for c, _f in k.camera_scale}))
+        flags.append(f"camera scaling ({cs.status}, {cs.date}): {what}, for the longer "
+                     "multi-view prompts, on rates measured on another layout ("
+                     f"{table.source} camera_scaling; {cs.source})")
+    unscaled = sorted({c for k in kinds for c in k.unscaled})
+    if unscaled:
+        flags.append("no camera scaling for " + ", ".join(f"{c}-view" for c in unscaled)
+                     + f" episodes in {table.source}: priced at rates measured on another "
+                     "layout, likely an underestimate")
     warm = [k for k in kinds if k.startup_cache == "warm"]
     if warm:
         what = "assumed (--assume-warm)" if req.assume_warm else "a published compile cache"
@@ -433,7 +470,8 @@ def build_option(req: PlanRequest, table: RateTable, rates: Rates, preset: str, 
         work_s=round(k.work[1], 3), startup_s=k.startup[1], finish_s=round(k.finish(1), 3),
         cost_usd=round(k.per_s * (k.work[1] + k.n * k.startup[1]), 4), rate_status=k.status,
         rate_provenance=k.provenance, rate_samples=k.samples,
-        startup_cache=k.startup_cache) for k in kinds)
+        startup_cache=k.startup_cache,
+        camera_scale=", ".join(f"{c}-view x{f:g}" for c, f in k.camera_scale)) for k in kinds)
     main_c = max(k.conc for k in kinds)
     suffix = "".join(f" +{f}" for f in missing)
     return PlanOption(
@@ -442,7 +480,7 @@ def build_option(req: PlanRequest, table: RateTable, rates: Rates, preset: str, 
         cost_high_usd=round(c_hi, 2), wall_s=round(wall, 1), wall_high_s=round(wall_hi, 1),
         peak_gpus=peak, certification=cert, status=status, flags=tuple(flags),
         rate_status=worst, requires=missing, unavailable=tuple(unavailable),
-        uncertified_allowed=allowed)
+        uncertified_allowed=allowed, camera_scaling=cam_status)
 
 
 def _gpus_for_deadline(kinds: list[_Kind], deadline_s: float) -> int | None:

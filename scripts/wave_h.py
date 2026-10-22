@@ -313,6 +313,8 @@ SPECS: dict[str, PlanSpec] = {
                         CERT_ROOT / "runbook.md", shared_data=True),
 }
 CERT_YAM_ROOT = ROOT / "reports" / "wave-h" / "certified-yam"
+from flora_deploy.planner.rates import RateTable  # noqa: E402 - camera_scaling, as flora plan
+
 # The certified plan per embodiment (``--embodiment``): each its own golden set, data dir,
 # state, work dir and records, so certified runs never collide and resume independently.
 CERT_SPECS: dict[str, PlanSpec] = {
@@ -321,7 +323,7 @@ CERT_SPECS: dict[str, PlanSpec] = {
                     CERT_YAM_ROOT / "state.json", CERT_YAM_ROOT / "work",
                     CERT_YAM_ROOT / "records", CERT_YAM_ROOT / "runbook.md", shared_data=True,
                     embodiment="yam", data="cert-yam",
-                    rate_scale=tuple(sorted(three_view_scale().items())),
+                    rate_scale=tuple(sorted(RateTable.load().camera_scaling.factors(3).items())),
                     lab_eps=CERT_YAM_EPISODES[:6]),
 }
 # config.schema.Embodiment; the ones without a golden certification set are refused.

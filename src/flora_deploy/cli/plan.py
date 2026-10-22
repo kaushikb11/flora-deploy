@@ -102,8 +102,13 @@ def _print_plan(cfg, workload, req, deadline_s, options, best, rates, table, con
     from flora_deploy.planner.options import rates_label
 
     dl = f", deadline {deadline_s / 3600:.0f} h" if deadline_s else ""
+    layouts: dict[int, float] = {}
+    for g in workload.groups:
+        layouts[g.cameras] = layouts.get(g.cameras, 0.0) + g.video_s
+    views = ("" if set(layouts) <= {1} else " (" + ", ".join(
+        f"{c}-view {s / 3600:,.1f} h" for c, s in sorted(layouts.items())) + ")")
     console.print(f"[bold]{escape(cfg.project)}[/bold]: {workload.video_s / 3600:,.1f} "
-                  f"video-hours, {workload.episodes:,} episodes; budget "
+                  f"video-hours{views}, {workload.episodes:,} episodes; budget "
                   f"{_money(req.budget_usd or 0)}{dl}, max {req.max_gpus} GPUs", soft_wrap=True)
     colour = {"ok": "green", "at risk": "yellow", "infeasible": "red", "unavailable": "red",
               "projection": "yellow"}
