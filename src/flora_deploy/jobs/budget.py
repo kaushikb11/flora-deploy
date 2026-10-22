@@ -607,11 +607,15 @@ def project(*, spent: float, pending: Sequence[Shard], in_flight: Mapping[str, i
             settings: RunSettings, rates: Rates, startup_s: Mapping[str, float] | None = None,
             calibration: Mapping[str, float] | None = None, in_flight_fraction: float = 1.0,
             estimator: ShardEstimator | None = None,
-            live_remaining_usd: Mapping[str, Sequence[float]] | None = None) -> Projection:
+            live_remaining_usd: Mapping[str, Sequence[float]] | None = None,
+            idle_containers: Mapping[str, int] | None = None) -> Projection:
     """Projected job cost. ``pending``: shards without a receipt (in-flight ones included).
     ``in_flight``: active calls per kind (as the orchestrator passes them). ``startup_s``:
     per-kind container startup seconds, charged for the containers still to be started
-    (``max_containers`` minus those in flight) of kinds that still have queued work.
+    (``max_containers`` minus those in flight and those already up, ``idle_containers``) of
+    kinds that still have queued work. ``idle_containers``: per kind, containers that are up
+    but run no live call (a pre-warm container, a warm one inside its scale-down window): the
+    queued work lands on them without a new start.
     ``live_remaining_usd``: per kind, the remaining cost of each live call the gate knows about
     (estimate less what has already run, which is in ``spent``); in-flight calls beyond those
     are charged ``mean estimate × in_flight_fraction``."""
@@ -634,7 +638,8 @@ def project(*, spent: float, pending: Sequence[Shard], in_flight: Mapping[str, i
         n_queued = len(costs) - n_flight
         if n_queued > 0 and startup_s and startup_s.get(kind):
             pool = settings.pools[kind]  # type: ignore[index]
-            running = math.ceil(n_live / max(pool.max_inputs, 1))
+            running = (math.ceil(n_live / max(pool.max_inputs, 1))
+                       + (idle_containers or {}).get(kind, 0))
             new = min(max(pool.max_containers - running, 0),
                       math.ceil(n_queued / max(pool.max_inputs, 1)))
             startup_usd += new * startup_s[kind] * pool_rate(rates, settings, kind)
@@ -672,10 +677,24 @@ class ProjectionBudgetGate:
     That bounds the overspend by one tick of burn, whatever the estimates said.
 
     **Estimates** default to ``planner/rates.json`` (:class:`RateTableEstimator`), the numbers
-    ``flora plan`` uses, and are calibrated online: per kind, the mean of (observed wall time −
-    startup) / (estimate × max_inputs) over finished calls, never below ``calibration``; the
-    startup is subtracted only from calls that needed a new container (no earlier call of the
-    kind ended within ``scaledown_s`` before the spawn)."""
+    ``flora plan`` uses, and are calibrated online (:meth:`effective_calibration`): per kind,
+    Σ observed work / Σ (estimate × max_inputs) over finished calls (weighted by estimate, so a
+    tiny shard cannot dominate), never below ``calibration``. A call's work starts at its
+    attempt marker (``jobs.attempts``: written when the container begins the shard, after
+    ``@enter``), so whatever the container's startup really took is never counted as work; a
+    call without a visible marker falls back to wall time less the startup, subtracted only
+    when it needed a new container (no earlier call of the kind ended within ``scaledown_s``
+    before the spawn, and it was not the first call onto a pre-warm container). Until a kind
+    has ``calibration_min_work_s`` of observed work, the shortfall counts as work at the
+    table's own rate (1.0x): a first 19-second shard that ran 2.5x moves the multiplier to
+    ~1.3x, not 2.5x (and could never reach the 16x the table-startup rule learned on
+    2026-10-22, scale-lite-102223538c21).
+
+    **Startup** (:meth:`startup_seconds`): per kind, the mean *observed* startup of its
+    containers (a container's first attempt marker less its call's spawn), else the table's.
+    Containers that are up and idle (a live pre-warm container, a warm one inside its
+    scale-down window) are not charged a new start; a pre-warm still starting is charged only
+    its remaining startup."""
 
     settings: RunSettings
     store: Store
@@ -703,6 +722,9 @@ class ProjectionBudgetGate:
     orchestrator_memory_gib: float = 0.0
     orchestrator_preemptible: bool = ORCHESTRATOR_PREEMPTIBLE
     learn_calibration: bool = True
+    # observed work a kind needs before its learned multiplier applies in full (the shortfall
+    # counts at 1.0x; see the class docstring)
+    calibration_min_work_s: float = 120.0
     billing_error: str | None = field(default=None, init=False)
     last_overspend: dict[str, Any] = field(default_factory=dict, init=False)
     _cache_at: float = field(default=-math.inf, init=False, repr=False)
@@ -713,6 +735,12 @@ class ProjectionBudgetGate:
     _state: BudgetState | None = field(default=None, init=False, repr=False)
     _billing_at: float = field(default=-math.inf, init=False, repr=False)
     _billing_usd: float | None = field(default=None, init=False, repr=False)
+    _tick: int = field(default=0, init=False, repr=False)
+    # call id -> (marker start, container id) of an ended call (final once found)
+    _markers: dict[str, tuple[float, str]] = field(default_factory=dict, init=False, repr=False)
+    # call id -> (tick, marker or None): a live call's lookup, or a miss, re-read once per tick
+    _marker_tick: dict[str, tuple[int, tuple[float, str] | None]] = field(
+        default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.safety_margin < 1.0:
@@ -731,6 +759,7 @@ class ProjectionBudgetGate:
         """Start of a tick: drop cached listings so this tick re-reads the store (call it after
         the store's own ``refresh()``). Receipts already known stay known."""
         self._cache_at = -math.inf
+        self._tick += 1
 
     def _refresh(self, now: float) -> None:
         if now - self._cache_at < self.refresh_s:
@@ -784,21 +813,105 @@ class ProjectionBudgetGate:
         return self.estimator.container_seconds(shard, self.settings.pools[shard.kind])
 
     def _startup(self, kind: str) -> float:
+        """The table's (or the configured) startup of ``kind``."""
         if self.startup_s is not None:
             return float(self.startup_s.get(kind, 0.0))
         assert self.estimator is not None
         return self.estimator.startup_s(kind)
 
+    # attempt markers: observed startup and work start ---------------------------------------
+    def _stage_map(self) -> dict[str, str]:
+        sh = self.stage_hashes() if callable(self.stage_hashes) else self.stage_hashes
+        return dict(sh if sh is not None else self.settings.stage_hashes)
+
+    def _read_marker(self, c: CallRecord) -> tuple[float, str] | None:
+        """``(started, container id)`` of the newest attempt marker of call ``c`` (by its
+        ``call_id``; a marker without one counts when it started inside the call's interval),
+        or ``None`` when none is visible or the store cannot be read."""
+        cfg = self.settings.config_hash
+        paths = JobPaths(self.settings.job_id, config_hash=cfg, stage_hashes=self._stage_map())
+        prefix = paths.attempt(cfg, c.kind, c.shard_id, "x")[:-len("x.json")]
+        try:
+            names = sorted(p for p in self.store.list(prefix) if p.endswith(".json"))
+        except Exception:  # listing failure: the table startup this tick
+            return None
+        end = c.ended_at if c.ended_at is not None else math.inf
+        best: tuple[float, str] | None = None
+        for p in names:
+            try:
+                doc = json.loads(self.store.get_bytes(p))
+                t = parse_utc(str(doc["started_utc"]))
+            except Exception:  # half-written or foreign file: not a marker we can use
+                continue
+            cid = doc.get("call_id") or ""
+            if cid != c.call_id and (cid or not c.spawned_at - 1.0 <= t <= end):
+                continue
+            if best is None or t > best[0]:
+                best = (t, str(doc.get("container_id") or ""))
+        return best
+
+    def _marker(self, c: CallRecord) -> tuple[float, str] | None:
+        hit = self._markers.get(c.call_id)
+        if hit is not None:
+            return hit
+        seen = self._marker_tick.get(c.call_id)
+        if seen is not None and seen[0] == self._tick:
+            return seen[1]
+        m = self._read_marker(c)
+        if m is not None and c.ended_at is not None:
+            self._markers[c.call_id] = m  # an ended call's marker is final
+            self._marker_tick.pop(c.call_id, None)
+        else:
+            self._marker_tick[c.call_id] = (self._tick, m)
+        return m
+
+    def _prewarm_call(self, kind: str) -> str | None:
+        """Call id of ``kind``'s first call when it went to a pre-warm container (pre-warms are
+        started only for kinds with no call yet, ``jobs.pools``)."""
+        if self._state is None or kind not in self._state.prewarms:
+            return None
+        p0 = self._state.prewarms[kind][0]
+        mine = [c for c in self._state.calls if c.kind == kind]
+        if not mine:
+            return None
+        first = min(mine, key=lambda c: (c.spawned_at, c.call_id))
+        return first.call_id if first.spawned_at >= p0 else None
+
+    def observed_startups(self) -> dict[str, list[float]]:
+        """Per kind, the observed startup of each container seen: its first attempt marker less
+        the spawn of the call that marker belongs to (queueing included), except a pre-warm
+        container's (its call was spawned onto a container that was already starting)."""
+        if self._state is None:
+            return {}
+        first: dict[str, tuple[float, CallRecord]] = {}
+        for c in self._state.calls:
+            m = self._marker(c)
+            if m is None or not m[1]:
+                continue
+            if m[1] not in first or m[0] < first[m[1]][0]:
+                first[m[1]] = (m[0], c)
+        out: dict[str, list[float]] = {}
+        for t, c in first.values():
+            if c.call_id == self._prewarm_call(c.kind):
+                continue
+            out.setdefault(c.kind, []).append(max(t - c.spawned_at, 0.0))
+        return out
+
+    def startup_seconds(self, kind: str, observed: Mapping[str, Sequence[float]] | None = None
+                        ) -> float:
+        """``kind``'s container startup: the mean observed one, else the table's."""
+        obs = (self.observed_startups() if observed is None else observed).get(kind)
+        return sum(obs) / len(obs) if obs else self._startup(kind)
+
     def effective_calibration(self) -> dict[str, float]:
+        """Per kind: max(``calibration``, (Σwork + pad) / (Σestimate + pad)) over finished calls,
+        ``pad = max(calibration_min_work_s − Σwork, 0)`` (class docstring)."""
         cal = dict(self.calibration)
         if not self.learn_calibration or self._state is None:
             return cal
         by_id = self._shard_map()
-        ratios: dict[str, list[float]] = {}
-        # Review 5 M-C / review 4 M5: startup is paid once per container, not per call. A call
-        # spawned when an earlier call of its kind had ended within ``scaledown_s`` ran on that
-        # warm container: its wall time is all work. Only the other ("cold") calls have the
-        # startup subtracted (subtracting it from every call under-calibrates long jobs).
+        work_sum: dict[str, float] = {}
+        est_sum: dict[str, float] = {}
         ended: dict[str, list[float]] = {}
         for c in self._state.calls:
             if c.ended_at is not None:
@@ -810,36 +923,96 @@ class ProjectionBudgetGate:
             est = self._cs(s) * max(self.settings.pools[s.kind].max_inputs, 1)
             if est <= 0:
                 continue
-            warm = any(c.spawned_at - self.scaledown_s <= t <= c.spawned_at
-                       for t in ended.get(c.kind, ()))
-            if not warm and self.settings.pools[s.kind].max_inputs > 1:
-                # review 6 B3: a sibling still running at spawn time has a container with
-                # free input slots; assume the call landed there (errs high, never optimistic)
-                warm = any(o is not c and o.kind == c.kind and o.spawned_at < c.spawned_at
-                           and (o.ended_at is None or o.ended_at >= c.spawned_at)
-                           for o in self._state.calls)
-            startup = 0.0 if warm else self._startup(s.kind)
-            work = max(c.ended_at - c.spawned_at - startup, 0.0)
-            ratios.setdefault(s.kind, []).append(work / est)
-        for kind, rs in ratios.items():
-            cal[kind] = max(cal.get(kind, 1.0), sum(rs) / len(rs))
+            m = self._marker(c)
+            if m is not None and m[0] <= c.ended_at:
+                work = c.ended_at - max(m[0], c.spawned_at)  # the container's startup excluded
+            else:
+                # No marker. Review 5 M-C / review 4 M5: startup is paid once per container,
+                # not per call. A call spawned when an earlier call of its kind had ended within
+                # ``scaledown_s`` ran on that warm container: its wall time is all work. Only
+                # the other ("cold") calls have the startup subtracted.
+                warm = any(c.spawned_at - self.scaledown_s <= t <= c.spawned_at
+                           for t in ended.get(c.kind, ()))
+                if not warm and self.settings.pools[s.kind].max_inputs > 1:
+                    # review 6 B3: a sibling still running at spawn time has a container with
+                    # free input slots; assume the call landed there (errs high)
+                    warm = any(o is not c and o.kind == c.kind and o.spawned_at < c.spawned_at
+                               and (o.ended_at is None or o.ended_at >= c.spawned_at)
+                               for o in self._state.calls)
+                if not warm and c.call_id == self._prewarm_call(c.kind):
+                    p0 = self._state.prewarms[c.kind][0]  # its startup began before the spawn
+                    startup = max(p0 + self._startup(s.kind) - c.spawned_at, 0.0)
+                else:
+                    startup = 0.0 if warm else self._startup(s.kind)
+                work = c.ended_at - c.spawned_at - startup
+            work_sum[s.kind] = work_sum.get(s.kind, 0.0) + max(work, 0.0)
+            est_sum[s.kind] = est_sum.get(s.kind, 0.0) + est
+        for kind, w in work_sum.items():
+            pad = max(self.calibration_min_work_s - w, 0.0)
+            cal[kind] = max(cal.get(kind, 1.0), (w + pad) / (est_sum[kind] + pad))
         return cal
 
     def _remaining(self, now: float, cal: Mapping[str, float]) -> dict[str, float]:
-        """call_id -> remaining $ of each live call (estimate less elapsed, never negative)."""
+        """call_id -> remaining $ of each live call (estimate less elapsed, never negative).
+        A call whose attempt marker is visible started its work at the marker; one without
+        still has the rest of its container's startup ahead (:meth:`startup_seconds`)."""
         if self._state is None:
             return {}
         by_id = self._shard_map()
+        observed = self.observed_startups()
         out: dict[str, float] = {}
         for c in self._state.live():
             pool = self.settings.pools[c.kind]  # type: ignore[index]
             mi = max(pool.max_inputs, 1)
             s = by_id.get(c.shard_id)
             est_cs = self._cs(s) * cal.get(c.kind, 1.0) if s else 0.0
-            wall = self._startup(c.kind) + est_cs * mi
-            left = max(wall - (now - c.spawned_at), 0.0)
+            m = self._marker(c)
+            if m is not None:
+                left = max(est_cs * mi - (now - max(m[0], c.spawned_at)), 0.0)
+            else:
+                startup = self.startup_seconds(c.kind, observed)
+                if c.call_id == self._prewarm_call(c.kind):
+                    startup = max(self._state.prewarms[c.kind][0] + startup - c.spawned_at,
+                                  0.0)
+                left = max(startup + est_cs * mi - (now - c.spawned_at), 0.0)
             out[c.call_id] = left / mi * pool_rate(self.rates, self.settings, c.kind)
         return out
+
+    def _idle_containers(self, now: float, observed: Mapping[str, Sequence[float]]
+                         ) -> tuple[dict[str, int], float]:
+        """Per kind, containers that are up but run no live call, and the $ of the startup
+        still ahead of pre-warm containers that are not ready yet. Up: a live pre-warm
+        (``BudgetState.prewarms`` without an end) and, from attempt markers, a container whose
+        last call ended inside its idle tail (``scaledown_s``, cut short by a drain) and that
+        runs no live call now."""
+        idle: dict[str, int] = {}
+        starting_usd = 0.0
+        if self._state is None:
+            return idle, starting_usd
+        for kind, (p0, p1) in self._state.prewarms.items():
+            if p1 is None and kind in self.settings.pools:
+                idle[kind] = idle.get(kind, 0) + 1
+                left = max(p0 + self.startup_seconds(kind, observed) - now, 0.0)
+                starting_usd += left * pool_rate(self.rates, self.settings, kind)
+        busy: set[str] = set()
+        last_end: dict[str, tuple[float, str]] = {}  # container -> (last end, kind)
+        for c in self._state.calls:
+            m = self._marker(c)
+            if m is None or not m[1]:
+                continue
+            if c.ended_at is None:
+                busy.add(m[1])
+            elif m[1] not in last_end or c.ended_at > last_end[m[1]][0]:
+                last_end[m[1]] = (c.ended_at, c.kind)
+        for container, (t, kind) in last_end.items():
+            if container in busy:
+                continue
+            drains = tuple(self._state.drains.get(kind, ()))
+            tail = (idle_tail_s(t, self.scaledown_s, drains, DRAINED_SCALEDOWN_S) if drains
+                    else self.scaledown_s)
+            if now < t + tail:
+                idle[kind] = idle.get(kind, 0) + 1
+        return idle, starting_usd
 
     def burn_per_s(self) -> float:
         """$/s the live calls are burning now (``ceil(calls / max_inputs)`` containers/kind)."""
@@ -890,12 +1063,15 @@ class ProjectionBudgetGate:
             rem = self._remaining(now, cal)
             for c in self._state.live():
                 remaining.setdefault(c.kind, []).append(rem[c.call_id])
-        startup = self.startup_s if self.startup_s is not None else {
-            k: self._startup(k) for k in {s.kind for s in pending}}
-        return project(spent=spent, pending=pending, in_flight=in_flight, settings=self.settings,
-                       rates=self.rates, startup_s=startup, calibration=cal,
-                       in_flight_fraction=self.in_flight_fraction, estimator=self.estimator,
-                       live_remaining_usd=remaining)
+        observed = self.observed_startups()
+        kinds = {s.kind for s in pending} | set(self.startup_s or {})
+        startup = {k: self.startup_seconds(k, observed) for k in kinds}
+        idle, starting_usd = self._idle_containers(now, observed)
+        p = project(spent=spent, pending=pending, in_flight=in_flight, settings=self.settings,
+                    rates=self.rates, startup_s=startup, calibration=cal,
+                    in_flight_fraction=self.in_flight_fraction, estimator=self.estimator,
+                    live_remaining_usd=remaining, idle_containers=idle)
+        return replace(p, startup_usd=p.startup_usd + starting_usd)
 
     def admit(self, shard: Shard, in_flight: Mapping[str, int]) -> BudgetDecision:
         p = self.projection(in_flight)
