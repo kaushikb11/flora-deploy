@@ -42,8 +42,9 @@ def fill_tree(local: Path, extra: dict[str, bytes] | None = None) -> None:
         p.write_bytes(data)
 
 
-def published_cache(tmp_path, key=None):
-    """A Volume (``vol``) holding one publish of ``key``, made by :func:`cc.publish`."""
+def published_cache(tmp_path, key=None, *, archive=True):
+    """A Volume (``vol``) holding one publish of ``key``, made by :func:`cc.publish`.
+    ``archive=False``: its manifest as a publisher before the archive wrote it (files only)."""
     key = key or seg_key()
     src = tmp_path / "src"
     fill_tree(src)
@@ -51,7 +52,16 @@ def published_cache(tmp_path, key=None):
     res = cc.publish(key, src, cc.DirSink(vol), cc.FileLeases(tmp_path / "leases"),
                      holder="ta-1", runtime=RUNTIME, log=lambda m: None)
     assert res["published"], res
+    if not archive:
+        _files_only(vol, key)
     return key, vol, res
+
+
+def _files_only(vol, key):
+    p = vol / cc.ROOT / key.name / cc.MANIFEST
+    m = json.loads(p.read_text())
+    m.pop("archive")
+    p.write_text(json.dumps(m))
 
 
 # --- key ------------------------------------------------------------------------------------
@@ -261,22 +271,80 @@ def _garbage_manifest(vol, key):
     (vol / cc.ROOT / key.name / cc.MANIFEST).write_text('{"schema": "flora-compile-ca')
 
 
-@pytest.mark.parametrize("damage,why", [
-    (_corrupt_byte, "sha256"),
-    (_truncate, "bytes"),
-    (_delete_file, "FileNotFoundError"),
-    (_garbage_manifest, "not JSON"),
-    (_edit_manifest(schema="other/v0"), "manifest"),
-    (_edit_manifest(digest="0" * 64), "not 'tempseg"),
-    (_edit_manifest(factors=lambda m: {**m["factors"], "gpu": "H100"}), "factors differ"),
-    (_edit_manifest(runtime=lambda m: {**m["runtime"], "torch": "2.12.0"}), "another runtime"),
-    (_edit_manifest(publish_id="../../etc"), "bad publish id"),
+def _tar(vol, key) -> Path:
+    m = json.loads((vol / cc.ROOT / key.name / cc.MANIFEST).read_text())
+    return vol / cc.ROOT / key.name / m["publish_id"] / cc.ARCHIVE
+
+
+def _corrupt_tar_member(vol, key):
+    p = _tar(vol, key)
+    data = p.read_bytes()
+    i = data.index(b"\x00\x01cubin")
+    p.write_bytes(data[:i] + b"\xff" + data[i + 1:])
+
+
+def _truncate_tar(vol, key):
+    p = _tar(vol, key)
+    p.write_bytes(p.read_bytes()[:700])
+
+
+def _delete_tar(vol, key):
+    _tar(vol, key).unlink()
+
+
+def _rewrite_tar(extra=None, drop=None):
+    """Rebuild the archive with a member added / dropped and the manifest's archive entry
+    updated to match (only the member check can catch it)."""
+    import hashlib
+    import io
+    import tarfile
+
+    def edit(vol, key):
+        p = _tar(vol, key)
+        with tarfile.open(p) as tf:
+            members = [(ti, tf.extractfile(ti).read()) for ti in tf if ti.isreg()]
+        members = [(ti, d) for ti, d in members if ti.name != drop]
+        if extra:
+            ti = tarfile.TarInfo(extra)
+            ti.size = 3
+            members.append((ti, b"new"))
+        with tarfile.open(p, "w") as tf:
+            for ti, d in members:
+                tf.addfile(ti, io.BytesIO(d))
+        _edit_manifest(archive=lambda m: {**m["archive"], "size": p.stat().st_size,
+                                          "sha256": hashlib.sha256(p.read_bytes())
+                                          .hexdigest()})(vol, key)
+    return edit
+
+
+# (damage, reason, archive): per-file damage on a files-only manifest (published before the
+# archive), archive damage and manifest edits on a current one
+@pytest.mark.parametrize("damage,why,archive", [
+    (_corrupt_byte, "sha256", False),
+    (_truncate, "bytes", False),
+    (_delete_file, "FileNotFoundError", False),
+    (_corrupt_tar_member, "kernel.cubin", True),
+    (_truncate_tar, "Error", True),
+    (_delete_tar, "FileNotFoundError", True),
+    (_rewrite_tar(extra="triton/K1/extra.bin"), "not in the manifest", True),
+    (_rewrite_tar(drop="xdg/flashinfer/a.so"), "archive lacks 1", True),
+    (_edit_manifest(archive=lambda m: {**m["archive"], "sha256": "0" * 64}), "cache.tar:",
+     True),
+    (_edit_manifest(archive={"path": "../x.tar", "size": 1, "sha256": "0" * 64}),
+     "bad archive entry", True),
+    (_garbage_manifest, "not JSON", True),
+    (_edit_manifest(schema="other/v0"), "manifest", True),
+    (_edit_manifest(digest="0" * 64), "not 'tempseg", True),
+    (_edit_manifest(factors=lambda m: {**m["factors"], "gpu": "H100"}), "factors differ", True),
+    (_edit_manifest(runtime=lambda m: {**m["runtime"], "torch": "2.12.0"}), "another runtime",
+     True),
+    (_edit_manifest(publish_id="../../etc"), "bad publish id", True),
     (_edit_manifest(files=lambda m: {"../escape": {"size": 1, "sha256": "0" * 64}}),
-     "unsafe path"),
-    (_edit_manifest(files={}), "no files"),
+     "unsafe path", True),
+    (_edit_manifest(files={}), "no files", True),
 ])
-def test_bad_cache_falls_back_cold(tmp_path, damage, why):
-    key, vol, _ = published_cache(tmp_path)
+def test_bad_cache_falls_back_cold(tmp_path, damage, why, archive):
+    key, vol, _ = published_cache(tmp_path, archive=archive)
     damage(vol, key)
     local = tmp_path / "local" / key.name
     (local / "vllm").mkdir(parents=True)
@@ -320,15 +388,117 @@ def test_consumers_read_a_read_only_mount(tmp_path):
             d.chmod(0o755)
 
 
-def test_legacy_seed(tmp_path):
+def test_restore_reads_the_archive_or_copies_files_in_parallel(tmp_path):
+    for archive in (True, False):
+        key, vol, _ = published_cache(tmp_path / str(archive), archive=archive)
+        logs: list[str] = []
+        local = tmp_path / f"local-{archive}" / key.name
+        st = cc.seed(key, vol, local, runtime=RUNTIME, log=logs.append)
+        assert st.state == "warm" and st.format == ("archive" if archive else "files")
+        assert st.files == 4 and (local / "triton/K1/kernel.cubin").read_bytes() == \
+            b"\x00\x01cubin"
+        assert st.expected_s is not None and st.as_json()["format"] == st.format
+        # the restore timing is logged: format, files, MB, seconds, expected, limit
+        assert len(logs) == 1 and "restored 4 files" in logs[0] and st.format in logs[0]
+        assert "expected" in logs[0] and "limit 150 s" in logs[0]
+
+
+def test_archive_holds_exactly_the_manifest_files(tmp_path):
+    import tarfile
+
+    key, vol, res = published_cache(tmp_path)
+    m = json.loads((vol / cc.ROOT / key.name / cc.MANIFEST).read_text())
+    tar = vol / cc.ROOT / key.name / res["publish_id"] / cc.ARCHIVE
+    assert m["archive"]["path"] == cc.ARCHIVE and m["archive"]["size"] == tar.stat().st_size
+    with tarfile.open(tar) as tf:
+        assert sorted(ti.name for ti in tf if ti.isreg()) == sorted(m["files"])
+    assert res["archive_bytes"] == tar.stat().st_size
+    assert not list((tmp_path / "src").parent.glob(".*.tar"))  # the local temp tar is gone
+
+
+# 2026-10-22, scale-lite-102223538c21: the published tempseg-L40S cache (files only)
+TONIGHT = {"files": {f"vllm/f{i}": {"size": 322_000_000 // 1932, "sha256": "0" * 64}
+                     for i in range(1932)}}
+
+
+def test_restore_guard_on_tonights_cache(monkeypatch):
+    """1,932 files / 322 MB copied one at a time took ~405 s, more than a cold compile
+    (~290 s). Serially the guard expects ~418 s (> 150 s: compile cold); in parallel ~38 s; as
+    one archive ~13 s."""
+    assert cc.MAX_RESTORE_S == cc.COLD_BUILD_S - cc.WARM_BUILD_S == 150.0
+    assert cc.expected_restore_s(TONIGHT) == pytest.approx(1932 * 0.21 / 16 + 12.88, abs=0.1)
+    archived = {**TONIGHT, "archive": {"path": cc.ARCHIVE, "size": 322_000_000}}
+    assert cc.expected_restore_s(archived) == pytest.approx(12.88, abs=0.01)
+    monkeypatch.setattr(cc, "COPY_WORKERS", 1)
+    assert cc.expected_restore_s(TONIGHT) == pytest.approx(1932 * 0.21 + 12.88, abs=0.1)
+    assert cc.expected_restore_s(TONIGHT) > cc.max_restore_s({})
+    assert cc.max_restore_s({cc.MAX_RESTORE_ENV: "500"}) == 500.0
+    assert cc.max_restore_s({cc.MAX_RESTORE_ENV: "soon"}) == cc.MAX_RESTORE_S
+
+
+def test_seed_skips_a_restore_expected_to_be_slower_than_compiling(tmp_path, monkeypatch):
+    key, vol, _ = published_cache(tmp_path, archive=False)
+    monkeypatch.setattr(cc, "FILE_LATENCY_S", 6000.0)  # as if each file took 100 minutes
+    logs: list[str] = []
+    local = tmp_path / "local" / key.name
+    st = cc.seed(key, vol, local, runtime=RUNTIME, log=logs.append)
+    assert st.state == "cold" and "a cold compile is faster" in st.reason
+    assert st.format == "files" and st.expected_s > 150 and st.identity() == "cold"
+    assert not any(p.is_file() for p in local.rglob("*"))
+    assert logs and "not restored, compiling cold" in logs[0]
+    # the same cache restores when the limit allows it
+    assert cc.seed(key, vol, local, runtime=RUNTIME, log=logs.append,
+                   max_restore=1e9).state == "warm"
+
+
+def test_seed_gives_up_a_restore_still_running_at_the_limit(tmp_path, monkeypatch):
+    key, vol, _ = published_cache(tmp_path)
+    clock = iter(float(i) * 100.0 for i in range(1000))  # 100 s pass between every check
+    monkeypatch.setattr(cc.time, "perf_counter", lambda: next(clock))
+    local = tmp_path / "local" / key.name
+    st = cc.seed(key, vol, local, runtime=RUNTIME, log=lambda m: None)
+    assert st.state == "cold" and "still running after 150 s" in st.reason
+    assert not any(p.is_file() for p in local.rglob("*"))
+    assert not list(local.parent.glob(".*staging*"))
+
+
+def test_files_only_cache_is_republished_once_with_an_archive(tmp_path, monkeypatch):
+    """A cache published before the archive restores file by file; the first warm container
+    republishes it with one (its own lease), and the next container reads the archive."""
+    monkeypatch.setattr(cc, "runtime_versions", lambda: RUNTIME)
+    key, vol, _ = published_cache(tmp_path, archive=False)
+    leases = tmp_path / "leases"
+    statuses = []
+    for i in range(2):
+        local = tmp_path / f"c{i}" / key.name
+        st = cc.seed(key, vol, local, runtime=RUNTIME, log=lambda m: None)
+        statuses.append(st)
+        wc = cc.WorkerCache(key, local, st, holder=f"ta-{i}", sink=lambda: cc.DirSink(vol),
+                            leases=lambda: cc.FileLeases(leases), mount=vol, log=lambda m: None)
+        res = wc.maybe_publish(SimpleNamespace(stats={"requests": 2}, dead=None))
+        if i == 0:
+            assert res["published"] and res["upgrade"], res
+        else:
+            assert res is None  # it loaded the archive: nothing to republish
+    assert [s.format for s in statuses] == ["files", "archive"]
+    again = cc.publish(key, tmp_path / "c0" / key.name, cc.DirSink(vol), cc.FileLeases(leases),
+                       holder="ta-9", runtime=RUNTIME, mount=vol, log=lambda m: None)
+    assert not again["published"] and "manifest already exists" in again["reason"]
+
+
+def test_legacy_seed_copies_nothing(tmp_path):
+    """2026-10-22: the unkeyed balanced/captioner copy took 294 s, as long as compiling."""
     key = seg_key()
     legacy = tmp_path / "balanced" / "tempseg"
     fill_tree(legacy)
-    st = cc.seed_legacy(legacy, tmp_path / "local", key)
-    assert st.state == "legacy" and (tmp_path / "local/vllm").is_dir()
-    assert not (tmp_path / "local/triton/K1/held.lock").exists()
+    logs: list[str] = []
+    st = cc.seed_legacy(legacy, tmp_path / "local", key, log=logs.append)
+    assert st.state == "cold" and cc.LEGACY_SKIPPED in st.reason and st.identity() == "cold"
+    assert (tmp_path / "local/vllm").is_dir()
+    assert not any(p.is_file() for p in (tmp_path / "local").rglob("*"))
+    assert logs and "not copied" in logs[0]
     missing = cc.seed_legacy(tmp_path / "none", tmp_path / "l2", key)
-    assert missing.state == "cold"
+    assert missing.state == "cold" and missing.reason == cc.NO_CACHE
 
 
 # --- the worker's view ------------------------------------------------------------------------
@@ -404,7 +574,9 @@ def test_prepare_cache_warm_legacy_and_cold(tmp_path, ba):
     assert cold.status.state == "cold" and cold.publish_enabled and cold.key == key
     fill_tree(mount / "balanced" / "tempseg")  # the lab's unkeyed cache, same GPU
     legacy = ba.prepare_cache("segment", spec, "c" * 64, {}, **kw)
-    assert legacy.status.state == "legacy"
+    # no longer copied (slower than compiling): cold, and it publishes a keyed cache
+    assert legacy.status.state == "cold" and cc.LEGACY_SKIPPED in legacy.status.reason
+    assert legacy.publish_enabled
     h100 = spec_for("segment", MODEL, "H100")  # the lab compiled on an L40S: not offered
     assert ba.prepare_cache("segment", h100, "c" * 64, {}, **kw).status.state == "cold"
     plugin = spec_for("segment", MODEL, "L40S", dtbias_fp32=True)  # no tempseg-dtbias here

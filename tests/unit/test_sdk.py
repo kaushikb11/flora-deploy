@@ -183,6 +183,28 @@ def test_wait_reports_a_dead_orchestrator(tmp_path):
     assert job.wait(poll_s=60, sleep=sleep, timeout_s=0).state == "planned"
 
 
+def test_report_counts_a_prewarm_container_without_calls(tmp_path):
+    """scale-lite-102223538c21: the caption pre-warm H100 ran 643 s and the job stopped before
+    any caption call; ``flora report`` left it out ($1.44 against ~$1.95 real)."""
+    from flora_deploy.jobs.budget import pinned_rates, pool_rate
+    from flora_deploy.jobs.pools import drains_path
+
+    app = DeployedApp(tmp_path, run=False)  # submitted, no worker call ever spawned
+    job = submit(app)
+    before = job.report()["spend"]
+    assert before["by_kind"] == {}
+    kind = sorted(job.settings.pools)[0]
+    t0 = job.clock() - 4000.0
+    path = drains_path(JobPaths(JOB).root, job.config_hash)
+    app.store.put_bytes(path, json.dumps({"drains": {}, "prewarms": {kind: [t0, t0 + 643.0]},
+                                          "schema": "flora_pool_drains_v1"}).encode())
+    after = job.report()["spend"]
+    usd = 643.0 * pool_rate(pinned_rates(), job.settings, kind)
+    assert after["by_kind"][kind] == {"calls": 0, "usd": pytest.approx(usd, abs=1e-4),
+                                      "prewarm_usd": pytest.approx(usd, abs=1e-4)}
+    assert after["total_usd"] == pytest.approx(before["total_usd"] + usd, abs=2e-3)
+
+
 def test_logs_by_kind(tmp_path):
     app = DeployedApp(tmp_path)
     job = submit(app)
