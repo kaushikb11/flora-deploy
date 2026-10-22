@@ -430,16 +430,47 @@ def test_infra_input_error_is_retryable_never_a_receipt(tmp_path):
     assert P.derive(jf, m, limit=3).complete
 
 
-def test_missing_task_fails_the_shard(tmp_path):
-    """Review-4 C2: no task instruction is a configuration error, never an excused episode."""
-    from flora_deploy.workers_impl.reward import TaskInstructionMissing
-
+@pytest.mark.parametrize("kind", ["reward.terminal", "reward.dense"])
+@pytest.mark.parametrize("blank", [None, "", "   "])
+def test_missing_task_excludes_only_that_episode(tmp_path, kind, blank):
+    """An episode with no task text (``dataset_task``, no fixed text) is a per-episode
+    ``missing_task`` exclusion: the rest of the shard runs and the receipt is written."""
     store = FakeStore()
-    shard = tshard(["notask"])
-    setup(store, [ep("notask", task=None)], [shard])
-    with pytest.raises(TaskInstructionMissing):
-        make_runner(store, tmp_path).run_shard(JOB, shard.shard_id, CFG)
-    assert P.read_receipt(jf_of(store), shard.kind, shard.shard_id) is None
+    cams = {"main": "/v/mmmmmm"}
+    eps = [ep("a", "task a", cams=cams), ep("notask", task=blank, cams=cams),
+           ep("b", "task b", cams=cams)]
+    shard = tshard(["a", "notask", "b"], sid=f"{kind}-00000", kind=kind)
+    m = setup(store, eps, [shard])
+    llm = FakeLLM()
+    rec = make_runner(store, tmp_path, llm=llm, group=8).run_shard(JOB, shard.shard_id, CFG)
+    assert rec.episodes_done == (uid("a"), uid("b"))
+    assert rec.episodes_failed == (uid("notask"),)
+    (err,) = all_errors(store, shard)
+    assert err.uid == uid("notask") and err.kind == "missing_task" and err.stage == kind
+    assert "no task text" in err.message and err.diagnostics["phase"] == "inputs"
+    assert any("task a" in p for p in prompts(llm)) and any("task b" in p for p in prompts(llm))
+    jf = jf_of(store)
+    prog = P.derive(jf, m, limit=3)
+    assert prog.complete and prog.episodes[(uid("notask"), kind)] == "failed"
+    assert prog.exclusions()[kind] == {"planned": 3, "done": 2, "excluded": 1, "pending": 0,
+                                       "upstream": 0}
+    # it counts toward max_episode_error_rate: 1 of 3 is above 0.2, within 0.5
+    assert prog.outcome(0.2) == "completed_with_errors" and prog.outcome(0.5) == "done"
+    assert not P.compose_input(jf, prog).missing
+
+
+def test_missing_task_with_fixed_instruction_is_not_excluded(tmp_path):
+    """``episode_instruction.source: fixed``: the fixed text fills an episode without a task."""
+    store = FakeStore()
+    eps = [ep("a", "task a"), ep("notask", task="")]
+    shard = tshard(["a", "notask"])
+    setup(store, eps, [shard])
+    llm = FakeLLM()
+    rec = make_runner(store, tmp_path, llm=llm, group=8,
+                      default_task="Fold the towel.").run_shard(JOB, shard.shard_id, CFG)
+    assert rec.episodes_done == (uid("a"), uid("notask")) and not rec.episodes_failed
+    assert not all_errors(store, shard)
+    assert any("Fold the towel." in p for p in prompts(llm))
 
 
 def test_cuda_fault_calls_fatal_after_marking(tmp_path):

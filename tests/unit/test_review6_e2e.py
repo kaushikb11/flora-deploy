@@ -339,13 +339,46 @@ def test_an_episode_without_task_text_is_excluded_not_the_whole_shard(tmp_path, 
     assert res.state == "completed_with_errors", res.as_dict()  # 1 of 7 > 10%
     s = res.summary
     (uid, reason), = s["unplanned_episodes"].items()
-    assert uid.endswith("--ep006") and reason.startswith("no_task_instruction")
+    assert uid.endswith("--ep006") and reason.startswith("missing_task")
     assert counts(res) == dict.fromkeys(STAGES, 6)
     assert any("left out of the plan" in p for p in s["problems"])
     # within the rate it is a done job, as on Modal
     cfg = scenario(tmp_path, videos, retries={"max_starts_before_quarantine": 3,
                                               "max_episode_error_rate": 0.2})
     assert run_local(cfg, store=tmp_path / "store2").state == "done"
+
+
+@pytest.mark.parametrize("rate,state", [(0.1, "completed_with_errors"), (0.2, "done")])
+def test_a_planned_episode_without_task_text_is_a_worker_exclusion(tmp_path, videos, rate,
+                                                                   state):
+    """A manifest that still holds an episode without task text (its receipt lost the text
+    after planning): the local reward workers, the Modal path's ``RewardShardRunner``, exclude
+    that episode only (``missing_task``) and finish their shards; it counts toward the rate."""
+    from flora_deploy.config.schema import load_config
+    from flora_deploy.jobs.store import JobPaths, fake_job_id
+
+    cfg = scenario(tmp_path, videos, retries={"max_starts_before_quarantine": 3,
+                                              "max_episode_error_rate": rate})
+    runner = LocalRunner(load_config(cfg), config_path=cfg, store=tmp_path / "store",
+                         job_id=fake_job_id("local-demo"))
+    try:
+        runner.index()
+        m = runner.plan()
+        target = next(e.uid for e in m.episodes if e.uid.endswith("--ep002"))
+        path = JobPaths(runner.job_id).index(target)
+        rec = json.loads(runner.store.get_bytes(path))
+        rec.update(task=None, instruction_text="")
+        runner.store.put_bytes(path, json.dumps(rec).encode())
+        outcome = runner.orchestrate()
+        s = runner.compose(outcome)
+    finally:
+        runner.close()
+    assert outcome == state, s
+    assert s["errors"]["by_kind"] == {"missing_task": 2}
+    assert s["errors"]["by_stage"] == {"reward.dense": 1, "reward.terminal": 1}
+    for stage in ("reward.terminal", "reward.dense"):
+        assert s["stages"][stage]["excused"] == 1 and s["stages"][stage]["records"] == 5
+    assert s["stages"]["segment"]["excused"] == 0
 
 
 def test_an_episode_that_fails_indexing_counts_as_excluded(tmp_path, videos):

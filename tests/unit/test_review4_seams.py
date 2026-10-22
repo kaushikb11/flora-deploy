@@ -173,12 +173,15 @@ def test_c2_fixed_instruction_reaches_the_worker(tmp_path):
     s = compose(store, JOB).summary
     assert s["status"] == "complete" and s["stages"][KIND]["records"] == 2
 
-    # without the env and without instruction_text: a config error, the job fails (not done)
+    # without the env and without instruction_text: the episode is a ``missing_task``
+    # exclusion (never ``done``: 0 of 1 has a record), not a failed shard
     store2 = FakeStore()
     reward_job(store2, ["e0"], instruction="fixed", task=None)
     env2 = {k: v for k, v in env.items() if k != "FLORA_INSTRUCTION_TEXT"}
     assert run_job(store2, lambda c: wa.reward_settings_from_env(env2),
-                   tmp_path=tmp_path / "b").result == "failed"
+                   tmp_path=tmp_path / "b").result == "completed_with_errors"
+    s2 = compose(store2, JOB, partial=True).summary
+    assert s2["errors"]["by_kind"] == {"missing_task": 1} and s2["stages"][KIND]["excused"] == 1
 
 
 def test_c2_new_receipts_carry_the_resolved_instruction(tmp_path):

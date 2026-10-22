@@ -32,8 +32,10 @@ a stale ledger or stale parts.
    ``modal.Retries`` / the orchestrator's bounded respawns and a persistent failure ends
    ``shard_failed`` (the job ``failed``), never ``done`` without the episode. After a CUDA fault
    the container is unusable: ``RewardShardRunner(fatal=...)`` (``os._exit`` in the Modal worker)
-   is called after the marker is written. An episode without a task instruction is a
-   configuration error (:class:`TaskInstructionMissing`): the shard fails, nothing is excused;
+   is called after the marker is written. An episode without task text (none in its receipt
+   and no fixed ``default_task``: ``jobs.indexing.episode_task``, the planner's rule too) is
+   excluded per episode as ``EpisodeError(kind="missing_task")``: terminal, counted toward
+   ``max_episode_error_rate``; the rest of the shard runs;
 5. ``KeyboardInterrupt`` (Python's SIGINT) or :meth:`~RewardShardRunner.preempt` (from
    ``@modal.exit``) flushes what is pending and calls ``attempts.mark_preempted``; any other
    exception flushes, calls ``attempts.mark_exception`` and re-raises;
@@ -80,6 +82,13 @@ from typing import Any
 from flora_deploy.jobs import attempts as A
 from flora_deploy.jobs import progress as P
 from flora_deploy.jobs.deps import StoreManifestSource
+from flora_deploy.jobs.indexing import (
+    MISSING_TASK,
+    RECEIPT_SCHEMA,
+    episode_task,
+    missing_task_message,
+    receipt_task,
+)
 from flora_deploy.jobs.manifest import NVIDIA_TERMINAL_GROUP
 from flora_deploy.jobs.orchestrator import utc
 from flora_deploy.jobs.store import Store
@@ -153,16 +162,12 @@ def parse_index_receipt(data: bytes | str) -> IndexInputs:
 
     Only the episode id, dataset, task, ``streams.<role>.source`` and ``envelope.ok`` are read."""
     d = json.loads(data)
-    task = d.get("task")
+    task = receipt_task(d)
     dataset = d.get("dataset")
-    if d.get("schema") == "flora_index_receipt_v1":
+    if d.get("schema") == RECEIPT_SCHEMA:
         if d.get("status") != "indexed":
             raise ValueError(f"episode {d.get('uid')!r} was not indexed: {d.get('error')}")
         dataset = dataset["name"]
-        if d.get("instruction_text"):
-            task = d["instruction_text"]
-        elif d.get("instruction", "dataset_task") != "dataset_task":
-            task = None
     sources: dict[str, SourceRef] = {}
     for role, stream in (d.get("streams") or {}).items():
         src = stream.get("source") if isinstance(stream, Mapping) else None
@@ -449,7 +454,8 @@ class ShardInfraError(RuntimeError):
 
 
 class TaskInstructionMissing(RuntimeError):
-    """A reward episode has no task instruction: a configuration error, never excused."""
+    """A reward episode has no task text: the runner excludes it per episode
+    (``EpisodeError(kind="missing_task")``), never the whole shard."""
 
 
 CUDA_FATAL_MARKERS = ("CUDA error", "cudaError", "CUBLAS_STATUS", "CUDNN_STATUS",
@@ -651,12 +657,9 @@ class RewardShardRunner:
         idx = parse_index_receipt(self.store.get_bytes(ref.index_ref))
         if not idx.sources:
             raise ValueError(f"episode {ref.uid!r}: index receipt has no camera streams")
-        task = idx.task or self.settings.default_task
-        if not str(task or "").strip():
-            raise TaskInstructionMissing(
-                f"episode {ref.uid!r}: no task instruction (the index receipt has none and "
-                "FLORA_INSTRUCTION_TEXT is unset); NVIDIA's reward prompts need one: use "
-                "episode_instruction.source dataset_task with tasks, or fixed + text")
+        task = episode_task(idx.task, self.settings.default_task)
+        if task is None:
+            raise TaskInstructionMissing(missing_task_message(ref.uid))
         if self.settings.rubric is not None:  # one video per camera, in rubric order
             from flora_deploy.stages import rubric as RB
 
@@ -710,7 +713,13 @@ class RewardShardRunner:
                 try:
                     episodes.append(self.episode_for(refs[uid]))
                     break
-                except (TaskInstructionMissing, *_config_errors()):
+                except TaskInstructionMissing as exc:  # per episode, never the shard
+                    errors.append(EpisodeError(
+                        uid=uid, stage=stage, shard_id=shard.shard_id,
+                        container_id=self.container_id, kind=MISSING_TASK, message=str(exc),
+                        diagnostics={"phase": "inputs", "mode": mode}))
+                    break
+                except _config_errors():
                     raise  # configuration: fail the shard, never excuse the episode
                 except ValueError as exc:  # NVIDIA semantics (parse, Collage, cut alignment)
                     errors.append(EpisodeError(

@@ -277,12 +277,16 @@ Reward stages have one row per record:
 
 An excluded episode has **no record** in its stage's JSONL or Parquet. It is counted in
 `summary.json`, under `stages.<stage>.excused`, `poison_pills` and `errors.by_kind`, and it has a
-line in an error file under `flora/<job>/<stage_hash>/errors/`. Episodes are excluded for two
+line in an error file under `flora/<job>/<stage_hash>/errors/`. Episodes are excluded for three
 reasons:
 
 * `nv_failure`: NVIDIA's own code rejected the episode (for example, an unparseable model answer
   where NVIDIA has no fallback);
-* `poison_pill`: the episode crashed workers repeatedly, so it was isolated after bisection.
+* `poison_pill`: the episode crashed workers repeatedly, so it was isolated after bisection;
+* `missing_task`: a reward stage needs the episode's task text, and it has none (empty in the
+  dataset, with `episode_instruction.source: dataset_task`). The planner usually leaves such an
+  episode out (`unplanned_episodes`, reason `missing_task`); a reward worker that still meets one
+  excludes that episode only, never its shard. With `source: fixed` the fixed text is used.
 
 `infra` errors (missing media, I/O, CUDA) are diagnostics: the shard is retried and they never
 exclude an episode by themselves. If a stage excludes more than `retries.max_episode_error_rate`
@@ -298,7 +302,7 @@ Error files are JSONL, one object per line:
 | `stage` | string | stage |
 | `shard_id` | string | shard that reported it |
 | `container_id` | string | container that reported it |
-| `kind` | string | `nv_failure`, `poison_pill` or `infra` |
+| `kind` | string | `nv_failure`, `poison_pill`, `missing_task` or `infra` |
 | `message` | string | one-line reason |
 | `diagnostics` | object | extra detail |
 

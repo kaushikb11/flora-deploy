@@ -179,8 +179,9 @@ class EpisodeError:
     shard_id: str
     container_id: str
     # nv_failure = NVIDIA's own semantics and poison_pill = D15 isolation: terminal, excused.
-    # infra = our side (missing media, I/O, CUDA): diagnostic only, never terminal (retried).
-    kind: Literal["nv_failure", "infra", "poison_pill"]
+    # missing_task = no task text for a reward prompt (``jobs.indexing.episode_task``): terminal,
+    # excused. infra = our side (missing media, I/O, CUDA): diagnostic only, never terminal.
+    kind: Literal["nv_failure", "infra", "poison_pill", "missing_task"]
     message: str
     diagnostics: dict = field(default_factory=dict)
 

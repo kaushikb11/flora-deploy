@@ -285,3 +285,21 @@ def test_job_round_trip_and_validation(v21):
     hub = I.DatasetSpec(format="lerobot_v3", repo="org/ds", revision="a" * 40, subdir="x/y")
     assert hub.name == "org/ds/x/y" and hub.key == "org--ds@aaaaaaaaaaaa"
     assert episode_uid(hub.name, "episode_000001") == "org-ds-x-y--episode_000001"
+
+
+def test_task_text_rule_shared_by_planner_and_reward_worker():
+    """``receipt_task`` + ``episode_task``: one rule for the planner's ``missing_task`` and the
+    reward worker's per-episode exclusion."""
+    v1 = {"schema": I.RECEIPT_SCHEMA, "instruction": "dataset_task", "task": "Fold it."}
+    assert I.receipt_task({**v1, "instruction_text": "Fold it."}) == "Fold it."
+    assert I.receipt_task({**v1, "instruction_text": ""}) == "Fold it."
+    assert I.receipt_task({**v1, "task": None, "instruction_text": ""}) is None
+    fixed = {**v1, "instruction": "fixed"}
+    assert I.receipt_task({**fixed, "instruction_text": "Wipe."}) == "Wipe."
+    assert I.receipt_task(fixed) is None  # older receipt: the worker's default_task fills it
+    assert I.receipt_task({"task": "plain"}) == "plain"
+    assert I.episode_task("Fold it.", "Wipe.") == "Fold it."
+    for blank in (None, "", "  \n"):
+        assert I.episode_task(blank) is None
+        assert I.episode_task(blank, "Wipe.") == "Wipe."
+        assert I.episode_task(blank, blank) is None
