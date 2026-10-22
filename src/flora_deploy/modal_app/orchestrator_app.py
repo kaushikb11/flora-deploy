@@ -10,6 +10,9 @@ docstring), applied here through :class:`ModalAutoscaler`.
   in-flight calls recorded in each shard's ``call.json``. ``modal.Retries`` re-runs a generation
   that still dies of an error; the retried input keeps its holder (the call id), so it re-takes
   its own lease.
+  At job end, if the orchestrator reports a worker class that could not start
+  (``Orchestrator.stop_app_reason``), the worker app is stopped (:func:`maybe_stop_worker_app`)
+  so Modal stops restarting the crashing class; never while another job's pool entry is busy.
 - ``reconcile(job_id, factory)``: stateless status; revives the orchestrator if it died.
 - ``reconcile_watched()``: opt-in scheduled reconciler (``modal.Cron``, every 10 min). Deploy
   with ``FLORA_RECONCILE_CRON=1`` (or a cron string) to schedule it; jobs opt in with
@@ -305,8 +308,11 @@ def build_orchestrator(job_id: str, deps: OrchestratorDeps, *, lease_kv: Any,
                        events: Callable[[dict[str, Any]], None] = _print_event,
                        deadline_s: float = DEADLINE_S, holder: str | None = None,
                        pools: PoolScaler | None = None) -> Orchestrator:
+    # the no-start watchdog's expected startup per kind: the budget gate's estimator
+    est = getattr(deps.budget, "estimator", None)
+    startup = getattr(est, "startup_s", None)
     return Orchestrator(
-        pools=pools,
+        pools=pools, startup_s=startup if callable(startup) else None,
         settings=deps.settings, store=deps.store,
         spawner=ModalSpawner(deps.worker_app, deps.worker_classes),
         lease=DictLease(lease_kv, f"orchestrator/{job_id}"),
@@ -316,6 +322,53 @@ def build_orchestrator(job_id: str, deps: OrchestratorDeps, *, lease_kv: Any,
 
 
 TERMINAL = ("done", "completed_with_errors", "failed", "cancelled", "budget_stopped")
+
+
+def stop_modal_app(app_name: str) -> None:
+    """``modal app stop <app> --yes`` through the installed client (modal 1.6.2:
+    ``modal.cli.app.stop``, a blocking click command; ``callback`` is the function itself).
+    The environment is the container's (``MODAL_ENVIRONMENT``). An app that is already stopped
+    exits with ``SystemExit``, which is not an error here."""
+    from modal.cli.app import stop
+
+    try:
+        stop.callback(app_name, yes=True, env=os.environ.get("MODAL_ENVIRONMENT") or None)
+    except SystemExit:
+        pass
+
+
+def maybe_stop_worker_app(orch: Any, outcome: Any, *, app_name: str, pools: Any,
+                          stopper: Callable[[str], None] = stop_modal_app,
+                          events: Callable[[dict[str, Any]], None] = _print_event
+                          ) -> dict[str, Any] | None:
+    """Job end: stop the worker app when ``orch.stop_app_reason()`` names a class that cannot
+    start (or a budget-cancelled call nothing ever started), so Modal stops restarting it.
+
+    Skipped while another job's pool entry says one of the classes is busy (one app serves every
+    job of its config), and without an app name. The factory app's orchestrator runs inside the
+    worker app, so stopping it ends this container too: everything is already written (lease
+    released, controls and ledgers saved) and the event is printed first. Resuming such a job
+    needs ``flora deploy`` again."""
+    if getattr(outcome, "result", None) not in TERMINAL or not app_name:
+        return None
+    reason_of = getattr(orch, "stop_app_reason", None)
+    reason = reason_of() if callable(reason_of) else None
+    if not reason:
+        return None
+    busy_of = getattr(pools, "busy_jobs", None)
+    busy = list(busy_of()) if callable(busy_of) else []
+    ev = {"event": "worker_app_stop", "job_id": orch.job_id, "app": app_name, "reason": reason,
+          "result": outcome.result}
+    if busy:
+        events({**ev, "event": "worker_app_stop_skipped", "busy_jobs": busy})
+        return {**ev, "stopped": False, "busy_jobs": busy}
+    events(ev)
+    try:
+        stopper(app_name)
+    except Exception as exc:  # noqa: BLE001 - reported; the job outcome stands
+        events({**ev, "event": "worker_app_stop_error", "error": repr(exc)})
+        return {**ev, "stopped": False, "error": repr(exc)}
+    return {**ev, "stopped": True}
 
 
 def _retry(fn: Callable[[], Any], attempts: int = 3, delay_s: float = 5.0) -> Any:
@@ -341,7 +394,8 @@ def run(job_id: str, factory: str, generation: int = 0, watch: bool = False) -> 
 
 def run_generation(job_id: str, factory: str, generation: int = 0, watch: bool = False, *,
                    spawn_successor: Callable[..., Any], watch_kv: Any = None,
-                   pool_kv: Any = None, autoscaler: Any = None) -> dict[str, Any]:
+                   pool_kv: Any = None, autoscaler: Any = None,
+                   app_stopper: Callable[[str], None] = stop_modal_app) -> dict[str, Any]:
     """``run``'s body. ``spawn_successor(job_id, factory, generation, watch)`` starts the next
     generation in the caller's own app; ``watch_kv`` (default ``watched``) is the reconciler's
     watch list. The app factory (``modal_app.factory``) passes its own app's handles.
@@ -369,8 +423,11 @@ def run_generation(job_id: str, factory: str, generation: int = 0, watch: bool =
                       "generation": generation + 1, "call_id": successor.object_id})
     elif outcome.result in TERMINAL and watch:
         watched_kv.pop(job_id, None)
-    return {**asdict(outcome), "generation": generation,
-            "budget": budget_summary(environment, deps.settings, backstop, gate=deps.budget)}
+    result = {**asdict(outcome), "generation": generation,
+              "budget": budget_summary(environment, deps.settings, backstop, gate=deps.budget)}
+    maybe_stop_worker_app(orch, outcome, app_name=deps.worker_app, pools=pools,
+                          stopper=app_stopper)  # last: it may end this container
+    return result
 
 
 def _reconcile_job(job_id: str, factory: str, revive: bool = True, *,

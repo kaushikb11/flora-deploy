@@ -50,6 +50,18 @@ whose poison file exists is marked ``poisoned``; none of them is spawned again.
 (workers flag preempted starts via ``attempts.mark_preempted``), so spot preemption alone never
 quarantines a shard or poison-pills a healthy episode.
 
+**Startup failures (fail fast).** A worker that crashes in ``@modal.enter`` never starts a shard,
+so Modal restarts it in a crash loop while its call stays ``pending`` and D15 counts nothing. For
+a live call with no shard start yet (``AttemptLedger.call_started``) the orchestrator therefore
+(1) counts the worker app's startup-failure markers written since the call was spawned
+(``attempts.record_startup_failure``) and, at ``max_starts_before_quarantine`` of them, fails the
+shard (``worker_startup_failed``, with the worker's error); and (2) runs a no-start watchdog: no
+start ``no_start_factor`` (3) times the kind's expected startup (the budget gate's estimate,
+at least ``no_start_min_s``) after the spawn also fails it (``no_shard_start``). Both terminate
+the call. A kind that failed this way is not spawned again in this generation (its queued shards
+fail with the same reason), and :meth:`Orchestrator.stop_app_reason` tells the deployment to
+stop the worker app at job end, so Modal stops restarting the class.
+
 **Spawn intent.** Before ``spawn`` the ledger is saved as ``spawning`` with ``spawn_n`` and a
 deterministic ``token`` (``attempts.spawn_token``), which the worker records in its marker and
 checks against the ledger (``attempts.superseded``). A successor that finds ``spawning`` adopts
@@ -82,6 +94,12 @@ POLL_INTERVAL_S = 15.0
 MAX_RESPAWNS = 3  # respawns after failed / expired / externally cancelled calls, per shard
 SPAWN_GRACE_S = 120.0  # how long a successor waits for a marker of an unconfirmed spawn
 RESPAWNS_EXHAUSTED = "respawns_exhausted"
+# Fail fast on worker startup crashes (module docstring, "Startup failures").
+STARTUP_FAILED = "worker_startup_failed"  # startup-failure markers reached the D15 limit
+NO_START = "no_shard_start"  # no-start watchdog
+NO_START_FACTOR = 3.0  # x the kind's expected container startup
+NO_START_MIN_S = 600.0  # never sooner than this after the spawn
+_STARTUP_REASONS = (STARTUP_FAILED, NO_START)
 
 Event = dict[str, Any]
 EventSink = Callable[[Event], None]
@@ -531,7 +549,9 @@ class Orchestrator:
                  clock: Callable[[], float] = time.time, deadline_s: float = DEADLINE_S,
                  lease_ttl_s: float = LEASE_TTL_S, max_respawns: int = MAX_RESPAWNS,
                  spawn_grace_s: float = SPAWN_GRACE_S, holder: str | None = None,
-                 pools: Any = None):
+                 pools: Any = None, startup_s: Callable[[str], float] | None = None,
+                 no_start_factor: float = NO_START_FACTOR,
+                 no_start_min_s: float = NO_START_MIN_S):
         self.settings = settings
         self.job_id = settings.job_id
         self.cfg = settings.config_hash
@@ -558,6 +578,13 @@ class Orchestrator:
         self._stopped = False  # a budget_stop is in force this tick
         # ``jobs.pools.PoolScaler`` (or None): drains worker classes with no remaining work
         self.pools = pools
+        # expected container startup per kind (the budget gate's estimator); None or 0: no
+        # no-start watchdog for that kind
+        self.startup_s = startup_s
+        self.no_start_factor, self.no_start_min_s = no_start_factor, no_start_min_s
+        self._started: set[tuple[str, str]] = set()  # (shard, call) seen started
+        self._broken: dict[str, str] = {}  # kind -> why its worker class cannot start
+        self._by_id: dict[str, Shard] = {}
 
     # events / files -------------------------------------------------------------------------
     def _emit(self, event: str, **kw: Any) -> None:
@@ -659,6 +686,7 @@ class Orchestrator:
             if s.kind not in self.settings.pools:
                 raise ValueError(f"shard {s.shard_id!r}: no pool configured for kind {s.kind!r}")
         by_id = {s.shard_id: s for s in shards}
+        self._by_id = by_id
         controls = self._controls()
 
         if controls.cancelled is not None:
@@ -889,6 +917,7 @@ class Orchestrator:
             led = by_call.get(cid)
             if led is not None and led.status in _LIVE:
                 led.calls.append({"call_id": cid, "outcome": "cancelled_budget",
+                                  "started": self._call_started(led),
                                   "utc": utc(self.clock())})
                 self._save(led, status="retry", call_id=None, reason="budget hard cap")
         self._emit("budget_overspend_cancel", calls=done,
@@ -929,6 +958,7 @@ class Orchestrator:
             return
         st = self.spawner.poll(led.call_id)
         if st.state == "pending":
+            self._check_startup(s, led)
             return
         if st.state == "success":
             got = st.receipt  # C2 canary: the call's own receipt (written LAST) beats a stale view
@@ -940,7 +970,7 @@ class Orchestrator:
         if st.state == "cancelled" and (led.call_id in self._budget_cancelled or self._stopped):
             # stopped by the budget hard cap (here or by a driver): re-queue, no respawn used
             led.calls.append({"call_id": led.call_id, "outcome": "cancelled_budget",
-                              "utc": utc(self.clock())})
+                              "started": self._call_started(led), "utc": utc(self.clock())})
             self._save(led, status="retry", call_id=None, reason="budget hard cap")
             self._emit("call_cancelled_budget", shard_id=s.shard_id, call_id=st.call_id)
             return
@@ -961,6 +991,107 @@ class Orchestrator:
             self._emit("shard_failed", shard_id=s.shard_id, reason=led.reason)
         else:
             self._save(led, status="retry", call_id=None, respawns=led.respawns + 1)
+
+    # worker startup failures (module docstring) ------------------------------------------------
+    def _spawned_utc(self, led: ShardLedger) -> str | None:
+        for e in led.calls:
+            if (e.get("call_id") == led.call_id and e.get("utc")
+                    and e.get("outcome") in ("spawned", "adopted")):
+                return str(e["utc"])
+        return None
+
+    def _call_started(self, led: ShardLedger) -> bool | None:
+        """Whether a container started the ledger's current call (None: unknown)."""
+        if not led.call_id:
+            return None
+        if (led.shard_id, led.call_id) in self._started:
+            return True
+        started = getattr(self.attempts, "call_started", None)
+        s = self._by_id.get(led.shard_id)
+        spawned = self._spawned_utc(led)
+        if not callable(started) or s is None or spawned is None:
+            return None
+        if started(s, led.token, spawned):
+            self._started.add((led.shard_id, led.call_id))
+            return True
+        return False
+
+    def _expected_startup(self, kind: str) -> float:
+        if self.startup_s is None:
+            return 0.0
+        try:
+            return max(float(self.startup_s(kind)), 0.0)
+        except Exception:  # noqa: BLE001 - no estimate: no watchdog for this kind
+            return 0.0
+
+    def _check_startup(self, s: Shard, led: ShardLedger) -> None:
+        """A pending call no container has started: fail it on repeated startup failures of its
+        worker class, or once the no-start watchdog expires."""
+        if self._call_started(led) is not False:
+            return
+        spawned = self._spawned_utc(led)
+        assert spawned is not None  # _call_started returned False
+        failures_of = getattr(self.attempts, "startup_failures", None)
+        failures = list(failures_of(s.kind, spawned)) if callable(failures_of) else []
+        if failures and len(failures) >= self.k:
+            last = failures[-1]
+            self._fail_startup(s, led, STARTUP_FAILED,
+                               f"{len(failures)} worker containers failed to start: {last.error}",
+                               containers=[f.container_id for f in failures])
+            return
+        expected = self._expected_startup(s.kind)
+        if expected <= 0:
+            return
+        limit = max(self.no_start_factor * expected, self.no_start_min_s)
+        age = self.clock() - _parse_utc(spawned)
+        if age >= limit:
+            why = (f"no shard start {age:.0f} s after the spawn (limit {limit:.0f} s: "
+                   f"{self.no_start_factor:g}x the expected {expected:.0f} s startup)")
+            if failures:
+                why += f"; last startup failure: {failures[-1].error}"
+            self._fail_startup(s, led, NO_START, why,
+                               containers=[f.container_id for f in failures])
+
+    def _fail_startup(self, s: Shard, led: ShardLedger, reason: str, message: str,
+                      **detail: Any) -> None:
+        call_id = led.call_id
+        stop = getattr(self.spawner, "terminate", None) or self.spawner.cancel
+        try:
+            stop(call_id)
+        except Exception as exc:  # retried next tick
+            self._emit("cancel_error", call_id=call_id, error=repr(exc))
+            return
+        led.calls.append({"call_id": call_id, "outcome": reason, "error": message,
+                          "utc": utc(self.clock())})
+        self._emit(reason, shard_id=s.shard_id, kind=s.kind, call_id=call_id, error=message)
+        self._fail_terminal(s, led, reason, message, call_id=call_id, **detail)
+        self._broken.setdefault(s.kind, f"{reason}: {message}")
+
+    def _fail_terminal(self, s: Shard, led: ShardLedger, reason: str, message: str,
+                       **detail: Any) -> None:
+        detail = {**detail, "error": message}
+        fail = getattr(self.attempts, "fail", None)
+        if fail is not None:
+            fail(s, reason, detail)
+        else:  # legacy ledgers: a quarantine record with this reason means "failed"
+            self.attempts.quarantine(s, RESPAWNS_EXHAUSTED, detail)
+        self._save(led, status="failed", call_id=None, reason=f"{reason}: {message}")
+        self._emit("shard_failed", shard_id=s.shard_id, reason=led.reason)
+
+    def stop_app_reason(self) -> str | None:
+        """Why the deployment should stop the worker app now that the job ended, or None: a
+        shard failed because its worker class could not start, or the budget stop cancelled a
+        call no container ever started (Modal keeps restarting a class that crashes in
+        ``@modal.enter`` even after its call is cancelled; 2026-10-22 noise-12)."""
+        for led in self._ledgers.values():
+            if led.status == "failed" and (led.reason or "").startswith(_STARTUP_REASONS):
+                return f"{led.kind}: {led.reason}"
+        for led in self._ledgers.values():
+            for e in led.calls:
+                if e.get("outcome") == "cancelled_budget" and e.get("started") is False:
+                    return (f"{led.kind}: budget stop cancelled call {e.get('call_id')}, which "
+                            f"no container ever started")
+        return None
 
     def _finish(self, s: Shard, led: ShardLedger, how: str) -> None:
         led.calls.append({"call_id": led.call_id, "outcome": "success", "utc": utc(self.clock())})
@@ -1030,6 +1161,10 @@ class Orchestrator:
         for s in shards:
             led = self._ledger(s)
             if led.status not in ("new", "retry") or s.shard_id in dead:
+                continue
+            if s.kind in self._broken:  # its worker class cannot start: do not spawn it
+                self._fail_terminal(s, led, STARTUP_FAILED,
+                                    f"not spawned: {self._broken[s.kind]}", not_spawned=True)
                 continue
             if s.depends_on and not deps_ready(s, by_id, satisfied, children):
                 continue

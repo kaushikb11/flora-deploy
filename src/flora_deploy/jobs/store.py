@@ -51,6 +51,21 @@ def _fan(key: str) -> str:
     return f"{h[:2]}/{h[2:4]}"
 
 
+# Worker startup failures (``jobs.attempts.write_startup_failure``). A container whose
+# ``@modal.enter`` fails has not received an input yet, so it knows its app, config and shard
+# kinds but not the job: the markers live per deployed app, outside every job root, and the
+# orchestrator matches them to its never-started calls by kind and time.
+STARTUP_ROOT = "flora/.startup"
+
+
+def startup_failures_prefix(app_name: str) -> str:
+    return f"{STARTUP_ROOT}/{safe_key(app_name)}/"
+
+
+def startup_failure_path(app_name: str, container_id: str) -> str:
+    return f"{startup_failures_prefix(app_name)}{safe_key(container_id)}.json"
+
+
 # Fake-models jobs (``flora run --fake-models``, the H0 rehearsal, and ``flora run --local
 # --fake-models``) run under their own job id, ``<job>.fake`` (review 8b M5). The suffix is part
 # of the job id itself, so every path under ``flora/<job>/`` (``manifest.json``, ``run.json``,
