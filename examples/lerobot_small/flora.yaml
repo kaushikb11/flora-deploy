@@ -34,5 +34,5 @@ pipeline:
   episode_instruction: {source: dataset_task}
 
 output:
-  sink: s3://my-bucket/flora/lerobot-small   # or volume://flora-results/lerobot-small
+  sink: volume://flora-results/lerobot-small   # or s3://your-bucket/flora/lerobot-small
   formats: [parquet, jsonl]
