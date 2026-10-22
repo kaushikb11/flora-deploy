@@ -78,9 +78,23 @@ PRESET_KINDS = {"exact": ("segcap",), "balanced": ("segment", "caption")}
 CERT_STAGES = ("segment", "caption")
 DEFERRED = "deferred to the certified run"
 LAB_KINDS = {"segment": "tempseg", "caption": "captioner"}
-SETS = {"exact": "exact_e2e", "noise": "noise", "balanced": "balanced"}
+SETS = {"exact": "exact_e2e", "noise": "noise", "balanced": "balanced",
+        # the stage-isolated caption job (J2) and an older noise run (reported only), as
+        # ``wave_h.certify_view`` names their steps
+        "isolated": "caption_iso", "repeat": "repeat"}
 # (d)'s cold witness (review 13 W1): its jobs are under the balanced step's "witness_jobs"
 WITNESS = ("witness", "balanced", "witness_jobs")
+ISO_WITNESS = ("isolated_witness", "caption_iso", "witness_jobs")  # J2w
+# Captioner calls in NVIDIA's ``model_calls`` (``stages.reference``): its token budget
+CAPTIONER_OUTPUT_LIMIT = 512
+DIGESTS = "digests.json"  # per side and job, beside its records: {uid: [hex64 | null per row]}
+# ``flora certify --digests`` side names of the record sides
+DIGEST_SIDES = {"exact": "exact", "noise": "noise", "isolated": "balanced",
+                "isolated_witness": "witness", "repeat": "repeat"}
+SEGCAP_DIGEST_SIDES = ("exact", "noise", "repeat")  # from the segcap audit lines
+CAPTION_DIGEST_SIDES = ("isolated", "isolated_witness")  # from the caption audit rows
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+_FAMILY = re.compile(r"[a-z0-9_.-]{1,32}")
 BLOCK_RESULTS = "results"
 BLOCK_COST = "cost"
 # Steps of a run that Modal billed on another workspace than the one the billing read covers:
@@ -647,9 +661,20 @@ def certify_all(paths: Paths, st: wh.State, out_dir: Path, *, derived: Mapping[s
             nz = record_path(paths, "noise", job, stage)
             if job in noise_jobs and nz.exists():
                 args += ["--noise", str(nz)]
-            wit = record_path(paths, WITNESS[0], job, stage)
-            if job in witness_jobs and wit.exists():
-                args += ["--witness", str(wit)]
+            iso = isolated_inputs(paths, st, job, tmp) if stage == "caption" else None
+            if iso is not None and iso.get("missing"):
+                o["refused"] = "missing input: " + ", ".join(iso["missing"]) + \
+                    " (run with --fetch)"
+                continue
+            if iso is not None:  # v4: the isolated J2 is the candidate, J2w its witness
+                i = args.index("--balanced")
+                args[i + 1] = iso["balanced"]
+                args[args.index("-c") + 1] = iso["cfg"]
+                args += iso["args"]
+            else:
+                wit = record_path(paths, WITNESS[0], job, stage)
+                if job in witness_jobs and wit.exists():
+                    args += ["--witness", str(wit)]
             kind = LAB_KINDS[stage]
             lab = l0_for_certify(lab_result(paths, st, kind), kind, pool_gpu("balanced", stage))
             if lab is not None:
@@ -670,6 +695,90 @@ def certify_all(paths: Paths, st: wh.State, out_dir: Path, *, derived: Mapping[s
             else:
                 o["cert"] = cert
     return outcomes
+
+
+def family_of(uid: str) -> str | None:
+    """A reported-only family label of a certified-plan uid (``<data dir>--<local id>``):
+    the witness / rest prefix (``n-`` / ``x-``) and the source dataset's first word, e.g.
+    ``n-egodex``, ``x-wgo``; None when the uid does not carry them. Label charset
+    ``[a-z0-9_.-]{1,32}`` (``flora certify --families``)."""
+    local = uid.rsplit("--", 1)[-1]
+    for prefix in (wh.NOISE_PREFIX, wh.REST_PREFIX):
+        if local.startswith(prefix):
+            src = re.sub(r"[^a-z0-9.]", "", local[len(prefix):].split("_", 1)[0]
+                         .split("-", 1)[0].lower())
+            label = f"{prefix}{src}"[:32]
+            return label if src and _FAMILY.fullmatch(label) else None
+    return None
+
+
+def families(uids: Sequence[str]) -> dict[str, str]:
+    return {u: f for u in sorted(set(uids)) if (f := family_of(u)) is not None}
+
+
+def _uids(path: Path) -> list[str]:
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            out.append(json.loads(line).get("uid"))
+    return [u for u in out if isinstance(u, str)]
+
+
+def isolated_inputs(paths: Paths, st: wh.State, job: str, tmp: Path) -> dict[str, Any] | None:
+    """The v4 (stage-isolated) caption certification inputs of ``job``, when its state has
+    the isolated caption job (step ``caption_iso``; None otherwise: the e2e caption inputs as
+    before). The candidate is J2 (records, its config), the witness J2w; ``--digests`` for
+    the oracle, the noise run, J2 and J2w (:data:`DIGEST_SIDES`), the staged oracle segment
+    file (``--oracle-segments``, checked against the sha256 J2's config pinned), J1's caption
+    records (``--reported-e2e``), the episode families (``--families``) and an older noise run
+    (``--reported-repeat``, ``--digests repeat=``) when there is one. ``missing``: what is
+    not there."""
+    iso_jobs = jobs_of(st, SETS["isolated"])
+    if job not in iso_jobs:
+        return None
+    r = iso_jobs[job]
+    res = (st.steps.get(SETS["isolated"]) or wh.StepState()).result
+    segs = r.get("oracle_segments") or res.get("oracle_segments") or {}
+    missing: list[str] = []
+    cand = record_path(paths, "isolated", job, "caption")
+    for p in (cand, digest_path(paths, "exact", job), digest_path(paths, "isolated", job)):
+        if not p.exists():
+            missing.append(paths.rel(p))
+    cfg = r.get("cfg")
+    if not cfg or not Path(cfg).exists():
+        missing.append(f"caption_iso.jobs.{job}.cfg ({paths.rel(cfg) if cfg else None})")
+    seg_file = Path(str(segs.get("path") or ""))
+    if not segs.get("path") or not seg_file.is_file():
+        missing.append(f"the staged oracle segments ({segs.get('path')})")
+    else:
+        import hashlib
+
+        if hashlib.sha256(seg_file.read_bytes()).hexdigest() != segs.get("sha256"):
+            missing.append(f"the staged oracle segments as pinned ({paths.rel(seg_file)}: "
+                           "sha256 differs)")
+    if missing:
+        return {"missing": missing}
+    args: list[str] = []
+    wit = record_path(paths, ISO_WITNESS[0], job, "caption")
+    if job in jobs_of(st, ISO_WITNESS[1], ISO_WITNESS[2]) and wit.exists():
+        args += ["--witness", str(wit)]
+    for side in ("exact", "noise", "isolated", "isolated_witness"):
+        d = digest_path(paths, side, job)
+        if d.exists():
+            args += ["--digests", f"{DIGEST_SIDES[side]}={d}"]
+    args += ["--oracle-segments", str(seg_file)]
+    e2e = record_path(paths, "balanced", job, "caption")
+    if e2e.exists():
+        args += ["--reported-e2e", str(e2e)]
+    rep, rep_d = record_path(paths, "repeat", job, "caption"), digest_path(paths, "repeat", job)
+    if job in jobs_of(st, SETS["repeat"]) and rep.exists() and rep_d.exists():
+        args += ["--reported-repeat", str(rep), "--digests", f"repeat={rep_d}"]
+    fam = families(_uids(cand))
+    if fam:
+        fp = tmp / f"families-{job}.json"
+        fp.write_text(json.dumps(fam, sort_keys=True), encoding="utf-8")
+        args += ["--families", str(fp)]
+    return {"balanced": str(cand), "cfg": str(cfg), "args": args}
 
 
 def parse_certificate(text: str, stage: str) -> dict[str, Any] | None:
@@ -753,7 +862,7 @@ def billing_rows(st: wh.State, *, certify_status: str | None = None
     rows, warnings = [], []
     wm = st.watermark  # billing is complete up to here (the rows' interval_start)
     elsewhere = billed_elsewhere(st)
-    for name in wh.STEPS:
+    for name in wh.ALL_STEPS:
         s = st.steps.get(name)
         if s is None:
             continue
@@ -1323,17 +1432,137 @@ def certification_blocks(readme: str, cert_dirs: Sequence[Path]) -> str:
 # Driver
 
 
-def fetch_records(paths: Paths, st: wh.State, run: Callable[..., Any] = subprocess.run) -> None:
-    """Export each job's segment / caption records from the run's store (a Volume read)."""
+def record_sets() -> list[tuple[str, str, str]]:
+    """(side, step, result key) of every job whose records ``--fetch`` exports."""
+    return [(side, step, "jobs") for side, step in SETS.items()] + [WITNESS, ISO_WITNESS]
+
+
+def job_audits(job_id: str, store: str) -> list[dict[str, Any]]:
+    """Every audit line of a job (its store's ``.../audit/...`` files; a Volume read)."""
+    import contextlib
+
+    from flora_deploy import sdk
+    from flora_deploy.jobs.store import JobPaths
+
+    job = sdk.open_job(job_id, store=store)
+    out: list[dict[str, Any]] = []
+    for f in job.store.list(f"{JobPaths(job_id).root}/"):
+        if "/audit/" not in f:
+            continue
+        for line in job.store.get_bytes(f).decode().splitlines():
+            with contextlib.suppress(ValueError):
+                a = json.loads(line)
+                if isinstance(a, dict):
+                    out.append(a)
+    return out
+
+
+def _hex_or_none(x: Any) -> str | None:
+    return x if isinstance(x, str) and _HEX64.fullmatch(x) else None
+
+
+def _caption_rows(rec: Any) -> list[Any]:
+    return list(getattr(rec, "segments", ()) or ())
+
+
+def segcap_digests(records: Sequence[Any], audits: Sequence[Mapping[str, Any]]
+                   ) -> dict[str, list[str | None]]:
+    """``{uid: [digest | None per caption row]}`` of an exact (segcap) job: from each episode's
+    audit line, ``result.flora_reference.model_calls`` with ``output_limit`` 512 (the
+    Captioner's), in call order; the k-th such call pairs with the k-th caption row whose
+    ``status`` is ``complete`` (``stages.reference``'s pairing), every other row is None, and
+    so is a complete row with no call left. An episode with several audit lines (a retried
+    shard) takes the one whose captions are the record's; if that leaves differing digest
+    lists, its rows are all None (certify then refuses: ``oracle_digests_missing``). Only hex
+    digests are kept: no text."""
+    by_uid: dict[str, list[Mapping[str, Any]]] = {}
+    for a in audits:
+        if a.get("stage") == "segcap" and isinstance(a.get("result"), dict) and a.get("uid"):
+            by_uid.setdefault(str(a["uid"]), []).append(a)
+    out: dict[str, list[str | None]] = {}
+    for rec in records:
+        if getattr(rec, "stage", None) != "caption":
+            continue
+        rows = _caption_rows(rec)
+        want = [s.caption for s in rows if s.status == "complete"]
+
+        def calls(a: Mapping[str, Any]) -> list[str | None]:
+            mc = ((a.get("result") or {}).get("flora_reference") or {}).get("model_calls") or []
+            return [_hex_or_none(c.get("input_digest")) for c in mc
+                    if isinstance(c, dict) and c.get("output_limit") == CAPTIONER_OUTPUT_LIMIT]
+
+        cands = by_uid.get(rec.uid, [])
+        if len(cands) > 1:  # in memory only: which line wrote this record's captions
+            same = [a for a in cands if [s.get("caption") for s in
+                                         (a["result"].get("segments") or ())
+                                         if isinstance(s, dict)
+                                         and s.get("status") == "complete"] == want]
+            cands = same or cands
+        lists = {tuple(calls(a)) for a in cands}
+        digests = list(next(iter(lists))) if len(lists) == 1 else []
+        it = iter(digests)
+        out[rec.uid] = [next(it, None) if s.status == "complete" else None for s in rows]
+    return out
+
+
+def caption_digests(records: Sequence[Any], audits: Sequence[Mapping[str, Any]]
+                    ) -> dict[str, list[str | None]]:
+    """``{uid: [digest | None per caption row]}`` of a balanced caption job: each episode's
+    caption audit row (``stage`` caption, not a ``shard_audit``) carries ``input_digests``,
+    one per caption row in record order (None: no Captioner call). A row list whose length is
+    not the record's, or an episode without one, gives all None (certify refuses:
+    ``inputs_not_isolated``). Only hex digests are kept."""
+    by_uid: dict[str, list[Any]] = {}
+    for a in audits:
+        if (a.get("stage") == "caption" and not a.get("shard_audit") and a.get("uid")
+                and isinstance(a.get("input_digests"), list)):
+            by_uid.setdefault(str(a["uid"]), []).append(a["input_digests"])
+    out: dict[str, list[str | None]] = {}
+    for rec in records:
+        if getattr(rec, "stage", None) != "caption":
+            continue
+        n = len(_caption_rows(rec))
+        lists = {tuple(_hex_or_none(x) for x in d) for d in by_uid.get(rec.uid, [])}
+        got = list(next(iter(lists))) if len(lists) == 1 else []
+        out[rec.uid] = got if len(got) == n else [None] * n
+    return out
+
+
+def write_digests(paths: Paths, side: str, job: str, records: Sequence[Any],
+                  audits: Sequence[Mapping[str, Any]]) -> Path:
+    """The side's digest JSON (:data:`DIGESTS`) beside its records."""
+    fn = segcap_digests if side in SEGCAP_DIGEST_SIDES else caption_digests
+    d = fn(records, audits)
+    out = record_path(paths, side, job, "caption").with_name(DIGESTS)
+    out.write_text(json.dumps(d, sort_keys=True) + "\n", encoding="utf-8")
+    return out
+
+
+def digest_path(paths: Paths, side: str, job: str) -> Path:
+    return record_path(paths, side, job, "caption").with_name(DIGESTS)
+
+
+def fetch_records(paths: Paths, st: wh.State, run: Callable[..., Any] = subprocess.run, *,
+                  audits: Callable[[str, str], list[dict[str, Any]]] | None = None) -> None:
+    """Export each job's segment / caption records from its store (the run's, or the one its
+    state record names: recertify's oracle and noise jobs are in (b)'s; a Volume read), and
+    for the sides the v4 caption certificate pairs (:data:`DIGEST_SIDES`) the digest JSON
+    (:func:`write_digests`) from the job's audit lines (``audits``: injectable), when the state
+    has the stage-isolated caption job they pair with."""
     import h0_rehearsal as h0
 
-    store = f"modal-volume://{wh.STORE_VOLUME}/{st.run_id}"
-    sets = [(side, step, "jobs") for side, step in SETS.items()] + [WITNESS]
-    for side, step, key in sets:
+    from flora_deploy.records import StageRecord
+
+    default = f"modal-volume://{wh.STORE_VOLUME}/{st.run_id}"
+    # a substituted ``run`` (a test, a dry export) exports nothing real: the audits are then
+    # read only through a substituted ``audits`` too, never from the real store
+    read_audits = audits or (job_audits if run is subprocess.run else None)
+    for side, step, key in record_sets():
         for job, r in sorted(jobs_of(st, step, key).items()):
             if "job_id" not in r:
                 continue
-            for stage in CERT_STAGES:
+            store = r.get("store") or default
+            for stage in r.get("stages") or CERT_STAGES:
                 out = record_path(paths, side, job, stage)
                 out.parent.mkdir(parents=True, exist_ok=True)
                 run([h0.flora_bin(), "results", "--job", r["job_id"], "--stage", stage,
@@ -1341,6 +1570,13 @@ def fetch_records(paths: Paths, st: wh.State, run: Callable[..., Any] = subproce
                 # which job these records are: the lab reads (d)'s only when this matches
                 wh.records_source_path(out).write_text(json.dumps(
                     {"job_id": r["job_id"], "store": store, "stage": stage}) + "\n")
+            cap = record_path(paths, side, job, "caption")
+            # digests only pair with a stage-isolated caption job (J2) of the same job key
+            if (read_audits is not None and side in DIGEST_SIDES and cap.exists()
+                    and job in jobs_of(st, SETS["isolated"])):
+                recs = [StageRecord.from_json(x) for x in cap.read_text().splitlines()
+                        if x.strip()]
+                write_digests(paths, side, job, recs, read_audits(r["job_id"], store))
 
 
 def analyze(paths: Paths, *, derived: Mapping[str, str] | None = None, cert_tmp: Path,
@@ -1369,7 +1605,7 @@ def analyze(paths: Paths, *, derived: Mapping[str, str] | None = None, cert_tmp:
             outputs[paths.costs_doc] = cost_table.render(
                 paths.costs_doc.read_text(encoding="utf-8"),
                 table=replace(table, source="planner/rates.json"))
-    outcomes = certify_all(paths, st, cert_tmp,
+    outcomes = certify_all(paths, wh.certify_view(st), cert_tmp,
                            derived=derived_content_used(st) if derived is None else derived,
                            cli=cli)
     labs = {k: lab_result(paths, st, k) for k in ("tempseg", "captioner")}
@@ -1513,17 +1749,19 @@ def main(argv: list[str] | None = None, *, cli: Callable[[list[str]], tuple[int,
     ap.add_argument("--root", type=Path, default=ROOT, help="repository root")
     ap.add_argument("--state", type=Path)
     ap.add_argument("--records", type=Path)
+    ap.add_argument("--lab", type=Path, help="the lab JSON directory (default reports/wave-h)")
     ap.add_argument("--cert-dir", type=Path)
     ap.add_argument("--derived-content", action="append", metavar="NAME=SHA256",
                     help="override the pinned derived-weight content digests")
     args = ap.parse_args(argv)
-    paths = Paths(root=args.root, state=args.state, records=args.records, certs=args.cert_dir)
+    paths = Paths(root=args.root, state=args.state, records=args.records, certs=args.cert_dir,
+                  lab=args.lab)
     derived = None
     if args.derived_content:
         derived = dict(x.split("=", 1) for x in args.derived_content)
     if args.fetch:
         st = wh.State.from_json(json.loads(paths.state.read_text(encoding="utf-8")))
-        fetch_records(paths, st)
+        fetch_records(paths, wh.certify_view(st))
     with tempfile.TemporaryDirectory(prefix="wave-h-finalize-") as tmp:
         f, outputs, certs = analyze(paths, derived=derived, cert_tmp=Path(tmp), cli=cli)
         print_findings(f)

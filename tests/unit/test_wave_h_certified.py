@@ -45,7 +45,8 @@ def _manifest() -> dict:
 
 
 def test_certified_plan_runs_b_f_d_then_certify_on_golden_v2():
-    assert wh.PLANS[wh.CERTIFIED] == ("exact_e2e", "noise", "balanced", "lab", "certify")
+    assert wh.PLANS[wh.CERTIFIED] == ("exact_e2e", "noise", "balanced", "lab", "caption_iso",
+                                      "certify")
     assert SPEC.golden == "golden/v2" and SPEC.shared_data
     assert len(SPEC.episodes) >= 12 and len(set(SPEC.episodes)) == len(SPEC.episodes)
     assert len(SPEC.noise) == wh.MIN_NOISE_EPISODES + wh.NOISE_SPARES
@@ -216,11 +217,81 @@ def _job(step: str, cfg: Path | None) -> dict:
             "containers": [], "video_hours": {"done": 0.06}, "cfg": str(cfg) if cfg else None}
 
 
+def digest_of(uid: str, j: int) -> str:
+    import hashlib
+
+    return hashlib.sha256(f"{uid}/{j}".encode()).hexdigest()
+
+
+def add_isolated(st, spec, records: Path, work: Path, *, witness: bool = True,
+                 caption_of=None) -> dict:
+    """(g) on top of a certified world: the oracle's segment JSONL staged as wave_h stages it,
+    J2 (caption-only, the oracle's bounds, ``segments_from``) and J2w records, J2's config,
+    and the digest JSONs of every side (the same per-row digest on every side: input
+    identical). ``caption_of(uid, j)``: the candidate's caption (default the oracle's)."""
+    from flora_deploy.records import StageRecord
+    from tests.fakes.certrecords import ORACLE_HASH
+
+    ex = [StageRecord.from_json(x) for x in
+          (records / "exact" / wh.JOB / "segment.jsonl").read_text().splitlines()]
+    ex_cap = [StageRecord.from_json(x) for x in
+              (records / "exact" / wh.JOB / "caption.jsonl").read_text().splitlines()]
+    data = wh.oracle_segment_bytes(ex, ORACLE_HASH, [r.uid for r in ex])
+    seg_dir = work / wh.ORACLE_SEGMENTS_DIR
+    seg_dir.mkdir(parents=True, exist_ok=True)
+    seg_file = seg_dir / f"{ORACLE_HASH}.jsonl"
+    seg_file.write_bytes(data)
+    import hashlib
+
+    sha = hashlib.sha256(data).hexdigest()
+    sf = {"sha256": sha, "oracle_stage_hash": ORACLE_HASH}
+    cfg = work / "flora-iso-human.yaml"
+    cfg.write_text(wh.with_caption_segments(
+        h0.config_text(project="p-iso", data_dir=wh.CERT_DATA, embodiment="human",
+                       stages=("caption",), store_volume="s", media_volume="m", run_id="r",
+                       preset="balanced"),
+        records=f"volume://s/r/{wh.ORACLE_SEGMENTS_DIR}/{ORACLE_HASH}.jsonl", sha256=sha,
+        oracle_stage_hash=ORACLE_HASH))
+
+    def iso(recs, **kw):
+        out = []
+        for r in recs:
+            caps = [caption_of(r.uid, j) if caption_of else s.caption
+                    for j, s in enumerate(r.segments)]
+            out.append(rec(r.uid, "caption", "balanced", embodiment="human", fp=None, gpu=None,
+                           segments=segs([(s.start_s, s.end_s) for s in r.segments], caps),
+                           segments_from=dict(sf), **kw))
+        return out
+
+    wit_uids = {_uid(g) for g in spec.witness}
+    _jsonl(records / "isolated" / wh.JOB / "caption.jsonl", iso(ex_cap))
+    sides = ["exact", "noise", "isolated"]
+    if witness:
+        _jsonl(records / "isolated_witness" / wh.JOB / "caption.jsonl",
+               iso([r for r in ex_cap if r.uid in wit_uids], compile_cache="cold:forced"))
+        sides.append("isolated_witness")
+    for side in sides:
+        path = records / side / wh.JOB / "caption.jsonl"
+        recs = [StageRecord.from_json(x) for x in path.read_text().splitlines()]
+        (path.parent / fin.DIGESTS).write_text(json.dumps(
+            {r.uid: [digest_of(r.uid, j) for j in range(len(r.segments))] for r in recs}))
+    s = st.step("caption_iso")
+    s.status = "done"
+    s.result = {"jobs": {wh.JOB: {**_job("iso", cfg), "stages": ["caption"]}},
+                "oracle_segments": {"path": str(seg_file), **sf,
+                                    "records": f"volume://s/r/oracle-segments/{ORACLE_HASH}"}}
+    if witness:
+        s.result["witness_jobs"] = {wh.JOB: {**_job("isocold", cfg), "compile_cache": "off"}}
+    s.attempts.append(wh.Attempt(started=T0 + 5000, status="done", finished=T0 + 5900,
+                                 tracked_usd=0.5))
+    return {"cfg": cfg, "segments": seg_file, "sha256": sha}
+
+
 def certified_world(tmp_path: Path, *, noise_n: int | None = None, shift: float = 0.01,
-                    witness: bool = True):
-    """A certified-plan state after (b), (f), (d): the records under the plan's records dir
-    (the cold witness's too, unless ``witness=False``), the balanced job's real-format config,
-    the lab JSON."""
+                    witness: bool = True, isolated: bool = True):
+    """A certified-plan state after (b), (f), (d) and (g): the records under the plan's
+    records dir (the cold witnesses' too, unless ``witness=False``), the balanced job's
+    real-format config, the stage-isolated caption job's (``isolated``), the lab JSON."""
     from dataclasses import replace
 
     spec = replace(SPEC, state=tmp_path / "state.json", work=tmp_path / "work",
@@ -256,6 +327,9 @@ def certified_world(tmp_path: Path, *, noise_n: int | None = None, shift: float 
                _records(noise, "exact", stage, noise_ref=True))
         _jsonl(spec.records / "balanced" / wh.JOB / f"{stage}.jsonl",
                _records(SPEC.episodes, "balanced", stage, shift=shift))
+    if isolated:
+        add_isolated(st, spec, spec.records, spec.work, witness=witness)
+        wh.save_state(st, spec.state)
     labs = _labs(tmp_path / "lab")
     ctx = wh.Ctx(st, _manifest(), spec.work, state_path=spec.state, spec=spec,
                  caps=wh.plan_caps(wh.CERTIFIED, wh.plan_projections(wh.CERTIFIED,

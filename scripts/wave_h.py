@@ -34,6 +34,15 @@ Every job stages one data dir (:data:`CERT_DATA`). Its caps are each step's uppe
 rounded up to $0.05 (:func:`plan_caps`), its global cap their sum rounded up to $0.10; its
 state, work dir and records live under ``reports/wave-h/certified/``.
 
+Under the v4 (stage-isolated) caption certificate the certified plan also runs **(g)**
+``caption_iso`` after (b) (:func:`run_caption_iso`): J2, a ``preset: balanced``, ``stages:
+[caption]`` job on every episode whose caption shards read the oracle's own segment records
+(``pipeline.caption_segments``: the JSONL staged byte-exact into the job store,
+:func:`stage_oracle_segments`), then J2w, the same config forced cold on the witness episodes.
+:attr:`PlanSpec.witness` (the cold witnesses' episodes and the ``n-`` local ids) is separate
+from :attr:`PlanSpec.noise` (the noise run's): yam's noise run covers all 12 and its (d) cold
+witness (J1w) runs the segment stage alone (:attr:`PlanSpec.segment_only_witness`).
+
 **Parallel steps** (``--max-parallel N``, default 3; certified only: the other plans are one
 chain). b, f and d are independent and run at once; d2 waits for d, e for all four
 (:data:`CERT_DEPS`, which says why). Each step runs in its own thread with its own heartbeat
@@ -50,14 +59,24 @@ steps, not GPUs: b, f and d hold **4 GPUs** at once, 2 of them H200 (:data:`CERT
 ``--max-gpus H200=1`` runs f after b).
 
 ``recertify`` (human; the stage-isolated caption re-certification, order A) is its own state
-(``reports/wave-h/recertified/``) on the certified run's ``run_id``. Its step f2 ``noise_all``
-repeats that run's (b) on **all 12** of its episodes: (b)'s own config file (``project``
-renamed per attempt: its own job and app) and data dir, re-indexed with no ``--limit``, nvidia
-mode, H200; the config hash and stage hashes are checked equal to (b)'s recorded ones, in this
-checkout, before any app (:func:`noise_all_check`). (b) is read from
-``reports/wave-h/certified/state.json`` (``--source-state``), never written, so the certified
-run's finished steps keep their records. Same stop rules, billing watermark and caps rule as
-``certified``.
+(``reports/wave-h/recertified/``) on the certified run's ``run_id``, one step after the other.
+Its step **f2** ``noise_all`` repeats that run's (b) on **all 12** of its episodes: (b)'s own
+config file (``project`` renamed per attempt: its own job and app) and data dir, re-indexed with
+no ``--limit``, nvidia mode, H200; the config hash and stage hashes are checked equal to (b)'s
+recorded ones, in this checkout, before any app (:func:`noise_all_check`), so it runs before the
+v4 code lands (once it landed the check refuses: f2 is then already done in this state). (b) is
+read from ``reports/wave-h/certified/state.json`` (``--source-state``), never written, so the
+certified run's finished steps keep their records. Then, on the v4 code (``"4" in
+certkey.GENERATOR_VERSIONS``, :func:`require_code_landed`): **d2'** the Captioner lab only
+(TempSeg's saved result reused, :func:`run_recert_lab`), **d'** J1 + the segment-only J1w,
+**g** J2 + J2w, **e'** ``flora certify`` v4 (segment: J1 + J1w + noise-12; caption: J2 + J2w +
+noise-12 with the digests, the staged oracle segments, J1's captions reported only, the
+families and (b)'s old noise run as the repeat: :func:`certify_view`). Its jobs, configs and
+apps take the ``rc-`` prefix (:attr:`PlanSpec.job_prefix`): it shares (b)'s run id, work dir
+and store, so none may be (b)'s. Same stop rules, billing watermark and caps rule as
+``certified``; its global cap is the uppers' sum rounded up to $0.10, never above the
+user-approved :data:`RECERT_GLOBAL_CAP_USD` (f2 included) unless ``--global-cap`` raises it: a
+done f2 counts at its actual cost (spent), the later steps at their uppers.
 
 ``--embodiment`` (``certified`` only; default ``human``) picks the certified plan's embodiment
 (:data:`CERT_SPECS`): ``yam`` runs the same steps on golden/v3-yam (12 three-view episodes,
@@ -199,7 +218,10 @@ PLANS: dict[str, tuple[str, ...]] = {
     "full": ("tempseg", "preflight", "exact_e2e", "balanced", "lab", "certify", "noise"),
     # The certified run (module docstring): b, f, d -> (d2 after d, skipped when done) -> e
     # (in this order with --max-parallel 1; b, f and d at once otherwise: CERT_DEPS).
-    "certified": ("exact_e2e", "noise", "balanced", "lab", "certify"),
+    "certified": ("exact_e2e", "noise", "balanced", "lab", "caption_iso", "certify"),
+    # The stage-isolated re-certification of human (module docstring, "recertify"): f2 -> d2'
+    # -> d' -> g -> e', one after the other, on (b)'s oracle (read from the certified state).
+    "recertify": ("noise_all", "lab", "balanced", "caption_iso", "certify"),
 }
 # What each step needs done first (``--max-parallel``; ``_runbook.run_parallel``). The
 # certified plan: (b), (f) and (d) are independent (one data dir, staged once:
@@ -215,7 +237,9 @@ PLANS: dict[str, tuple[str, ...]] = {
 # (each step needs the one before): they run as they always did.
 CERT_DEPS: dict[str, tuple[str, ...]] = {
     "exact_e2e": (), "noise": (), "balanced": (), "lab": ("balanced",),
-    "certify": ("exact_e2e", "noise", "balanced", "lab")}
+    # (g) captions the oracle's own segment records: it needs (b) only
+    "caption_iso": ("exact_e2e",),
+    "certify": ("exact_e2e", "noise", "balanced", "lab", "caption_iso")}
 # The GPUs each certified step holds at once (``--max-gpus``; ``_runbook.gpu_wait``): (b) and
 # (f) one H200 container each (``max_containers: 1``, one app each), (d) its two pools at once
 # (L40S segment + H100 caption, one container each; the cold witness runs after), (d2) one GPU
@@ -223,7 +247,7 @@ CERT_DEPS: dict[str, tuple[str, ...]] = {
 # H200. A Modal app's ``max_gpus`` caps that app only, and ``--max-parallel`` counts steps.
 CERT_GPUS: dict[str, dict[str, int]] = {
     "exact_e2e": {"H200": 1}, "noise": {"H200": 1}, "balanced": {"L40S": 1, "H100": 1},
-    "lab": {"L40S": 1}, "certify": {}}
+    "lab": {"L40S": 1}, "caption_iso": {"H100": 1}, "noise_all": {"H200": 1}, "certify": {}}
 DEFAULT_MAX_GPUS = 4  # the certified plan's peak: the default never holds a step back
 
 
@@ -243,11 +267,19 @@ def plan_deps(plan: str) -> dict[str, tuple[str, ...]]:
     return dict(CERT_DEPS) if plan == "certified" else rb.chain(PLANS[plan])
 
 
+def is_cert(plan: str | None) -> bool:
+    """The plans that certify: their own state, golden/v2 or v3-yam, honest caps."""
+    return plan in CERT_PLANS
+
+
 DEFAULT_PLAN = "balanced-only"
 DEFERRED_NOTE = "deferred to the certified run"
 CERTIFIED = "certified"
+RECERTIFY = "recertify"
+CERT_PLANS = (CERTIFIED, RECERTIFY)  # the plans with their own state (never shared)
 # --- The certified plan (golden/v2, docs/golden-manifest-v2.md) -------------------------------
 CERT_ROOT = ROOT / "reports" / "wave-h" / "certified"  # its own state, work dir and records
+RECERT_ROOT = ROOT / "reports" / "wave-h" / "recertified"  # recertify: state, records, lab
 CERT_GOLDEN = "golden/v2"
 CERT_DATA = "cert-human"  # ONE data dir for the oracle, noise and balanced jobs (see CertSpec)
 NOISE_PREFIX, REST_PREFIX = "n-", "x-"  # local id prefixes: the noise episodes sort first
@@ -360,19 +392,38 @@ class PlanSpec:
     rate_scale: tuple[tuple[str, float], ...] = ()
     lab_eps: tuple[str, ...] | None = None
     # recertify: the certified run's state whose (b) it repeats (read-only; ``--source-state``)
+    # and whose (b) and old (f) the later steps read
     source: Path | None = None
+    # The cold witnesses' episodes (() : the noise subset, as the golden/v2 human run had it).
+    # They keep the :data:`NOISE_PREFIX` local ids, so ``flora index --limit`` selects them
+    # and the uids stay those of (b)'s run when the noise run grows to every episode.
+    witness: tuple[str, ...] = ()
+    # recertify: where its lab JSON lives (None: :data:`LAB_OUT`)
+    lab_dir: Path | None = None
+    # the balanced step's cold witness (J1w) runs the segment stage only: the caption
+    # certificate's witness is the isolated caption job's (J2w)
+    segment_only_witness: bool = False
+    # recertify runs on (b)'s run id, in (b)'s work dir and store: its own jobs, configs and
+    # apps take this prefix, so none is (b)'s (``balanced-human`` is (b)'s (d))
+    job_prefix: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.witness:
+            object.__setattr__(self, "witness", self.noise)
 
     @property
     def scale(self) -> dict[str, float]:
         return dict(self.rate_scale)
 
     def local_id(self, gid: str) -> str:
-        """The episode id a job sees (the ``mp4_dir`` file stem). Certified: the noise episodes
-        get :data:`NOISE_PREFIX`, the rest :data:`REST_PREFIX`, so ``flora index --limit 5``
-        on the oracle's own config and data dir indexes exactly the noise subset."""
+        """The episode id a job sees (the ``mp4_dir`` file stem). Certified: the witness
+        episodes (the old noise subset) get :data:`NOISE_PREFIX`, the rest
+        :data:`REST_PREFIX`, so ``flora index --limit 6`` on the job's own config and data dir
+        indexes exactly them. Keyed on the witness set, never on the noise run's episodes, so
+        a noise run on every episode leaves every uid as (b) had it."""
         if not self.shared_data:
             return h0.episode_id(gid)
-        return (NOISE_PREFIX if gid in self.noise else REST_PREFIX) + h0.episode_id(gid)
+        return (NOISE_PREFIX if gid in self.witness else REST_PREFIX) + h0.episode_id(gid)
 
     def data_dir(self, step: str) -> str:
         return self.data if self.shared_data else f"{step}-{JOB}"
@@ -390,6 +441,15 @@ class PlanSpec:
     def noise_limit(self) -> int | None:
         """``flora index --limit`` for the noise job (None: all of the oracle's episodes)."""
         return len(self.noise) if self.shared_data and self.noise != self.episodes else None
+
+    @property
+    def witness_limit(self) -> int:
+        """``flora index --limit`` for a cold witness job: the witness episodes sort first."""
+        return len(self.witness)
+
+    @property
+    def labs(self) -> Path:
+        return self.lab_dir if self.lab_dir is not None else LAB_OUT
 
 
 _V1 = {"golden": "golden/v1", "episodes": EPISODES, "noise": NOISE_EPISODES, "state": STATE,
@@ -414,12 +474,14 @@ _YAM_SCALE = () if NO_CAMERA_SCALING else tuple(sorted(_CAMERA_SCALING.factors(3
 # state, work dir and records, so certified runs never collide and resume independently.
 CERT_SPECS: dict[str, PlanSpec] = {
     "human": SPECS[CERTIFIED],
-    "yam": PlanSpec(CERTIFIED, CERT_YAM_GOLDEN, CERT_YAM_EPISODES, CERT_YAM_NOISE,
+    # noise on all 12 (R2 of the v4 pre-registration), the witnesses on the noise subset
+    "yam": PlanSpec(CERTIFIED, CERT_YAM_GOLDEN, CERT_YAM_EPISODES, CERT_YAM_EPISODES,
                     CERT_YAM_ROOT / "state.json", CERT_YAM_ROOT / "work",
                     CERT_YAM_ROOT / "records", CERT_YAM_ROOT / "runbook.md", shared_data=True,
                     embodiment="yam", data="cert-yam",
                     rate_scale=_YAM_SCALE,
-                    lab_eps=CERT_YAM_EPISODES[:6]),
+                    lab_eps=CERT_YAM_EPISODES[:6], witness=CERT_YAM_NOISE,
+                    segment_only_witness=True),
 }
 # config.schema.Embodiment; the ones without a golden certification set are refused.
 ALL_EMBODIMENTS = ("human", "yam", "yam32", "dex", "tianji")
@@ -443,20 +505,21 @@ def spec_for(plan: str, embodiment: str = EMBODIMENT) -> PlanSpec:
 # Its own state (``reports/wave-h/recertified/state.json``), so the certified run's state, and
 # with it every finished step's record (b, f, d, d2, e), is never written; it reads (b) from the
 # certified state, read-only (:func:`oracle_source`), and takes that run's ``run_id``: (b)'s
-# config writes into that run's store and reads that run's staged media. Later recertify steps
-# (lab, balanced, caption_iso, certify) are added by the stage-isolated caption work.
-RECERTIFY = "recertify"
-RECERT_ROOT = ROOT / "reports" / "wave-h" / "recertified"
+# config writes into that run's store and reads that run's staged media. The later steps
+# (PLANS[RECERTIFY]: d2' lab, d' balanced, g caption_iso, e' certify) run on the v4 code: the
+# noise run is all 12 (noise == episodes), the witnesses (b)'s old noise subset (its n- local
+# ids, so (b)'s uids), the J1 witness segment-only, the lab JSON in RECERT_ROOT, and every job,
+# config and app of theirs prefixed ``rc-`` (it shares (b)'s run id and work dir).
 RECERT_SOURCE = CERT_ROOT / "state.json"  # the certified run whose (b) is repeated (read-only)
-RECERT_STEPS = ("noise_all",)
+RECERT_STEPS = PLANS[RECERTIFY]
 NOISE_ALL_JOB = "noise12"  # job / app / index tag: wave-h-<run>-noise12-<embodiment>-a<n>
-PLANS[RECERTIFY] = RECERT_STEPS
 SPECS[RECERTIFY] = replace(SPECS[CERTIFIED], name=RECERTIFY, state=RECERT_ROOT / "state.json",
                            # (b)'s work dir: its config's relative ``input.path`` (the data dir,
                            # hashed by content) resolves there, and flora runs from it
                            work=CERT_ROOT / "work", records=RECERT_ROOT / "records",
-                           report=RECERT_ROOT / "runbook.md", source=RECERT_SOURCE)
-CERT_PLANS = (CERTIFIED, RECERTIFY)  # the plans with their own state (never shared)
+                           report=RECERT_ROOT / "runbook.md", source=RECERT_SOURCE,
+                           noise=CERT_EPISODES, witness=CERT_NOISE, lab_dir=RECERT_ROOT,
+                           segment_only_witness=True, job_prefix="rc-")
 # Per-step caps (USD): each step's upper projection, priced on the golden selection's expected
 # durations x (1 + DURATION_HEADROOM) (the staged human files run ~5% longer in all), rounded up
 # to 5 cents (``honest_caps``), on the shipped ``planner/rates.json`` (the balanced rows measured
@@ -469,8 +532,14 @@ CERT_PLANS = (CERTIFIED, RECERTIFY)  # the plans with their own state (never sha
 # step whose upper projection no longer fits the cap left). Raising a cap is the user's decision.
 DURATION_HEADROOM = 0.10
 CAPS_USD = {"tempseg": 0.75, "preflight": 0.05, "exact_e2e": 3.30, "balanced": 2.35,
-            "lab": 2.35, "certify": 0.0, "noise": 3.30}
+            "lab": 2.35, "certify": 0.0, "noise": 3.30,
+            # the certifying plans' own steps (their caps are honest_caps; these never gate)
+            "noise_all": 4.20, "caption_iso": 2.85}
 GLOBAL_CAP_USD = 6.50  # --plan full; balanced-only derives its own (plan_global_cap)
+# --plan recertify: the user-approved global cap (2026-10-23, pre-registration D5: the human
+# recertify upper total, f2's noise-12 included). Its derived cap (the uppers' sum rounded up
+# to $0.10) is used when lower; above it only a --global-cap the user approves raises it.
+RECERT_GLOBAL_CAP_USD = 11.70
 # The most --global-cap may approve: the project's whole GPU budget (review 12 F7: ``inf`` once
 # turned every global check into a no-op): ``$FLORA_PROJECT_BUDGET_USD``, default $50, the one
 # setting ``spend.py`` and ``cert_preflight.py`` read too.
@@ -734,6 +803,25 @@ def balanced_job_seconds(video_s: float, table: Any = None, *,
     return out
 
 
+def single_pool_seconds(kind: str, video_s: float, table: Any = None, *,
+                        compile_factor: float = COLD_COMPILE_FACTOR,
+                        scale: Mapping[str, float] | None = None) -> tuple[float, float]:
+    """Nominal and upper container-seconds of a balanced job with **one** pool (a
+    segment-only cold witness, a caption-only isolated job): its cold start, the work and the
+    idle until ``modal app stop`` (upper: ``(start + work) x (1 + uncertainty)`` plus the
+    client slack). No other pool waits on it, so there is no scale-down tail."""
+    from flora_deploy.planner.rates import RateTable
+
+    t = table or RateTable.load()
+    e = t.rate("balanced", kind, 1, 1)
+    st = t.startup_for("balanced", kind)
+    start, _basis = cold_startup_s(st, compile_factor)
+    w = video_s * e.container_s_per_video_s * ((scale or {}).get(kind, 1.0))
+    unc = max(e.uncertainty, st.uncertainty)
+    return (start + w + IDLE_AFTER_JOB_S,
+            (start + w) * (1 + unc) + IDLE_AFTER_JOB_S + CLIENT_SLACK_S)
+
+
 def project(step: str, manifest: Mapping[str, Any], spec: PlanSpec | None = None, *,
             reuse: Iterable[str] = (), lab_done: bool = False,
             witness_only: bool = False) -> Projection:
@@ -776,13 +864,18 @@ def project(step: str, manifest: Mapping[str, Any], spec: PlanSpec | None = None
               "compile)", seg, secs["segment"][0], upper_s=secs["segment"][1], group="job")
         p.add(f"balanced caption {job} ({len(eps)} ep, {v:.1f} s{work('caption')}, cold "
               "compile)", cap, secs["caption"][0], upper_s=secs["caption"][1], group="job")
-        if spec.shared_data:  # certified: the forced-cold job on the noise subset
-            neps = [i for i in spec.noise if i in dur]
+        if spec.shared_data:  # certified: the forced-cold job on the witness episodes
+            neps = [i for i in spec.witness if i in dur]
             nv = sum(dur[i] for i in neps)
-            ws = balanced_job_seconds(nv, scale=sc or None)
-            for kind, c in (("segment", seg), ("caption", cap)):
-                p.add(f"cold witness {kind} {job} ({len(neps)} ep, {nv:.1f} s{work(kind)}, "
-                      "forced cold)", c, ws[kind][0], upper_s=ws[kind][1], group="witness")
+            if spec.segment_only_witness:  # J1w: the segment stage alone, one pool
+                n, u = single_pool_seconds("segment", nv, scale=sc or None)
+                p.add(f"cold witness segment-only {job} ({len(neps)} ep, {nv:.1f} s"
+                      f"{work('segment')}, forced cold)", seg, n, upper_s=u, group="witness")
+            else:
+                ws = balanced_job_seconds(nv, scale=sc or None)
+                for kind, c in (("segment", seg), ("caption", cap)):
+                    p.add(f"cold witness {kind} {job} ({len(neps)} ep, {nv:.1f} s{work(kind)}, "
+                          "forced cold)", c, ws[kind][0], upper_s=ws[kind][1], group="witness")
             if witness_only:  # (d)'s job is done: the witness alone re-runs
                 full = p.usd_upper
                 p.items = [i for i in p.items if i["what"].startswith("cold witness")]
@@ -804,7 +897,9 @@ def project(step: str, manifest: Mapping[str, Any], spec: PlanSpec | None = None
                   LAB[kind], LAB_EXPECTED_S[kind], upper_s=LAB_DEADLINE_S[kind] + LAB_SLACK_S)
         p.peak_usd_per_s = max((LAB[k].usd_per_s() for k in LAB if k not in reuse),
                                default=0.0)  # one after the other
-        if reuse:
+        # recertify reuses TempSeg's saved result by design (its engine did not change): its
+        # cap is the Captioner call's upper alone
+        if reuse and spec.name != RECERTIFY:
             p.cap_usd_upper = round(full, 4)
     elif step == "noise":
         neps = [i for i in spec.noise if i in dur]
@@ -818,6 +913,21 @@ def project(step: str, manifest: Mapping[str, Any], spec: PlanSpec | None = None
         p.add(f"segcap {job} repeat of (b), all {len(eps)} ep ({v:.1f} s{work('segcap')}, "
               "cold start)", pool_container("segcap"), nominal, upper_s=upper)
         p.peak_usd_per_s = pool_container("segcap").usd_per_s()
+    elif step == "caption_iso":  # J2 (every episode), then J2w (the witnesses, forced cold)
+        cap = pool_container("caption", "balanced")
+        weps = [i for i in spec.witness if i in dur]
+        wv = sum(dur[i] for i in weps)
+        for what, n_ep, vs, extra in (("isolated caption", len(eps), v, "cold compile"),
+                                      ("isolated caption cold witness", len(weps), wv,
+                                       "forced cold")):
+            n, u = single_pool_seconds("caption", vs, scale=sc or None)
+            p.add(f"{what} {job} ({n_ep} ep, {vs:.1f} s{work('caption')}, oracle segments, "
+                  f"{extra})", cap, n, upper_s=u)
+        if witness_only:  # J2 is done: the witness alone re-runs
+            full = p.usd_upper
+            p.items = [i for i in p.items if "cold witness" in i["what"]]
+            p.cap_usd_upper = full
+        p.peak_usd_per_s = cap.usd_per_s()
     elif step == "certify":
         pass
     else:
@@ -845,6 +955,8 @@ def plan_global_cap(plan: str, projections: Mapping[str, Projection],
     else:
         up = round(sum(_cap_upper(projections[s]) for s in PLANS[plan]), 6)
         derived = round(math.ceil(up * 10 - 1e-9) / 10, 2)
+        if plan == RECERTIFY:  # never above what the user approved (f2 included)
+            derived = min(derived, RECERT_GLOBAL_CAP_USD)
     return max(derived, override) if override is not None else derived
 
 
@@ -871,6 +983,9 @@ def global_cap_label(st: State, plan: str, projections: Mapping[str, Projection]
     ov = st.override_for(plan)
     if ov is not None and ov > derived + 1e-9:
         return f"user-approved override for plan {plan}; derived ${derived:.2f}"
+    if plan == RECERTIFY and derived >= RECERT_GLOBAL_CAP_USD - 1e-9:
+        return (f"the user-approved ${RECERT_GLOBAL_CAP_USD:.2f} (f2 included): the sum of the "
+                "plan's upper projections, rounded up to $0.10, is not below it")
     return ("the sum of the plan's upper projections, rounded up to $0.10" if plan != "full"
             else "GLOBAL_CAP_USD")
 
@@ -888,7 +1003,7 @@ def plan_caps(plan: str, projections: Mapping[str, Projection]) -> dict[str, flo
     the golden/v2 durations) rounded up to 5 cents (:func:`honest_caps`), so the stop rule
     before a step is its upper price and nothing more (``recertify`` too). Other plans:
     :data:`CAPS_USD`."""
-    if plan not in CERT_PLANS:
+    if not is_cert(plan):
         return dict(CAPS_USD)
     honest = honest_caps({s: projections[s] for s in PLANS[plan]})
     return {**CAPS_USD, **{s: honest[s] for s in PLANS[plan]}}
@@ -896,16 +1011,22 @@ def plan_caps(plan: str, projections: Mapping[str, Projection]) -> dict[str, flo
 
 def plan_projections(plan: str, manifest: Mapping[str, Any], *, lab_done: bool = False,
                      reuse: Iterable[str] = (), spec: PlanSpec | None = None,
-                     witness_only: bool = False) -> dict[str, Projection]:
-    """Every step's projection on the plan's episodes (``lab_done`` only applies to
-    ``certified``: the other plans run their lab; ``reuse``: :func:`lab_reuse`; ``spec``:
-    default the plan's, :func:`spec_for` for another embodiment; ``witness_only``:
-    :func:`witness_pending`, (d) priced at its cold witness alone)."""
+                     witness_only: bool = False,
+                     iso_witness_only: bool = False) -> dict[str, Projection]:
+    """Every step's projection on the plan's episodes (``lab_done`` only applies to the
+    certifying plans: the other plans run their lab; ``reuse``: :func:`lab_reuse`; recertify
+    always reuses TempSeg's; ``spec``: default the plan's, :func:`spec_for` for another
+    embodiment; ``witness_only``: :func:`witness_pending`, (d) priced at its cold witness
+    alone; ``iso_witness_only``: :func:`iso_witness_pending`, (g) at J2w alone)."""
     spec = spec or SPECS[plan]
-    return {s: project(s, manifest, spec, lab_done=lab_done and plan == CERTIFIED,
+    if plan == RECERTIFY:
+        reuse = tuple(sorted(set(reuse) | {"tempseg"}))
+    cert = is_cert(plan)
+    return {s: project(s, manifest, spec, lab_done=lab_done and cert,
                        reuse=reuse if s == "lab" else (),
-                       witness_only=witness_only and plan == CERTIFIED and s == "balanced")
-            for s in STEPS + tuple(x for x in PLANS[plan] if x not in STEPS)}
+                       witness_only=cert and ((witness_only and s == "balanced")
+                                              or (iso_witness_only and s == "caption_iso")))
+            for s in ALL_STEPS + tuple(x for x in PLANS[plan] if x not in ALL_STEPS)}
 
 
 def lab_engine_hashes(kind: str) -> dict[str, str]:
@@ -934,7 +1055,8 @@ def lab_hash_problem(kind: str, res: Mapping[str, Any]) -> str | None:
     return None
 
 
-def lab_already_done(lab_dir: Path | None = None) -> tuple[bool, str]:
+def lab_already_done(lab_dir: Path | None = None,
+                     kinds: Sequence[str] = ("tempseg", "captioner")) -> tuple[bool, str]:
     """Whether the lab's L0 + Gate A evidence exists (``balanced-<kind>.json``, as step d2 or
     ``--only lab`` writes it): per kind non-empty L0 rows, every one with equal ids and grids,
     Gate A over at least one request, measured on the balanced pool's GPU **under the current
@@ -945,7 +1067,8 @@ def lab_already_done(lab_dir: Path | None = None) -> tuple[bool, str]:
     from flora_deploy.engines.offline_llm import EngineArgsError, normalize_gpu
 
     lab_dir = lab_dir or LAB_OUT
-    pool = {"tempseg": "segment", "captioner": "caption"}
+    pool = {k: v for k, v in {"tempseg": "segment", "captioner": "caption"}.items()
+            if k in kinds}
     why = []
     for kind, stage in pool.items():
         p = lab_dir / f"balanced-{kind}.json"
@@ -982,7 +1105,7 @@ def lab_already_done(lab_dir: Path | None = None) -> tuple[bool, str]:
     if why:
         return False, "; ".join(why)
     return True, (f"L0 + Gate A evidence for the current engine settings in "
-                  f"{lab_dir}/balanced-{{tempseg,captioner}}.json")
+                  f"{lab_dir}/balanced-{{{','.join(pool)}}}.json")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -996,30 +1119,48 @@ TITLES = {"tempseg": "0. TempSeg merger v2 build + equivalence (CPU + L40S), the
           "balanced": "d. balanced via flora deploy/run (L40S + H100)",
           "lab": "d2. balanced lab L0 / Gate A on (d)'s job (L40S, then H100)",
           "certify": "e. offline provisional certification",
-          "noise": "f. noise: oracle job repeated, default mode, H200"}
+          "noise": "f. noise: oracle job repeated, default mode, H200",
+          "noise_all": "f2. noise: (b)'s oracle job repeated on all its episodes, H200",
+          "caption_iso": "g. caption-only isolated job on the oracle's segments + cold witness"}
+# The certifying plans' own steps (not in the v1 plans: never listed as deferred there)
+EXTRA_STEPS = ("noise_all", "caption_iso")
+ALL_STEPS = STEPS + EXTRA_STEPS
+
+
 def cert_titles(spec: PlanSpec) -> dict[str, str]:
-    return {**TITLES,
-            "exact_e2e": f"b. exact oracle, {len(spec.episodes)} {spec.embodiment} episodes "
-                         f"({spec.golden}), nvidia mode, H200",
-            "noise": f"f. noise: {len(spec.noise)} of (b)'s episodes, (b)'s stage hash/GPU/mode",
-            "balanced": f"d. balanced via flora deploy/run, {len(spec.episodes)} episodes",
-            "lab": "d2. lab L0 / Gate A (skipped when already done)",
-            "certify": ("e. flora certify, then wave_h_finalize.py" if spec.embodiment == "human"
-                        else "e. flora certify (wave_h_finalize.py not run: human only)")}
+    seg_w = " + segment-only cold witness" if spec.segment_only_witness else ""
+    out = {**TITLES,
+           "exact_e2e": f"b. exact oracle, {len(spec.episodes)} {spec.embodiment} episodes "
+                        f"({spec.golden}), nvidia mode, H200",
+           "noise": f"f. noise: {len(spec.noise)} of (b)'s episodes, (b)'s stage hash/GPU/mode",
+           "balanced": f"d. balanced via flora deploy/run, {len(spec.episodes)} episodes{seg_w}",
+           "lab": "d2. lab L0 / Gate A (skipped when already done)",
+           "caption_iso": f"g. caption-only isolated J2 ({len(spec.episodes)} ep) + cold witness "
+                          f"J2w ({len(spec.witness)} ep) on the oracle's segments",
+           "certify": ("e. flora certify, then wave_h_finalize.py" if spec.embodiment == "human"
+                       else "e. flora certify (wave_h_finalize.py not run: human only)")}
+    if spec.name == RECERTIFY:
+        out.update({
+            "noise_all": "f2. noise-12: (b) repeated on all its episodes, (b)'s stage "
+                         "hash/GPU/mode",
+            "lab": "d2'. Captioner lab L0 / Gate A, new engine (TempSeg's reused)",
+            "balanced": f"d'. balanced J1 ({len(spec.episodes)} ep) + segment-only cold "
+                        f"witness J1w ({len(spec.witness)} ep)",
+            "caption_iso": f"g. caption-only isolated J2 ({len(spec.episodes)} ep) + cold "
+                           f"witness J2w ({len(spec.witness)} ep), oracle segments",
+            "certify": "e'. flora certify (v4), then wave_h_finalize.py"})
+    return out
 
 
 CERT_TITLES = cert_titles(SPECS[CERTIFIED])
-ALL_STEPS = STEPS + RECERT_STEPS  # ``--only`` choices
-RECERT_TITLES = {**CERT_TITLES,
-                 "noise_all": "f2. noise-12: (b) repeated on all its episodes, (b)'s stage "
-                              "hash/GPU/mode"}
+RECERT_TITLES = cert_titles(SPECS[RECERTIFY])
 
 
 def titles(plan: str, spec: PlanSpec | None = None) -> dict[str, str]:
-    if plan == RECERTIFY:
-        return RECERT_TITLES
-    if plan != CERTIFIED:
+    if not is_cert(plan):
         return TITLES
+    if plan == RECERTIFY:
+        return RECERT_TITLES if spec is None or spec is SPECS[RECERTIFY] else cert_titles(spec)
     return CERT_TITLES if spec is None or spec is SPECS[CERTIFIED] else cert_titles(spec)
 
 
@@ -1313,7 +1454,8 @@ class Ctx:
         """This attempt's own app name (:func:`app_name`), ``part`` appended for a step that
         starts more than one app (step 0: merge, then equivalence)."""
         n = max(1, len(self.st.step(self.step).attempts))
-        return app_name(self.st.run_id, self.step, n) + (f"-{part}" if part else "")
+        name = app_name(self.st.run_id, self.spec.job_prefix + self.step, n)
+        return name + (f"-{part}" if part else "")
 
     def note_app_id(self, app_id: str | None) -> None:
         """Record a started app's id (``ap-...``): it is stopped and billed by id."""
@@ -1612,7 +1754,9 @@ def stage_data(ctx: Ctx, data: str, ids: Sequence[str]) -> None:
     with _STAGE_LOCK:
         stage_local(ctx, data, ids)
         key = (str(ctx.work / data), f"{run}/{data}")
-        if key not in _UPLOADED:
+        # recertify stages nothing new: the data dir is (b)'s, uploaded by (b) (its content is
+        # in every stage hash, checked equal to (b)'s before f2's app)
+        if key not in _UPLOADED and ctx.spec.name != RECERTIFY:
             h0.upload_dir(MEDIA_VOLUME, ctx.work / data, f"{run}/{data}")
             _UPLOADED.add(key)
 
@@ -1752,9 +1896,10 @@ def balanced_episodes(manifest: Mapping[str, Any], spec: PlanSpec | None = None,
         if len(spec.episodes) < MIN_CERT_EPISODES:
             raise RuntimeError(f"{side}: {len(spec.episodes)} episodes; a certificate needs at "
                                f"least {MIN_CERT_EPISODES}")
-        if len(spec.noise) < MIN_NOISE_EPISODES or not set(spec.noise) <= set(spec.episodes):
-            raise RuntimeError(f"{side}: the noise subset must be at least "
-                               f"{MIN_NOISE_EPISODES} of the oracle's episodes")
+        for what, eps in (("noise subset", spec.noise), ("witness subset", spec.witness)):
+            if len(eps) < MIN_NOISE_EPISODES or not set(eps) <= set(spec.episodes):
+                raise RuntimeError(f"{side}: the {what} must be at least "
+                                   f"{MIN_NOISE_EPISODES} of the oracle's episodes")
     return spec.episodes
 
 
@@ -1765,6 +1910,8 @@ def run_balanced(ctx: Ctx) -> dict[str, Any]:
     from flora_deploy.config.receipts import derived_content as content_of
     from flora_deploy.config.schema import load_config
 
+    if ctx.spec.name == RECERTIFY:
+        require_code_landed("balanced")
     require_tempseg_pin(ctx)
     rate = (pool_container("segment", "balanced").usd_per_s()
             + pool_container("caption", "balanced").usd_per_s())
@@ -1772,7 +1919,7 @@ def run_balanced(ctx: Ctx) -> dict[str, Any]:
         return rerun_cold_witness(ctx, rate)
     episodes = balanced_episodes(ctx.manifest, ctx.spec)
     derived = resolve_receipts(["captioner_bf16", "tempseg_merged"], require_pin=True)
-    cfg, job_id = _stage_job(ctx, f"balanced-{ctx.spec.embodiment}", episodes,
+    cfg, job_id = _stage_job(ctx, f"{ctx.spec.job_prefix}balanced-{ctx.spec.embodiment}", episodes,
                              embodiment=ctx.spec.embodiment,
                              stages=("segment", "caption"), budget=ctx.caps["balanced"],
                              preset="balanced", derived=derived,
@@ -1798,14 +1945,46 @@ def run_balanced(ctx: Ctx) -> dict[str, Any]:
     return {**e2e, **out}
 
 
-def witness_config_text(text: str, project: str) -> str:
+def witness_config_text(text: str, project: str,
+                        stages: Sequence[str] | None = None) -> str:
     """(d)'s config text with its ``project`` replaced: the cold witness's own job id and app
-    name. The project name is not hashed (``config.hashing``), so the stage hash stays (d)'s."""
+    name. The project name is not hashed (``config.hashing``), so the stage hash stays (d)'s.
+    ``stages``: also keep only these pipeline stages (J1w: ``("segment",)``) and drop the
+    ``resources`` lines of the shard kinds they no longer run. The segment stage hash does not
+    depend on whether ``caption`` is in the job (``config.hashing._stage_hashes``)."""
     lines = text.splitlines(keepends=True)
     hits = [i for i, ln in enumerate(lines) if ln.startswith("project:")]
     if len(hits) != 1:
         raise RuntimeError(f"cold witness: {len(hits)} top-level project lines in (d)'s config")
     lines[hits[0]] = f"project: {project}\n"
+    if stages is not None:
+        st = [i for i, ln in enumerate(lines) if ln.startswith("  stages: [")]
+        if len(st) != 1:
+            raise RuntimeError(f"cold witness: {len(st)} pipeline stages lines in (d)'s config")
+        lines[st[0]] = f"  stages: [{', '.join(stages)}]\n"
+        res = next((i for i, ln in enumerate(lines) if ln.startswith("resources:")), None)
+        if res is not None:
+            end = next((i for i in range(res + 1, len(lines))
+                        if not lines[i].startswith("  ")), len(lines))
+            keep = [ln for ln in lines[res + 1:end]
+                    if ln.split(":", 1)[0].strip() in stages]
+            lines[res + 1:end] = keep
+    return "".join(lines)
+
+
+def with_caption_segments(text: str, *, records: str, sha256: str,
+                          oracle_stage_hash: str) -> str:
+    """A ``stages: [caption]`` config text with ``pipeline.caption_segments`` (the pinned
+    oracle segment records the caption shards read instead of upstream segment shards)."""
+    lines = text.splitlines(keepends=True)
+    st = [i for i, ln in enumerate(lines) if ln.startswith("  stages: [caption]")]
+    if len(st) != 1:
+        raise RuntimeError("caption_segments: the config is not one `stages: [caption]` job")
+    if any(ln.startswith("  caption_segments:") for ln in lines):
+        raise RuntimeError("caption_segments: already set")
+    lines[st[0] + 1:st[0] + 1] = [
+        "  caption_segments:\n", f"    records: {records}\n", f"    sha256: {sha256}\n",
+        f"    oracle_stage_hash: {oracle_stage_hash}\n"]
     return "".join(lines)
 
 
@@ -1821,21 +2000,29 @@ def run_cold_witness(ctx: Ctx, cfg: Path, rate: float, *, spent: float) -> dict[
     are (d)'s attempt's, less what (d)'s job spent (``_runbook.budget_for``)."""
     emb = ctx.spec.embodiment
     n = max(1, len(ctx.st.step("balanced").attempts))
-    job_id = f"wave-h-{ctx.st.run_id}-{COLD_JOB}-{emb}-a{n}"
-    tag = f"{COLD_JOB}-{emb}"
+    job_id = f"wave-h-{ctx.st.run_id}-{ctx.spec.job_prefix}{COLD_JOB}-{emb}-a{n}"
+    tag = f"{ctx.spec.job_prefix}{COLD_JOB}-{emb}"
     wcfg = ctx.work / f"flora-{tag}.yaml"
-    wcfg.write_text(witness_config_text(cfg.read_text(), job_id))
-    _index(ctx, wcfg, job_id, tag, limit=len(ctx.spec.noise))
-    got = noise_index_problems(ctx.work / f"summary-{tag}.json", ctx.manifest, ctx.spec)
+    seg_only = ctx.spec.segment_only_witness
+    stages = ("segment",) if seg_only else None
+    wcfg.write_text(witness_config_text(cfg.read_text(), job_id, stages))
+    _index(ctx, wcfg, job_id, tag, limit=ctx.spec.witness_limit)
+    got = noise_index_problems(ctx.work / f"summary-{tag}.json", ctx.manifest, ctx.spec,
+                               ctx.spec.witness)
     if got:
         return {"job_id": job_id, "state": "skipped", "error": f"witness index: {got}",
                 "spend": 0.0, "compile_cache": "off"}
+    if seg_only:  # one pool: the segment container's $/s alone
+        rate = pool_container("segment", "balanced").usd_per_s()
     # in this step's commands' environment only (Ctx.env): a step running beside it keeps
     # its compile cache
     wctx = replace(ctx, env={**ctx.env, COMPILE_CACHE_ENV: "off"})
     r = _run_job(wctx, "balanced", wcfg, job_id, determinism=ORACLE_DETERMINISM,
                  usd_per_s=rate, spent_in_step=spent, side="witness")
-    return {**r, "compile_cache": "off", "episodes": len(ctx.spec.noise)}
+    out = {**r, "compile_cache": "off", "episodes": len(ctx.spec.witness)}
+    if seg_only:
+        out["stages"] = list(stages)
+    return out
 
 
 def rerun_cold_witness(ctx: Ctx, rate: float) -> dict[str, Any]:
@@ -1865,7 +2052,17 @@ def witness_pending(st: State) -> bool:
     """(d)'s deployed job is done but its cold witness is missing or not done, on a state that
     needs one (the certified plan, or a result that ran one): only the witness re-runs."""
     res = (st.steps.get("balanced") or StepState()).result
-    if not balanced_job_done(st) or (st.plan != CERTIFIED and "witness_jobs" not in res):
+    if not balanced_job_done(st) or (not is_cert(st.plan) and "witness_jobs" not in res):
+        return False
+    return ((res.get("witness_jobs") or {}).get(JOB) or {}).get("state") != "done"
+
+
+def iso_witness_pending(st: State) -> bool:
+    """(g)'s isolated caption job (J2) is done but its cold witness (J2w) is not: only J2w
+    re-runs."""
+    res = (st.steps.get("caption_iso") or StepState()).result
+    job = (res.get("jobs") or {}).get(JOB) or {}
+    if job.get("state") != "done" or not job.get("job_id"):
         return False
     return ((res.get("witness_jobs") or {}).get(JOB) or {}).get("state") != "done"
 
@@ -2103,14 +2300,18 @@ def _lab_kind_summary(res: Mapping[str, Any], wall: float, usd: float) -> dict[s
 def run_lab(ctx: Ctx, *, missing: Callable[[Iterable[str]], list[str]] | None = None,
             records: Callable[[Ctx, Mapping[str, Any]], list[Any]] | None = None,
             binding: Callable[[Ctx, Mapping[str, Any]], dict[str, str]] | None = None,
-            lab_module: Any = None) -> dict[str, Any]:
+            lab_module: Any = None, source: State | None = None,
+            kinds: Sequence[str] = tuple(LAB), lab_dir: Path | None = None) -> dict[str, Any]:
     """(d2): the lab's L0 + Gate A against (d)'s finished deployed job: (d)'s episodes, and
     (d)'s segment records for the Captioner (``--only lab`` retries it alone). Every
     precondition is checked before any container (:func:`lab_preconditions`); a failed one
     charges $0. TempSeg runs first; when it gets no request in, the Captioner is not started
     (it reads the same inputs). Each call's deadline is :data:`LAB_DEADLINE_S` (two cold
     compiles), shortened by the budget left; a call the budget cannot carry to its expected
-    length is not started. Spend is each started call's wall time x list $/s."""
+    length is not started. Spend is each started call's wall time x list $/s. ``source``: the
+    state whose (d) the lab reads (default this run's; recertify: (b)'s certified state,
+    :func:`run_recert_lab`); ``kinds``: the lab kinds to run; ``lab_dir``: where the lab JSON
+    is written (default :data:`LAB_OUT`)."""
     if ctx.spec.name == CERTIFIED:
         done, why_done = lab_already_done()
         if done:  # the certified run's "lab already done" skip: nothing starts, $0
@@ -2119,19 +2320,22 @@ def run_lab(ctx: Ctx, *, missing: Callable[[Iterable[str]], list[str]] | None = 
     if lab_module is None:
         from flora_deploy.modal_app import balanced_lab as lab_module
     lab = lab_module
-    bal = ctx.st.step("balanced").result
-    if not balanced_job_done(ctx.st):
+    src = ctx.st if source is None else source
+    sctx = ctx if source is None else replace(ctx, st=source)  # its store, its (d)
+    kinds = tuple(k for k in LAB if k in kinds)
+    bal = src.step("balanced").result
+    if not balanced_job_done(src):
         raise RuntimeError("the lab runs against (d)'s finished deployed job; (d) has none "
                            "(run --only balanced first)")
-    if witness_pending(ctx.st):
+    if witness_pending(src):
         raise RuntimeError("(d)'s cold witness is not done; the lab waits for it (run --only "
                            "balanced: it re-runs the witness alone)")
     job = bal["jobs"][JOB]
     episodes = [e for e in bal.get("episodes") or () if e in ctx.spec.lab_episodes]
     bound: dict[str, str] | None = None
     try:
-        bound = (binding or segment_binding)(ctx, job)
-        recs = list((records or _segment_records)(ctx, job))
+        bound = (binding or segment_binding)(sctx, job)
+        recs = list((records or _segment_records)(sctx, job))
         why = segment_provenance_problems(recs, episodes, bound, ctx.spec.local_id)
         segments = {} if why else deployed_segments(recs, episodes, ctx.spec.local_id)
     except Exception as e:  # noqa: BLE001 - before any container: a precondition
@@ -2157,20 +2361,21 @@ def run_lab(ctx: Ctx, *, missing: Callable[[Iterable[str]], list[str]] | None = 
                                      "apps": [name] if todo else []}
         save_state(ctx.st, ctx.state_path)
 
-    for kind in LAB:
-        saved = reusable_lab_result(kind, ctx.st.run_id, episodes, segments_from=bound)
+    rdir = lab_dir or LAB_OUT
+    for kind in kinds:
+        saved = reusable_lab_result(kind, ctx.st.run_id, episodes,
+                                    path=rdir / f"balanced-{kind}.json", segments_from=bound)
         if saved is not None:
             out["kinds"][kind] = {**_lab_kind_summary(saved, 0.0, 0.0), "reused": True,
                                   "requests": ((saved.get("baseline") or {}).get("batcher")
                                                or {}).get("requests")}
-    todo = [k for k in LAB if k not in out["kinds"]]
+    todo = [k for k in kinds if k not in out["kinds"]]
     if not todo:
         out["note"] = "every kind reused a saved result; nothing started"
         return {"ok": True, **out, "tracked_usd": 0.0, "apps": []}
     persist()
     import modal
 
-    rdir = LAB_OUT
     rdir.mkdir(parents=True, exist_ok=True)
     fns = {"tempseg": lab.run_tempseg, "captioner": lab.run_captioner}
     first = todo[0]  # a reused TempSeg result always had requests in
@@ -2222,8 +2427,68 @@ def run_lab(ctx: Ctx, *, missing: Callable[[Iterable[str]], list[str]] | None = 
                 if v.get("episode_errors") and k not in bad})
     if bad:
         out["error"] = "; ".join(f"{k}: {v}" for k, v in bad.items())
-    return {"ok": not bad and len(out["kinds"]) == 2, **out, "tracked_usd": spent,
+    return {"ok": not bad and len(out["kinds"]) == len(kinds), **out, "tracked_usd": spent,
             "apps": [name]}
+
+
+def require_code_landed(step: str) -> None:
+    """recertify's d2', d' and g run the v4 code (the stage-isolated caption certificate):
+    refused, before any app, on a checkout without it (``"4" in
+    certkey.GENERATOR_VERSIONS``)."""
+    from flora_deploy.validate.certkey import GENERATOR_VERSIONS
+
+    if "4" not in GENERATOR_VERSIONS:
+        raise RuntimeError(f"{step}: needs the v4 certification code (certkey."
+                           f"GENERATOR_VERSIONS {GENERATOR_VERSIONS} has no '4'); land it first "
+                           "(the noise run f2 runs before it, on the unchanged checkout)")
+
+
+def source_state(spec: PlanSpec) -> State:
+    """The certified state recertify reads (b)'s oracle and the old noise run from (read-only;
+    never saved). Raises when there is none."""
+    if spec.source is None or not spec.source.is_file():
+        raise RuntimeError(f"{spec.name}: no certified state at {spec.source} (run --plan "
+                           "certified first: its (b) is the oracle)")
+    return rb.load_state(spec.source)
+
+
+def oracle_of(st: State) -> dict[str, Any]:
+    """(b)'s finished oracle job (its state record), with the store it wrote to."""
+    s = st.steps.get("exact_e2e") or StepState()
+    job = dict((s.result.get("jobs") or {}).get(JOB) or {})
+    if s.status != "done" or job.get("state") != "done" or not job.get("job_id"):
+        raise RuntimeError("the oracle (b) has not finished (no done exact_e2e job)")
+    sh = (job.get("stage_hashes") or {}).get("segcap")
+    if not sh:
+        raise RuntimeError(f"(b)'s job {job['job_id']} has no recorded segcap stage hash")
+    job.setdefault("store", store_uri(st))
+    return job
+
+
+def run_recert_lab(ctx: Ctx, **kw: Any) -> dict[str, Any]:
+    """recertify's d2': the Captioner lab only (L0 + Gate A) on the new engine settings, on
+    (b)'s (d) job's segment records (L0 is per engine, not per episode). TempSeg's saved result
+    (:data:`LAB_OUT`) is reused: it must still be evidence for the current TempSeg engine
+    (:func:`lab_already_done`), and is copied beside the new Captioner one in the plan's lab
+    dir. Skipped at $0 when both are there for the current engines."""
+    lab_dir = ctx.spec.labs
+    done, why = lab_already_done(lab_dir)
+    if done:
+        return {"ok": True, "skipped": f"lab already done: {why}", "kinds": {},
+                "tracked_usd": 0.0, "apps": []}
+    require_code_landed("lab")
+    ok, why = lab_already_done(LAB_OUT, ("tempseg",))
+    if not ok:
+        raise RuntimeError(f"lab: TempSeg's saved lab result is not reusable ({why}); "
+                           "recertify re-runs the Captioner lab only")
+    lab_dir.mkdir(parents=True, exist_ok=True)
+    src, dst = LAB_OUT / "balanced-tempseg.json", lab_dir / "balanced-tempseg.json"
+    if src.resolve() != dst.resolve():
+        dst.write_bytes(src.read_bytes())
+    res = run_lab(ctx, source=source_state(ctx.spec), kinds=("captioner",), lab_dir=lab_dir,
+                  **kw)
+    res["tempseg_reused"] = str(dst)
+    return res
 
 
 def _job_rows(ctx: Ctx, step: str) -> dict[str, dict[str, list[dict]]]:
@@ -2336,6 +2601,154 @@ def run_cert_noise(ctx: Ctx) -> dict[str, Any]:
     return res
 
 
+ORACLE_SEGMENTS_DIR = "oracle-segments"  # under the job store's sink (pipeline.caption_segments)
+
+
+def oracle_segment_bytes(records: Iterable[Any], oracle_stage_hash: str,
+                         uids: Iterable[str]) -> bytes:
+    """The pinned oracle segment JSONL: the oracle's ``segment`` records of ``uids`` (exact
+    preset, ``provenance.config_hash`` the oracle's segcap stage hash), one
+    ``StageRecord.to_json`` line each, by uid. Raises when a uid has no such record, or has
+    more than one."""
+    want = set(uids)
+    by: dict[str, list[Any]] = {}
+    for r in records:
+        prov = getattr(r, "provenance", None)
+        if (r.stage == "segment" and r.uid in want and getattr(prov, "preset", None) == "exact"
+                and getattr(prov, "config_hash", None) == oracle_stage_hash):
+            by.setdefault(r.uid, []).append(r)
+    miss = sorted(want - set(by))
+    if miss:
+        raise RuntimeError(f"oracle segments: no exact segment record of stage hash "
+                           f"{oracle_stage_hash[:12]} for {len(miss)} episode(s)")
+    dup = sorted(u for u, rs in by.items() if len({x.to_json() for x in rs}) > 1)
+    if dup:
+        raise RuntimeError(f"oracle segments: {len(dup)} episode(s) with differing records")
+    return "".join(by[u][0].to_json() + "\n" for u in sorted(by)).encode()
+
+
+def oracle_segment_records(ctx: Ctx, oracle: Mapping[str, Any]) -> list[Any]:
+    """The oracle's segment records: the exported JSONL when its sidecar names the oracle job
+    (``wave_h_finalize.py --fetch``), else read from the oracle's store (a Volume read)."""
+    from flora_deploy.records import StageRecord
+
+    path = Path(str((oracle.get("records") or {}).get("segment") or ""))
+    try:
+        src = json.loads(records_source_path(path).read_text())
+    except (OSError, ValueError):
+        src = {}
+    if path.is_file() and isinstance(src, dict) and src.get("job_id") == oracle["job_id"]:
+        return [StageRecord.from_json(line) for line in path.read_text().splitlines()
+                if line.strip()]
+    from flora_deploy import sdk
+
+    return list(sdk.open_job(oracle["job_id"], store=oracle["store"]).results("segment"))
+
+
+def stage_oracle_segments(ctx: Ctx, oracle: Mapping[str, Any], *,
+                          records: Callable[[Ctx, Mapping[str, Any]], list[Any]] | None = None,
+                          upload: Callable[[str, Path, str], Any] | None = None
+                          ) -> dict[str, Any]:
+    """Stage (b)'s segment records for the isolated caption jobs: written locally
+    (``work/oracle-segments/<oracle stage hash>.jsonl``, byte-exact, its sha256 computed here)
+    and uploaded into this run's job store at ``<run>/oracle-segments/<hash>.jsonl``, where
+    the ``caption_segments.records`` URI (under ``output.sink``) points. Returns the
+    ``caption_segments`` fields and the local path ``flora certify --oracle-segments`` reads."""
+    import hashlib
+
+    from flora_deploy.jobs.types import episode_uid
+
+    sh = str(oracle["stage_hashes"]["segcap"])
+    uids = [episode_uid(ctx.spec.data, ctx.spec.local_id(g)) for g in ctx.spec.episodes]
+    data = oracle_segment_bytes((records or oracle_segment_records)(ctx, oracle), sh, uids)
+    d = ctx.work / ORACLE_SEGMENTS_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    local = d / f"{sh}.jsonl"
+    if local.exists() and local.read_bytes() != data:
+        raise RuntimeError(f"oracle segments: {local} exists with other bytes")
+    local.write_bytes(data)
+    (upload or h0.upload_dir)(STORE_VOLUME, d, f"{ctx.st.run_id}/{ORACLE_SEGMENTS_DIR}")
+    return {"records": f"volume://{STORE_VOLUME}/{ctx.st.run_id}/{ORACLE_SEGMENTS_DIR}/"
+                       f"{sh}.jsonl",
+            "sha256": hashlib.sha256(data).hexdigest(), "oracle_stage_hash": sh,
+            "path": str(local), "episodes": len(uids), "oracle_job": oracle["job_id"]}
+
+
+def run_caption_iso(ctx: Ctx) -> dict[str, Any]:
+    """(g): the stage-isolated caption evidence. J2: a ``preset: balanced``, ``stages:
+    [caption]`` job on every episode whose caption shards read the oracle's own segment
+    records (``pipeline.caption_segments``: :func:`stage_oracle_segments`), so every pair has
+    one Captioner input; then J2w: the same config (its ``project`` renamed) on the witness
+    episodes with ``FLORA_COMPILE_CACHE=off``. A re-run with J2 done re-runs J2w alone
+    (:func:`iso_witness_pending`). Needs the v4 code (:func:`require_code_landed`)."""
+    require_code_landed("caption_iso")
+    require_tempseg_pin(ctx)
+    src = source_state(ctx.spec) if ctx.spec.source is not None else ctx.st
+    oracle = oracle_of(src)
+    rate = pool_container("caption", "balanced").usd_per_s()
+    emb, pre = ctx.spec.embodiment, ctx.spec.job_prefix
+    prev = ctx.st.step("caption_iso").result
+    out: dict[str, Any] = {}
+    if iso_witness_pending(ctx.st):
+        main = dict(prev["jobs"][JOB])
+        cfg = Path(str(main.get("cfg") or ""))
+        if not main.get("cfg") or not cfg.is_file():
+            raise RuntimeError(f"isolated witness re-run: J2's config {main.get('cfg')!r} is "
+                               "gone; re-run (g) in full")
+        segs = dict(prev["oracle_segments"])
+        jobs, spent = {JOB: main}, 0.0
+        out["witness_only"] = True
+    else:
+        episodes = balanced_episodes(ctx.manifest, ctx.spec, side="(g)")
+        segs = stage_oracle_segments(ctx, oracle)
+        derived = resolve_receipts(["captioner_bf16"], require_pin=True)
+        stage_data(ctx, ctx.spec.data, episodes)
+        text, job_id = config_text(ctx, f"{pre}iso-{emb}", embodiment=emb, stages=("caption",),
+                                   budget=ctx.caps["caption_iso"], preset="balanced",
+                                   derived=derived, data=ctx.spec.data)
+        cfg = ctx.work / f"flora-{pre}iso-{emb}.yaml"
+        cfg.write_text(with_caption_segments(text, records=segs["records"],
+                                             sha256=segs["sha256"],
+                                             oracle_stage_hash=segs["oracle_stage_hash"]))
+        _index(ctx, cfg, job_id, f"{pre}iso-{emb}")
+        r = _run_job(ctx, "caption_iso", cfg, job_id, determinism=ORACLE_DETERMINISM,
+                     usd_per_s=rate, spent_in_step=0.0, side="isolated")
+        jobs = {JOB: {**r, "stages": ["caption"], "oracle_segments": segs}}
+        spent = float(r.get("spend") or 0.0)
+        if r.get("state") != "done":
+            res = _jobs_result(jobs, 1)
+            res.update(oracle_segments=segs, error=f"J2 ended {r.get('state')!r}"
+                       + (f" ({r['error']})" if r.get("error") else ""))
+            return res
+    n = max(1, len(ctx.st.step("caption_iso").attempts))
+    wjob = f"wave-h-{ctx.st.run_id}-{pre}isocold-{emb}-a{n}"
+    wtag = f"{pre}isocold-{emb}"
+    wcfg = ctx.work / f"flora-{wtag}.yaml"
+    wcfg.write_text(witness_config_text(cfg.read_text(), wjob))
+    _index(ctx, wcfg, wjob, wtag, limit=ctx.spec.witness_limit)
+    got = noise_index_problems(ctx.work / f"summary-{wtag}.json", ctx.manifest, ctx.spec,
+                               ctx.spec.witness)
+    if got:
+        w: dict[str, Any] = {"job_id": wjob, "state": "skipped", "spend": 0.0,
+                             "error": f"witness index: {got}", "compile_cache": "off"}
+    else:
+        wctx = replace(ctx, env={**ctx.env, COMPILE_CACHE_ENV: "off"})
+        w = _run_job(wctx, "caption_iso", wcfg, wjob, determinism=ORACLE_DETERMINISM,
+                     usd_per_s=rate, spent_in_step=spent, side="isolated_witness")
+        w.update(compile_cache="off", episodes=len(ctx.spec.witness), stages=["caption"])
+    res = _jobs_result(jobs, 1)
+    res.update(witness_jobs={JOB: w}, oracle_segments=segs,
+               tracked_usd=(0.0 if out.get("witness_only") else spent)
+               + float(w.get("spend") or 0.0),
+               apps=sorted({*(res["apps"] if not out.get("witness_only") else []),
+                            *([w["app"]] if "app" in w else [])}), **out)
+    if w.get("state") != "done":
+        res["ok"] = False
+        res["error"] = (f"isolated cold witness ended {w.get('state')!r}"
+                        + (f" ({w['error']})" if w.get("error") else ""))
+    return res
+
+
 def run_noise(ctx: Ctx) -> dict[str, Any]:
     """(f): (b)'s job repeated: its own config file and staged data (same stage hash, so the
     same app), a new job id, default mode; all of its episodes (module docstring). The
@@ -2373,19 +2786,22 @@ def run_noise(ctx: Ctx) -> dict[str, Any]:
     return res
 
 
-def noise_index_problems(summary: Path, manifest: Mapping[str, Any], spec: PlanSpec) -> str:
+def noise_index_problems(summary: Path, manifest: Mapping[str, Any], spec: PlanSpec,
+                         episodes: Sequence[str] | None = None) -> str:
     """Empty when the noise job's index (``flora index --limit``) holds exactly the plan's
-    noise subset: its episode count and its video seconds (within 1%) equal theirs."""
+    noise subset (``episodes``: another set, e.g. the cold witnesses'): its episode count and
+    its video seconds (within 1%) equal theirs."""
+    eps = spec.noise if episodes is None else tuple(episodes)
     try:
         d = json.loads(summary.read_text())
     except (OSError, ValueError) as e:
         return f"unreadable {summary.name}: {e}"
     n = (d.get("counts") or {}).get("episodes")
     dur = durations(manifest)
-    want = sum(dur.get(g, 0.0) for g in spec.noise)
+    want = sum(dur.get(g, 0.0) for g in eps)
     got = float(d.get("video_s") or 0.0)
-    if n != len(spec.noise) or abs(got - want) > 0.01 * max(want, 1.0):
-        return (f"{n} episodes / {got:.1f} video s indexed, not the {len(spec.noise)} noise "
+    if n != len(eps) or abs(got - want) > 0.01 * max(want, 1.0):
+        return (f"{n} episodes / {got:.1f} video s indexed, not the {len(eps)} noise "
                 f"episodes / {want:.1f} s")
     return ""
 
@@ -2578,7 +2994,29 @@ def noise_all_lines(st: State, spec: PlanSpec) -> list[str]:
 
 
 CERT_STAGES = ("segment", "caption")
-RECORD_STEPS = ("exact_e2e", "noise", "balanced")  # the steps whose jobs' records (e) reads
+# the steps whose jobs' records (e) reads
+RECORD_STEPS = ("exact_e2e", "noise", "balanced", "noise_all", "caption_iso", "repeat")
+
+
+def certify_view(st: State, spec: PlanSpec | None = None) -> State:
+    """What (e) exports and certifies, as the step names ``wave_h_finalize.py`` reads:
+    ``exact_e2e`` (the oracle), ``noise``, ``balanced`` (J1 + J1w), ``caption_iso`` (J2 +
+    J2w) and, when there is one, ``repeat`` (an older noise run: reported only). recertify
+    takes (b)'s oracle from the certified state, its own f2 as the noise run and (b)'s old
+    noise run as the repeat, each job with the store it wrote to. Other plans: ``st`` as is
+    (a copy). Never saved."""
+    view = copy.deepcopy(st)
+    spec = spec or SPECS.get(st.plan or "")
+    if spec is None or spec.name != RECERTIFY:
+        return view
+    src = source_state(spec)
+    for name, frm in (("exact_e2e", "exact_e2e"), ("repeat", "noise")):
+        s = copy.deepcopy(src.steps.get(frm) or StepState())
+        for r in (s.result.get("jobs") or {}).values():
+            r.setdefault("store", store_uri(src))
+        view.steps[name] = s
+    view.steps["noise"] = copy.deepcopy(st.steps.get("noise_all") or StepState())
+    return view
 
 
 def finished_view(st: State) -> State:
@@ -2606,10 +3044,11 @@ def run_flora_certify(ctx: Ctx, *, finalize: Any = None, sh: Callable[..., Any] 
     if finalize is None:
         import wave_h_finalize as finalize
     paths = finalize.Paths(root=ROOT, state=ctx.state_path, records=ctx.spec.records,
-                           lab=lab_dir or LAB_OUT)
+                           lab=lab_dir or ctx.spec.labs)
     save_state(ctx.st, ctx.state_path)
-    done = finished_view(ctx.st)  # only the finished steps' jobs (a parallel run: see there)
-    finalize.fetch_records(paths, done)  # every job's records, freshly (no container)
+    # only the finished steps' jobs (a parallel run: see there), recertify's with (b)'s oracle
+    done = finished_view(certify_view(ctx.st, ctx.spec))
+    finalize.fetch_records(paths, done)  # every job's records and digests (no container)
     out_dir = ctx.work / "certify"
     out_dir.mkdir(parents=True, exist_ok=True)
     outcomes = finalize.certify_all(paths, done, out_dir,
@@ -2647,6 +3086,8 @@ def run_flora_certify(ctx: Ctx, *, finalize: Any = None, sh: Callable[..., Any] 
         return res
     args = [sys.executable, str(ROOT / "scripts" / "wave_h_finalize.py"), "--state",
             str(ctx.state_path), "--records", str(ctx.spec.records), "--write"]
+    if ctx.spec.lab_dir is not None:  # recertify: its own lab JSON
+        args[-1:-1] = ["--lab", str(lab_dir or ctx.spec.labs)]
     p = (sh or ctx.sh)(args, timeout=1800, check=False)
     res["finalize_rc"] = getattr(p, "returncode", None)
     res["finalize"] = " ".join(args[1:])
@@ -2656,13 +3097,16 @@ def run_flora_certify(ctx: Ctx, *, finalize: Any = None, sh: Callable[..., Any] 
 RUNNERS: dict[str, Callable[[Ctx], dict[str, Any]]] = {
     "tempseg": run_tempseg, "preflight": run_preflight, "exact_e2e": run_exact,
     "balanced": run_balanced, "lab": run_lab, "certify": run_certify, "noise": run_noise,
-    "noise_all": run_noise_all}
+    "noise_all": run_noise_all, "caption_iso": run_caption_iso}
 
 
 def runner(plan: str, step: str) -> Callable[[Ctx], dict[str, Any]]:
-    """The certified plan's (e) is ``flora certify`` + finalize; the rest are shared."""
-    if plan == CERTIFIED and step == "certify":
+    """The certifying plans' (e) is ``flora certify`` + finalize, recertify's lab the
+    Captioner-only one; the rest are shared."""
+    if is_cert(plan) and step == "certify":
         return run_flora_certify
+    if plan == RECERTIFY and step == "lab":
+        return run_recert_lab
     return RUNNERS[step]
 
 
@@ -2684,11 +3128,12 @@ def render_report(st: State, projections: Mapping[str, Projection], *,
              "`scripts/spend.py` when larger; billing lags about an hour).", "",
              "| step | status | cap | projected (upper) | attempts | tracked | billed |",
              "|---|---|---|---|---|---|---|"]
-    shown = PLANS[plan] if plan == RECERTIFY else STEPS  # recertify: its own steps only
+    shown = (PLANS[plan] if plan == RECERTIFY  # recertify: its own steps only
+             else STEPS + tuple(s for s in EXTRA_STEPS if s in PLANS[plan] or s in st.steps))
     for name in shown:
         s = st.steps.get(name, StepState())
         if name not in PLANS[plan] and s.status == "pending":
-            if plan != CERTIFIED:
+            if not is_cert(plan):
                 lines.append(f"| {title[name]} | {DEFERRED_NOTE} | - | - | 0 | - | - |")
             continue
         p = projections.get(name)
@@ -2735,7 +3180,7 @@ def letter(title: str) -> str:
 def max_parallel_for(plan: str, only: str | None, requested: int) -> int:
     """The steps a run starts at once: ``--max-parallel`` for the certified plan's steps; 1
     for ``--only`` and for the other plans (one chain: nothing to run beside)."""
-    return max(1, requested) if plan == CERTIFIED and not only else 1
+    return max(1, requested) if plan == CERTIFIED and not only else 1  # recertify: a chain
 
 
 def wall_lines(st: State, projections: Mapping[str, Projection], plan: str,
@@ -2784,11 +3229,16 @@ def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
         out(f"  episodes: {len(eps)} {spec.embodiment}, {sum(dur[e] for e in eps):.1f} video s "
             f"({src}"
             + (f"; NOT STAGED, left out: {', '.join(miss)}" if miss else "") + ")")
-        if plan == CERTIFIED:
+        if is_cert(plan):
             nv = sum(dur.get(e, 0.0) for e in spec.noise)
-            out(f"  noise subset: {len(spec.noise)} of them, {nv:.1f} video s (`flora index "
-                f"--limit {spec.noise_limit}` on the oracle's config and data dir: the same "
-                "stage hash)")
+            lim = (f"`flora index --limit {spec.noise_limit}`" if spec.noise_limit is not None
+                   else "`flora index` with no --limit")
+            out(f"  noise run: {len(spec.noise)} of them, {nv:.1f} video s ({lim} on the "
+                "oracle's config and data dir: the same stage hash)")
+            if spec.witness != spec.noise:
+                wv = sum(dur.get(e, 0.0) for e in spec.witness)
+                out(f"  cold witnesses: {len(spec.witness)} of them ({NOISE_PREFIX} local ids, "
+                    f"`--limit {spec.witness_limit}`), {wv:.1f} video s")
     for name in steps:
         p = projections[name]
         s = st.steps.get(name, StepState())
@@ -2800,12 +3250,26 @@ def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
             out(f"      {i['what']:60s} {i['gpu']:>5s} {i['seconds']:6.0f} s / "
                 f"{i['upper_seconds']:6.0f} s x ${i['usd_per_h']:.2f}/h = ${i['usd']:.3f} "
                 f"(upper ${i['usd_upper']:.3f})")
-    if plan == RECERTIFY and "noise_all" in steps:
+    if (plan == RECERTIFY and "noise_all" in steps
+            and (st.steps.get("noise_all") or StepState()).status != "done"):
         for line in noise_all_lines(st, spec):
             out(line)
-    for name in () if only or plan in CERT_PLANS else deferred_steps(plan):
+    for name in () if only or is_cert(plan) else deferred_steps(plan):
         out(f"  {title[name]:66s} [{DEFERRED_NOTE}; never runs in plan {plan}]")
-    if plan == CERTIFIED and "exact_e2e" in steps:
+    if plan == RECERTIFY:
+        out("  assumption: f2 (noise_all) runs from a checkout whose hashed code is (b)'s (before "
+            "the v4 code lands): its segcap stage hash must equal (b)'s recorded one, else it "
+            "refuses before any app; d2', d' and g need the v4 code ('4' in "
+            "certkey.GENERATOR_VERSIONS). The single-pool jobs (J1w, J2, J2w) are priced "
+            "start + work + 30 s (upper (start + work) x (1 + band) + 30 + "
+            f"{CLIENT_SLACK_S} s), no scale-down tail; caps are each step's upper rounded up to "
+            "$0.05, the global cap the uppers' sum rounded up to $0.10")
+        f2 = projections["noise_all"]
+        rest = [s for s in steps if s != "noise_all"]
+        out(f"  split: f2 noise_all nominal ${f2.usd:.2f}, upper ${f2.usd_upper:.2f}; the rest "
+            f"(phase 2) nominal ${sum(projections[s].usd for s in rest):.2f}, upper "
+            f"${sum(projections[s].usd_upper for s in rest):.2f}")
+    if is_cert(plan) and ("exact_e2e" in steps or "noise_all" in steps):
         from flora_deploy.planner.rates import RateTable
 
         t = RateTable.load()
@@ -2856,11 +3320,13 @@ def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
             "(rates.json `compile_cache: warm`, placeholders) are never used here: a cache is "
             "keyed by the engine spec, so none is published for this code's yet; a worker that "
             "compiled publishes one after its first shard (engines/compile_cache.py)")
-        if plan == CERTIFIED:
-            out("  assumption: (d) then runs the cold witness, the same config on the "
-                f"{len(spec.noise)} noise episodes with {COMPILE_CACHE_ENV}=off (one container "
-                "per kind forced cold, priced cold): the certificate's evidence covers warm "
-                "(the cache (d)'s first container publishes) and cold compiles")
+        if is_cert(plan):
+            what = ("the segment stage alone (J1w; the caption witness is (g)'s J2w)"
+                    if spec.segment_only_witness else "the same config")
+            out(f"  assumption: (d) then runs the cold witness, {what} on the "
+                f"{len(spec.witness)} witness episodes with {COMPILE_CACHE_ENV}=off (one "
+                "container per kind forced cold, priced cold): the certificate's evidence "
+                "covers warm (the cache (d)'s first container publishes) and cold compiles")
         lim = balanced_engine_limits()
         out("  assumption: (d) runs the batch-fill engine limits and batch policy: "
             + ", ".join(f"{k} on {v['gpu']} max_num_seqs {v['max_num_seqs']}, "
@@ -2874,8 +3340,8 @@ def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
             + f" (expected x {1 + LAB_UNCERTAINTY:.2f}, <= the {LAB_TIMEOUT_S} s container "
             "timeout); the lab commits flora-cache:/balanced/<engine>[-dtbias] after each "
             "engine, so a warm cache only makes it cheaper")
-    if plan == CERTIFIED and "lab" in steps:
-        done, why = lab_already_done()
+    if is_cert(plan) and "lab" in steps:
+        done, why = lab_already_done(spec.labs)
         out(f"  lab (d2): {'already done, skipped at $0' if done else 'runs'} ({why})")
     nominal = sum(projections[s].usd for s in steps)
     upper = sum(projections[s].usd_upper for s in steps)
@@ -2886,7 +3352,12 @@ def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
                            max_parallel_for(plan, only, max_parallel)):
         out(line)
     honest = honest_caps({s: projections[s] for s in steps})
-    if upper > gcap + 1e-9:
+    left = [s for s in steps if (st.steps.get(s) or StepState()).status != "done"]
+    upper_left = st.spent + sum(projections[s].usd_upper for s in left)
+    if left != list(steps) and upper_left <= gcap + 1e-9:  # a done step's actual cost counts
+        out(f"  fits: spent ${st.spent:.2f} + the upper of the steps not done "
+            f"${upper_left - st.spent:.2f} = ${upper_left:.2f} <= the ${gcap:.2f} global cap")
+    elif upper > gcap + 1e-9:
         out(f"  NOT HONEST AT ${gcap:.2f}: the upper total needs a global cap of at "
             f"least ${honest['global']:.2f} (per step: "
             + ", ".join(f"{s} ${honest[s]:.2f}" for s in steps) + "); the runbook stops at the "
@@ -3012,7 +3483,7 @@ def print_status(st: State, projections: Mapping[str, Projection], *, plan: str,
         stop = next((n for n in s.notes if n.startswith("stop rule")), None)
         why = f"  [{err or stop}]" if (err or stop) and s.status != "done" else ""
         if name == "balanced" and witness_pending(st):
-            why += (f"  [witness pending: will re-run the {len(spec.noise)}-episode cold job "
+            why += (f"  [witness pending: will re-run the {len(spec.witness)}-episode cold job "
                     "only]")
         out(f"  {title[name]:66s} {s.status:9s} cap ${caps[name]:.2f}  attempts "
             f"{len(s.attempts)}  charged ${s.charged(wm):.2f}  tracked ${s.tracked_usd:.2f}"
@@ -3108,9 +3579,10 @@ def main(argv: list[str] | None = None) -> int:
                         "cap and who approved it, and the next decision (reads; never writes)")
     ap.add_argument("--plan", choices=tuple(PLANS), default=DEFAULT_PLAN,
                     help="balanced-only (default): steps 0, a, d; full: every step; "
-                         "certified: b, f, d, (d2), e on golden/v2 (its own state); "
-                         "recertify: f2, the certified run's (b) repeated on all 12 episodes "
-                         "(its own state; reads the certified state, never writes it)")
+                         "certified: b, f, d, (d2), g, e on golden/v2 (its own state); "
+                         "recertify: f2 (the certified run's (b) repeated on all 12 episodes), "
+                         "d2', d', g, e' (stage-isolated caption on (b)'s oracle; its own "
+                         "state; reads the certified state, never writes it)")
     ap.add_argument("--embodiment", choices=ALL_EMBODIMENTS, default=EMBODIMENT,
                     help="certified only: the embodiment to certify (human: golden/v2; yam: "
                          "golden/v3-yam; each its own state). dex, tianji, yam32: no golden "
@@ -3185,13 +3657,14 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     else:
         st = load_state(args.state)
-    if st.plan is not None and st.plan != args.plan and set(CERT_PLANS) & {st.plan, args.plan}:
+    if (st.plan is not None and st.plan != args.plan
+            and (is_cert(st.plan) or is_cert(args.plan))):
         print(f"refused: {args.state} was run under plan {st.plan}, not {args.plan}")
         return 2
     preview = args.dry_run or args.status or not (args.yes_spend or args.report)
     if preview:  # the dry run and --status decide on a copy: the state file is never written
         st = copy.deepcopy(st)
-    if args.plan in CERT_PLANS:
+    if is_cert(args.plan):
         st.plan = args.plan
     if adopt_balanced_job(st):
         print("note: (d)'s deployed job is done; (d) counts as done and its lab is step lab")
@@ -3209,15 +3682,22 @@ def main(argv: list[str] | None = None) -> int:
         print(f"note: only {len(spec.episodes) - len(miss)} of the {len(spec.episodes)} "
               f"{spec.embodiment} episodes are staged; using those (missing: "
               f"{', '.join(miss)})")
-    lab_done = args.plan == CERTIFIED and lab_already_done()[0]
-    reuse = () if lab_done else lab_reuse(st, spec)
-    pending = args.plan == CERTIFIED and witness_pending(st)
+    lab_done = is_cert(args.plan) and lab_already_done(spec.labs)[0]
+    reuse = () if lab_done or args.plan == RECERTIFY else lab_reuse(st, spec)
+    pending = is_cert(args.plan) and witness_pending(st)
+    iso_pending = is_cert(args.plan) and iso_witness_pending(st)
     projections = plan_projections(args.plan, manifest, lab_done=lab_done, reuse=reuse,
-                                   spec=spec, witness_only=pending)
+                                   spec=spec, witness_only=pending,
+                                   iso_witness_only=iso_pending)
     caps = plan_caps(args.plan, projections)
     if pending:
         print(f"note: (d)'s deployed job is done; witness pending: will re-run the "
-              f"{len(spec.noise)}-episode cold job only")
+              f"{len(spec.witness)}-episode cold job only")
+    if iso_pending:
+        print(f"note: (g)'s J2 is done; its cold witness J2w ({len(spec.witness)} episodes) "
+              "re-runs alone")
+    if args.plan == RECERTIFY and not lab_done:
+        print("note: recertify's lab reuses TempSeg's saved result; the Captioner lab runs")
     if reuse:
         print(f"note: lab reuses the saved {', '.join(reuse)} result(s) (evidence, run "
               f"{st.run_id}, (d)'s episodes); only the rest runs")
