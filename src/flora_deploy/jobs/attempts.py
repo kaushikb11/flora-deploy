@@ -57,6 +57,15 @@ children and the same error file: it is idempotent.
 ``modal.Retries``, expiry without a receipt) is marked :func:`mark_failed`
 (``ControlRecord(kind="shard_failed")``): terminal, never bisected, and the job ends ``failed``.
 
+**Startup failures.** A worker whose ``@modal.enter`` raises never starts a shard, so it writes
+no ``AttemptMarker``: Modal restarts the class with a crash-loop backoff and the call stays
+``pending`` forever (2026-10-22 noise-12: 19 crashed containers, ``starts() == 0``, stopped only by
+the budget cap 42 minutes later). Such a worker writes a :class:`StartupFailure`
+(:func:`record_startup_failure`) under the deployed app's ``startup_failure_path``; the
+orchestrator counts those written after a never-started call was spawned against the same limit
+as D15 starts and then *fails* the shard (``shard_failed``, with the worker's error): a class that
+cannot start is not an episode problem, so it is never bisected or poison-pilled.
+
 **Spawn tokens.** :func:`spawn_token` is the deterministic idempotency token of the orchestrator's
 ``n``-th spawn of a shard. Workers record it in their marker, and :func:`superseded` tells a worker
 whose spawn the orchestrator has since replaced (or never confirmed) to exit without work.
@@ -231,6 +240,99 @@ def mark_exception(jf: JobFiles, kind: ShardKind, shard_id: str, container_id: s
     m = replace(m, error=error[:2000], ended_utc=ended_utc, crashed=crashed)
     jf.store.put_bytes(jf.paths.attempt(jf.config_hash, kind, shard_id, container_id), to_json(m))
     return m
+
+
+# --- startup failures (before any shard) ---------------------------------------------------
+
+STARTUP_FAILURE_SCHEMA = "flora-startup-failure/v1"
+
+
+@dataclass(frozen=True)
+class StartupFailure:
+    """One container whose startup (``@modal.enter``) raised before it could run a shard."""
+
+    app: str
+    container_id: str
+    failed_utc: str
+    error: str
+    kinds: tuple[str, ...] = ()  # shard kinds the worker class serves (``FLORA_SHARD_KINDS``)
+    config_hash: str = ""
+    schema: str = STARTUP_FAILURE_SCHEMA
+
+
+def write_startup_failure(store: Store, f: StartupFailure) -> str:
+    """Whole-file write of the container's own marker (it is the only writer)."""
+    from flora_deploy.jobs.store import startup_failure_path
+
+    path = startup_failure_path(f.app, f.container_id)
+    store.put_bytes(path, json.dumps({**asdict(f), "kinds": list(f.kinds)},
+                                     sort_keys=True).encode())
+    return path
+
+
+def record_startup_failure(store: Store, exc: BaseException, *,
+                           env: Mapping[str, str] | None = None,
+                           now: float | None = None) -> str | None:
+    """Worker side, in an ``except`` around ``@modal.enter`` (before re-raising): record why this
+    container could not start, from the env the app factory set (``FLORA_APP_NAME``,
+    ``FLORA_SHARD_KINDS``, ``FLORA_CONFIG_HASH``, ``MODAL_TASK_ID``). Never raises (the startup
+    error is the one to surface); returns the marker path, or ``None`` if it was not written."""
+    import os
+    import time
+    from datetime import UTC, datetime
+
+    env = os.environ if env is None else env
+    try:
+        app = env.get("FLORA_APP_NAME", "")
+        if not app:
+            return None
+        t = time.time() if now is None else now
+        cid = env.get("MODAL_TASK_ID") or f"local-{os.getpid()}-{int(t * 1000)}"
+        kinds = tuple(k for k in env.get("FLORA_SHARD_KINDS", "").split(",") if k)
+        return write_startup_failure(store, StartupFailure(
+            app=app, container_id=cid, kinds=kinds, config_hash=env.get("FLORA_CONFIG_HASH", ""),
+            failed_utc=datetime.fromtimestamp(t, UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            error=f"{type(exc).__name__}: {exc}"[:2000]))
+    except Exception:  # noqa: BLE001 - best effort; never mask the startup error
+        return None
+
+
+def read_startup_failures(store: Store, app: str, *, kind: str | None = None,
+                          since_utc: str = "") -> list[StartupFailure]:
+    """Visible startup failures of ``app`` (a lower bound under listing lag), oldest first;
+    ``kind``: only workers serving it; ``since_utc``: only those failed at or after it (both
+    timestamps in ``orchestrator.utc``'s format, which sorts as text)."""
+    from flora_deploy.jobs.store import startup_failures_prefix
+
+    out: list[StartupFailure] = []
+    for p in store.list(startup_failures_prefix(app)):
+        if not p.endswith(".json"):
+            continue
+        try:
+            d = json.loads(store.get_bytes(p))
+            f = StartupFailure(app=str(d["app"]), container_id=str(d["container_id"]),
+                               failed_utc=str(d["failed_utc"]), error=str(d.get("error", "")),
+                               kinds=tuple(d.get("kinds") or ()),
+                               config_hash=str(d.get("config_hash", "")),
+                               schema=str(d.get("schema", "")))
+        except (KeyError, TypeError, ValueError, OSError):
+            continue
+        if kind is not None and f.kinds and kind not in f.kinds:
+            continue
+        if f.failed_utc < since_utc:
+            continue
+        out.append(f)
+    return sorted(out, key=lambda f: (f.failed_utc, f.container_id))
+
+
+def call_started(jf: JobFiles, kind: ShardKind, shard_id: str, *, token: str = "",
+                 since_utc: str = "") -> bool:
+    """Whether a container started this spawn of the shard: a marker with ``token`` or, for a
+    spawn without one, any marker started at or after ``since_utc``."""
+    for m in markers(jf, kind, shard_id):
+        if (token and m.token == token) or (not token and m.started_utc >= since_utc):
+            return True
+    return False
 
 
 def attempt_containers(jf: JobFiles, kind: ShardKind, shard_id: str) -> set[str]:

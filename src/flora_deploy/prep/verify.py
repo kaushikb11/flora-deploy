@@ -20,11 +20,14 @@ its per-file resume metadata and tree cache there; it is not snapshot content bu
 Receipt reuse (``check_receipt``) does not re-hash. It requires, in order: the current schema; a
 passing result; the same ``pin_digest`` (the full pin incl. ``expected``, ``allow_patterns``,
 ``plan_digest``, plus the verifier version); the same ``plan_digest``; exactly the planned file set
-on disk; and each file's fingerprint (size, mtime_ns, inode) equal to what was hashed. A rewrite,
-replacement or ``modal volume put`` changes the fingerprint; storage-level bit rot does not, which
-is what ``flora prepare --reverify`` is for. ``st_dev`` is recorded but not compared, because a
-Volume's device number differs between container mounts. If a backend does not keep inode or
-mtime_ns stable, reuse simply fails and the snapshot is re-hashed (slow, never unsafe).
+on disk; and each file's fingerprint (size, mtime_ns) equal to what was hashed. A rewrite or
+``modal volume put`` changes the fingerprint; storage-level bit rot does not, which is what
+``flora prepare --reverify`` is for. ``st_ino`` and ``st_dev`` are recorded but not compared: a
+Modal Volume assigns inode and device numbers per container mount, so a receipt written by the
+prep container never matched them on a later mount (every exact worker rejected its receipts
+with ``fingerprint changed (ino)``). The cost: a replacement that also restores the size and
+mtime_ns is no longer caught without a re-hash. If a backend does not keep mtime_ns stable,
+reuse simply fails and the snapshot is re-hashed (slow, never unsafe).
 
 Upgrading receipts: a receipt with an older ``schema`` is never reused. The next ``flora
 prepare`` treats the pin like ``--reverify``: ``snapshot_download`` finds the files complete and
@@ -58,8 +61,9 @@ CHUNK = 8 * 2**20
 MANIFEST_NAMES = ("SOURCE_MANIFEST.sha256", "SHA256SUMS")
 # snapshot_download(local_dir=...) keeps its resume metadata here; it is not part of the snapshot.
 IGNORED_DIRS = (".cache",)
-# Fingerprint fields compared on reuse (st_dev is recorded only; see module docstring).
-REUSE_FINGERPRINT = ("size", "mtime_ns", "ino")
+# Fingerprint fields compared on reuse. st_ino / st_dev are recorded only: both change between
+# Modal Volume mounts (see module docstring).
+REUSE_FINGERPRINT = ("size", "mtime_ns")
 
 
 @dataclass(frozen=True)

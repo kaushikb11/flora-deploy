@@ -119,8 +119,9 @@ class StoreAttemptLedger:
     """``AttemptLedger`` over attempt markers, quarantine / shard_failed records and errors."""
 
     def __init__(self, jf: A.JobFiles, *, limit: int, clock: Clock = time.time,
-                 manifests: StoreManifestSource | None = None):
+                 manifests: StoreManifestSource | None = None, app: str = ""):
         self.jf, self.limit, self.clock, self.manifests = jf, limit, clock, manifests
+        self.app = app  # the deployed worker app (startup-failure markers); "" = none
         self._own_q: dict[str, ControlRecord] = {}
         self._own_f: dict[str, ControlRecord] = {}
 
@@ -167,6 +168,18 @@ class StoreAttemptLedger:
 
     def call_for_token(self, shard: Shard, token: str) -> str | None:
         return A.call_for_token(self.jf, shard.kind, shard.shard_id, token)
+
+    def call_started(self, shard: Shard, token: str, since_utc: str) -> bool:
+        """A container started this spawn of ``shard`` (``attempts.call_started``)."""
+        return A.call_started(self.jf, shard.kind, shard.shard_id, token=token,
+                              since_utc=since_utc)
+
+    def startup_failures(self, kind: str, since_utc: str) -> list[A.StartupFailure]:
+        """Containers of the worker app serving ``kind`` whose startup failed at or after
+        ``since_utc`` (``attempts.read_startup_failures``)."""
+        if not self.app:
+            return []
+        return A.read_startup_failures(self.jf.store, self.app, kind=kind, since_utc=since_utc)
 
     def is_poisoned(self, shard: Shard) -> bool:
         """Poison file of a single-episode shard exists (e.g. isolated under another config that
@@ -240,7 +253,7 @@ def build_deps(store: Store, settings: RunSettings, *, budget: BudgetGate | None
     jf = A.JobFiles(store, settings.job_id, settings.config_hash)
     manifests = StoreManifestSource(jf, clock=clock, rescan_s=rescan_s)
     attempts = StoreAttemptLedger(jf, limit=settings.max_starts_before_quarantine, clock=clock,
-                                  manifests=manifests)
+                                  manifests=manifests, app=worker_app)
     if budget is None:
         budget = default_budget_gate(store, settings, manifests, attempts, clock=clock)
     return OrchestratorDeps(

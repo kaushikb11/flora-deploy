@@ -34,7 +34,7 @@ This page holds numbers only. Full results are on `flora-golden:/reference_runs/
   - exactly the receipt's file set on disk, with the recorded sizes;
   - `pins.py`'s expected digests (adapter, NVIDIA manifest sha256), derived from the receipt's own sha256 table;
   - the sha256 of every small file (configs, tokenizer, chat template);
-  - for schema 2 receipts, `pin_digest` and size/mtime/inode fingerprints.
+  - for schema 2 receipts, `pin_digest` and size/mtime fingerprints. The inode is recorded but not compared: a Modal Volume assigns new inode numbers on every container mount, so comparing it rejected every receipt with `fingerprint changed (ino)` (2026-10-22).
 
   **The Volume's receipts are still schema 1**, which has no fingerprints. So the worker re-hashes all 19.3 GB of the TempSeg base against its receipt in the background (41 s, overlapped). The base is the only snapshot with no NVIDIA manifest. Re-running `flora prepare` would upgrade the receipts to schema 2. I did not do that, because it rewrites the shared weights Volume.
 - **OPT-2 shard check.** `captioner_load`'s install-time check is fast and does not catch corrupted shard bodies. The worker therefore also runs `verify_derived(full=True)` over all 54.7 GB, in the background during the TempSeg load. It is not ready until that passes. *This was added after the measured run; its cost is not measured yet* (≈25 s of I/O, overlapped).

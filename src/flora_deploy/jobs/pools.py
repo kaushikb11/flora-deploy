@@ -474,6 +474,13 @@ class PoolScaler:
         self._emit("pool_drained", worker_class=cls, scaledown_s=self.drained_s,
                    kinds=self._kinds_of(cls), final=final)
 
+    def busy_jobs(self) -> list[str]:
+        """Other jobs whose fresh entry says one of this job's classes is busy (the app is
+        shared: stopping it would kill their work)."""
+        now = self.clock()
+        return sorted({j for cls in set(self.classes.values())
+                       for j in self._busy_others(cls, now)})
+
     def _busy_others(self, cls: str, now: float) -> list[str]:
         prefix = f"{cls}/job/"
         out: list[str] = []
