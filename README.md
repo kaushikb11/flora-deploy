@@ -8,9 +8,9 @@
   [Modal](https://modal.com) account.** Subtasks, captions and rewards for a LeRobot dataset or a
   folder of MP4s, one command per step, scaling to zero when the job ends.
 - **Checked against NVIDIA's own code.** The `exact` preset runs it as the reference. The faster
-  `balanced` preset (vLLM on L40S + H100) is measured against it on 12 human episodes:
-  segment boundary error 0.009 s (NVIDIA vs itself: 0.007 s), 85% of captions byte-identical.
-  Rewards run NVIDIA's own engine.
+  `balanced` preset (vLLM on L40S + H100) is certified against it for segmentation of human data:
+  boundary error 0.009 s on 12 episodes (NVIDIA vs itself: 0.007 s). Captioning is not certified
+  yet. Rewards run NVIDIA's own engine.
 - **Priced before it runs.** `flora plan` estimates the cost of your dataset, `flora run` stops at
   your budget, and `flora resume` picks up where a job stopped.
 
