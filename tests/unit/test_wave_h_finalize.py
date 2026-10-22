@@ -763,3 +763,23 @@ def test_new_rates_regenerate_the_cost_guide(tmp_path, capsys):
     assert doc != doc0 and doc == cost_table.render(doc0, table=table)
     rc, out = run(root, "--write", capsys=capsys)
     assert rc == 0 and "costs.md" not in out  # idempotent
+
+
+def test_write_regenerates_the_limitations_status(tmp_path, capsys):
+    """docs/limitations.md's status tables follow the new rates and certificates."""
+    from flora_deploy.planner.rates import RateTable
+
+    lim = _load("limitations_status")
+    root = build(tmp_path)
+    shutil.copyfile(REPO / "docs/limitations.md", root / "docs/limitations.md")
+    rc, out = run(root, "--write", capsys=capsys)
+    assert rc == 0, out
+    assert "docs/limitations.md" in out
+    doc0 = (REPO / "docs/limitations.md").read_text(encoding="utf-8")
+    doc = (root / "docs/limitations.md").read_text(encoding="utf-8")
+    table = RateTable.load(root / "src/flora_deploy/planner/rates.json")
+    assert doc != doc0
+    assert doc == lim.render(doc0, cert_dirs=[root / "src/flora_deploy/config/certificates"],
+                             table=table)
+    rc, out = run(root, "--write", capsys=capsys)
+    assert rc == 0 and "limitations.md" not in out  # idempotent

@@ -107,6 +107,7 @@ class Paths:
     readme: Path | None = None
     manifest: Path | None = None
     costs_doc: Path | None = None
+    limitations_doc: Path | None = None
 
     def __post_init__(self) -> None:
         r = self.root
@@ -121,6 +122,7 @@ class Paths:
         self.readme = self.readme or r / "README.md"
         self.manifest = self.manifest or w / "finalize.json"
         self.costs_doc = self.costs_doc or r / "docs" / "costs.md"
+        self.limitations_doc = self.limitations_doc or r / "docs" / "limitations.md"
 
     def rel(self, p: str | Path) -> str:
         """``p`` as the committed files may name it: relative to the root, never a local
@@ -1137,6 +1139,14 @@ def analyze(paths: Paths, *, derived: Mapping[str, str] | None = None, cert_tmp:
              if o.get("cert") and o["cert"]["verdict"] != "fail"]
     readme = outputs.get(paths.readme) or paths.readme.read_text(encoding="utf-8")
     outputs[paths.readme] = certification_blocks(readme, [paths.certs, cert_tmp])
+    if paths.limitations_doc.exists():  # its status tables follow the certificates and rates
+        import limitations_status  # scripts/, on sys.path above
+
+        outputs[paths.limitations_doc] = limitations_status.render(
+            paths.limitations_doc.read_text(encoding="utf-8"), cert_dirs=[paths.certs, cert_tmp],
+            table=RateTable.from_dict(json.loads(outputs.get(paths.rates)
+                                                 or paths.rates.read_text(encoding="utf-8")),
+                                      source=str(paths.rates)))
     return f, outputs, certs
 
 

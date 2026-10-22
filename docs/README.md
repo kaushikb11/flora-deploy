@@ -15,6 +15,7 @@ Start with the repository [`README.md`](../README.md) (users) or [`PLAN.md`](PLA
 | [`PLAN.md`](PLAN.md) | Build plan v4: architecture, the numbered design decisions (D1-D18), cost model, determinism, licensing, roadmap | contributor, maintainer |
 | [`cli.md`](cli.md) | Every `flora` command, its options and defaults, and exit codes; generated from the CLI | user |
 | [`costs.md`](costs.md) | What a `balanced` job costs by size, where the money goes and how to spend less, including what warm starts and batch fill would save (estimates); its tables are generated from the rates | user |
+| [`limitations.md`](limitations.md) | What flora-deploy doesn't do yet: certification status per embodiment, measured vs estimated costs, unsupported inputs, known approximations; its status tables are generated | user |
 | [`export.md`](export.md) | `flora export --to lerobot`: which labels go where in the dataset copy, and alignment rules | user |
 | [`output-format.md`](output-format.md) | Every field a finished job writes (JSONL, Parquet, `summary.json`, exclusions); checked against the code by a test | user, contributor |
 | [`certification.md`](certification.md) | How a `balanced` certificate is computed, what it binds to, and when it unlocks a preset | user, maintainer |
