@@ -269,6 +269,31 @@ Container-seconds come from `planner/rates.json`: startup + video-s × container
   With 6 noise episodes (at least 5) but 6 candidates (fewer than 10 per pool), H-lite is
   **provisional by design** (`docs/certification.md`).
 
+## Before a paid run
+
+Run the preflight first. It only reads, starts nothing and says **GO** (exit 0) or **NO-GO**
+(exit 1, usage error 2). Every check prints a one-line fix:
+
+```
+uv run python scripts/cert_preflight.py            # human (default)
+uv run python scripts/cert_preflight.py --json     # the same, as JSON
+```
+
+| Check | GO when |
+|---|---|
+| git | the tree is clean, HEAD is `origin/main`, and every CI job for that SHA succeeded (a warning without `gh`) |
+| plan | the certified plan's next step **runs** under the runbook's own decision (`--status --json`, else `--status` / `--dry-run`); it prints the caps, the upper total vs the global cap, and any held attempt |
+| episodes | every golden/v2 `human` episode (`--embodiment yam`: golden/v3-yam) is on `flora-golden` with the manifest's file sizes |
+| weights | `DERIVED_PINS` match the receipts on `flora-weights` (`flora prepare --show-receipt`) |
+| images | the image locks are current (`lock_images.py --check`; until that mode exists, only the `.in` inputs are compared, as a warning) |
+| apps | no `flora*` Modal app is running (other apps are ignored, never touched) |
+| lab | the lab runs, or its saved result's engine-settings hash equals the current one (no hash yet: a warning, "will re-run") |
+| freeze | `cert_freeze.py --check` and `tests/unit/test_certificate_drift.py` pass |
+| budget | billed spend plus the plan's upper total leaves at least the margin (default $2) of the $50 project budget; it prints what remains |
+
+A NO-GO costs nothing. A held attempt ("wait") clears once billing covers it; re-run the
+preflight then rather than starting the run early.
+
 ## The certified run (`--plan certified`)
 
 This run makes `balanced` **certified** for the `human` embodiment, so human data no longer
