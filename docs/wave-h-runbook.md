@@ -520,11 +520,46 @@ These are offline dry-run figures (expected durations +10%).
   against vLLM on golden yam media. If the evidence is missing, the lab runs on yam's first six
   episodes, priced at the human lab's measured times.
 - **(e)** runs `flora certify` but not `wave_h_finalize.py --write`, which writes the human
-  rates, report and docs. The certificates stay in the work dir until finalize is
-  embodiment-aware.
+  rates, report and docs. `scripts/after_certified.py --embodiment yam` lands the yam
+  certificates ("After the certified run").
 - **dex, tianji, yam32** are refused: they have no golden certification set yet
   (`docs/golden-manifest-v3-yam.md` lists the pinned data and rough prices). Their users need
   `allow_uncertified: true`.
+
+### After the certified run
+
+`scripts/after_certified.py` does every step between the certified run and the commit, in
+order, and stops at the first failure:
+
+```
+uv run python scripts/after_certified.py                    # dry run: check and summarize
+uv run python scripts/after_certified.py --write            # apply, when every check passes
+uv run python scripts/after_certified.py --embodiment yam   # the yam run's certificates
+```
+
+1. Exports the records if any are missing (`wave_h_finalize.fetch_records`, a Volume read),
+   then runs `wave_h_finalize.py --write` against a staging copy of the files finalize owns.
+2. Runs `scripts/cert_check.py` on the staged certificates, locks and report.
+3. Runs `scripts/cert_freeze.py --check` on the staged certificates.
+4. Regenerates `docs/costs.md`, `docs/limitations.md`, the README blocks (`wave-h:certified`,
+   `wave-h:allow-uncertified`, `wave-h:cost`) and `docs/cli.md`. Each must be its generator's
+   fixed point.
+5. Scans every file it would change for NVIDIA text (license shingles) and record strings
+   (`cert_check`'s scan).
+6. Prints one summary to paste: the verdict, each metric against its threshold and noise
+   floor, coverage, the warm/cold witness, preemptions, spend (tracked, billed), and a diff
+   stat per file, with the README blocks in full.
+
+The checkout is untouched until steps 1-5 pass. With `--write`, the files are then applied
+and the drift tests run on the checkout (`test_certificate_drift.py`, `test_cost_docs.py`,
+`test_limitations_doc.py`, `test_cli_docs.py`). If any of them fails, every file is restored
+byte for byte. Exit 0 means all good (with `--write`, applied); 1 means a check failed and
+nothing is applied; 2 means a usage error. Running it twice changes nothing the second time.
+For `human`, (e) has already run finalize, so a clean run lists nothing to change and only
+re-checks. `--embodiment yam` applies only the certificates, their locks, the README
+certification blocks and `docs/limitations.md`; the rates, report and cost docs stay the
+human run's. The script never commits or pushes: the coordinator commits after reviewing the
+summary.
 
 ### Tested offline
 
