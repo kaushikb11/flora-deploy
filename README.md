@@ -117,8 +117,8 @@ labels = captions.merge(scores[["uid", "terminal_score"]], on="uid")
 
 Training on LeRobot? `flora export --to lerobot --out labeled/ --allow-uncertified` writes the
 labels into a copy of your dataset: subtasks and success scores per episode, dense rewards per
-frame ([`docs/export.md`](docs/export.md)). The flag is needed while `balanced` segment/caption
-are uncertified, and is recorded in the export; `flora.yaml`'s `allow_uncertified` doesn't apply.
+frame ([`docs/export.md`](docs/export.md)). The flag is needed when any exported record says
+`certified: false`, and is recorded in the export; `flora.yaml`'s `allow_uncertified` doesn't apply.
 A fake-models run needs `--allow-fake` instead. Export needs a LeRobot dataset, so the MP4 demo
 can't be exported; `flora init --template local_demo_lerobot` is the same demo on LeRobot data.
 
@@ -141,7 +141,8 @@ Three numbers, three definitions:
   captioning approaches it.
 - **`flora plan`**: the all-in estimate for your dataset: GPU work for every stage you chose,
   plus each container's startup, a short idle tail after its stage's last episode (about 17 s),
-  and the orchestrator. `balanced` shows as "partly certified" (rewards need no certificate).
+  and the orchestrator. It also says whether `balanced` is certified for your embodiment (rewards
+  need no certificate; segmentation and captioning do).
 - **`flora report`**: what the job actually spent: everything above plus idle time. On a job of
   a few minutes of video, startup and idle can make this several times the GPU-work rate.
 

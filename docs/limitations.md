@@ -22,8 +22,8 @@ Nothing is certified yet, so `balanced` segmentation and captioning need `allow_
 and their records say `certified: false`.
 <!-- /limitations:certification -->
 
-Certification sets are staged for `human` ([v2](golden-manifest-v2.md)) and `yam`
-([v3-yam](golden-manifest-v3-yam.md)); the `human` run comes first.
+Certification sets exist for `human` ([v2](golden-manifest-v2.md)) and `yam`
+([v3-yam](golden-manifest-v3-yam.md)); the other embodiments have none yet (below).
 
 ## What "certified" promises, and what it doesn't
 

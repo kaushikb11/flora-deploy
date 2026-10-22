@@ -25,7 +25,8 @@ starts a container, never commits and never pushes; the coordinator commits afte
    ``wave-h:allow-uncertified`` (``wave_h_finalize.certification_blocks``; ``wave-h:cost`` is
    finalize's) and ``docs/cli.md`` (``scripts/cli_docs.py``) are regenerated, and each must be
    its generator's fixed point. With ``--write``, their drift tests (:data:`DRIFT_TESTS`) run
-   on the checkout after the files are applied; a failure restores every file byte for byte.
+   on the checkout after the files are applied; a failure restores every file byte for byte
+   (so does an error while writing them, and a timeout or interrupt of the drift tests).
 5. **Leakage.** Every file it would change is scanned for NVIDIA text (the license shingles,
    against the fetched NVIDIA code) and for record strings (``cert_check``'s scan: captions,
    ids, dataset names, NVIDIA metadata).
@@ -301,22 +302,46 @@ def leakage(changes: Sequence[Change], inp: cc.Inputs, root: Path) -> None:
         raise Refused("leakage", hits)
 
 
-def apply(changes: Sequence[Change]) -> None:
-    for c in changes:
-        if c.new is None:
-            c.path.unlink(missing_ok=True)
-        else:
-            c.path.parent.mkdir(parents=True, exist_ok=True)
-            c.path.write_bytes(c.new)
+def _missing_dirs(p: Path) -> list[Path]:
+    """``p``'s ancestors that do not exist yet, deepest first."""
+    out = []
+    while not p.exists():
+        out.append(p)
+        p = p.parent
+    return out
 
 
-def restore(changes: Sequence[Change]) -> None:
+def apply(changes: Sequence[Change]) -> list[Path]:
+    """Write ``changes``; returns the directories it created (deepest first), for
+    :func:`restore`. A failure part way restores what was written, then re-raises."""
+    created: list[Path] = []
+    try:
+        for c in changes:
+            if c.new is None:
+                c.path.unlink(missing_ok=True)
+            else:
+                new_dirs = _missing_dirs(c.path.parent)
+                c.path.parent.mkdir(parents=True, exist_ok=True)
+                created = new_dirs + created
+                c.path.write_bytes(c.new)
+    except BaseException:
+        restore(changes, created)
+        raise
+    return created
+
+
+def restore(changes: Sequence[Change], created: Sequence[Path] = ()) -> None:
+    """Put back every file of ``changes`` byte for byte, and remove the directories
+    :func:`apply` created when they are empty again."""
     for c in changes:
         if c.old is None:
             c.path.unlink(missing_ok=True)
         else:
             c.path.parent.mkdir(parents=True, exist_ok=True)
             c.path.write_bytes(c.old)
+    for d in created:
+        with contextlib.suppress(OSError):
+            d.rmdir()
 
 
 # ---------------------------------------------------------------------------------------------
@@ -463,6 +488,10 @@ def main(argv: list[str] | None = None, *, fetch_run: Callable[..., Any] = subpr
         except Refused as e:
             print(summary(o, emb=emb, root=real.root, write=a.write, error=e))
             return FAILED
+        except Exception as e:  # noqa: BLE001 - staged only: the checkout is untouched
+            err = Refused("an unexpected error (staging only)", [f"{type(e).__name__}: {e}"])
+            print(summary(o, emb=emb, root=real.root, write=a.write, error=err))
+            return FAILED
         readme = next((c.new for c in o.changes if c.path == real.readme), None)
         o.readme = (readme.decode("utf-8") if readme is not None
                     else real.readme.read_text(encoding="utf-8") if real.readme.exists()
@@ -471,10 +500,21 @@ def main(argv: list[str] | None = None, *, fetch_run: Callable[..., Any] = subpr
             o.notes.append("the drift tests run on the checkout with --write")
             print(summary(o, emb=emb, root=real.root, write=False))
             return OK
-        apply(o.changes)
-        rc, tail = pytest_runner(real.root, DRIFT_TESTS)  # 3. and 4. (the checkout)
+        try:
+            created = apply(o.changes)
+        except Exception as e:  # apply restored what it wrote
+            err = Refused("apply (restored every file)", [f"{type(e).__name__}: {e}"])
+            print(summary(o, emb=emb, root=real.root, write=True, error=err))
+            return FAILED
+        try:
+            rc, tail = pytest_runner(real.root, DRIFT_TESTS)  # 3. and 4. (the checkout)
+        except BaseException as e:  # a timeout, an interrupt: the checkout goes back too
+            restore(o.changes, created)
+            if not isinstance(e, Exception):
+                raise
+            rc, tail = 1, f"{type(e).__name__}: {e}"
         if rc != 0:
-            restore(o.changes)
+            restore(o.changes, created)
             err = Refused("drift tests (restored every file)", [*DRIFT_TESTS, tail])
             print(summary(o, emb=emb, root=real.root, write=True, error=err))
             return FAILED

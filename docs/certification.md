@@ -25,11 +25,13 @@ Anything that cannot be shown from the records refuses or downgrades the certifi
 
 `balanced`'s reward stages (`reward.terminal`, `reward.dense`, `reward.rubric` on `H100!`) run
 exactly what `exact` runs, so they are the **reference** and need no certificate ("Reference by
-identity" below). `segment` and `caption` need one, and none exists yet. So today:
+identity" below). `segment` and `caption` need one for your embodiment and GPU; which exist is
+in [`limitations.md`](limitations.md#accuracy-certificates). So:
 
 - `flora plan` labels each option `reference`, `certified`, `partly certified` (some stages are
-  certified or the reference, others are not) or `uncertified`. Today's `balanced` option is
-  **partly certified**. Each option also gets a `certificates:` line with one label per stage:
+  certified or the reference, others are not) or `uncertified`. A `balanced` option is
+  **certified** when its `segment` and `caption` both have one, and **partly certified** when
+  only its rewards (or one of the two) are covered. Each option also gets a `certificates:` line with one label per stage:
   `certified (human, L40S)`, `reference (NVIDIA's own engine, no certificate needed)`, `not
   certified`, `certified for human, not for yam`, or `not certified (...)` with the reason: `only a
   provisional certificate`, `its certificate failed`, `certified for another build (engine,
