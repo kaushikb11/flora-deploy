@@ -15,10 +15,6 @@ from pathlib import Path
 
 DOC = Path(__file__).resolve().parents[1] / "docs" / "cli.md"
 
-# Workflow order; any command not listed is appended, so none is ever left out.
-ORDER = ["init", "doctor", "prepare", "index", "plan", "estimate", "deploy", "run", "status",
-         "logs", "cancel", "resume", "report", "results", "compose", "certify", "version"]
-
 JOB_SCOPED = {"status", "logs", "cancel", "resume", "report", "results", "export"}
 
 HEADER = """\
@@ -76,6 +72,14 @@ it from there when you give no `--index` or `--video-hours`.
 """
 
 
+def _panels() -> dict[str, tuple[str, ...]]:
+    """The ``flora --help`` panels (``cli._app.HELP_PANELS``), in workflow order; a command in
+    no panel is appended, so none is ever left out."""
+    from flora_deploy.cli._app import HELP_PANELS
+
+    return HELP_PANELS
+
+
 def _app_command():
     import typer
 
@@ -130,8 +134,20 @@ def _usage(name: str, cmd) -> str:
 
 def render() -> str:
     cmds = commands()
-    names = [n for n in ORDER if n in cmds] + sorted(n for n in cmds if n not in ORDER)
+    panels = _panels()
+    order = [n for names in panels.values() for n in names]
+    extra = sorted(n for n in cmds if n not in order)  # `--help` shows these in the last panel
+    names = [n for n in order if n in cmds] + extra
     out = [HEADER]
+    rows = []
+    for i, (panel, members) in enumerate(panels.items()):
+        shown = [n for n in members if n in cmds and not cmds[n].hidden]
+        if i == len(panels) - 1:
+            shown += [n for n in extra if not cmds[n].hidden]
+        if shown:
+            rows.append(f"| {panel} | " + ", ".join(f"[`{n}`](#flora-{n})" for n in shown)
+                        + " |")
+    out.append("As grouped in `flora --help`:\n\n| | |\n|---|---|\n" + "\n".join(rows) + "\n")
     for name in names:
         cmd = cmds[name]
         if cmd.hidden:
