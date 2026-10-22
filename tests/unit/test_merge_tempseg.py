@@ -19,6 +19,16 @@ from flora_deploy.config.pins import PINS_BY_KEY  # noqa: E402
 from flora_deploy.prep import merge_tempseg as mt  # noqa: E402
 from flora_deploy.prep.convert_captioner import DtypePolicy  # noqa: E402
 
+
+@pytest.fixture(autouse=True)
+def _tempseg_unpinned(monkeypatch):
+    """These tests merge synthetic checkpoints, whose content digests differ from the real
+    TempSeg v2 pin (2026-10-22): run them in the unpinned state they describe."""
+    from flora_deploy.config.pins import DERIVED_PINS_BY_KEY as _PINS
+
+    monkeypatch.setitem(_PINS, "tempseg-merged",
+                        replace(_PINS["tempseg-merged"], content_sha256=None))
+
 # --- adapter spec / key mapping --------------------------------------------------------------
 
 BASE_CFG = {"peft_type": "LORA", "r": 32, "lora_alpha": 64, "bias": "none", "use_dora": False,
