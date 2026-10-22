@@ -43,8 +43,13 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from spend import BUDGET_ENV, project_budget_usd  # noqa: E402 - the one project-budget setting
+
 ROOT = Path(__file__).resolve().parents[1]
-PROJECT_BUDGET_USD = 50.0  # the user's total Modal budget for the whole build
+# the user's total Modal budget for the whole build: $FLORA_PROJECT_BUDGET_USD (default 50)
+PROJECT_BUDGET_USD = project_budget_usd()
 MARGIN_USD = 2.0  # kept free on top of the upper projection (billing lags about an hour)
 BILLING_SINCE = "2026-10-20"
 PLAN = "certified"
@@ -592,16 +597,16 @@ def check_freeze(env: Env) -> Check:
 # 9. Budget
 
 
-def billed_total(env: Env) -> tuple[float | None, str]:
-    r = env.py("scripts/spend.py", "--since", BILLING_SINCE, "--budget",
-               f"{PROJECT_BUDGET_USD:g}", timeout=120)
+def billed_total(env: Env, budget: float = PROJECT_BUDGET_USD) -> tuple[float | None, str]:
+    r = env.py("scripts/spend.py", "--since", BILLING_SINCE, "--budget", f"{budget:g}",
+               timeout=120)
     m = re.search(r"^TOTAL\s+\$\s*([0-9.]+)", r.out, re.M) if r.rc == 0 else None
     return (float(m.group(1)), "") if m else (None, _tail(r) or "no TOTAL line")
 
 
 def check_budget(env: Env, plan: PlanInfo | None, *, budget: float, margin: float) -> Check:
     name = "budget"
-    billed, why = billed_total(env)
+    billed, why = billed_total(env, budget)
     if billed is None:
         return Check(name, FAIL, f"billing unreadable: {why}", "check `modal token`, then "
                      "`uv run python scripts/spend.py`")
@@ -616,7 +621,7 @@ def check_budget(env: Env, plan: PlanInfo | None, *, budget: float, margin: floa
            f"${budget:.2f}; remaining after the upper case ${left:.2f} (margin ${margin:.2f})")
     if left < margin:
         return Check(name, FAIL, msg, "shrink the plan (fewer episodes / steps) or get the user "
-                     "to raise the project budget", d)
+                     f"to raise the project budget (--budget USD or {BUDGET_ENV})", d)
     return Check(name, PASS, msg, "", d)
 
 
@@ -668,7 +673,8 @@ def main(argv: list[str] | None = None, env: Env | None = None) -> int:
     ap.add_argument("--embodiment", choices=tuple(GOLDEN), default="human")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--repo", type=Path, default=None, help="checkout to check (default: this)")
-    ap.add_argument("--budget", type=float, default=PROJECT_BUDGET_USD)
+    ap.add_argument("--budget", type=float, default=PROJECT_BUDGET_USD,
+                    help=f"project budget in USD (default: ${BUDGET_ENV}, else 50)")
     ap.add_argument("--margin", type=float, default=MARGIN_USD)
     args = ap.parse_args(argv)  # a usage error exits 2
     if args.repo is not None and not (args.repo / "scripts" / "wave_h.py").is_file():

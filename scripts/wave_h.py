@@ -159,6 +159,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import _runbook as rb  # noqa: E402 - state, billing, heartbeat, stop rules (shared)
 import h0_rehearsal as h0  # noqa: E402 - the same staging and configs as H0
+import spend as _spend  # noqa: E402 - the project budget (FLORA_PROJECT_BUDGET_USD)
 
 STATE = ROOT / "reports" / "wave-h" / "state.json"
 REPORT = ROOT / "reports" / "wave-h" / "runbook.md"  # docs/wave-h-report.md: wave_h_finalize.py
@@ -434,8 +435,9 @@ CAPS_USD = {"tempseg": 0.75, "preflight": 0.05, "exact_e2e": 3.30, "balanced": 2
             "lab": 2.35, "certify": 0.0, "noise": 3.30}
 GLOBAL_CAP_USD = 6.50  # --plan full; balanced-only derives its own (plan_global_cap)
 # The most --global-cap may approve: the project's whole GPU budget (review 12 F7: ``inf`` once
-# turned every global check into a no-op).
-MAX_GLOBAL_CAP_USD = 50.0
+# turned every global check into a no-op): ``$FLORA_PROJECT_BUDGET_USD``, default $50, the one
+# setting ``spend.py`` and ``cert_preflight.py`` read too.
+MAX_GLOBAL_CAP_USD = _spend.project_budget_usd()
 # Cold compile (image smoke, 2026-10-22): ``flora-cache`` holds no compile cache for
 # balanced/tempseg or balanced/captioner at the current image key, so (d)'s first L40S and H100
 # engine starts compile from scratch (torch.compile, Triton, CUDA graphs). The balanced startup
@@ -2803,15 +2805,34 @@ def running_lines(st: State, plan: str, title: Mapping[str, str], only: str | No
     return out
 
 
+class NotStaged(Exception):
+    """The golden set's manifest is not on the golden Volume (or the Volume does not exist)."""
+
+
+def _not_found(e: BaseException) -> bool:
+    """A missing Volume file (``FileNotFoundError``) or Volume (``modal`` ``NotFoundError``)."""
+    return isinstance(e, FileNotFoundError) or type(e).__name__ == "NotFoundError"
+
+
 def load_manifest(offline: bool, version: str = "golden/v1") -> dict[str, Any]:
+    """The ``version`` manifest from the golden Volume (``offline``: the selection's expected
+    durations). Raises :class:`NotStaged` when the set was never staged there."""
     if offline:
         return offline_manifest(DURATION_HEADROOM, version)
-    if version == "golden/v1":
-        return h0.golden_manifest()
-    import modal
+    try:
+        if version == "golden/v1":
+            return h0.golden_manifest()
+        import modal
 
-    vol = modal.Volume.from_name(h0.GOLDEN_VOLUME, version=2)
-    return json.loads(b"".join(vol.read_file(f"{version}/manifest.json")))
+        vol = modal.Volume.from_name(h0.GOLDEN_VOLUME, version=2)
+        return json.loads(b"".join(vol.read_file(f"{version}/manifest.json")))
+    except Exception as e:
+        if not _not_found(e):
+            raise
+        raise NotStaged(f"{version} is not staged: no {version}/manifest.json on Volume "
+                        f"{h0.GOLDEN_VOLUME} ({type(e).__name__}); run "
+                        f"scripts/golden_stage.py --version {version} (or pass --offline to "
+                        "price the selection's expected durations)") from None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2897,7 +2918,11 @@ def main(argv: list[str] | None = None) -> int:
         st.mark_killed()
     elif preview:  # what a run would find: a heartbeat this old is a dead process
         st.mark_killed(stale_before=time.time() - DEAD_HEARTBEAT_S)
-    manifest = load_manifest(args.offline, spec.golden)
+    try:
+        manifest = load_manifest(args.offline, spec.golden)
+    except NotStaged as e:
+        print(f"refused: {e}")
+        return 2
     miss = missing_episodes(manifest, spec.episodes)
     if miss:
         print(f"note: only {len(spec.episodes) - len(miss)} of the {len(spec.episodes)} "

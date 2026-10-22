@@ -1,6 +1,8 @@
 """`flora index`: dataset -> per-episode index receipts + ``index/summary.json`` in the job store.
 
-Default: runs on Modal CPU containers (``modal_app/index_app.py``). ``--local`` runs in-process
+Default: runs on Modal CPU containers (``modal_app/index_app.py``, an ephemeral app named
+``flora-index``, or ``--app-name`` / ``$FLORA_INDEX_APP`` so a runbook can attribute its
+billing to its own run). ``--local`` runs in-process
 (small datasets, tests). The summary is also written locally (``--out``, default
 ``summary.json`` next to the config: :func:`default_index_summary`), where ``flora plan`` reads
 it by default.
@@ -10,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Annotated
 
@@ -26,6 +29,7 @@ def _fail(msg: str, code: int = 2) -> typer.Exit:
 
 
 INDEX_SUMMARY_NAME = "summary.json"
+_APP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 
 def default_index_summary(config: Path) -> Path:
@@ -99,6 +103,11 @@ def index(
     out: Annotated[Path | None, typer.Option(
         help="Also write the summary here (default: summary.json next to the config, where "
              "`flora plan` reads it).", show_default=False)] = None,
+    app_name: Annotated[str | None, typer.Option(
+        "--app-name", envvar="FLORA_INDEX_APP",
+        help="Modal app name of this index run (default: flora-index). Billing reports spend "
+             "per app name, so give each run its own to attribute it.",
+        show_default=False)] = None,
 ) -> None:
     """Index a dataset: per-episode receipts (video probe, envelope, eligibility).
 
@@ -116,6 +125,8 @@ def index(
     except ConfigError as e:
         raise _fail(str(e)) from None
     job_id = job or cfg.project
+    if app_name is not None and not _APP_NAME.fullmatch(app_name):
+        raise _fail(f"--app-name {app_name!r}: use 1-64 letters, digits, '-', '_' or '.'")
     try:
         store_uri = store or store_for_sink(cfg.output.sink)
         ijob = IndexJob.from_config(cfg, job_id, decode=decode)
@@ -169,7 +180,9 @@ def index(
         from flora_deploy.modal_app import index_app
 
         index_app = importlib.reload(index_app)  # pick up FLORA_INDEX_VOLUME
-        with modal.enable_output(), index_app.app.run(environment_name=cfg.modal.environment):
+        run_kw = {"name": app_name} if app_name else {}  # default: the app's own, flora-index
+        with modal.enable_output(), index_app.app.run(environment_name=cfg.modal.environment,
+                                                      **run_kw):
             summary = index_app.run_index_remote.remote(
                 ijob.to_dict(), store_uri, cfg.input.stage_to, limit, max_episodes, force)
 

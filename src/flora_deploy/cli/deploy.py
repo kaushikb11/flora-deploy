@@ -54,6 +54,33 @@ def _deploy(modal_app: Any, plan: Any) -> str | None:
     return getattr(modal_app, "app_id", None)
 
 
+def _cache_volumes(plan: Any) -> list[str]:
+    """The Volumes the app mounts that ``flora deploy`` creates when missing: ``flora-cache``
+    (an empty cache is valid; workers compile cold). Workers mount it read-only, and a
+    read-only mount cannot create it, so a fresh workspace would fail the deploy. Weights and
+    staged media are not created here (an empty one would hide a missing ``flora prepare``)."""
+    from flora_deploy.layout import CACHE_VOLUME
+
+    return sorted({m.name for o in plan.objects for m in o.volumes.values()
+                   if m.name == CACHE_VOLUME})
+
+
+def _ensure_volume(name: str, environment: str) -> None:
+    """Create Volume ``name`` (version 2) in ``environment`` if missing. (A seam for tests.)
+    Client-side only: the plan, its images and engine specs (and so every hash) are as before."""
+    import modal
+
+    modal.Volume.from_name(name, version=2, create_if_missing=True,
+                           environment_name=environment).hydrate()
+
+
+def _ensure_volumes(plan: Any) -> list[str]:
+    names = _cache_volumes(plan)
+    for name in names:
+        _ensure_volume(name, plan.environment)
+    return names
+
+
 def _record(plan: Any, record: dict[str, Any]) -> str:
     """Write the deployment record whole into the job store; returns where."""
     from flora_deploy.modal_app.factory import deployment_path
@@ -210,6 +237,13 @@ def deploy(
         console.print("dry run: nothing deployed")
         return
 
+    try:
+        _ensure_volumes(plan)
+    except Exception as e:  # noqa: BLE001 - nothing deployed yet; say how to fix it by hand
+        names = " ".join(_cache_volumes(plan))
+        raise _fail(f"could not create the Volume(s) {names} the workers mount: {e!r}; "
+                    f"create them with `modal volume create <name> --version 2 --env "
+                    f"{plan.environment}`") from None
     try:
         app_id = _deploy(materialize(plan), plan)
     except DeployError as e:

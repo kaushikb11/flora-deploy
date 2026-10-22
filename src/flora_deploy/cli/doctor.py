@@ -13,6 +13,8 @@ a problem):
 * **store**: the output sink is reachable and writable (a tiny probe object, deleted again); the
   ``flora-bucket`` Secret exists for ``s3://`` / ``gs://`` / ``r2://`` sinks, the Volume for
   ``volume://`` sinks;
+* **cache**: the ``flora-cache`` Volume the config's workers mount read-only exists (``flora
+  deploy`` creates it when missing; a ``--emit`` script deployed by hand does not);
 * **weights**: the pinned snapshots (and their prep receipts) are on the ``flora-weights``
   Volume, and the derived-weight receipts are in ``flora.yaml`` (``weights.derived``);
 * **certificates**: each stage's certificate status in plain words ("certified (human, L40S)",
@@ -418,6 +420,32 @@ def check_store(p: Probes, cfg: Any) -> list[Check]:
     return out
 
 
+def _mounts_cache(cfg: Any) -> bool:
+    """Whether a worker of the config's shard kinds mounts ``flora-cache`` (read-only)."""
+    from flora_deploy.modal_app.factory import WORKERS
+
+    return any(ref.cache for k in cfg.pools() if (ref := WORKERS.get(k)) is not None)
+
+
+def check_cache(p: Probes, cfg: Any) -> list[Check]:
+    from flora_deploy.layout import CACHE_VOLUME
+
+    if not _mounts_cache(cfg):
+        return []
+    env = cfg.modal.environment
+    fix = f"modal volume create {CACHE_VOLUME} --version 2 --env {env}"
+    r = p.modal_volume(CACHE_VOLUME, env)
+    if r == "ok":
+        return [Check("cache.volume", "pass", f"Volume {CACHE_VOLUME!r} exists")]
+    if r == "missing":
+        return [Check("cache.volume", "warn", f"Volume {CACHE_VOLUME!r} does not exist in "
+                      f"environment {env!r}; the workers mount it read-only, which cannot "
+                      "create it. `flora deploy` creates it; a `flora deploy --emit` script "
+                      "deployed with `modal deploy` does not", f"or create it now: {fix}")]
+    return [Check("cache.volume", "warn", f"could not look up the Volume {CACHE_VOLUME!r} ({r})",
+                  f"check `modal volume list --env {env}`; if it is missing: {fix}")]
+
+
 def _needed(cfg: Any) -> tuple[list[str], list[str]]:
     """Pin keys and derived-weight names the config's shard kinds need."""
     from flora_deploy.config.presets import get_preset, shard_kinds_for
@@ -632,11 +660,12 @@ def run_checks(config: Path, probes: Probes) -> list[Check]:
     hf, token = check_hf(probes)
     out += hf
     if cfg is None:
-        out.append(Check("rest", "warn", "store, weights, certificate, budget and input checks "
-                         "skipped (the config did not load)", "fix the config first"))
+        out.append(Check("rest", "warn", "store, cache, weights, certificate, budget and input "
+                         "checks skipped (the config did not load)", "fix the config first"))
         return out
     steps: Iterable[Callable[[], list[Check] | Check]] = (
         lambda: check_store(probes, cfg),
+        lambda: check_cache(probes, cfg),
         lambda: check_weights(probes, cfg),
         lambda: check_certificates(probes, cfg),
         lambda: check_budget(cfg),

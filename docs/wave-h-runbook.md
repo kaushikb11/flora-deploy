@@ -24,9 +24,9 @@ below; `--plan full` cannot certify). The dry run comes to **$3.25 nominal and $
 run: every step is done, at $5.16.
 
 **`--global-cap USD`** applies to every plan. It can only raise the derived cap: it is refused
-above $50 (`MAX_GLOBAL_CAP_USD`), below the derived cap, or below what was already spent. It is
-saved in the state only with `--yes-spend` (a dry run only shows its effect) and holds for that
-`--plan` only. The dry run labels the cap in force "user-approved override for plan ...;
+above the project budget (`MAX_GLOBAL_CAP_USD`: `FLORA_PROJECT_BUDGET_USD`, default $50), below
+the derived cap, or below what was already spent. It is saved in the state only with
+`--yes-spend` (a dry run only shows its effect) and holds for that `--plan` only. The dry run labels the cap in force "user-approved override for plan ...;
 derived $X".
 
 ```
@@ -370,7 +370,7 @@ uv run python scripts/cert_preflight.py --json     # the same, as JSON
 | apps | no `flora*` Modal app is running (other apps are ignored, never touched) |
 | lab | the lab runs, or its saved result's engine-settings hash equals the current one (no hash yet: a warning, "will re-run") |
 | freeze | `cert_freeze.py --check` and `tests/unit/test_certificate_drift.py` pass |
-| budget | billed spend plus the plan's upper total leaves at least the margin (default $2) of the $50 project budget; it prints what remains |
+| budget | billed spend plus the plan's upper total leaves at least the margin (default $2) of the project budget (`--budget`, else `FLORA_PROJECT_BUDGET_USD`, default $50); it prints what remains |
 
 A NO-GO costs nothing. A held attempt ("wait") clears once billing covers it; re-run the
 preflight then rather than starting the run early.

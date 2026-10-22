@@ -1,16 +1,41 @@
 """Actual Modal spend per app from the workspace billing API, against a build budget.
 
-Usage: uv run python scripts/spend.py [--since 2026-10-20] [--budget 50] [--app flora-gatec]
+Usage: uv run python scripts/spend.py [--since 2026-10-20] [--budget USD] [--app flora-gatec]
 Billing data covers complete hours only, so the last hour or so of usage is not yet included.
+
+The project budget is one setting, :func:`project_budget_usd`: ``FLORA_PROJECT_BUDGET_USD``
+(default $50), which ``--budget`` overrides here. ``cert_preflight.py`` (its budget check) and
+``wave_h.py`` (the ``--global-cap`` ceiling) read the same setting.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 import subprocess
 from collections import defaultdict
+from collections.abc import Mapping
 from datetime import UTC, datetime
+
+BUDGET_ENV = "FLORA_PROJECT_BUDGET_USD"
+DEFAULT_PROJECT_BUDGET_USD = 50.0  # the user's total Modal budget for the whole build
+
+
+def project_budget_usd(environ: Mapping[str, str] | None = None) -> float:
+    """The project's total Modal budget in USD: ``$FLORA_PROJECT_BUDGET_USD``, else $50. A value
+    that is not a finite positive number is refused (``SystemExit`` with the reason)."""
+    raw = (os.environ if environ is None else environ).get(BUDGET_ENV, "").strip()
+    if not raw:
+        return DEFAULT_PROJECT_BUDGET_USD
+    try:
+        value = float(raw.lstrip("$"))
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value <= 0:
+        raise SystemExit(f"{BUDGET_ENV}={raw!r}: not a positive number of USD (e.g. 50)")
+    return value
 
 
 def report(since: str) -> list[dict]:
@@ -53,9 +78,13 @@ def rows(since: str) -> list[dict]:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--since", default="2026-10-20")
-    ap.add_argument("--budget", type=float, default=50.0)
+    ap.add_argument("--budget", type=float, default=None,
+                    help=f"project budget in USD (default: ${BUDGET_ENV}, else "
+                         f"{DEFAULT_PROJECT_BUDGET_USD:g})")
     ap.add_argument("--app", help="only this app (description)")
     args = ap.parse_args()
+    if args.budget is None:
+        args.budget = project_budget_usd()
 
     totals: dict[str, float] = defaultdict(float)
     for row in report(args.since):
