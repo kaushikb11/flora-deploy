@@ -118,7 +118,7 @@ FAKE_EPISODES = round(VIDEO_S / ((FAKE_MIN_S + FAKE_MAX_S) / 2))  # 784
 # 2 + 3: the cheapest size with >= 2 containers per pool whose upper wall is within the hour
 # at the measured rates (docs/scale-test.md "Pool sizing"; :func:`pool_sizing`,
 # :func:`recommend`). caption (0.906 container-s per video-s, 2.5x segment) is the bottleneck:
-# a third segment container only adds a cold start and a scale-down tail.
+# a third segment container only adds a cold start and a drained idle tail.
 POOLS = {"segment": {"gpu": "L40S", "max_containers": 2},
          "caption": {"gpu": "H100!", "max_containers": 3}}
 MAX_GPUS = 5
@@ -343,7 +343,7 @@ class PoolSim:
     startup_s: float = 0.0
     busy_s: float = 0.0
     wait_s: float = 0.0  # ready but idle between shards (waiting for upstream shards)
-    tail_s: float = 0.0  # after its last shard: scale-down window, cut at the app stop
+    tail_s: float = 0.0  # after its last shard: the 300 s window, or the drain at the pool end
     container_s: float = 0.0
     peak: int = 0
     t_peak: float | None = None  # first time the pool had its size of containers started
@@ -363,14 +363,18 @@ class PoolSim:
 
 
 def _schedule(inputs: Sequence[tuple[float, float]], n: int, startup: float,
-              scaledown: float) -> tuple[list[list[Any]], list[tuple[float, float]]]:
+              scaledown: float, *, prewarm_at: float | None = None
+              ) -> tuple[list[list[Any]], list[tuple[float, float]]]:
     """FIFO inputs ``(ready, seconds)`` on a pool of at most ``n`` containers that each start
     in ``startup`` s and scale down ``scaledown`` s after their last input; a queued input
-    starts a new container while the pool is below ``n`` and none is free. Returns the
-    containers ``[spawn, ready, free, end]`` (end None while alive) and the input spans, in
-    input order."""
+    starts a new container while the pool is below ``n`` and none is free. ``prewarm_at``: one
+    container is spawned then, before any input (the caption pre-warm, ``jobs.pools``).
+    Returns the containers ``[spawn, ready, free, end]`` (end None while alive) and the input
+    spans, in input order."""
     conts: list[list[Any]] = []
     spans: list[tuple[float, float]] = []
+    if prewarm_at is not None and n > 0:
+        conts.append([prewarm_at, prewarm_at + startup, 0.0, None])
     for r, d in inputs:  # ready times are non-decreasing (FIFO)
         for c in conts:  # containers idle past the window by now are gone
             if c[3] is None and c[2] > 0 and r > c[2] + scaledown:
@@ -387,15 +391,29 @@ def _schedule(inputs: Sequence[tuple[float, float]], n: int, startup: float,
     return conts, spans
 
 
+# The deployed pool behaviour the schedule models (``jobs.pools``): once a pool has no work
+# left, the orchestrator drains it within one poll to a 2 s window, so each of its containers
+# idles at most ``planner.options.POOL_END_TAIL_S`` (15 + 2 s, what ``flora plan`` charges)
+# past the pool's last shard; and the caption pool is pre-warmed so its first container is
+# ready when its first shard becomes runnable (skipped when ``min_containers`` > 0).
+MIN_CONTAINERS = 0  # `flora deploy --min-containers` for this run (the default)
+
+
 def simulate(sizes: Mapping[str, int], rates: Mapping[str, KindRate],
-             video_s: float = VIDEO_S, *, upper: bool = False) -> dict[str, Any]:
+             video_s: float = VIDEO_S, *, upper: bool = False,
+             prewarm: bool = MIN_CONTAINERS == 0) -> dict[str, Any]:
     """Shard-level schedule of the run without chaos: every ``segment`` shard is queued at
     t=0, a ``caption`` shard is queued once the segment shards covering its episodes have
-    receipts (per-shard ``depends_on``), each pool autoscales up to its size, containers
-    scale down ``WORKER_SCALEDOWN_S`` after their last shard, and the app stops
-    :data:`IDLE_AFTER_JOB_S` after the last receipt. ``upper``: rates and startups at
-    ``1 + uncertainty``. Returns ``{"wall_s", "pools": {kind: PoolSim}, "pipelining"}``."""
+    receipts (per-shard ``depends_on``), each pool autoscales up to its size, a container
+    idle between shards scales down ``WORKER_SCALEDOWN_S`` after its last shard, every
+    container still up when its pool's last shard ends leaves ``POOL_END_TAIL_S`` later (the
+    job-aware drain), and the app stops :data:`IDLE_AFTER_JOB_S` after the last receipt.
+    ``prewarm``: one caption container is spawned a caption startup before the first caption
+    shard is runnable (a perfect ready estimate; it is charged from its spawn). ``upper``:
+    rates and startups at ``1 + uncertainty``. Returns ``{"wall_s", "pools": {kind:
+    PoolSim}, "pipelining"}``."""
     from flora_deploy.jobs.settings import WORKER_SCALEDOWN_S
+    from flora_deploy.planner.options import POOL_END_TAIL_S
 
     def rate(k: str) -> float:
         return rates[k].cs_per_video_s * ((1 + rates[k].uncertainty) if upper else 1.0)
@@ -415,14 +433,17 @@ def simulate(sizes: Mapping[str, int], rates: Mapping[str, KindRate],
         hi = min(n_shards["segment"] - 1, int(((j + 1) * cap_v - 1e-6) // seg_v))
         cap_in.append((max(seg_end[lo:hi + 1]), cap_v * rate("caption")))
     cap_in.sort(key=lambda x: x[0])
-    cap_c, cap_sp = _schedule(cap_in, sizes["caption"], start("caption"), WORKER_SCALEDOWN_S)
+    pre_at = max(0.0, cap_in[0][0] - start("caption")) if prewarm and cap_in else None
+    cap_c, cap_sp = _schedule(cap_in, sizes["caption"], start("caption"), WORKER_SCALEDOWN_S,
+                              prewarm_at=pre_at)
     wall = max(e for _, e in seg_sp + cap_sp)
     stop = wall + IDLE_AFTER_JOB_S
     out: dict[str, Any] = {"wall_s": wall, "pools": {}}
     for kind, conts, spans in (("segment", seg_c, seg_sp), ("caption", cap_c, cap_sp)):
         p = PoolSim()
-        ends = [min(c[3] if c[3] is not None else c[2] + WORKER_SCALEDOWN_S, stop)
-                for c in conts]
+        drained = max(e for _, e in spans) + POOL_END_TAIL_S
+        ends = [min(c[3] if c[3] is not None else min(c[2] + WORKER_SCALEDOWN_S, drained),
+                    stop) for c in conts]
         for c, end in zip(conts, ends, strict=True):
             p.starts += 1
             p.startup_s += c[1] - c[0]
@@ -497,7 +518,10 @@ def project(step: str, mode: str, video_s: float = VIDEO_S, table: Any = None, *
               f"+/-{k.uncertainty:.0%})", c, a.busy_s, upper_s=b.busy_s)
         p.add(f"{kind}: idle between shards (pipelining waits)", c, a.wait_s,
               upper_s=max(a.wait_s, b.wait_s))
-        p.add(f"{kind}: idle tail x{a.starts} (scale-down / stop)", c, a.tail_s,
+        # nominal: the drained tail (POOL_END_TAIL_S); upper: the deployed window + client
+        # slack, because whether Modal applies the lowered window to an already-idle
+        # container is not yet confirmed live (``jobs.pools``; criterion 9 measures it)
+        p.add(f"{kind}: idle tail x{a.starts} (drained / stop)", c, a.tail_s,
               upper_s=b.starts * (WORKER_SCALEDOWN_S + CLIENT_SLACK_S))
         shard = shard_video_s(kind) * k.cs_per_video_s
         p.add(f"{kind}: 1 preemption (replacement start + lost shard)", c,
