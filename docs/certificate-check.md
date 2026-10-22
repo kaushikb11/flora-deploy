@@ -52,7 +52,7 @@ file, an unknown generator version, a crash) is a FAIL that names the reason.
 |---|---|---|
 | `0 inputs` | the records, state and certificate were found | wrong paths, or finalize did not write a certificate for the stage |
 | `1 metrics` | every mean, `n`, `count_matched`, `missing`, `unpaired` and `coverage` in the certificate equals the value recomputed from the records (oracle vs balanced, oracle vs noise, oracle vs cold witness), within 2e-6 | the records changed after `flora certify` ran, or the generator computes a metric differently from the definition. The detail names the metric and both values |
-| `2 pass rule` | the knobs are within policy; the recorded floors, caps, `over` basis and thresholds are the policy's; every check, every reason and the verdict recompute; **count-flip tolerance**: the `count_mismatch` threshold lets one episode in ten differ in subtask count (0.10; 1 in 12 passes, 2 fail) | a loosened or older rule (generator version 2 has no count-flip tolerance and no caption `count_mismatch`), or a verdict that does not follow from the numbers |
+| `2 pass rule` | the knobs are within policy; the recorded floors, caps, `over` basis and thresholds are the policy's; every check, every reason and the verdict recompute; **count-flip tolerance**: the `count_mismatch` threshold lets one episode in ten differ in subtask count (0.10), counted over the union of the candidate's and the witness's episodes and rounded half up (2 of 18 pass, 3 fail; without a witness 1 in 12 passes, 2 fail), and the certificate's per-group and union figures are the records' | a loosened or older rule (generator version 2 has no count-flip tolerance and no caption `count_mismatch`), or a verdict that does not follow from the numbers |
 | `2 pass rule` / `publishable` | the verdict is `certified` (or `provisional` with `--allow-provisional`) | the run did not certify; the detail and the `verdict` row give the reasons |
 | `3 coverage` | the certificate's hashed episode ids are exactly the oracle/balanced pairs; the noise and witness episodes are the oracle's (or are counted `unpaired`); the balanced and witness records share one stage hash and one `cert_key`, and that key is the key the current code computes; the oracle binding (stage hash, key, H200, `nvidia` determinism) holds and the noise run repeats it; the embodiment is `human` and the GPU is the pool's (`L40S` for segment, `H100!` for caption) | records from another job or another build, or code changed since the run (the detail lists the key fields that differ) |
 | `4 evidence` | every engine record states its compile cache; the cold-witness job finished and all its records are `cold:forced`; the certificate's `compile_cache` block matches the records; no record preempted or lacks the count (or the certificate is `provisional` because of it); the lab's L0 and Gate A are present and its baseline engine-settings hash equals the current engine settings and the certificate's engine | no forced-cold evidence, a preempted engine, or a lab measured under other engine settings (re-run the lab) |
@@ -81,11 +81,12 @@ records, or re-run the step whose evidence is missing.
 
 ## Notes for reviewers
 
-- **The cold witness is held to the candidate's thresholds on 6 episodes.** One subtask-count
-  flip among them is 1/6 = 17%, which is above the 10% count-flip floor. So a single flip in the
-  witness fails the certificate, even though the same flip among the 12 candidate episodes
-  would pass. That is the generator's rule, and the check reports it as it is (`2 pass rule`,
-  `cold-witness count_mismatch` among the failing checks).
+- **Count flips are counted over the union of the candidate's and the witness's episodes**
+  (`docs/certification.md`, "Pass rule"): `flips <= 0.10 x n` rounded half up, so 2 of the
+  certified run's 18 pass and 3 fail. The checker recomputes the per-group and union figures
+  from the records (`count-flip tolerance` names both) and compares them with
+  `metrics.count_flips` and the `union count_mismatch` check. The witness's other means are
+  still checked on their own (`cold-witness <metric>` among the failing checks).
 - The checker knows the rules of generator versions 2 and 3. A version-2 certificate always
   fails `count-flip tolerance` and `certificate states the caches`: it predates the user's
   count-flip decision and the cache evidence.

@@ -24,6 +24,7 @@ from tests.fakes.certrecords import (
     BOUNDS,
     L0_PASS,
     caption_set,
+    cold_witness,
     key,
     lab_for,
     rec,
@@ -46,6 +47,8 @@ def uids(n, start=0):
 
 
 def certify(exact, balanced, noise, *, stage="segment", l0=L0_PASS, gpu="L40S", **kw):
+    balanced = list(balanced)
+    kw.setdefault("witness", cold_witness(balanced) if stage in C.L0_STAGES else None)
     return C.certify_stage(stage, exact=exact, balanced=balanced, noise=noise,
                            engine_spec=key("balanced", stage, gpu), gpu=gpu, l0=l0,
                            generated_at=STAMP, **kw)
@@ -100,8 +103,9 @@ def test_caption_counts_are_bounded_and_caption_means_stay_tight():
     # one differing caption on a count-matched episode: 1/(12*3) of the slots, under 0.075
     off = caption_set("balanced", 12)
     off[0] = rec("u0", "caption", "balanced", segments=segs(BOUNDS, ["a", "b", "z"]))
+    clean = cold_witness(caption_set("balanced", 12))  # the witness does not repeat the typo
     assert certify(ex, off, caption_set("exact", 5), stage="caption", l0=lab_for("caption"),
-                   gpu="H100!")["verdict"] == "certified"
+                   gpu="H100!", witness=clean)["verdict"] == "certified"
     off[1] = rec("u1", "caption", "balanced", segments=segs(BOUNDS, ["q", "r", "z"]))
     off[2] = rec("u2", "caption", "balanced", segments=segs(BOUNDS, ["q", "r", "z"]))
     assert certify(ex, off, caption_set("exact", 5), stage="caption", l0=lab_for("caption"),
@@ -222,7 +226,7 @@ def test_certificate_states_the_compile_caches_its_evidence_covers():
                                   "witness": {"cold:forced": 6},
                                   "covers": sorted(["cold", "cold:forced", warm])}
     assert c["metrics"]["witness"]["n"] == 6
-    assert {ch["class"] for ch in c["checks"]} == {"yam", "cold-witness"}
+    assert {ch["class"] for ch in c["checks"]} == {"yam", "cold-witness", "union"}
     assert certkey.policy_problems(c) == []
 
 
@@ -234,8 +238,13 @@ def test_a_diverging_or_unforced_cold_witness_does_not_certify():
     assert c["verdict"] == "fail"
     assert {ch["class"] for ch in c["checks"] if ch["pass"] is False} == {"cold-witness"}
     warmish = seg_recs("balanced", uids(6), compile_cache="warm:k:" + "f" * 16)
-    c = certify(ex, bal, nz, witness=warmish)
-    assert c["verdict"] == "provisional" and "witness_not_forced_cold" in c["reasons"]
+    c = certify(ex, bal, nz, witness=warmish)  # no record forced cold: no witness at all
+    assert c["verdict"] == "provisional" and c["reasons"] == ["no_witness"]
+    mixed = cold_witness(bal)[:5] + warmish[5:]
+    c = certify(ex, bal, nz, witness=mixed)
+    assert c["verdict"] == "provisional" and c["reasons"] == ["witness_not_forced_cold"]
+    c = certify(ex, bal, nz, witness=None)
+    assert c["verdict"] == "provisional" and c["reasons"] == ["no_witness"]
     c = certify(ex, bal, nz, witness=seg_recs("balanced", uids(4), compile_cache="cold:forced"))
     assert c["verdict"] == "provisional" and "too_few_witness_samples" in c["reasons"]
     with pytest.raises(C.CertifyError, match="witness"):

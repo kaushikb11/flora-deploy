@@ -78,6 +78,11 @@ def test_what_certified_promises_matches_the_policy():
     assert f"no more than {tol} times as much" in TEXT
     count = metric_threshold("count_mismatch", 0.0, tol, 0.0)  # quiet NVIDIA runs: the floor
     assert f"up to {count:.1%} of episodes" in TEXT
+    # counted over the candidate and the cold witness together, to the nearest episode
+    from flora_deploy.validate.certkey import count_flips_allowed
+
+    assert count_flips_allowed(count, 18) == 2 and "2 of 18 pass" in TEXT
+    assert "warm and\ncold containers together" in TEXT
     assert metric_threshold("count_mismatch", 0.1, tol, 0.0) > count  # "more when ... disagree"
 
 

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 from flora_deploy import LOGIC_VERSION
 from flora_deploy.config.presets import get_preset
 from flora_deploy.records import DenseReward, Provenance, Segment, StageRecord, TerminalReward
@@ -80,6 +82,13 @@ def segs(bounds, captions=None) -> list[Segment]:
 
 
 BOUNDS = [(0.0, 2.0), (2.0, 5.0), (5.0, 9.0)]
+
+
+def cold_witness(records, n: int = 6) -> list[StageRecord]:
+    """The cold witness: forced-cold copies (``compile_cache`` ``cold:forced``) of the first
+    ``n`` candidate records. ``segment``/``caption`` certify only with one (``no_witness``)."""
+    return [dataclasses.replace(r, provenance=dataclasses.replace(
+        r.provenance, compile_cache="cold:forced")) for r in list(records)[:n]]
 
 
 def segment_set(preset: str, n: int, shift: float = 0.0, *, start: int = 0, **kw):

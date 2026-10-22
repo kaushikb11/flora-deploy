@@ -28,6 +28,7 @@ from tests.fakes.certrecords import (
     FP,
     L0_PASS,
     STAGE_SETS,
+    cold_witness,
     key,
     lab_for,
     prov,
@@ -44,9 +45,11 @@ MATCH = {"embodiment": "yam", "derived_content": CONTENT, **FP}
 def cert_for(stage="segment", *, n=12, noise=True, n_noise=5, shift=0.0, noise_shift=0.0,
              l0=L0_PASS, gpu="L40S", stamp=STAMP, **kw):
     noise_recs = segment_set("exact", n_noise, noise_shift) if noise else None
-    return C.certify_stage(stage, exact=segment_set("exact", n), balanced=segment_set(
-        "balanced", n, shift), noise=noise_recs, engine_spec=key("balanced", stage, gpu),
-        gpu=gpu, l0=l0, generated_at=stamp, **kw)
+    bal = segment_set("balanced", n, shift)
+    kw.setdefault("witness", cold_witness(bal) if stage in C.L0_STAGES else None)
+    return C.certify_stage(stage, exact=segment_set("exact", n), balanced=bal,
+                           noise=noise_recs, engine_spec=key("balanced", stage, gpu),
+                           gpu=gpu, l0=l0, generated_at=stamp, **kw)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -261,9 +264,11 @@ def _write_stage(tmp_path, cfg, stage, *, noise=True, content=CONTENT, stamp=STA
     modes = kind_modes(cfg, stage)
     lab = lab_for(stage)
     doc = key("balanced", stage, gpu, fp=None, modes=modes, content=content)
+    bal = mk("balanced", 10, fp=None, modes=modes)
     C.write_certificate(C.certify_stage(
-        stage, exact=mk("exact", 10, fp=None), balanced=mk("balanced", 10, fp=None, modes=modes),
+        stage, exact=mk("exact", 10, fp=None), balanced=bal,
         noise=mk("exact", 5, fp=None) if noise else None, engine_spec=doc, gpu=gpu,
+        witness=cold_witness(bal) if stage in C.L0_STAGES else None,
         l0=lab if stage in C.L0_STAGES else None, generated_at=stamp), tmp_path)
 
 
@@ -415,13 +420,14 @@ def test_cli_certify_writes_metrics_only_certificates(tmp_path):
     ex = _jsonl(tmp_path / "exact.jsonl", segment_set("exact", 12, fp=None))
     bal = _jsonl(tmp_path / "bal.jsonl", segment_set("balanced", 12, fp=None))
     nz = _jsonl(tmp_path / "noise.jsonl", segment_set("exact", 5, fp=None))
+    wit = _jsonl(tmp_path / "witness.jsonl", cold_witness(segment_set("balanced", 12, fp=None)))
     lab = tmp_path / "lab.json"
     lab.write_text(json.dumps(L0_PASS))
     out = tmp_path / "certs"
     args = ["certify", "--exact", str(ex), "-c", str(cfg), "--out-dir", str(out),
             *_content_args()]
     r = CliRunner().invoke(app, [*args, "--balanced", str(bal), "--noise", str(nz),
-                                 "--l0", str(lab), "--json"])
+                                 "--witness", str(wit), "--l0", str(lab), "--json"])
     assert r.exit_code == 0, r.output
     (cert,) = json.loads(r.output)
     assert cert["verdict"] == "certified" and cert["gpu"] == "L40S"

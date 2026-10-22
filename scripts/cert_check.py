@@ -34,7 +34,8 @@ Checks (one or more rows each):
    oracle vs noise, oracle vs the cold witness), with ``n``, ``count_matched``, ``missing``,
    ``unpaired`` and ``coverage``, within :data:`TOL`;
 2. **pass rule**: knobs within policy, recorded floors equal to the policy's, every threshold
-   and check recomputed, the count-flip tolerance, the provisional and fail reasons, the
+   and check recomputed, the count-flip tolerance (over the union of the candidate's and the
+   witness's episodes, per-group figures recorded), the provisional and fail reasons, the
    verdict, and whether it may be published (``certified``, or ``--allow-provisional``);
 3. **coverage**: the hashed episode ids equal the matched episodes; noise and witness episodes
    are the oracle's; one stage hash and one key on the balanced records, equal to the current
@@ -86,6 +87,11 @@ FLOOR: dict[str, float] = {
 # v3: up to about one episode in ten may differ in subtask count (1 in 12 passes, 2 fail).
 ABS_FLOOR_V3: dict[str, float] = {"count_mismatch": 0.10}
 COUNT_FLIP_SHARE = 0.10  # one flip in ten episodes must pass
+# v3: the count flips are counted over the union of the candidate's and the witness's episodes
+# (a witness episode is a sample of its own), and pass while flips - threshold x n <= 1/2
+# (threshold x n rounded half up: 2 of 18 pass, 2 of 14 fail). The witness's other means are
+# held to the thresholds on their own.
+UNION_CLASS = "union"
 CAP: dict[str, float] = {"expected_score_abs_delta": 0.05}
 METRICS_V2 = {
     "segment": ("iou_divergence", "boundary_error_s", "count_mismatch", "label_disagreement"),
@@ -758,12 +764,21 @@ def check_pass_rule(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
         blocks[run.inp.embodiment] = rc.cand_means
     if v == "3" and rc.witness is not None:
         blocks[WITNESS_CLASS] = rc.witness_means or {}
+    union = v == "3" and "count_mismatch" in rc.names
     want_checks = {}
     for cls, mm in blocks.items():
         for m in rc.names:
+            if union and m == "count_mismatch":
+                continue
             val, t = mm.get(m), want_t[m]
             want_checks[(cls, m)] = (val, t, None if val is None or t is None
                                      else bool(val <= t + 1e-12))
+    flips = count_flips(run, rc) if union else None
+    if flips is not None:
+        u, t = flips["union"], want_t["count_mismatch"]
+        want_checks[(UNION_CLASS, "count_mismatch")] = (
+            u["rate"], t, None if t is None or not u["n"]
+            else bool(u["flips"] - t * u["n"] <= 0.5 + 1e-9))
     got_checks = {(c.get("class"), c.get("metric")): c for c in cert.get("checks") or ()}
     cb = []
     if set(got_checks) != set(want_checks):
@@ -776,6 +791,12 @@ def check_pass_rule(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
                 or g.get("pass") is not ok:
             cb.append(f"{k[0]} {k[1]}: {g.get('value')}/{g.get('threshold')}/{g.get('pass')} "
                       f"!= {val}/{t}/{ok}")
+        if k[0] == UNION_CLASS and flips is not None:
+            u = flips["union"]
+            if (g.get("flips"), g.get("n")) != (u["flips"], u["n"]) or (
+                    t is not None and g.get("allowed") != flips_allowed(t, u["n"])):
+                cb.append(f"union count_mismatch: {g.get('flips')} of {g.get('n')} allowed "
+                          f"{g.get('allowed')} != {u['flips']} of {u['n']}")
     failing = [f"{c} {m}" for (c, m), (_, _, ok) in want_checks.items() if ok is False]
     rows.append(Row(C, f"{stage} checks", FAIL if cb else PASS,
                     "; ".join(cb) or (f"{len(want_checks)} agree"
@@ -788,16 +809,29 @@ def check_pass_rule(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
     elif "count_mismatch" in rc.names:
         t = want_t["count_mismatch"]
         t_rec = (pm.get("count_mismatch") or {}).get("threshold")
-        flips = sum(1 for x in rc.cand.values() if x.get("count_mismatch"))
-        n = len(rc.cand)
         ok = (v == CURRENT_RULE and t is not None and t >= COUNT_FLIP_SHARE - 1e-9
               and isinstance(t_rec, int | float) and t_rec >= COUNT_FLIP_SHARE - 1e-9)
-        allowed = math.floor(t * n + 1e-9) if t is not None else None
+        if flips is None:  # a v2 certificate: per group, floored
+            k = sum(1 for x in rc.cand.values() if x.get("count_mismatch"))
+            n = len(rc.cand)
+            allowed = math.floor(t * n + 1e-9) if t is not None else None
+            detail = f"{k} of {n} episodes differ in count; threshold {t} allows {allowed}"
+        else:
+            u = flips["union"]
+            allowed = flips_allowed(t, u["n"]) if t is not None else None
+            per = ", ".join(f"{g['flips']} of {g['n']} {c}" for c, g in flips["groups"].items())
+            detail = (f"{u['flips']} of {u['n']} episodes differ in count ({per}); threshold "
+                      f"{t} allows {allowed}")
+            recorded = (cert.get("metrics") or {}).get("count_flips") or {}
+            want_rec = {"groups": flips["groups"],
+                        "union": {**u, "threshold": t, "allowed": allowed}}
+            if not _same_flips(recorded, want_rec):
+                ok = False
+                detail += f"; certificate records {recorded}"
         rows.append(Row(C, f"{stage} count-flip tolerance", PASS if ok else FAIL,
-                        f"{flips} of {n} episodes differ in count; threshold {t} allows "
-                        f"{allowed}" + ("" if ok else f" (rule needs >= {COUNT_FLIP_SHARE}: "
-                                                      "1 flip in 10 must pass; generator "
-                                                      f"version {v})")))
+                        detail + ("" if ok else f" (rule needs >= {COUNT_FLIP_SHARE}: "
+                                                "1 flip in 10 must pass, counted over the "
+                                                f"union; generator version {v})")))
 
     # reasons and verdict
     l0 = l0_status(run, stage, cert)
@@ -830,12 +864,16 @@ def check_pass_rule(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
             prov.add("engine_preempted")
         if pre["unknown"]:
             prov.add("preemptions_unknown")
-        if rc.witness is not None:
+        paired = [r for r in run.side("witness", stage).values()
+                  if r.get("uid") in run.side("exact", stage)]
+        cold = [r for r in paired
+                if (r.get("provenance") or {}).get("compile_cache") == FORCED_COLD]
+        if stage in LAB_KIND and not cold:  # no forced-cold evidence at all
+            prov.add("no_witness")
+        if rc.witness:
             if len(rc.witness) < min_n:
                 prov.add("too_few_witness_samples")
-            if any((r.get("provenance") or {}).get("compile_cache") != FORCED_COLD
-                   for r in run.side("witness", stage).values() if
-                   r.get("uid") in run.side("exact", stage)):
+            if cold and len(cold) < len(paired):
                 prov.add("witness_not_forced_cold")
     verdict = "fail" if failures else ("provisional" if prov else "certified")
     reasons = failures | prov
@@ -855,6 +893,30 @@ def check_pass_rule(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
                     f"{verdict}" + ("" if ok_pub else " (publishing needs certified; "
                                     "--allow-provisional accepts provisional)")))
     return rows
+
+
+def flips_allowed(t: float, n: int) -> int:
+    """``t x n`` rounded half up: the most flips ``flips - t x n <= 1/2`` admits."""
+    return int(t * n + 0.5 + 1e-9)
+
+
+def count_flips(run: Run, rc: Recomputed) -> dict[str, Any]:
+    """Per group (the pool, the cold witness) and over their union: episodes and count flips."""
+    groups: dict[str, dict[str, int]] = {}
+    for cls, eps in ((run.inp.embodiment, rc.cand), (WITNESS_CLASS, rc.witness)):
+        if eps:
+            groups[cls] = {"n": len(eps),
+                           "flips": sum(1 for x in eps.values() if x.get("count_mismatch"))}
+    n = sum(g["n"] for g in groups.values())
+    k = sum(g["flips"] for g in groups.values())
+    return {"groups": groups, "union": {"n": n, "flips": k, "rate": r6(k / n) if n else None}}
+
+
+def _same_flips(got: Mapping[str, Any], want: Mapping[str, Any]) -> bool:
+    if dict(got.get("groups") or {}) != want["groups"]:
+        return False
+    gu, wu = dict(got.get("union") or {}), want["union"]
+    return set(gu) == set(wu) and all(close(gu.get(k), v) for k, v in wu.items())
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1200,14 +1262,14 @@ def our_strings(run: Run, stage: str, cert: Mapping[str, Any]) -> set[str]:
     allowed = {"certified", "provisional", "fail", "pass", "stale", "missing",
                "not_applicable", "all", "count_matched", "nvidia", "deterministic",
                "human", "yam", "yam32", "dex", "tianji", "exact", "balanced", "budget",
-               "interactive", WITNESS_CLASS, "flora-certify", "flora-certificate/v2",
+               "interactive", WITNESS_CLASS, UNION_CLASS, "flora-certify", "flora-certificate/v2",
                *SUPPORTED_VERSIONS}
     allowed |= {m for ms in METRICS_V3.values() for m in ms} | {"caption_similarity_divergence"}
     allowed |= set(METRICS_V3) | set(LAB_KIND.values())
     allowed |= {"divergence_above_noise_floor", "l0_failed", "no_noise_run",
                 "too_few_noise_samples", "too_few_samples", "incomplete_coverage", "no_l0",
                 "stale_l0", "metric_not_evaluable", "engine_preempted", "preemptions_unknown",
-                "too_few_witness_samples", "witness_not_forced_cold"}
+                "too_few_witness_samples", "witness_not_forced_cold", "no_witness"}
 
     def walk(o: Any) -> None:
         if isinstance(o, str):

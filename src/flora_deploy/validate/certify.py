@@ -29,22 +29,27 @@ Per stage, every metric below is a *divergence* (0 = identical; definitions in
 
 Pass rule, per (stage, embodiment pool) and metric: ``mean(balanced vs exact) <= min(cap,
 max(absolute_floor, tolerance x max(noise, floor) + slack))`` (``certkey.metric_threshold``;
-knobs and floors bounded by ``certkey.POLICY``). ``count_mismatch`` is averaged over every
-episode (absolute floor 10%: about one episode in ten may differ in subtask count); the other
-segment / caption metrics over the episodes whose counts agree (:data:`COUNT_CONDITIONED`).
+knobs and floors bounded by ``certkey.POLICY``). The other segment / caption metrics are
+averaged over the episodes whose counts agree (:data:`COUNT_CONDITIONED`), per group (the pool,
+and the cold witness on its own). ``count_mismatch`` (absolute floor 10%: about one episode in
+ten may differ in subtask count) is judged once, over the **union** of the candidate's and the
+witness's episodes (each witness episode is a sample of its own: same episode, another
+container): ``flips <= threshold x n``, rounded half up (``certkey.count_flips_allowed``: 2 of
+18 pass). ``metrics.count_flips`` records the per-group and the union figures.
 
 **Which episodes** (review 13 S3-3): every episode both sides labelled, never a chosen subset.
 The candidate is paired with the oracle (at most ``max_missing`` oracle episodes may lack a
 candidate record: the spares), the noise run with the oracle (noise episodes the oracle did not
 label are dropped, so a spare noise episode fills in), and so is the optional **cold witness**
 (``witness``: balanced records of one container forced cold, ``FLORA_COMPILE_CACHE=off``,
-checked against the same thresholds).
+held to the same mean thresholds on its own, its count flips counted in the union).
 
 Verdict: ``fail`` if any check fails or a present L0 fails; else ``provisional`` if there is no
 noise run, too few samples (per pool, in the noise run or in the witness), too many missing
 episodes, (video stages) no L0 or an L0 measured under other engine settings (``stale_l0``), a
 candidate or witness record whose engine preempted while it ran (``engine_preempted``) or that
-does not say (``preemptions_unknown``), or a witness not forced cold; else ``certified``. The
+does not say (``preemptions_unknown``), (video stages) no witness record forced cold
+(``no_witness``), or a witness with some record not forced cold; else ``certified``. The
 certificate states the compile caches its evidence ran (``compile_cache``).
 
 The certificate holds metrics only: no record string ever goes in (no captions, prompts,
@@ -71,14 +76,17 @@ from flora_deploy.validate.certkey import (
     ABSOLUTE_FLOOR,
     CERT_DIR,
     CERT_SCHEMA,
+    COUNT_METRIC,
     FAKE_CERTIFICATES,
     GENERATOR,
     MAX_MISSING,
     MIN_NOISE_SAMPLES_FLOOR,
     MIN_SAMPLES_FLOOR,
     NOISE_FLOOR,
+    UNION_CLASS,
     canonical,
     certificate_id,
+    count_flips_allowed,
     document_problems,
     engine_settings_hash,
     metric_threshold,
@@ -668,9 +676,31 @@ def certify_stage(
     checks = []
     for c, block in blocks.items():
         for m in names:
+            if m == COUNT_METRIC:  # over the union, below
+                continue
             v, t = block["means"][m], per_metric[m]["threshold"]
             ok = None if v is None or t is None else bool(v <= t + 1e-12)
             checks.append({"class": c, "metric": m, "value": v, "threshold": t, "pass": ok})
+    # The count-flip check: over the union of the candidate's and the witness's episodes (a
+    # witness episode is a sample of its own), flips <= threshold x n rounded half up.
+    count_flips = None
+    if COUNT_METRIC in names:
+        eps = {pool: per_ep} if per_ep else {}
+        if wit is not None:
+            eps[WITNESS_CLASS] = w_ep
+        groups = {c: {"n": len(e), "flips": sum(1 for x in e.values() if x[COUNT_METRIC])}
+                  for c, e in eps.items()}
+        n = sum(g["n"] for g in groups.values())
+        k = sum(g["flips"] for g in groups.values())
+        t = per_metric[COUNT_METRIC]["threshold"]
+        allowed = count_flips_allowed(t, n) if t is not None else None
+        ok = None if allowed is None or not n else bool(k <= allowed)
+        count_flips = {"groups": groups,
+                       "union": {"n": n, "flips": k, "rate": _r(k / n) if n else None,
+                                 "threshold": t, "allowed": allowed}}
+        checks.append({"class": UNION_CLASS, "metric": COUNT_METRIC,
+                       "value": _r(k / n) if n else None, "threshold": t, "flips": k, "n": n,
+                       "allowed": allowed, "pass": ok})
 
     vllm = b["doc"].get("vllm_engine")
     l0s = l0_summary(stage, l0, gpu,
@@ -702,10 +732,15 @@ def certify_stage(
         provisional.append("engine_preempted")
     if preempt["unknown"]:
         provisional.append("preemptions_unknown")
-    if witness_block is not None:
+    # Video stages: the evidence must cover a forced-cold container (no_witness: no witness
+    # record paired, or none of them forced cold).
+    forced = sum(1 for r in (wit or {}).values() if r.provenance.compile_cache == FORCED_COLD)
+    if stage in L0_STAGES and not forced:
+        provisional.append("no_witness")
+    if witness_block is not None and wit:
         if witness_block["n"] < th.min_noise_samples:
             provisional.append("too_few_witness_samples")
-        if any(r.provenance.compile_cache != FORCED_COLD for r in wit.values()):
+        if forced and forced < len(wit):
             provisional.append("witness_not_forced_cold")
     verdict = "fail" if failures else ("provisional" if provisional else "certified")
 
@@ -742,6 +777,7 @@ def certify_stage(
                    "gpu": o["gpu"], "determinism": o["determinism"]},
         "episodes": episode_set(per_ep),
         "metrics": {"candidate": candidate, "noise": noise_block, "witness": witness_block,
+                    "count_flips": count_flips,
                     "coverage": _r(coverage), "missing": missing,
                     "similarity_hook": similarity_name if similarity else None},
         "thresholds": {**th.as_dict(),

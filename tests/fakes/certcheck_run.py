@@ -138,6 +138,8 @@ class Options:
     caption_typo: bool = True  # one balanced caption differs by one character
     witness: bool = True
     witness_cache: str = cc.FORCED_COLD
+    witness_flips: int = 0  # the first noise episodes' witness records split one subtask
+    witness_drift: str | None = None  # "boundary" (+0.2 s) or "caption" (every caption differs)
     preemptions: int | None = 0  # on the first balanced record
     lab_hash: str | None = None  # None: the current engine-settings hash
     gate_requests: int = 6
@@ -270,8 +272,19 @@ def build(tmp: Path, opts: Options | None = None, *,
         by_eid = {r["episode_id"]: r for r in bal}
         sets["witness"][stage] = []
         if o.witness:
-            for e in o.noise:
+            for j, e in enumerate(o.noise):
                 r = copy.deepcopy(by_eid[e])
+                if j < o.witness_flips or o.witness_drift:
+                    i = o.episodes.index(e)
+                    b = balanced_bounds(i, o)
+                    if j < o.witness_flips:  # one subtask split in two
+                        b = b[:2] + [(5.0, 7.0), (7.0, 9.0)]
+                    if o.witness_drift == "boundary":
+                        b = [(s + 0.2, t + 0.2) for s, t in b]
+                    caps = balanced_captions(i, o, len(b))
+                    if o.witness_drift == "caption":
+                        caps = ["then " + c for c in caps]
+                    r = record("balanced", stage, e, b, caps)
                 r["provenance"]["compile_cache"] = o.witness_cache
                 r["provenance"]["engine_preemptions"] = 0
                 sets["witness"][stage].append(r)

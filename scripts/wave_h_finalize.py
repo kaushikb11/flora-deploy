@@ -102,6 +102,8 @@ MISSING_HELP = {
                            "({unknown} without)",
     "too_few_witness_samples": "at least {min_noise} cold-witness episodes (has {witness_n})",
     "witness_not_forced_cold": "a cold witness whose records are all compile_cache cold:forced",
+    "no_witness": "a cold witness: records from a container forced cold (compile_cache "
+                  "cold:forced)",
 }
 
 

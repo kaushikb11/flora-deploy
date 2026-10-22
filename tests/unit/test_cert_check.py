@@ -26,6 +26,7 @@ import pytest
 from flora_deploy.records import DenseReward, Provenance, Segment, StageRecord, TerminalReward
 from flora_deploy.validate import certify as CY
 from tests.fakes import certcheck_run as R
+from tests.fakes import witness_cases as WC
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -225,7 +226,8 @@ def test_good_run_passes_every_row(base):
     assert by["5 freeze lock | tests/unit/test_certificate_drift.py"].status == cc.PASS
     if V3:
         assert by["2 pass rule | segment count-flip tolerance"].detail.startswith(
-            "1 of 12 episodes differ in count; threshold 0.1 allows 1")
+            "1 of 18 episodes differ in count (1 of 12 human, 0 of 6 cold-witness); "
+            "threshold 0.1 allows 2")
         assert by["1 metrics | segment oracle vs cold witness"].status == cc.PASS
 
 
@@ -335,12 +337,66 @@ def test_check_and_verdict_tampered(fake):
 
 @needs_v3
 def test_one_count_flip_in_ten_passes_two_fail(tmp_path):
+    """Over the union: 2 in 12 + 6 witness episodes pass (rounded half up), 3 in 18 fail."""
     two = R.by_item(build(tmp_path, flips=2).run())
-    assert two["2 pass rule | segment count-flip tolerance"].status == cc.PASS  # the rule
-    assert two["2 pass rule | segment verdict"].status == cc.PASS  # agrees: fail
-    assert "fail" in two["2 pass rule | segment verdict"].detail
-    assert "human count_mismatch" in two["2 pass rule | segment checks"].detail
-    assert_fail(two, "2 pass rule | segment publishable")
+    assert "certified" in two["2 pass rule | segment verdict"].detail
+    three = R.by_item(build(tmp_path / "3", flips=3).run())
+    assert three["2 pass rule | segment count-flip tolerance"].status == cc.PASS  # the rule
+    assert three["2 pass rule | segment verdict"].status == cc.PASS  # agrees: fail
+    assert "fail" in three["2 pass rule | segment verdict"].detail
+    assert "union count_mismatch" in three["2 pass rule | segment checks"].detail
+    assert_fail(three, "2 pass rule | segment publishable")
+
+
+@needs_v3
+@pytest.mark.parametrize("case", WC.CASES, ids=WC.CASE_IDS)
+def test_witness_union_cases(tmp_path, case):
+    """The table the generator is tested on (tests/unit/test_certify_witness_union.py): count
+    flips over the union of the candidate's and the witness's episodes, witness means alone."""
+    opts = {"episodes": R.EPISODES[:case.main], "flips": case.main_flips,
+            "witness_flips": case.witness_flips,
+            "witness_drift": case.drift if case.drift in ("boundary", "caption") else None,
+            "witness": case.drift != "absent"}
+    if case.drift == "warm":
+        opts["witness_cache"] = R.WARM
+    f = build(tmp_path, **opts)
+    rows = R.by_item(f.run())
+    s = case.stage
+    # the checker agrees with the certificate, whatever the verdict
+    for item in ("checks", "verdict", "count-flip tolerance"):
+        row = rows[f"2 pass rule | {s} {item}"]
+        assert row.status == cc.PASS, row
+    if case.drift != "absent":
+        assert rows[f"1 metrics | {s} oracle vs cold witness"].status == cc.PASS
+    verdict = rows[f"2 pass rule | {s} verdict"].detail
+    assert verdict.split(" ")[0] == case.verdict, verdict
+    for reason in case.reasons:
+        assert reason in verdict, verdict
+    flips, n, allowed = WC.UNION[case.id]
+    assert rows[f"2 pass rule | {s} count-flip tolerance"].detail.startswith(
+        f"{flips} of {n} episodes differ in count")
+    assert f"allows {allowed}" in rows[f"2 pass rule | {s} count-flip tolerance"].detail
+    failing = rows[f"2 pass rule | {s} checks"].detail
+    want = {f"{c} {m}" for c, m in case.failing}
+    got = set(failing.split("failing: ")[1].split(", ")) if "failing: " in failing else set()
+    assert got == want, failing
+    if case.verdict == "certified":
+        assert rows[f"2 pass rule | {s} publishable"].status == cc.PASS
+    else:
+        assert_fail(rows, f"2 pass rule | {s} publishable")
+
+
+@needs_v3
+def test_union_count_flips_misstated(fake):
+    def hide_witness_flip(c):
+        c["metrics"]["count_flips"]["groups"]["cold-witness"]["flips"] = 1
+        for ch in c["checks"]:
+            if ch["class"] == "union":
+                ch["flips"] = 2
+
+    fake.edit_cert("segment", hide_witness_flip)
+    assert_fail(rows_of(fake), "2 pass rule | segment count-flip tolerance",
+                "2 pass rule | segment checks")
 
 
 @needs_v3

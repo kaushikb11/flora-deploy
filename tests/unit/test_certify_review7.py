@@ -19,6 +19,7 @@ from tests.fakes.certrecords import (
     FP,
     L0_PASS,
     ORACLE_HASH,
+    cold_witness,
     dense_set,
     key,
     rec,
@@ -33,9 +34,11 @@ MATCH = {"embodiment": "yam", "derived_content": CONTENT, **FP}
 
 
 def seg_cert(*, exact=None, balanced=None, noise=None, n=12, n_noise=5, stamp=STAMP, **kw):
+    balanced = balanced if balanced is not None else segment_set("balanced", n)
+    kw.setdefault("witness", cold_witness(balanced))
     return C.certify_stage(
         "segment", exact=exact if exact is not None else segment_set("exact", n),
-        balanced=balanced if balanced is not None else segment_set("balanced", n),
+        balanced=balanced,
         noise=noise if noise is not None else segment_set("exact", n_noise),
         engine_spec=key("balanced", "segment", "L40S"), gpu="L40S", l0=L0_PASS,
         generated_at=stamp, **kw)

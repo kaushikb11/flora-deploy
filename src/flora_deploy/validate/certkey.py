@@ -38,6 +38,7 @@ import ast
 import hashlib
 import io
 import json
+import math
 import re
 import tokenize
 from collections.abc import Iterable, Mapping
@@ -100,6 +101,11 @@ NOISE_FLOOR: dict[str, float] = {
 # ten may differ in subtask count; the other segment / caption metrics are averaged over the
 # episodes whose counts agree (``validate.certify.COUNT_CONDITIONED``), with their tight floors.
 ABSOLUTE_FLOOR: dict[str, float] = {"count_mismatch": 0.10}
+# The count-flip check is over the union of the candidate's and the cold witness's episodes
+# (each witness episode is a sample of its own: same episode, another container), not per group:
+# one flip among the witness's 6 is 17%, but one in 18 is what the policy allows.
+COUNT_METRIC = "count_mismatch"
+UNION_CLASS = "union"
 SLACK_MAX: dict[str, float] = dict(NOISE_FLOOR)  # --slack may at most add one floor
 # Absolute bars from PLAN-v3.md §2 ("terminal E[s] MAE <= 0.05"), on top of the noise rule.
 ABSOLUTE_CAPS: dict[str, float] = {"expected_score_abs_delta": 0.05}
@@ -137,6 +143,13 @@ def engine_settings_hash(hashed: Mapping[str, Any]) -> str:
     doc["engine_kwargs"] = {k: v for k, v in dict(doc.get("engine_kwargs") or {}).items()
                             if k not in RETURN_ONLY_KWARGS}
     return sha256_hex(doc)
+
+
+def count_flips_allowed(threshold: float, n: int) -> int:
+    """How many of ``n`` episodes may differ in subtask count under the ``count_mismatch``
+    ``threshold``: ``threshold x n`` rounded half up. At 0.10: 1 of 10-14, 2 of 15-24 (2 of 18,
+    11%, passes; 3 of 18 fail)."""
+    return math.floor(float(threshold) * int(n) + 0.5 + 1e-9)
 
 
 def metric_threshold(metric: str, noise: float, tolerance: float, slack: float) -> float:
@@ -407,14 +420,56 @@ def policy_problems(cert: Mapping[str, Any]) -> list[str]:
     blocks = dict(cand)
     if metrics.get("witness") is not None:
         blocks["witness"] = metrics["witness"]
+    counted = False
     for pool, block in blocks.items():
         for m, v in (block.get("means") or {}).items():
+            if m == COUNT_METRIC:  # judged over the union below
+                counted = True
+                continue
             if v is None or means.get(m) is None:
                 out.append(f"{pool} {m}: not evaluable")
                 continue
             t = metric_threshold(m, means[m], tol, slack.get(m, 0.0))
             if float(v) > t + 1e-12:
                 out.append(f"{pool} {m}: {v} > {t}")
+    if counted:
+        out += _count_flip_problems(metrics, cand, means, tol, slack)
+    return out
+
+
+def _count_flip_problems(metrics: Mapping[str, Any], cand: Mapping[str, Any],
+                         noise_means: Mapping[str, Any], tol: float,
+                         slack: Mapping[str, float]) -> list[str]:
+    """The count-flip check over the union of the candidate's and the witness's episodes,
+    recomputed from the recorded per-group figures (``metrics.count_flips``)."""
+    cf = metrics.get("count_flips") or {}
+    groups, union = dict(cf.get("groups") or {}), dict(cf.get("union") or {})
+    want = dict(cand)
+    if metrics.get("witness") is not None:
+        want["cold-witness"] = metrics["witness"]
+    if set(groups) != set(want) or not union:
+        return ["count flips: per-group and union figures missing or for other groups"]
+    out = []
+    try:
+        for g, block in want.items():
+            n, k = int(groups[g]["n"]), int(groups[g]["flips"])
+            mean = (block.get("means") or {}).get(COUNT_METRIC)
+            if n != int(block.get("n") or 0) or mean is None or not 0 <= k <= n \
+                    or abs(k / max(n, 1) - float(mean)) > 1e-6:
+                out.append(f"count flips: {g} {k}/{n} disagrees with its block")
+        n = sum(int(x["n"]) for x in groups.values())
+        k = sum(int(x["flips"]) for x in groups.values())
+        if int(union["n"]) != n or int(union["flips"]) != k:
+            out.append("count flips: union is not the sum of the groups")
+        if noise_means.get(COUNT_METRIC) is None:
+            return [*out, f"{UNION_CLASS} {COUNT_METRIC}: not evaluable"]
+        t = metric_threshold(COUNT_METRIC, noise_means[COUNT_METRIC], tol,
+                             slack.get(COUNT_METRIC, 0.0))
+        if k > count_flips_allowed(t, n):
+            out.append(f"{UNION_CLASS} {COUNT_METRIC}: {k} of {n} flips > "
+                       f"{count_flips_allowed(t, n)}")
+    except (KeyError, TypeError, ValueError):
+        out.append("count flips malformed")
     return out
 
 

@@ -53,6 +53,13 @@ def current_doc(kind="segment", gpu="L40S", preset="balanced", **kw):
     return K.key_document(preset, kind, gpu, **kw)
 
 
+def no_flips(pools):
+    """``metrics.count_flips`` for 12 candidate episodes per pool, none differing in count."""
+    return {"groups": {p: {"n": 12, "flips": 0} for p in pools},
+            "union": {"n": 12 * len(pools), "flips": 0, "rate": 0.0, "threshold": 0.1,
+                      "allowed": K.count_flips_allowed(0.1, 12 * len(pools))}}
+
+
 def make_cert(doc, *, verdict="certified", gpu="L40S", pools=("human",), stamp=STAMP,
               preset=None, kind=None, tolerance=1.5):
     """A certificate body for ``doc`` that passes ``certkey.policy_problems`` (when certified)."""
@@ -74,7 +81,8 @@ def make_cert(doc, *, verdict="certified", gpu="L40S", pools=("human",), stamp=S
         "pins": {k: v["revision"] for k, v in sorted(doc["nvidia_pins"].items())},
         "derived_weights": dict(doc["derived_weights"]),
         "metrics": {"candidate": {p: {"n": 12, "means": zeros} for p in pools},
-                    "noise": {"n": 5, "means": zeros}, "coverage": 1.0, "missing": 0},
+                    "noise": {"n": 5, "means": zeros}, "coverage": 1.0, "missing": 0,
+                    "count_flips": no_flips(pools)},
         "thresholds": {"tolerance": tolerance, "min_samples": 10, "min_noise_samples": 5,
                        "max_missing": K.MAX_MISSING, "slack": {},
                        "noise_floor": {m: K.NOISE_FLOOR[m] for m in SEG_METRICS},
@@ -308,6 +316,7 @@ def test_orphan_certificates(tmp_path, change, needle):
     body = {**make_cert(doc), **change}
     body["metrics"]["candidate"] = {p: {"n": 12, "means": dict.fromkeys(SEG_METRICS, 0.0)}
                                     for p in body["covered_pools"]}
+    body["metrics"]["count_flips"] = no_flips(body["covered_pools"])
     body["id"] = K.certificate_id(body)
     commit(tmp_path, body)
     (f,) = errors(F.check(tmp_path))
@@ -358,7 +367,7 @@ def test_flora_certify_writes_the_freeze_lock(tmp_path):
     from typer.testing import CliRunner
 
     from flora_deploy.cli import app
-    from tests.fakes.certrecords import L0_PASS, key, segment_set
+    from tests.fakes.certrecords import L0_PASS, cold_witness, key, segment_set
     from tests.unit.test_certify import _balanced_yaml, _jsonl
 
     content = pinned_content("balanced", "segment")
@@ -366,11 +375,14 @@ def test_flora_certify_writes_the_freeze_lock(tmp_path):
     ex = _jsonl(tmp_path / "exact.jsonl", segment_set("exact", 12, fp=None))
     bal = _jsonl(tmp_path / "bal.jsonl", segment_set("balanced", 12, fp=None, cert_key=doc))
     nz = _jsonl(tmp_path / "noise.jsonl", segment_set("exact", 5, fp=None))
+    wit = _jsonl(tmp_path / "witness.jsonl",
+                 cold_witness(segment_set("balanced", 12, fp=None, cert_key=doc)))
     lab = tmp_path / "lab.json"
     lab.write_text(json.dumps(L0_PASS))
     out = tmp_path / "certs"
     r = CliRunner().invoke(app, [
-        "certify", "--exact", str(ex), "--balanced", str(bal), "--noise", str(nz), "--l0",
+        "certify", "--exact", str(ex), "--balanced", str(bal), "--noise", str(nz),
+        "--witness", str(wit), "--l0",
         str(lab), "-c", str(_balanced_yaml(tmp_path)), "--out-dir", str(out),
         "--derived-content", f"tempseg_merged={content['tempseg_merged']}", "--json"])
     assert r.exit_code == 0, r.output
