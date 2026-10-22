@@ -16,8 +16,11 @@ spawned). From those, per container (:func:`container_rows`):
 
 Startup facts (:func:`write_startup_facts` / :func:`read_startup_facts`): a worker that wants its
 ``@modal.enter`` facts (batch policy, executor size, container resources) next to the job writes
-them once per job and container to ``<job root>/containers/<container id>.json``; the fake
-balanced workers do (``local.balanced``), so the H0 rehearsal can check them on Modal.
+them once per job and container to ``<job root>/startup/<container id>.json``; the fake
+balanced workers do (``local.balanced``), so the H0 rehearsal can check them on Modal. They are
+not ``ContainerReceipt`` files and stay out of ``containers/`` (the receipts' prefix: facts
+written there broke ``flora report``'s per-container rows); :func:`read_startup_facts` still
+reads facts an older worker wrote there.
 
 Orchestration bookkeeping only (``config/logic.py``: not output-affecting).
 """
@@ -155,7 +158,7 @@ def startup_facts_path(job_id: str, container_id: str) -> str:
     from flora_deploy.jobs.store import JobPaths
     from flora_deploy.jobs.types import safe_key
 
-    return f"{JobPaths(job_id).root}/containers/{safe_key(container_id)}.json"
+    return f"{JobPaths(job_id).root}/startup/{safe_key(container_id)}.json"
 
 
 def write_startup_facts(store: Any, job_id: str, container_id: str, kind: str,
@@ -173,19 +176,22 @@ def write_startup_facts(store: Any, job_id: str, container_id: str, kind: str,
 
 
 def read_startup_facts(store: Any, job_id: str) -> dict[str, dict[str, Any]]:
-    """Container id -> the startup facts written for ``job_id`` (unreadable files skipped)."""
+    """Container id -> the startup facts written for ``job_id`` (unreadable files skipped; facts
+    an older worker wrote under ``containers/`` count, the current location wins)."""
     import json
 
     from flora_deploy.jobs.store import JobPaths
 
+    root = JobPaths(job_id).root
     out: dict[str, dict[str, Any]] = {}
-    for p in store.list(f"{JobPaths(job_id).root}/containers/"):
-        if not p.endswith(".json"):
-            continue
-        try:
-            d = json.loads(store.get_bytes(p))
-        except (OSError, ValueError):
-            continue
-        if isinstance(d, dict) and d.get("schema") == STARTUP_SCHEMA:
-            out[str(d.get("container_id"))] = d
+    for prefix in (f"{root}/containers/", f"{root}/startup/"):  # legacy first: overwritten
+        for p in sorted(store.list(prefix)):
+            if not p.endswith(".json"):
+                continue
+            try:
+                d = json.loads(store.get_bytes(p))
+            except (OSError, ValueError):
+                continue
+            if isinstance(d, dict) and d.get("schema") == STARTUP_SCHEMA:
+                out[str(d.get("container_id"))] = d
     return out

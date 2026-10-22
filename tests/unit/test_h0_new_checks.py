@@ -262,6 +262,31 @@ def test_batch_fill_fields_of_a_recorded_balanced_run(h0, recorded_bal):
     assert "GPU memory n/a (CPU)" in detail and "peak RSS" in detail
 
 
+def test_report_rows_of_a_recorded_balanced_run_classify_its_containers(h0, recorded_bal):
+    """H0 on Modal (2026-10-22): the fake workers' startup facts broke ``flora report``'s
+    per-container rows, so every container was "other" and no caption container was found.
+    The same job here: rows per worker, each attributed to its pool by ``drain_rows`` and the
+    caption one found by ``prewarm_check``."""
+    from flora_deploy import sdk
+
+    store, job_id = recorded_bal
+    rows = list(sdk.open_job(job_id, store=str(store.root)).report()["spend"]["containers"])
+    assert {"segment", "caption"} <= {r["kind"] for r in rows}
+    balanced = {r["container_id"] for r in rows if r["kind"] in ("segment", "caption")}
+    assert set(read_startup_facts(store, job_id)) == balanced
+    seen = {r["container_id"]: {"app": APP, "started_at": 1.0, "ended_at": 10.0}
+            for r in rows}
+    drains = {k: ((5.0, None),) for k in CLASSES}
+    dr = h0.drain_rows(APP, rows, seen, drains, CLASSES, observed_until=10.0)
+    assert "other" not in {r["class"] for r in dr}
+    assert {"FakeSegmentWorker", "FakeCaptionWorker"} <= {r["class"] for r in dr}
+    ok, detail = h0.drain_check(dr)
+    assert ok and f"{len(rows)} worker container(s) measured" in detail, detail
+    plan = {"caption": {"decision": "prewarm", "start_at": 0.0, "t": 0.0}}
+    ok, detail = h0.prewarm_check(plan, {"caption": (0.0, 1.0)}, rows, seen)
+    assert ok, detail
+
+
 def test_batch_fill_check_catches_missing_or_wrong_fields(h0, recorded_bal):
     store, job_id = recorded_bal
     audits = h0.job_audits(store, JobPaths(job_id).root)

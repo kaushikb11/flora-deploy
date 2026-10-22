@@ -25,6 +25,7 @@ flora/<job_id>/
   runs/<config_hash>.json       # one run spec per config
   job.json                      # a status cache; status is derived from receipts
   control/  containers/         # cancel/resume requests and container heartbeats
+  startup/                      # fake-models workers: each container's startup facts
   index/                        # `flora index`: one receipt per episode, plus summary.json
   <config_hash>/
     manifest.json               # this config's manifest (episodes, shards, stage hashes)

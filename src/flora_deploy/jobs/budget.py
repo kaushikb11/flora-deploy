@@ -33,11 +33,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import MISSING, dataclass, field, fields, replace
 from datetime import datetime
 from typing import Any, Protocol
 
@@ -47,6 +48,8 @@ from flora_deploy.jobs.settings import PoolSettings, RunSettings
 from flora_deploy.jobs.store import JobPaths, Store
 from flora_deploy.jobs.types import ContainerReceipt, Shard
 from flora_deploy.planner.rates import RateTable
+
+log = logging.getLogger(__name__)
 
 # ----------------------------------------------------------------------------------------------
 # Rates
@@ -247,12 +250,51 @@ def spend(receipts: Iterable[ContainerReceipt], rates: Rates, now: float, *,
     return Spend(total, running_usd, n, running)
 
 
+_RECEIPT_FIELDS = {f.name for f in fields(ContainerReceipt)}
+_RECEIPT_REQUIRED = {f.name for f in fields(ContainerReceipt)
+                     if f.default is MISSING and f.default_factory is MISSING}
+
+
+def parse_container_receipt(doc: Any, path: str = "") -> ContainerReceipt | None:
+    """A ``ContainerReceipt`` from its JSON, or ``None`` when ``doc`` is not one.
+
+    Tolerant by design, so nothing written next to the receipts can break a report or the
+    budget: a document carrying a ``schema`` (receipts have none; e.g. a container's startup
+    facts, ``jobs.containers``) or missing a required field is skipped, and unknown keys are
+    dropped. Each is logged at debug level."""
+    if not isinstance(doc, dict):
+        log.debug("container receipt %s: not an object; skipped", path)
+        return None
+    if "schema" in doc:
+        log.debug("container receipt %s: a %r document, not a receipt; skipped",
+                  path, doc["schema"])
+        return None
+    missing = _RECEIPT_REQUIRED - doc.keys()
+    if missing:
+        log.debug("container receipt %s: missing %s; skipped", path, sorted(missing))
+        return None
+    extra = doc.keys() - _RECEIPT_FIELDS
+    if extra:
+        log.debug("container receipt %s: unknown keys %s ignored", path, sorted(extra))
+    return ContainerReceipt(**{k: v for k, v in doc.items() if k in _RECEIPT_FIELDS})
+
+
 def read_container_receipts(store: Store, job_id: str) -> list[ContainerReceipt]:
+    """The job's ``ContainerReceipt`` files (:func:`parse_container_receipt`: anything else under
+    ``containers/``, or an unreadable file, is skipped)."""
     prefix = JobPaths(job_id).root + "/containers/"
     out = []
     for path in sorted(store.list(prefix)):
-        if path.endswith(".json"):
-            out.append(ContainerReceipt(**json.loads(store.get_bytes(path))))
+        if not path.endswith(".json"):
+            continue
+        try:
+            doc = json.loads(store.get_bytes(path))
+        except (OSError, ValueError) as exc:
+            log.debug("container receipt %s: unreadable (%r); skipped", path, exc)
+            continue
+        r = parse_container_receipt(doc, path)
+        if r is not None:
+            out.append(r)
     return out
 
 
@@ -684,9 +726,11 @@ class ProjectionBudgetGate:
             if old is not None and old.stopped_utc is not None:
                 continue  # final: never re-read
             try:  # by path, not by listing: a known receipt never disappears under lag
-                self._receipts[p] = ContainerReceipt(**json.loads(self.store.get_bytes(p)))
+                r = parse_container_receipt(json.loads(self.store.get_bytes(p)), p)
             except Exception:  # half-visible or a transient read error: keep what we had
                 continue
+            if r is not None:
+                self._receipts[p] = r
         sh = self.stage_hashes() if callable(self.stage_hashes) else self.stage_hashes
         keys = {self.settings.config_hash, *(sh or {}).values()}
         for key in sorted(keys):
