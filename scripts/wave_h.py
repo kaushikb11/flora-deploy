@@ -10,6 +10,7 @@ Usage::
     uv run python scripts/wave_h.py --plan full --dry-run  # every v1 step (cannot certify)
     uv run python scripts/wave_h.py --plan certified --dry-run  # the certified run (golden/v2)
     uv run python scripts/wave_h.py --plan certified --embodiment yam --dry-run  # golden/v3-yam
+    uv run python scripts/wave_h.py --plan recertify --dry-run  # f2: (b) repeated on all 12
 
 **Plans** (``--plan``, :data:`PLANS`). ``balanced-only`` (the default; the user's decision of
 2026-10-22) runs steps 0 -> a -> d and nothing else; (b), (e) and (f) are listed as "deferred to
@@ -47,6 +48,16 @@ both ways; ``--status`` the running steps and their reservations. ``--max-parall
 steps, not GPUs: b, f and d hold **4 GPUs** at once, 2 of them H200 (:data:`CERT_GPUS`);
 ``--max-gpus`` caps the GPUs held across the running steps' apps (default 4, the peak; e.g.
 ``--max-gpus H200=1`` runs f after b).
+
+``recertify`` (human; the stage-isolated caption re-certification, order A) is its own state
+(``reports/wave-h/recertified/``) on the certified run's ``run_id``. Its step f2 ``noise_all``
+repeats that run's (b) on **all 12** of its episodes: (b)'s own config file (``project``
+renamed per attempt: its own job and app) and data dir, re-indexed with no ``--limit``, nvidia
+mode, H200; the config hash and stage hashes are checked equal to (b)'s recorded ones, in this
+checkout, before any app (:func:`noise_all_check`). (b) is read from
+``reports/wave-h/certified/state.json`` (``--source-state``), never written, so the certified
+run's finished steps keep their records. Same stop rules, billing watermark and caps rule as
+``certified``.
 
 ``--embodiment`` (``certified`` only; default ``human``) picks the certified plan's embodiment
 (:data:`CERT_SPECS`): ``yam`` runs the same steps on golden/v3-yam (12 three-view episodes,
@@ -348,6 +359,8 @@ class PlanSpec:
     data: str = CERT_DATA
     rate_scale: tuple[tuple[str, float], ...] = ()
     lab_eps: tuple[str, ...] | None = None
+    # recertify: the certified run's state whose (b) it repeats (read-only; ``--source-state``)
+    source: Path | None = None
 
     @property
     def scale(self) -> dict[str, float]:
@@ -420,6 +433,30 @@ def spec_for(plan: str, embodiment: str = EMBODIMENT) -> PlanSpec:
     if plan == CERTIFIED:
         return CERT_SPECS[embodiment]
     raise KeyError(embodiment)
+
+
+# --- The recertify plan (human; scratchpad caption-prereg.md, order A) -----------------------
+# Step f2 ``noise_all``: the certified run's (b) repeated on ALL of its episodes (12), exact vs
+# exact, from a checkout that still reproduces (b)'s stage hash: (b)'s own config file (its
+# ``project`` renamed, so this attempt has its own job and app) and data dir, re-indexed with no
+# ``--limit``, so the same stage hash, GPU (H200) and mode (nvidia). (b) is reused, not re-run.
+# Its own state (``reports/wave-h/recertified/state.json``), so the certified run's state, and
+# with it every finished step's record (b, f, d, d2, e), is never written; it reads (b) from the
+# certified state, read-only (:func:`oracle_source`), and takes that run's ``run_id``: (b)'s
+# config writes into that run's store and reads that run's staged media. Later recertify steps
+# (lab, balanced, caption_iso, certify) are added by the stage-isolated caption work.
+RECERTIFY = "recertify"
+RECERT_ROOT = ROOT / "reports" / "wave-h" / "recertified"
+RECERT_SOURCE = CERT_ROOT / "state.json"  # the certified run whose (b) is repeated (read-only)
+RECERT_STEPS = ("noise_all",)
+NOISE_ALL_JOB = "noise12"  # job / app / index tag: wave-h-<run>-noise12-<embodiment>-a<n>
+PLANS[RECERTIFY] = RECERT_STEPS
+SPECS[RECERTIFY] = replace(SPECS[CERTIFIED], name=RECERTIFY, state=RECERT_ROOT / "state.json",
+                           # (b)'s work dir: its config's relative ``input.path`` (the data dir,
+                           # hashed by content) resolves there, and flora runs from it
+                           work=CERT_ROOT / "work", records=RECERT_ROOT / "records",
+                           report=RECERT_ROOT / "runbook.md", source=RECERT_SOURCE)
+CERT_PLANS = (CERTIFIED, RECERTIFY)  # the plans with their own state (never shared)
 # Per-step caps (USD): each step's upper projection, priced on the golden selection's expected
 # durations x (1 + DURATION_HEADROOM) (the staged human files run ~5% longer in all), rounded up
 # to 5 cents (``honest_caps``), on the shipped ``planner/rates.json`` (the balanced rows measured
@@ -776,6 +813,11 @@ def project(step: str, manifest: Mapping[str, Any], spec: PlanSpec | None = None
         p.add(f"segcap {job} repeat ({len(neps)} ep, {nv:.1f} s{work('segcap')}, cold start)",
               pool_container("segcap"), nominal, upper_s=upper)
         p.peak_usd_per_s = pool_container("segcap").usd_per_s()
+    elif step == "noise_all":  # recertify f2: (b) repeated on every one of its episodes
+        nominal, upper = exact_job_seconds(v * sc["segcap"] if "segcap" in sc else v)
+        p.add(f"segcap {job} repeat of (b), all {len(eps)} ep ({v:.1f} s{work('segcap')}, "
+              "cold start)", pool_container("segcap"), nominal, upper_s=upper)
+        p.peak_usd_per_s = pool_container("segcap").usd_per_s()
     elif step == "certify":
         pass
     else:
@@ -844,8 +886,9 @@ def honest_caps(projections: Mapping[str, Projection]) -> dict[str, float]:
 def plan_caps(plan: str, projections: Mapping[str, Projection]) -> dict[str, float]:
     """Per-step caps (USD). ``certified``: each step's own upper projection (measured rates on
     the golden/v2 durations) rounded up to 5 cents (:func:`honest_caps`), so the stop rule
-    before a step is its upper price and nothing more. Other plans: :data:`CAPS_USD`."""
-    if plan != CERTIFIED:
+    before a step is its upper price and nothing more (``recertify`` too). Other plans:
+    :data:`CAPS_USD`."""
+    if plan not in CERT_PLANS:
         return dict(CAPS_USD)
     honest = honest_caps({s: projections[s] for s in PLANS[plan]})
     return {**CAPS_USD, **{s: honest[s] for s in PLANS[plan]}}
@@ -862,7 +905,7 @@ def plan_projections(plan: str, manifest: Mapping[str, Any], *, lab_done: bool =
     return {s: project(s, manifest, spec, lab_done=lab_done and plan == CERTIFIED,
                        reuse=reuse if s == "lab" else (),
                        witness_only=witness_only and plan == CERTIFIED and s == "balanced")
-            for s in STEPS}
+            for s in STEPS + tuple(x for x in PLANS[plan] if x not in STEPS)}
 
 
 def lab_engine_hashes(kind: str) -> dict[str, str]:
@@ -966,9 +1009,15 @@ def cert_titles(spec: PlanSpec) -> dict[str, str]:
 
 
 CERT_TITLES = cert_titles(SPECS[CERTIFIED])
+ALL_STEPS = STEPS + RECERT_STEPS  # ``--only`` choices
+RECERT_TITLES = {**CERT_TITLES,
+                 "noise_all": "f2. noise-12: (b) repeated on all its episodes, (b)'s stage "
+                              "hash/GPU/mode"}
 
 
 def titles(plan: str, spec: PlanSpec | None = None) -> dict[str, str]:
+    if plan == RECERTIFY:
+        return RECERT_TITLES
     if plan != CERTIFIED:
         return TITLES
     return CERT_TITLES if spec is None or spec is SPECS[CERTIFIED] else cert_titles(spec)
@@ -2341,6 +2390,193 @@ def noise_index_problems(summary: Path, manifest: Mapping[str, Any], spec: PlanS
     return ""
 
 
+def planned_hashes(text: str, base_dir: Path) -> tuple[str, dict[str, str]]:
+    """``(config hash, stage hashes)`` ``flora deploy`` plans config ``text`` with, as if it
+    were a file in ``base_dir`` (its relative ``input.path`` resolves there; local, nothing
+    written: ``factory.plan_app``)."""
+    from flora_deploy.config.receipts import resolve
+    from flora_deploy.config.schema import loads_config
+    from flora_deploy.modal_app.factory import plan_app
+
+    c = loads_config(text, source=str(base_dir / "flora.yaml"), base_dir=base_dir)
+    plan = plan_app(c, determinism=ORACLE_DETERMINISM, derived_receipts=resolve(c))
+    return plan.config_hash, dict(plan.stage_hashes)
+
+
+def oracle_source(path: Path | None) -> dict[str, Any]:
+    """(b) of a finished certified run, from its state file (read, never written): its run id,
+    (b)'s job record (config file, data dir, hashes, GPU, video seconds) and episode count, and
+    every job id that state ran. Raises when (b) cannot be repeated as it ran."""
+    if path is None:
+        raise RuntimeError("recertify: no certified state to repeat (b) from")
+    try:
+        src = rb.State.from_json(json.loads(Path(path).read_text()))
+    except (OSError, ValueError, KeyError) as e:
+        raise RuntimeError(f"recertify: no readable certified state at {path}: {e}") from None
+    b = src.steps.get("exact_e2e") or StepState()
+    job = dict((b.result.get("jobs") or {}).get(JOB) or {})
+    why = []
+    if src.plan != CERTIFIED:
+        why.append(f"its plan is {src.plan!r}, not {CERTIFIED!r}")
+    if b.status != "done" or job.get("state") != "done":
+        why.append(f"(b) is {b.status!r}, its job {job.get('state')!r}, not done")
+    why += [f"(b)'s job has no {k}" for k in ("cfg", "job_id", "config_hash", "stage_hashes",
+                                              "data", "video_s") if not job.get(k)]
+    if job.get("preset") != "exact":
+        why.append(f"(b)'s job preset is {job.get('preset')!r}, not exact")
+    cfg = Path(str(job.get("cfg") or ""))
+    if job.get("cfg") and not cfg.is_file():
+        why.append(f"(b)'s config {cfg} is gone")
+    elif job.get("data") and not (cfg.parent / str(job["data"])).is_dir():
+        why.append(f"(b)'s data dir {cfg.parent / str(job['data'])} is gone")
+    want_gpu = (pool_container("segcap").gpu or "").rstrip("!")
+    gpus = {str(c.get("gpu") or "").rstrip("!") for c in job.get("containers") or ()}
+    if gpus != {want_gpu}:
+        why.append(f"(b) ran on {sorted(gpus) or 'no recorded GPU'}, not {want_gpu}")
+    episodes = int(b.result.get("episodes") or 0)
+    if why:
+        raise RuntimeError(f"recertify: (b) of run {src.run_id} ({path}) cannot be repeated: "
+                           + "; ".join(why))
+    job_ids = sorted({str(r.get("job_id")) for s in src.steps.values()
+                      for key in ("jobs", "witness_jobs")
+                      for r in (s.result.get(key) or {}).values() if r.get("job_id")})
+    return {"state": str(path), "run_id": src.run_id, "job": job, "episodes": episodes,
+            "job_ids": job_ids}
+
+
+def noise_all_job(st: State, emb: str, *, preview: bool = False) -> tuple[str, str]:
+    """This attempt's (job id, index tag): ``wave-h-<run>-noise12-<emb>-a<n>`` (its own job
+    and app, :func:`witness_config_text`) and ``noise12-<emb>-a<n>`` (its own local store and
+    index summary beside (b)'s and (f)'s, never theirs). ``preview``: the attempt a run would
+    start next (the running attempt is already counted in a run)."""
+    s = st.steps.get("noise_all") or StepState()
+    n = len(s.attempts) + 1 if preview else max(1, len(s.attempts))
+    return f"wave-h-{st.run_id}-{NOISE_ALL_JOB}-{emb}-a{n}", f"{NOISE_ALL_JOB}-{emb}-a{n}"
+
+
+def noise_all_check(st: State, spec: PlanSpec, *, preview: bool = False) -> dict[str, Any]:
+    """Everything f2 checks before any app, from local reads only (the dry run and the run):
+    (b) from the certified state, this state's run id is (b)'s, the job id is new, (b)'s config
+    still names (b)'s project, and the renamed config plans to (b)'s config hash and stage
+    hashes in this checkout. Returns the source, the config text, job id, tag and hashes;
+    raises otherwise."""
+    src = oracle_source(spec.source)
+    job = src["job"]
+    if st.run_id != src["run_id"]:
+        raise RuntimeError(f"recertify: this state's run {st.run_id} is not (b)'s run "
+                           f"{src['run_id']} (its store and staged media)")
+    if src["episodes"] != len(spec.episodes):
+        raise RuntimeError(f"recertify: (b) ran {src['episodes']} episodes, not the "
+                           f"{len(spec.episodes)} of {spec.golden}")
+    job_id, tag = noise_all_job(st, spec.embodiment, preview=preview)
+    if job_id in src["job_ids"] or job_id == job["job_id"]:
+        raise RuntimeError(f"recertify: job id {job_id} was already used by run {st.run_id}")
+    ocfg = Path(job["cfg"])
+    text = ocfg.read_text()
+    if f"project: {job['job_id']}\n" not in text:
+        raise RuntimeError(f"recertify: {ocfg} no longer names (b)'s project {job['job_id']}")
+    new = witness_config_text(text, job_id)
+    want = (str(job["config_hash"]), dict(job["stage_hashes"]))
+    got_b, got = planned_hashes(text, ocfg.parent), planned_hashes(new, ocfg.parent)
+    if got != want or got_b != want:
+        raise RuntimeError(f"recertify: this checkout plans (b)'s config to {got_b[1]} "
+                           f"(config {got_b[0][:12]}) and the noise config to {got[1]} (config "
+                           f"{got[0][:12]}), not (b)'s {want[1]} (config {want[0][:12]}): run "
+                           "f2 from a checkout that reproduces (b) (order A), or re-run (b)")
+    return {"source": src, "cfg": ocfg.parent / f"flora-{tag}.yaml", "text": new,
+            "job_id": job_id, "tag": tag, "config_hash": got[0], "stage_hashes": got[1]}
+
+
+def noise_all_index_problems(summary: Path, oracle_summary: Path, src: Mapping[str, Any]
+                             ) -> str:
+    """Empty when f2's index holds what (b)'s did: every one of its episodes, the same dataset
+    revision and video seconds as (b)'s own index summary (else (b)'s recorded video seconds,
+    within 1%)."""
+    try:
+        d = json.loads(summary.read_text())
+    except (OSError, ValueError) as e:
+        return f"unreadable {summary.name}: {e}"
+    try:
+        o = json.loads(oracle_summary.read_text())
+    except (OSError, ValueError):
+        o = None
+    n, got = (d.get("counts") or {}).get("episodes"), float(d.get("video_s") or 0.0)
+    want_n = src["episodes"] if o is None else (o.get("counts") or {}).get("episodes")
+    want = float(src["job"]["video_s"] if o is None else o.get("video_s") or 0.0)
+    tol = 0.01 * max(want, 1.0) if o is None else 1e-6 * max(want, 1.0)
+    if n != want_n or abs(got - want) > tol:
+        return (f"{n} episodes / {got:.1f} video s indexed, not (b)'s {want_n} / {want:.1f} s")
+    rev = ((d.get("dataset") or {}).get("revision"), ((o or {}).get("dataset") or {})
+           .get("revision"))
+    if o is not None and rev[0] != rev[1]:
+        return f"dataset revision {rev[0]}, not (b)'s {rev[1]}"
+    return ""
+
+
+def run_noise_all(ctx: Ctx) -> dict[str, Any]:
+    """Recertify f2: (b) of the certified run repeated on **all** of its episodes, exact vs
+    exact (``noise_all``). (b)'s own config file with its ``project`` renamed (this attempt's
+    job and app; the project is not hashed) and its own data dir, re-indexed with no
+    ``--limit``; the config hash and stage hashes are checked equal to (b)'s recorded ones
+    before any app (:func:`noise_all_check`), and the index to hold (b)'s episodes. Then
+    ``flora deploy`` / ``flora run`` in nvidia mode on (b)'s pool (H200), under this step's
+    budget and deadline. Nothing of the certified state or its records is written."""
+    require_tempseg_pin(ctx)  # every GPU step runs from the pinned commit
+    chk = noise_all_check(ctx.st, ctx.spec)
+    src, job, cfg, tag = chk["source"], chk["source"]["job"], chk["cfg"], chk["tag"]
+    cfg.write_text(chk["text"])
+    if planned_hashes(cfg.read_text(), cfg.parent) != (chk["config_hash"],
+                                                        chk["stage_hashes"]):
+        raise RuntimeError(f"recertify: {cfg} as written does not plan to (b)'s hashes")
+    _index(ctx, cfg, chk["job_id"], tag)  # no --limit: every episode of (b)'s data dir
+    ocfg = Path(job["cfg"])
+    why = noise_all_index_problems(
+        ctx.work / f"summary-{tag}.json",
+        ocfg.parent / f"summary-{ocfg.stem.removeprefix('flora-')}.json", src)
+    if why:  # before any app: charged $0
+        raise RuntimeError(f"noise_all index: {why}")
+    r = _run_job(ctx, "noise_all", cfg, chk["job_id"], determinism=ORACLE_DETERMINISM,
+                 usd_per_s=pool_container("segcap").usd_per_s(), spent_in_step=0.0,
+                 side="noise_all")
+    r["data"] = job["data"]
+    res = _jobs_result({JOB: r}, 1)
+    res.update(episodes=src["episodes"], stage_hashes_of_oracle=True,
+               oracle={"state": src["state"], "run_id": src["run_id"],
+                       "job_id": job["job_id"], "config_hash": job["config_hash"],
+                       "stage_hashes": dict(job["stage_hashes"]),
+                       "records": job.get("records")})
+    return res
+
+
+def new_recert_state(spec: PlanSpec) -> State:
+    """A fresh recertify state: its own billing baseline and attempts, but (b)'s ``run_id``
+    (:func:`oracle_source`), since (b)'s config writes into that run's store and reads that
+    run's staged media; its apps are its own (per attempt), so billing never mixes them up."""
+    src = oracle_source(spec.source)
+    st = rb.new_state()
+    st.run_id, st.plan = src["run_id"], RECERTIFY
+    return st
+
+
+def noise_all_lines(st: State, spec: PlanSpec) -> list[str]:
+    """The dry run's / ``--status``'s f2 lines: what it repeats and whether this checkout
+    plans it to (b)'s hashes (local reads only; nothing written)."""
+    try:
+        chk = noise_all_check(st, spec, preview=True)
+    except Exception as e:  # noqa: BLE001 - shown, not raised: a run refuses on it
+        return [f"  f2 check: REFUSED before any app: {e}"]
+    job = chk["source"]["job"]
+    sh = ", ".join(f"{k} {v}" for k, v in sorted(chk["stage_hashes"].items()))
+    return [f"  f2 repeats (b) of run {chk['source']['run_id']} (job {job['job_id']}, "
+            f"{chk['source']['episodes']} episodes, {job['video_s']} video s, "
+            f"{', '.join(sorted({c.get('gpu') for c in job.get('containers') or ()}))}, "
+            f"{ORACLE_DETERMINISM} mode) from {chk['source']['state']} (read-only)",
+            f"  f2 config: {chk['cfg']} (project {chk['job_id']}), data dir "
+            f"{Path(job['cfg']).parent / job['data']}, flora index with no --limit",
+            f"  f2 stage hash: {sh} == (b)'s; config hash {chk['config_hash']} == (b)'s "
+            "(this checkout)"]
+
+
 CERT_STAGES = ("segment", "caption")
 RECORD_STEPS = ("exact_e2e", "noise", "balanced")  # the steps whose jobs' records (e) reads
 
@@ -2419,7 +2655,8 @@ def run_flora_certify(ctx: Ctx, *, finalize: Any = None, sh: Callable[..., Any] 
 
 RUNNERS: dict[str, Callable[[Ctx], dict[str, Any]]] = {
     "tempseg": run_tempseg, "preflight": run_preflight, "exact_e2e": run_exact,
-    "balanced": run_balanced, "lab": run_lab, "certify": run_certify, "noise": run_noise}
+    "balanced": run_balanced, "lab": run_lab, "certify": run_certify, "noise": run_noise,
+    "noise_all": run_noise_all}
 
 
 def runner(plan: str, step: str) -> Callable[[Ctx], dict[str, Any]]:
@@ -2447,7 +2684,8 @@ def render_report(st: State, projections: Mapping[str, Projection], *,
              "`scripts/spend.py` when larger; billing lags about an hour).", "",
              "| step | status | cap | projected (upper) | attempts | tracked | billed |",
              "|---|---|---|---|---|---|---|"]
-    for name in STEPS:
+    shown = PLANS[plan] if plan == RECERTIFY else STEPS  # recertify: its own steps only
+    for name in shown:
         s = st.steps.get(name, StepState())
         if name not in PLANS[plan] and s.status == "pending":
             if plan != CERTIFIED:
@@ -2458,7 +2696,7 @@ def render_report(st: State, projections: Mapping[str, Projection], *,
         billed = f"${s.billed_usd:.2f}" if s.billed_usd is not None else "-"
         lines.append(f"| {title[name]} | {s.status} | ${caps[name]:.2f} | {proj} | "
                      f"{len(s.attempts)} | ${s.tracked_usd:.2f} | {billed} |")
-    for name in STEPS:
+    for name in shown:
         s = st.steps.get(name)
         if not s or s.status == "pending":
             continue
@@ -2562,7 +2800,10 @@ def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
             out(f"      {i['what']:60s} {i['gpu']:>5s} {i['seconds']:6.0f} s / "
                 f"{i['upper_seconds']:6.0f} s x ${i['usd_per_h']:.2f}/h = ${i['usd']:.3f} "
                 f"(upper ${i['usd_upper']:.3f})")
-    for name in () if only or plan == CERTIFIED else deferred_steps(plan):
+    if plan == RECERTIFY and "noise_all" in steps:
+        for line in noise_all_lines(st, spec):
+            out(line)
+    for name in () if only or plan in CERT_PLANS else deferred_steps(plan):
         out(f"  {title[name]:66s} [{DEFERRED_NOTE}; never runs in plan {plan}]")
     if plan == CERTIFIED and "exact_e2e" in steps:
         from flora_deploy.planner.rates import RateTable
@@ -2579,6 +2820,17 @@ def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
             f"{CLIENT_SLACK_S} s client slack cover them")
         out("  assumption: certified plan caps are each step's own upper projection rounded "
             "up to $0.05 (plan_caps); the global cap is their sum rounded up to $0.10")
+    if plan == RECERTIFY and "noise_all" in steps:
+        from flora_deploy.planner.rates import RateTable
+
+        t = RateTable.load()
+        e, su = t.rate("exact", "segcap", 1, 1), t.startup_for("exact", "segcap")
+        out(f"  assumption: f2 is priced as (b) was: the measured exact segcap rate "
+            f"{e.container_s_per_video_s:g} container-s/video-s +/-{e.uncertainty:.0%} (H200, "
+            f"default mode) and the measured @enter {su.startup_s:g} s +/-{su.uncertainty:.0%} "
+            f"(its own app: a cold start), {CLIENT_SLACK_S} s client slack; its cap is its "
+            "upper projection rounded up to $0.05 (plan_caps), the global cap the plan's "
+            "uppers rounded up to $0.10")
     if spec.scale:
         sc = spec.scale
         out(f"  assumption: {spec.embodiment} is three-view; the measured 1-view rates are scaled "
@@ -2767,6 +3019,9 @@ def print_status(st: State, projections: Mapping[str, Projection], *, plan: str,
             + ("" if s.billed_usd is None else f"  billed ${s.billed_usd:.2f}") + why)
     for line in held_lines(st):
         out(line)
+    if plan == RECERTIFY and (st.steps.get("noise_all") or StepState()).status != "done":
+        for line in noise_all_lines(st, spec):
+            out(line)
     for line in running_lines(st, plan, title, only):
         out(line)
     d = next_decision(st, plan, projections, only, spec.embodiment)
@@ -2853,12 +3108,17 @@ def main(argv: list[str] | None = None) -> int:
                         "cap and who approved it, and the next decision (reads; never writes)")
     ap.add_argument("--plan", choices=tuple(PLANS), default=DEFAULT_PLAN,
                     help="balanced-only (default): steps 0, a, d; full: every step; "
-                         "certified: b, f, d, (d2), e on golden/v2 (its own state)")
+                         "certified: b, f, d, (d2), e on golden/v2 (its own state); "
+                         "recertify: f2, the certified run's (b) repeated on all 12 episodes "
+                         "(its own state; reads the certified state, never writes it)")
     ap.add_argument("--embodiment", choices=ALL_EMBODIMENTS, default=EMBODIMENT,
                     help="certified only: the embodiment to certify (human: golden/v2; yam: "
                          "golden/v3-yam; each its own state). dex, tianji, yam32: no golden "
                          "certification set yet")
-    ap.add_argument("--only", choices=STEPS, help="run just this step (if not done)")
+    ap.add_argument("--only", choices=ALL_STEPS, help="run just this step (if not done)")
+    ap.add_argument("--source-state", type=Path, default=None,
+                    help="recertify only: the certified state whose (b) f2 repeats (default "
+                         "reports/wave-h/certified/state.json; read, never written)")
     ap.add_argument("--global-cap", type=float, default=None, metavar="USD",
                     help="raise this plan's global cap to this (a cap the user approved; "
                          "saved in the state only with --yes-spend, for this --plan only; "
@@ -2900,6 +3160,15 @@ def main(argv: list[str] | None = None) -> int:
     other = {s.state.resolve() for e, s in CERT_SPECS.items() if e != args.embodiment}
     if args.state is not None and args.plan == CERTIFIED and args.state.resolve() in other:
         ap.error(f"--state {args.state} is another embodiment's certified state")
+    if args.source_state is not None:
+        if args.plan != RECERTIFY:
+            ap.error("--source-state is for --plan recertify")
+        spec = replace(spec, source=args.source_state)
+    if args.plan == RECERTIFY:
+        certified = {s.state.resolve() for s in CERT_SPECS.values()} | {spec.source.resolve()}
+        if args.state is not None and args.state.resolve() in certified:
+            ap.error(f"--state {args.state} is a certified run's state: recertify keeps its "
+                     "own and never writes that one")
     args.state = args.state or spec.state
     args.work = args.work or spec.work
     if args.offline and args.yes_spend:
@@ -2908,15 +3177,22 @@ def main(argv: list[str] | None = None) -> int:
         ap.error(f"--only {args.only}: {DEFERRED_NOTE} (not in plan {args.plan}; use --plan "
                  "full)")
 
-    st = load_state(args.state)
-    if st.plan is not None and st.plan != args.plan and CERTIFIED in (st.plan, args.plan):
+    if args.plan == RECERTIFY and not args.state.exists():
+        try:  # a new recertify state takes (b)'s run id: (b)'s store and staged media
+            st = new_recert_state(spec)
+        except RuntimeError as e:
+            print(f"refused: {e}")
+            return 2
+    else:
+        st = load_state(args.state)
+    if st.plan is not None and st.plan != args.plan and set(CERT_PLANS) & {st.plan, args.plan}:
         print(f"refused: {args.state} was run under plan {st.plan}, not {args.plan}")
         return 2
     preview = args.dry_run or args.status or not (args.yes_spend or args.report)
     if preview:  # the dry run and --status decide on a copy: the state file is never written
         st = copy.deepcopy(st)
-    if args.plan == CERTIFIED:
-        st.plan = CERTIFIED
+    if args.plan in CERT_PLANS:
+        st.plan = args.plan
     if adopt_balanced_job(st):
         print("note: (d)'s deployed job is done; (d) counts as done and its lab is step lab")
     if args.yes_spend:
