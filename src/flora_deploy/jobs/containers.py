@@ -14,6 +14,11 @@ spawned). From those, per container (:func:`container_rows`):
 - ``seconds``: its first call's spawn to ``min(stopped_at, now, last end + scale-down window)``,
   what it was billed for; ``usd``: that at its pool's list price.
 
+Startup facts (:func:`write_startup_facts` / :func:`read_startup_facts`): a worker that wants its
+``@modal.enter`` facts (batch policy, executor size, container resources) next to the job writes
+them once per job and container to ``<job root>/containers/<container id>.json``; the fake
+balanced workers do (``local.balanced``), so the H0 rehearsal can check them on Modal.
+
 Orchestration bookkeeping only (``config/logic.py``: not output-affecting).
 """
 
@@ -141,3 +146,46 @@ def job_container_rows(store: Any, job_id: str, config_hash: str, manifest: Any,
                           pool_gpus={k: getattr(p, "gpu", None) for k, p in pools.items()},
                           scaledown_s=scaledown_s, stopped_at=stopped_at, now=now,
                           usd_per_s=usd_per_s)
+
+
+STARTUP_SCHEMA = "flora_container_startup_v1"
+
+
+def startup_facts_path(job_id: str, container_id: str) -> str:
+    from flora_deploy.jobs.store import JobPaths
+    from flora_deploy.jobs.types import safe_key
+
+    return f"{JobPaths(job_id).root}/containers/{safe_key(container_id)}.json"
+
+
+def write_startup_facts(store: Any, job_id: str, container_id: str, kind: str,
+                        facts: Mapping[str, Any], *, now: float | None = None) -> str:
+    """Write one container's startup facts for ``job_id`` (module docstring)."""
+    import json
+
+    from flora_deploy.jobs.orchestrator import utc
+
+    path = startup_facts_path(job_id, container_id)
+    body = {"schema": STARTUP_SCHEMA, "container_id": container_id, "kind": kind,
+            "written_utc": utc(time.time() if now is None else now), "startup": dict(facts)}
+    store.put_bytes(path, json.dumps(body, sort_keys=True, default=str).encode())
+    return path
+
+
+def read_startup_facts(store: Any, job_id: str) -> dict[str, dict[str, Any]]:
+    """Container id -> the startup facts written for ``job_id`` (unreadable files skipped)."""
+    import json
+
+    from flora_deploy.jobs.store import JobPaths
+
+    out: dict[str, dict[str, Any]] = {}
+    for p in store.list(f"{JobPaths(job_id).root}/containers/"):
+        if not p.endswith(".json"):
+            continue
+        try:
+            d = json.loads(store.get_bytes(p))
+        except (OSError, ValueError):
+            continue
+        if isinstance(d, dict) and d.get("schema") == STARTUP_SCHEMA:
+            out[str(d.get("container_id"))] = d
+    return out

@@ -222,8 +222,10 @@ Caption is never drained while segment still produces.
 2 s) in place of nothing.
 
 **Not verified live:** whether Modal applies a lowered window to a container that is *already*
-idle, or only to containers that go idle afterwards. One CPU fake-models run settles it: deploy,
-run one shard, watch `modal container list` after the `pool_drained` event. If the window only
+idle, or only to containers that go idle afterwards. The H0 rehearsal settles it
+(`scripts/h0_rehearsal.py`, default `--preset balanced`): it polls Modal's running containers
+during the jobs and checks that each one is gone at most 30 s after its class's drain, printing
+the measured gap per container. If the window only
 applies to containers going idle later, the fallback is to drain one tick *before* the last
 shard ends. For that, the orchestrator would need the shard's ETA, which it already has from the
 pre-warm estimates.

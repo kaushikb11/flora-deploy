@@ -3,7 +3,8 @@ the one GPU session").
 
 Usage::
 
-    uv run python scripts/h0_rehearsal.py [--dry-run] [--keep] [--work DIR] [--max-wall-s 1500]
+    uv run python scripts/h0_rehearsal.py [--preset balanced|exact|both] [--dry-run] [--keep]
+        [--work DIR] [--max-wall-s 1500] [--json REPORT]
 
 What it runs, per job, exactly the commands Wave H runs, with fake models. ``exact`` jobs:
 ``human`` (2 EgoDex episodes) and ``yam`` (2 three-view + 2 single-view robot episodes + 1
@@ -11,8 +12,10 @@ injected poison episode). ``balanced`` jobs (``preset: balanced``, ``allow_uncer
 the factory's ``FakeSegmentWorker`` / ``FakeCaptionWorker``) on the same 6 episodes:
 ``bal-human`` (clean), ``bal-yam-seg`` (one preemption of a ``segment`` shard, the poison episode
 poisoned at ``segment``: excluded at caption too, counted once) and ``bal-yam-cap`` (one
-preemption of a ``caption`` shard, poisoned at ``caption`` only). ``--preset exact|balanced``
-runs one family; the default runs both:
+preemption of a ``caption`` shard, poisoned at ``caption`` only). ``--preset`` picks the jobs:
+``balanced`` (the default, the fast path: only the episodes and apps those 3 jobs need),
+``exact`` or ``both``. Before anything is deployed it prints the projected cost
+(:func:`projected_cost`, about $0.4 for the default):
 
 1. fetch the episodes from the golden Volume (``flora-golden``, ``golden/v1/``) into a local
    ``mp4_dir`` dataset (task text next to each video) and upload it to this run's media Volume
@@ -25,8 +28,30 @@ runs one family; the default runs both:
    episode of the first start of a ``segcap`` (``segment`` / ``caption``) shard and a poison
    episode (``os._exit(137)`` every time; for the balanced jobs only in workers of the named
    kind), then ``flora run --fake-models --determinism deterministic`` for every job in parallel;
+   while the jobs run, :class:`ContainerWatch` polls Modal's running containers (``TaskList``,
+   metadata only) every 5 s for this run's apps; after the last ``flora run`` returns it waits
+   up to 45 s for them to go before anything is stopped;
 5. ``flora status``, ``flora results`` and the SDK's ``Job.results`` / store listing;
-6. assertions (printed as PASS/FAIL), then ``modal app stop`` for the apps it deployed and
+6. assertions (printed as PASS/FAIL). Besides the original H0 checks, the behaviours that had
+   never run on Modal (:func:`assert_new`):
+
+   - *job-end scale-to-zero* (``jobs.pools``): every container of the job's app is gone at most
+     ``DRAIN_BOUND_S`` (30 s) after its class was drained (the drain start in the job's pool
+     file; Modal's lifetime from the watch, matched to the job report's per-container rows by
+     task id), instead of the 300 s window. The measured gap per container is printed and
+     written to the JSON report: this answers whether a lowered ``scaledown_window`` reaches a
+     container that is already idle;
+   - *caption pre-warm* (balanced): the ``pool_prewarm_plan`` decision is recorded (pool file
+     ``prewarm_plans``) as ``prewarm``, it started, and the first caption container started
+     within 120 s of the planned start;
+   - *batch-fill fields* (balanced): two-phase gates, batch policy and resource samples (peak
+     RSS, cores, GPU memory when there is a GPU) in the segment / caption shard audits and in
+     each container's startup facts (``jobs.containers.read_startup_facts``, written by the
+     fake balanced workers on Modal);
+   - *compile-cache provenance per shard* (Fix-13): checked when any shard records it,
+     otherwise reported as a skipped GAP;
+
+   then ``modal app stop`` for the apps it deployed and
    deletion of this run's two Volumes and its lease/watch entries (``--keep`` skips the Volume
    deletion). The Volumes are named per run, so a cleanup never touches another H0 run's
    (review 8b L3).
@@ -36,7 +61,7 @@ ones ``flora run --fake-models`` submits under.
 
 ``--dry-run`` plans everything offline (configs, fake app plans, the real-vs-fake hashes) and
 contacts Modal only to read the golden manifest (nothing is deployed or written).
-CPU only; well under $0.30.
+CPU only.
 """
 
 from __future__ import annotations
@@ -53,7 +78,7 @@ import threading
 import time
 import uuid
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -537,6 +562,453 @@ def assert_job(r: JobRun, run_id: str, poison: str | None) -> None:
 
 
 # ---------------------------------------------------------------------------------------------
+# Projected cost (printed before anything is deployed)
+
+# Projection model (CPU fake workers; nothing here is measured): each container of a worker
+# class lives a cold start plus the class's active span, then the drained tail (one orchestrator
+# poll + the 2 s window). Every class is assumed active for PROJ_ACTIVE_S (conservative: segment
+# is active for a fraction of the job). One container per shard kind of a class, up to
+# max_containers, plus one for the preempted kind.
+PROJ_STARTUP_S = 60.0
+PROJ_ACTIVE_S = 480.0
+PROJ_JOB_WALL_S = 900.0  # the orchestrator's (0.125-core) lifetime per job
+PROJ_UNDRAINED_TAIL_S = 300.0  # jobs.settings.WORKER_SCALEDOWN_S: what the drain removes
+
+
+def projected_cost(plans_by_job: dict[str, Any], specs: dict[str, JobSpec] | None = None
+                   ) -> dict[str, Any]:
+    """``{"usd", "usd_undrained", "jobs": {job: usd}, "model"}`` from each job's fake app plan
+    (its containers' CPU / memory requests at ``jobs.budget`` list prices)."""
+    from flora_deploy.jobs.budget import pinned_rates
+    from flora_deploy.jobs.orchestrator import POLL_INTERVAL_S
+    from flora_deploy.jobs.pools import (
+        DRAINED_SCALEDOWN_S,
+        ORCHESTRATOR_CORES,
+        ORCHESTRATOR_MEMORY_GIB,
+        ORCHESTRATOR_PREEMPTIBLE,
+    )
+
+    specs = specs or JOB_SPECS
+    rates = pinned_rates()
+    tail = POLL_INTERVAL_S + DRAINED_SCALEDOWN_S
+    jobs: dict[str, float] = {}
+    undrained = 0.0
+    for job, plan in plans_by_job.items():
+        spec = specs[job]
+        usd = PROJ_JOB_WALL_S * rates.per_second(None, 0, ORCHESTRATOR_CORES,
+                                                 ORCHESTRATOR_MEMORY_GIB,
+                                                 preemptible=ORCHESTRATOR_PREEMPTIBLE)
+        by_cls: dict[str, list[str]] = {}
+        for kind, cls in plan.worker_classes.items():
+            by_cls.setdefault(cls, []).append(kind)
+        for cls, kinds in by_cls.items():
+            o = plan.object(cls)
+            mem = o.memory[0] if isinstance(o.memory, (tuple, list)) else o.memory
+            per_s = rates.per_second(None, 0, float(o.cpu or 0.0), float(mem or 0) / 1024.0,
+                                     preemptible=not o.nonpreemptible)
+            n = min(int(o.max_containers or len(kinds)), len(kinds)) + int(spec.preempt in kinds)
+            usd += n * (PROJ_STARTUP_S + PROJ_ACTIVE_S + tail) * per_s
+            undrained += n * (PROJ_UNDRAINED_TAIL_S - tail) * per_s
+        jobs[job] = round(usd, 4)
+    total = sum(jobs.values())
+    return {"usd": round(total, 3), "usd_undrained": round(total + undrained, 3), "jobs": jobs,
+            "model": {"startup_s": PROJ_STARTUP_S, "active_s": PROJ_ACTIVE_S,
+                      "drained_tail_s": tail, "orchestrator_s": PROJ_JOB_WALL_S}}
+
+
+# ---------------------------------------------------------------------------------------------
+# New-behaviour checks: job-end drain, caption pre-warm, batch-fill fields, cache provenance
+
+DRAIN_BOUND_S = 30.0  # a drained container must be gone this long after its class's drain
+WATCH_INTERVAL_S = 5.0  # Modal TaskList poll period (the resolution of every measured end)
+WATCH_TAIL_S = DRAIN_BOUND_S + 15.0  # keep watching this long after the last job returned
+PREWARM_TOL_S = 120.0  # pre-warmed caption container start vs the planned start
+
+
+def modal_task_list(env: str = "main") -> list[dict[str, Any]]:
+    """Modal's running containers in ``env`` (``modal container list``'s ``TaskList``):
+    ``{"task_id", "app_id", "app", "started_at"}``. The task id is the ``MODAL_TASK_ID`` a
+    worker records as its container id (``jobs.containers``). Metadata only: no compute."""
+    from modal._utils.async_utils import synchronizer
+    from modal.client import _Client
+    from modal_proto import api_pb2
+
+    @synchronizer.create_blocking
+    async def _list() -> list[dict[str, Any]]:
+        client = await _Client.from_env()
+        res = await client._stub.TaskList(api_pb2.TaskListRequest(environment_name=env))
+        return [{"task_id": t.task_id, "app_id": t.app_id, "app": t.app_description,
+                 "started_at": float(t.started_at) or None} for t in res.tasks]
+
+    return _list()
+
+
+class ContainerWatch:
+    """Polls Modal's running containers every ``interval_s`` and keeps, per container of an app
+    ``match`` accepts: its app, Modal's start time, first / last time seen and ``ended_at`` (the
+    first poll it was missing from: an upper bound at ``interval_s`` resolution). This is the
+    observed lifetime. ``flora report``'s container ``seconds`` are derived from the recorded
+    drains, not observed, so they cannot tell whether a lowered window reached a container that
+    was already idle."""
+
+    def __init__(self, match: Callable[[str], bool], *, interval_s: float = WATCH_INTERVAL_S,
+                 list_fn: Callable[[], list[dict[str, Any]]] | None = None,
+                 clock: Callable[[], float] = time.time):
+        self.match, self.interval_s, self.clock = match, interval_s, clock
+        self.list_fn = list_fn or modal_task_list
+        self.seen: dict[str, dict[str, Any]] = {}
+        self.errors = 0
+        self.last_poll: float | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def poll(self) -> None:
+        try:
+            tasks = self.list_fn()
+        except Exception:  # noqa: BLE001 - a missed poll only widens the resolution
+            self.errors += 1
+            return
+        now = self.clock()
+        live = set()
+        for t in tasks:
+            if not self.match(str(t.get("app") or "")):
+                continue
+            tid = str(t["task_id"])
+            live.add(tid)
+            rec = self.seen.setdefault(tid, {"task_id": tid, "app": t.get("app"),
+                                             "started_at": t.get("started_at"),
+                                             "first_seen": now, "ended_at": None})
+            rec["last_seen"] = now
+            rec["started_at"] = rec.get("started_at") or t.get("started_at")
+            rec["ended_at"] = None
+        for tid, rec in self.seen.items():
+            if tid not in live and rec["ended_at"] is None:
+                rec["ended_at"] = now
+        self.last_poll = now
+
+    def alive(self) -> list[str]:
+        return sorted(t for t, r in self.seen.items() if r["ended_at"] is None)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self.poll()
+            self._stop.wait(self.interval_s)
+
+    def start(self) -> ContainerWatch:
+        self._thread = threading.Thread(target=self._run, name="h0-watch", daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=60)
+        self.poll()
+
+    def wait_drained(self, until: float, *, sleep: Callable[[float], Any] = time.sleep) -> None:
+        """Return once no watched container is alive, or at ``until`` (wall clock)."""
+        while self.clock() < until:
+            if self.seen and not self.alive():
+                return
+            sleep(min(self.interval_s, max(until - self.clock(), 0.0)))
+
+
+def drain_rows(app: str, report_rows: list[dict[str, Any]], seen: dict[str, dict[str, Any]],
+               drains: dict[str, tuple[tuple[float, float | None], ...]],
+               classes: dict[str, str], *, observed_until: float | None,
+               bound_s: float = DRAIN_BOUND_S) -> list[dict[str, Any]]:
+    """Per container of ``app`` that Modal ran: when its class had no work left (``drain_at``)
+    and how long after that it was gone (``gap_s``).
+
+    A worker container (in ``report_rows``, ``flora report``'s per-container rows: container id
+    = Modal task id) is measured from the latest drain start of its class at or before its end
+    (``drains``: kind -> ``(start, end | None)``, the orchestrator's record). One that ended
+    before any drain (preempted, replaced) has no gap and passes. Any other container (the
+    orchestrator, a worker that ran no shard) is measured from the job's last drain start (the
+    job-end drain). A container still alive at ``observed_until`` gets the lower bound
+    ``observed_until - drain_at`` (``alive``)."""
+    kind_of = {str(r["container_id"]): r.get("kind") for r in report_rows}
+    starts_by_cls: dict[str, list[float]] = {}
+    for kind, ivs in drains.items():
+        starts_by_cls.setdefault(classes.get(kind, kind), []).extend(float(a) for a, _ in ivs)
+    every = sorted(a for v in starts_by_cls.values() for a in v)
+    out = []
+    for tid, rec in sorted(seen.items()):
+        if rec.get("app") != app:
+            continue
+        kind = kind_of.get(tid)
+        end = rec.get("ended_at")
+        alive = end is None
+        t_end = observed_until if alive else float(end)
+        if kind is not None:
+            role = classes.get(kind, kind)
+            cands = [a for a in starts_by_cls.get(role, ()) if t_end is None or a <= t_end]
+        else:
+            role = "other"
+            cands = every[-1:]
+        drain = max(cands) if cands else None
+        gap = round(t_end - drain, 1) if drain is not None and t_end is not None else None
+        if gap is not None:
+            ok = gap <= bound_s
+        else:  # a worker that ended before its class drained; anything else is unmeasurable
+            ok = kind is not None and not alive
+        out.append({"container_id": tid, "kind": kind, "class": role, "drain_at": drain,
+                    "ended_at": end, "alive": alive, "gap_s": gap, "ok": bool(ok)})
+    return out
+
+
+def drain_check(rows: list[dict[str, Any]], bound_s: float = DRAIN_BOUND_S
+                ) -> tuple[bool, str]:
+    """``(ok, detail)`` over :func:`drain_rows`: every container gone within ``bound_s`` of its
+    class's drain, and at least one worker container measured against one."""
+    measured = [r for r in rows if r["kind"] is not None and r["gap_s"] is not None]
+    parts = []
+    for r in rows:
+        g = "ended before any drain" if r["gap_s"] is None else (
+            f"{'>=' if r['alive'] else ''}{r['gap_s']:.0f} s")
+        parts.append(f"{r['container_id'][-8:]} {r['kind'] or r['class']}: {g}")
+    ok = bool(measured) and all(r["ok"] for r in rows)
+    head = (f"bound {bound_s:.0f} s, {len(measured)} worker container(s) measured" if measured
+            else "no worker container measured against a drain")
+    return ok, head + ("; " + ", ".join(parts) if parts else "")
+
+
+def prewarm_check(plans: dict[str, dict[str, Any]], prewarms: dict[str, Any],
+                  report_rows: list[dict[str, Any]], seen: dict[str, dict[str, Any]], *,
+                  kind: str = "caption", tol_s: float = PREWARM_TOL_S) -> tuple[bool, str]:
+    """``kind``'s ``pool_prewarm_plan`` is recorded and says ``prewarm``, the pre-warm started,
+    and ``kind``'s first container started within ``tol_s`` of the planned start
+    (``max(start_at, decision time)``: a planned start in the past means "now"; the container's
+    start is Modal's, else its first attempt marker)."""
+    from flora_deploy.jobs.containers import parse_utc
+
+    plan = plans.get(kind)
+    if not plan:
+        return False, f"no pool_prewarm_plan recorded for {kind} (plans: {sorted(plans)})"
+    if plan.get("decision") != "prewarm":
+        return False, f"{kind} pre-warm skipped: {plan.get('reason')}"
+    planned = max(float(plan["start_at"]), float(plan.get("t", plan["start_at"])))
+    pw = prewarms.get(kind)
+    if not pw:
+        return False, f"{kind} pre-warm planned at {planned:.0f} but never started"
+    starts = []
+    for r in report_rows:
+        if r.get("kind") != kind:
+            continue
+        cid = str(r["container_id"])
+        t = (seen.get(cid) or {}).get("started_at") or parse_utc(r.get("started_utc"))
+        if t is not None:
+            starts.append((float(t), cid))
+    if not starts:
+        return False, f"no {kind} container found (pre-warm started at {float(pw[0]):.0f})"
+    t0, cid = min(starts)
+    delta = t0 - planned
+    return abs(delta) <= tol_s, (
+        f"plan saves {plan.get('saves_s')} s; pre-warm started {float(pw[0]) - planned:+.0f} s "
+        f"after the planned start, first {kind} container {cid[-8:]} {delta:+.0f} s "
+        f"(tolerance {tol_s:.0f} s)")
+
+
+def _num(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def resources_ok(res: Any) -> tuple[bool, str]:
+    """Plausible container resources (``observe.sampler.ContainerSampler``): cores >= 1, a peak
+    host RSS in (0, 64] GiB, the process tree's high-water mark at least the process's RSS; GPU
+    memory, when sampled, used <= total (CPU fake workers have none: reported, not required)."""
+    if not isinstance(res, dict) or "error" in res:
+        return False, f"resources {res!r}"
+    bad = []
+    if not (_num(res.get("cores")) and res["cores"] >= 1):
+        bad.append(f"cores={res.get('cores')}")
+    peak = res.get("rss_peak_gib")
+    if not (_num(peak) and 0 < peak <= 64):
+        bad.append(f"rss_peak_gib={peak}")
+    tree = res.get("tree_rss_hwm_gib")
+    if tree is not None and not (_num(tree) and tree >= (res.get("rss_max_gib") or 0) * 0.99):
+        bad.append(f"tree_rss_hwm_gib={tree}")
+    gpu = "GPU memory n/a (CPU)"
+    if "gpu_mem_used_max_mib" in res:
+        used, total = res.get("gpu_mem_used_max_mib"), res.get("gpu_mem_total_mib")
+        if not (_num(used) and _num(total) and 0 <= used <= total):
+            bad.append(f"gpu_mem {used}/{total}")
+        else:
+            gpu = f"GPU memory {used:.0f}/{total:.0f} MiB"
+    return not bad, (", ".join(bad) if bad else
+                     f"cores {res.get('cores')}, peak RSS {peak} GiB, {gpu}")
+
+
+def policy_ok(pol: Any, kind: str) -> bool:
+    from flora_deploy.engines.batch_policy import POLICY_SCHEMA
+
+    return (isinstance(pol, dict) and pol.get("schema") == POLICY_SCHEMA
+            and pol.get("kind") == kind and isinstance(pol.get("digest"), str)
+            and len(pol["digest"]) == 16 and int(pol.get("infer_episodes") or 0) >= 1
+            and int(pol.get("prefetch_episodes") or 0) >= 1)
+
+
+def batch_fill_check(audits: list[dict[str, Any]], startup: dict[str, dict[str, Any]],
+                     kinds: tuple[str, ...] = ("segment", "caption")) -> tuple[bool, str]:
+    """The batch-fill fields (``workers_impl.segment``). Per shard audit row of ``kinds``: a
+    valid batch policy, ``phased`` (two-phase episodes), gate peaks inside their bounds with at
+    least one episode through each phase, batcher rounds and plausible resources; every episode
+    audit row of the kind names that policy's digest. Per container of those kinds: startup
+    facts (``jobs.containers.read_startup_facts``) with the policy, ``phased``, an executor
+    size and plausible resources."""
+    bad: list[str] = []
+    rows: dict[str, int] = {}
+    digests: dict[str, set[str]] = {}
+    note = ""
+    for a in audits:
+        if not a.get("shard_audit") or a.get("stage") not in kinds:
+            continue
+        k = a["stage"]
+        rows[k] = rows.get(k, 0) + 1
+        sid = str(a.get("shard_id"))[-14:]
+        pol = a.get("batch_policy")
+        if not policy_ok(pol, k):
+            bad.append(f"{sid}: batch_policy {pol!r}")
+            continue
+        digests.setdefault(k, set()).add(pol["digest"])
+        if a.get("phased") is not True:
+            bad.append(f"{sid}: phased={a.get('phased')}")
+        g = a.get("gates") or {}
+        if int(a.get("episodes_run") or 0) > 0:
+            if not (1 <= int(g.get("peak_preparing") or 0) <= int(g.get("prefetch") or 0)
+                    and 1 <= int(g.get("peak_inferring") or 0) <= int(g.get("infer") or 0)):
+                bad.append(f"{sid}: gates {g}")
+            if not (a.get("batcher") or {}).get("rounds"):
+                bad.append(f"{sid}: batcher {a.get('batcher')}")
+        ok, why = resources_ok(a.get("resources"))
+        if not ok:
+            bad.append(f"{sid}: {why}")
+        note = note or why
+    bad += [f"no {k} shard audit row" for k in kinds if not rows.get(k)]
+    for a in audits:  # episode rows name their shard's policy digest
+        k = a.get("stage")
+        if a.get("shard_audit") or k not in kinds or "uid" not in a:
+            continue
+        if a.get("batch_policy") not in digests.get(k, set()):
+            bad.append(f"{a['uid']}: episode batch_policy {a.get('batch_policy')!r}")
+    facts = {cid: f for cid, f in startup.items() if f.get("kind") in kinds}
+    bad += [f"no {k} startup facts" for k in kinds
+            if not any(f.get("kind") == k for f in facts.values())]
+    for cid, f in sorted(facts.items()):
+        st = f.get("startup") or {}
+        if not policy_ok(st.get("batch_policy"), f["kind"]) or st.get("phased") is not True \
+                or not (_num(st.get("executor_workers")) and st["executor_workers"] >= 1):
+            bad.append(f"{cid[-8:]} startup facts {sorted(st)}")
+            continue
+        ok, why = resources_ok(st.get("resources"))
+        if not ok:
+            bad.append(f"{cid[-8:]} startup: {why}")
+    detail = (f"shard audits {rows}, startup facts from {len(facts)} container(s)"
+              + (f"; {note}" if note else ""))
+    return not bad, detail + ("; " + "; ".join(bad[:6]) if bad else "")
+
+
+CACHE_KEYS = ("compile_cache", "cache_provenance")
+
+
+def cache_provenance_check(audits: list[dict[str, Any]], receipts: list[dict[str, Any]],
+                           kinds: tuple[str, ...] = ("segment", "caption")
+                           ) -> tuple[bool | None, str]:
+    """Compile-cache provenance per shard (Fix-13). ``None`` (skipped) when no shard audit row
+    or receipt of ``kinds`` carries one of :data:`CACHE_KEYS`; otherwise every such shard must,
+    naming a ``state`` (or ``source``)."""
+    def prov(d: dict[str, Any]) -> Any:
+        return next((d[k] for k in CACHE_KEYS if d.get(k) is not None), None)
+
+    shards: dict[str, Any] = {}
+    for d in [a for a in audits if a.get("shard_audit") and a.get("stage") in kinds] + \
+            [x for x in receipts if x.get("kind") in kinds]:
+        sid = str(d.get("shard_id"))
+        if shards.get(sid) is None:
+            shards[sid] = prov(d)
+    if not any(v is not None for v in shards.values()):
+        return None, "no shard records it (Fix-13 compile-cache provenance not merged): skipped"
+    missing = sorted(s for s, v in shards.items() if v is None)
+
+    def named(v: Any) -> str | None:
+        if isinstance(v, dict):
+            return v.get("state") or v.get("source")
+        return v if isinstance(v, str) and v else None
+
+    unnamed = sorted(s for s, v in shards.items() if v is not None and not named(v))
+    states = Counter(str(named(v)) for v in shards.values() if v is not None)
+    return (not missing and not unnamed,
+            f"{len(shards) - len(missing)}/{len(shards)} shards, states {dict(states)}"
+            + (f"; missing {missing}" if missing else "")
+            + (f"; no state {unnamed}" if unnamed else ""))
+
+
+def job_audits(store: Any, root: str) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for f in store.list(f"{root}/"):
+        if "/audit/" not in f:
+            continue
+        for line in store.get_bytes(f).decode().splitlines():
+            with contextlib.suppress(ValueError):
+                a = json.loads(line)
+                if isinstance(a, dict):
+                    out.append(a)
+    return out
+
+
+def assert_new(r: JobRun, watch: ContainerWatch | None) -> None:
+    """The checks of the behaviours H0 had never run on Modal (module docstring, step 6)."""
+    from dataclasses import asdict
+
+    from flora_deploy import sdk
+    from flora_deploy.jobs import attempts as A
+    from flora_deploy.jobs import progress as P
+    from flora_deploy.jobs.containers import read_startup_facts
+    from flora_deploy.jobs.pools import read_drains, read_prewarm_plans
+    from flora_deploy.jobs.store import JobPaths
+
+    p = r.plan
+    job = sdk.open_job(r.job_id, store=p.store.uri, environment=p.environment)
+    store = job.store
+    root = JobPaths(r.job_id).root
+    drains, prewarms = read_drains(store, root, p.config_hash)
+    plans = read_prewarm_plans(store, root, p.config_hash)
+    try:
+        rows = list(job.report()["spend"]["containers"])
+    except Exception as e:  # noqa: BLE001 - reported as a failed check
+        rows = []
+        r.check("job report: per-container rows", False, repr(e))
+    seen = watch.seen if watch is not None else {}
+    if watch is not None:
+        dr = drain_rows(p.app_name, rows, seen, drains, dict(p.worker_classes),
+                        observed_until=watch.last_poll)
+        r.drain = dr  # type: ignore[attr-defined]
+        ok, detail = drain_check(dr)
+        r.check(f"job-end scale-to-zero: containers gone <= {DRAIN_BOUND_S:.0f} s after drain",
+                ok, detail + (f" ({watch.errors} missed polls)" if watch.errors else ""))
+    else:
+        r.check("job-end scale-to-zero", False, "no container watch (Modal TaskList)")
+    if r.spec.preset != "balanced":
+        return
+    ok, detail = prewarm_check(plans, prewarms, rows, seen)
+    r.check("caption pre-warm: planned, started, container on time", ok, detail)
+    audits = job_audits(store, root)
+    ok, detail = batch_fill_check(audits, read_startup_facts(store, r.job_id))
+    r.check("batch-fill fields (two-phase, policy, resources) in audits + startup facts",
+            ok, detail)
+    receipts: list[dict[str, Any]] = []
+    with contextlib.suppress(Exception):
+        manifest = job._deps().manifests.load()
+        jf = A.JobFiles(store, r.job_id, p.config_hash, stage_hashes=dict(manifest.stage_hashes))
+        for s in manifest.shards:
+            rec = P.read_receipt(jf, s.kind, s.shard_id)
+            if rec is not None:
+                receipts.append(asdict(rec))
+    okc, detail = cache_provenance_check(audits, receipts)
+    r.check("compile-cache provenance per shard", bool(okc), detail, gap=okc is None)
+
+
+# ---------------------------------------------------------------------------------------------
 # Cleanup
 
 
@@ -594,8 +1066,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-wall-s", type=float, default=1500.0,
                     help="cancel the jobs if `flora run` has not returned by then")
     ap.add_argument("--json", type=Path, help="write the report here")
-    ap.add_argument("--preset", choices=("exact", "balanced", "both"), default="both",
-                    help="which jobs to run (default both: 2 exact + 3 balanced)")
+    ap.add_argument("--preset", choices=("exact", "balanced", "both"), default="balanced",
+                    help="which jobs to run (default balanced: the 3 balanced jobs; both: "
+                         "also the 2 exact ones)")
     args = ap.parse_args(argv)
 
     run_id = args.run_id or (time.strftime("%m%d%H%M") + uuid.uuid4().hex[:4])
@@ -608,15 +1081,21 @@ def main(argv: list[str] | None = None) -> int:
     t0 = time.time()
     print(f"H0 run {run_id} in {work}", flush=True)
 
-    manifest = golden_manifest()
-    eps = fetch_dataset(manifest, work, download=not args.dry_run)
     runs: list[JobRun] = []
-    for spec in JOBS:
-        if args.preset != "both" and spec.preset != args.preset:
-            continue
+    selected = [s for s in JOBS if args.preset == "both" or s.preset == args.preset]
+    needed = {s.data for s in selected}
+    manifest = golden_manifest()
+    eps = fetch_dataset(manifest, work, download=not args.dry_run,
+                        episodes={k: v for k, v in EPISODES.items() if k in needed},
+                        poison_job="yam" if "yam" in needed else None)
+    for spec in selected:
         cfg_path = write_config(work, spec.name, run_id)
         runs.append(JobRun(spec.name, cfg_path, job_id_for(run_id, spec.name),
                            eps[spec.data]))
+    projection = projected_cost({r.job: plans(r.cfg_path)["fake"] for r in runs})
+    print(f"projected cost: ${projection['usd']:.2f} (${projection['usd_undrained']:.2f} if "
+          f"idle pools kept their {PROJ_UNDRAINED_TAIL_S:.0f} s window); per job "
+          f"{projection['jobs']}", flush=True)
     if args.dry_run:
         for r in runs:
             pl = plans(r.cfg_path) if (work / r.spec.data).is_dir() else None
@@ -634,6 +1113,7 @@ def main(argv: list[str] | None = None) -> int:
     app_names: list[str] = []
     watch: list[str] = []
     notes: list[str] = []
+    watch: ContainerWatch | None = None
     try:
         # media to its own Volume (input.stage_to), as Wave H stages it
         for data in sorted({r.spec.data for r in runs}):
@@ -691,6 +1171,8 @@ def main(argv: list[str] | None = None) -> int:
             for fut in [pool.submit(setup, r) for r in runs]:
                 fut.result()  # re-raise the first setup failure
 
+        # every container of this run's apps, as Modal sees it (the drain / pre-warm checks)
+        watch = ContainerWatch(lambda app: app in app_names).start()
         procs = {}
         for r in runs:
             args_ = [fl, "run", "--config", str(r.cfg_path), "--fake-models", "--determinism",
@@ -714,6 +1196,12 @@ def main(argv: list[str] | None = None) -> int:
                 f.write(f"[{r.job} flora run rc={pr.returncode}]\n{out}\n")
             print(f"[{r.job}] flora run rc={pr.returncode}\n  " +
                   "\n  ".join(out.strip().splitlines()[-8:]), flush=True)
+        # the job-end drains happen as the jobs end: give them the bound (and one poll) to act
+        # before anything is stopped (`modal app stop` would end the containers itself)
+        watch.wait_drained(time.time() + WATCH_TAIL_S)
+        watch.stop()
+        print(f"container watch: {len(watch.seen)} containers, still alive {watch.alive()}",
+              flush=True)
         for r in runs:
             st = sh([fl, "status", r.job_id, "--config", str(r.cfg_path), "--json"], cwd=work,
                     log=log, check=False)
@@ -725,23 +1213,31 @@ def main(argv: list[str] | None = None) -> int:
                     res.returncode == 0, " ".join((res.stdout + res.stderr).split())[-160:],
                     gap=True)
             assert_job(r, run_id, getattr(r, "poison", None))
+            try:
+                assert_new(r, watch)
+            except Exception as e:  # noqa: BLE001 - reported as a failed check
+                r.check("new-behaviour checks ran", False, repr(e))
     except Exception as e:  # noqa: BLE001 - always clean up, then report
         import traceback
 
         traceback.print_exc()
         notes.append(f"aborted: {e!r}")
     finally:
+        if watch is not None:
+            watch.stop()
         notes += cleanup(app_names, run_id, [r.job_id for r in runs], watch, keep=args.keep)
         if not args.work:
             for data in EPISODES:
                 shutil.rmtree(work / data, ignore_errors=True)
 
     report = {"run_id": run_id, "wall_s": round(time.time() - t0, 1), "apps": app_names,
-              "notes": notes, "jobs": {r.job: {
+              "projected": projection, "notes": notes, "jobs": {r.job: {
                   "job_id": r.job_id, "state": r.status.get("state"), "rc": r.run_rc,
                   "spend_usd": r.status.get("spend_usd"),
+                  "drain": getattr(r, "drain", None),
                   "checks": [c.__dict__ for c in r.checks]} for r in runs}}
-    print(f"\nH0 {run_id}: {report['wall_s']} s, apps {app_names}")
+    print(f"\nH0 {run_id}: {report['wall_s']} s, apps {app_names}, projected "
+          f"${projection['usd']:.2f}")
     ok = not any(n.startswith("aborted") for n in notes)
     for r in runs:
         print(f"  [{r.job}] {r.job_id}: state={r.status.get('state')} rc={r.run_rc} "
@@ -750,6 +1246,10 @@ def main(argv: list[str] | None = None) -> int:
             tag = "PASS" if c.ok else ("GAP " if c.gap else "FAIL")
             print(f"    {tag} {c.name}" + (f": {c.detail}" if c.detail else ""))
             ok &= c.ok or c.gap
+        for d in getattr(r, "drain", None) or ():
+            gap = "-" if d["gap_s"] is None else f"{'>=' if d['alive'] else ''}{d['gap_s']} s"
+            print(f"      container {d['container_id']} {d['kind'] or d['class']}: "
+                  f"gone {gap} after its drain")
     for n in notes:
         print(f"  note: {n}")
     if args.json:

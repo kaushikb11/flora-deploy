@@ -16,7 +16,7 @@ dry run comes to **$2.25 nominal and $4.42 upper**, so its global cap is **$4.50
 runs only after review 10 is clean, CI is green and H0 passes.
 
 ```
-uv run python scripts/h0_rehearsal.py               # H0: CPU rehearsal on real Modal (~$0.10)
+uv run python scripts/h0_rehearsal.py               # H0: balanced CPU rehearsal on Modal (~$0.4)
 uv run python scripts/wave_h.py --dry-run           # balanced-only: the plan and its estimates
 uv run python scripts/wave_h.py --dry-run --offline # ... without reading the golden manifest
 uv run python scripts/wave_h.py --yes-spend         # step 0; exits 4 with the pin to make
