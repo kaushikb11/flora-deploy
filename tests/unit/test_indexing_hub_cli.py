@@ -96,6 +96,37 @@ def test_hub_staged_keeps_files_and_missing_file_is_source_error(tmp_path):
     assert len(list((tmp_path / "stage").rglob("*.mp4"))) == 1
 
 
+class ResolvingHub(FakeHub):
+    """Like ``hf_hub_download``: resolves ``local_dir`` and returns the file by its real path."""
+
+    def download(self, repo, revision, filename, local_dir):
+        return super().download(repo, revision, filename, Path(local_dir).resolve())
+
+
+def test_hub_staged_under_symlinked_mount_is_not_copied_onto_itself(tmp_path):
+    """Modal mounts a Volume at /vol/<name> as a symlink to /__modal/volumes/vo-...: the
+    download comes back by the real path and must not be copied onto itself (SameFileError)."""
+    tree = tmp_path / "repo"
+    eps = [{k: Spec(n, seed=e * 10 + c) for c, k in enumerate(KEYS)}
+           for e, n in enumerate([8, 6])]
+    synth.lerobot_v3_tree(tree / "sub", eps, ["t"])
+    real = tmp_path / "__modal" / "volumes" / "vo-x"
+    real.mkdir(parents=True)
+    mount = tmp_path / "vol" / "flora-scale"
+    mount.parent.mkdir()
+    mount.symlink_to(real, target_is_directory=True)
+    hub = ResolvingHub(tree)
+    job = _hub_job("lerobot_v3", subdir="sub", cameras=CMAP)
+    job = I.IndexJob(job_id=job.job_id, dataset=job.dataset, pool=job.pool, decode=True,
+                     revision=REV)  # the Modal index decodes through the mount path too
+    files = I.open_dataset(job.dataset, work=str(mount / "run" / "wash"), hub=hub,
+                           staged=True)
+    s = I.run_index(job, LocalStore(tmp_path / "store"), files, log=lambda m: None)
+    assert s["counts"]["indexed"] == 2 and s["counts"]["failed"] == 0
+    assert len(list((real / "run" / "wash").rglob("meta/info.json"))) == 1
+    assert len(list((real / "run" / "wash").rglob("*.mp4"))) == 3
+
+
 def test_hub_mp4_dir_lists_names_without_downloading(tmp_path):
     tree = tmp_path / "repo"
     synth.encode(tree / "clips/a.mp4", Spec(5))
