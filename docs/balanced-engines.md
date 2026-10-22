@@ -1,14 +1,28 @@
-# P1b-1: vLLM engines and the `balanced` segment / caption stages
+# vLLM engines and the `balanced` segment / caption stages
 
-Status: 2026-10-21. Code, unit tests, conformance and nvlink tests are done and green on CPU.
-**GPU validation has not been run.** The user put it on hold for budget reasons. It is ready to run
-as one command per model kind (see "GPU validation" below). No Modal GPU container was started,
-and P1b-1 has spent **$0**.
+Status: 2026-10-22. CPU tests, conformance and nvlink tests are green. A first GPU pass ran on
+2026-10-22 (see Results): TempSeg's in-engine checks passed, the Captioner's are still to do, and
+no `balanced` certificate exists yet.
 
-2026-10-22 (Wire-balanced): `balanced` deploys and runs through `flora deploy` / `flora run`
-(see "Deployment" below). Without a certificate it needs `allow_uncertified: true`. Every record
-these stages write is `certified: false` with `uncertified_reason: "uncertified_stack"` until
-certificates (P1b-2) exist.
+Terms used below (maintainer doc):
+
+- **oracle**: the `exact` preset's run, NVIDIA's own code on the reference GPU, which `balanced`
+  is measured against.
+- **Gate C**: the capture check that vLLM's model inputs match NVIDIA's HF processor
+  ([`gate-c.md`](gate-c.md)).
+- **L0**: the in-engine check that vLLM's prompt token ids and video grid equal NVIDIA's HF
+  processor replay on captured requests.
+- **Gate A**: the `dt_bias` FP32 drift check: logit differences between the stock bf16 engine and
+  the FP32 `dt_bias` plugin engine (recorded only; it does not affect certification).
+- **the 2026-10-22 GPU run** ("Wave H-lite" in `scripts/wave_h.py` and the Results block): the
+  first measured `balanced` session ([`wave-h-runbook.md`](wave-h-runbook.md)).
+
+`balanced` deploys and runs through `flora deploy` / `flora run` (see "Deployment" below).
+Without a certificate it needs `allow_uncertified: true`. Every `segment` / `caption` record is
+`certified: false` with `uncertified_reason: "uncertified_stack"` until a certificate
+([`certification.md`](certification.md)) exists. `balanced`'s reward stages are not affected:
+they run exactly `exact`'s engine, so they are the reference by identity and are certified
+without a certificate.
 
 ## Deployment (`modal_app/factory.py`, `modal_app/balanced_app.py`)
 
@@ -18,16 +32,19 @@ certificates (P1b-2) exist.
   `flora-weights` and `flora-cache` mounted read-only, and the store and media mounts. Their env
   adds `FLORA_DERIVED_RECEIPTS` (the `weights.derived` receipts of the kind),
   `FLORA_POOL_GPUS`, `FLORA_KIND_MODES` and `FLORA_EMBODIMENT`.
-- **`@modal.enter`**, failing closed at each step: the preflight (store, media root,
+- **`@modal.enter`**, failing closed at each step. Step 0 is `check_pinned_kind`: a derived
+  weight with no pinned content digest makes the container serve a `RefusedRunner`, which ends
+  every shard `deployment_refused` at once, with no retry. The keyed compile cache is prepared
+  before NVIDIA's code is loaded. Then the preflight (store, media root,
   instruction); then the derived weights. The receipt file on the Volume must hash to the
   recorded `weights.derived` identity, and its content digest (recomputed) must equal
-  `pins.DERIVED_PINS` (`None` refuses: TempSeg merger v2 is not pinned yet, so `SegmentWorker`
-  refuses until it is). Every byte is then hashed against the receipt, on a thread joined before
+  `pins.DERIVED_PINS` (`None` refuses; both `captioner-bf16` and `tempseg-merged` v2 are
+  pinned, `config/pins.py`). Every byte is then hashed against the receipt, on a thread joined before
   ready. Next the Captioner's `model.visual` `_extra_state` check, then the certification stamp
   (`workers_impl/certstamp.py`: `embodiment`, `cert_key` from `validate.certkey.key_document`
   on the pool GPU with the verified content digests, `gpu`). Then NVIDIA's code, the processor,
   and `OfflineEngine(spec_for(kind, model, pool GPU))`, which runs the dt_bias plugin flag check
-  and the GDN dtype verify (M6). Last come the accel patches and the runner, with
+  and the GDN dtype verify. Last come the accel patches and the runner, with
   `fatal=workers_app._die` (CUDA fault or dead engine: mark, then exit the container).
 - **Segment -> caption, per episode.** Caption shards `depends_on` the segment shards that hold
   their episodes (manifest). The orchestrator (`jobs.orchestrator.deps_ready`; the reconciler
@@ -35,13 +52,23 @@ certificates (P1b-2) exist.
   upstream. A segment shard is resolved when it is satisfied. A quarantined, bisected one is
   resolved when the child holding that episode is satisfied, or when the episode was done before
   the bisection. In the worker, `attempts.upstream_excluded` gives the episodes the segment
-  stage excluded: poison-pilled ones, and ones in a segment receipt's `episodes_failed`
+  stage excluded: ones set aside for crashing their worker every time (`poison_pill`), and ones in a segment receipt's `episodes_failed`
   (`nv_failure`). They are written as caption `EpisodeError`s with that kind and
   `diagnostics.upstream: true`, and never reach the model. The error-rate guard counts them
   once, at `segment` (`progress.UPSTREAM_KINDS`, `tally_exclusions`, compose's
   `excused_upstream`). Resume, preemption and bisection use the existing machinery for both
   pools. The budget projection prices both pools (rate table rows `balanced segment/caption`,
   with a startup per pool).
+- **Scale to zero and pre-warm** (`jobs/pools.py`). When a pool has no work left (segment while
+  caption still runs, and every pool at job end), the orchestrator drops that class's
+  `scaledown_window` to 2 s within one 15 s poll, and restores it before new work arrives. Caption
+  is never drained while segment still produces. The orchestrator also raises caption's
+  `min_containers` to 1 at the estimated `segment ready - caption startup`, so an H100 boots
+  while segment finishes (`pool_prewarm_*` events; the budget charges the pre-warmed container
+  from its start). The pre-warm is skipped when `min_containers > 0`.
+- **GPU overrides.** Each pool needs a minimum of GPU memory (segment 44 GiB, caption 79 GiB,
+  `config/presets.py`) and a `GPU_LIMITS` row for its GPU (below): TempSeg runs on L40S,
+  A100-80GB, H100 or H200; the Captioner on H100 or H200. `flora deploy` refuses any other.
 - **Fake models.** `flora deploy/run --fake-models` registers `FakeSegmentWorker` /
   `FakeCaptionWorker` (CPU), and `flora run --local --fake-models` runs `preset: balanced` too.
   Both are the real `BalancedShardRunner` and micro-batcher, with `local/balanced.py`'s fake jobs
@@ -51,16 +78,16 @@ certificates (P1b-2) exist.
 ## Design
 
 ```
-episode coroutines (one event loop, ≤ max_inflight_episodes)
+episode coroutines (one event loop; ≤ 8 preparing, ≤ 64 segment / 32 caption inferring)
   NVIDIA FineSubtaskSegmenter ──await apredict(request)──► MicroBatchPredictor (subclass of NVIDIA's Predictor)
                                                              │ to_thread: NVIDIA's own Predictor.predict
                                                              │   (window, frame plan, frames_for, human_transport,
                                                              │    temporal_inputs → CaptureProcessor)
                                                              │   pipeline.generate is tapped → CapturedRequest + sentinel
                                                              ▼
-  NVIDIA caption_three / caption_single ── same tap ──► CapturedRequests (Gate C wrap: vllm_prompt)
+  NVIDIA caption_three / caption_single ── same tap ──► CapturedRequests (capture wrap: vllm_prompt)
                                                              ▼
-                                         MicroBatcher.generate_many  (round-based, D14)
+                                         MicroBatcher.generate_many  (round-based)
                                                              ▼  one llm.generate per round, worker thread
                                          OfflineEngine (vLLM 0.24.0 offline LLM, explicit args)
                                                              ▼
@@ -94,8 +121,11 @@ episode coroutines (one event loop, ≤ max_inflight_episodes)
   size, profile, wrist and sync checks. The pool comes from `pipeline.annotate`'s one-liner,
   restated in `pool_for`. The caption stage reproduces `pipeline.annotate`'s provenance copy and
   `api.annotate`'s interval check.
-- **Micro-batcher** (`engines/microbatch.py`). Each episode runs inside `async with mb.episode()`.
-  A round fires when one of these holds:
+- **Micro-batcher** (`engines/microbatch.py`) and **batch policy** (`engines/batch_policy.py`).
+  An episode prepares its inputs first (input resolve and NVIDIA's probe; at most
+  `prefetch_episodes` = 8 preparing or waiting), then enters `async with mb.episode()` for
+  inference only (at most `infer_episodes`: segment 64, caption 32), so a preparing episode never
+  holds a round back. A round fires when one of these holds:
   - every live episode is blocked on the batcher (it has calls pending or in flight, or is waiting
     for admission);
   - `max_batch` requests or `max_batch_bytes` of frames are pending;
@@ -108,6 +138,16 @@ episode coroutines (one event loop, ≤ max_inflight_episodes)
   pending. Failures are isolated: a batch that raises fails only its own calls, and per-request
   errors come back in `Completion.error`. On `KeyboardInterrupt` (SIGINT) the batcher fails its
   calls and the exception propagates, so the worker's preemption path runs.
+
+  The batch policy's bounds are `max_batch` 128, `max_wait_s` 0.5, `max_batch_bytes` 3 GiB and
+  `max_pending_bytes` 6 GiB. They are code, not a `flora.yaml` knob: batch grouping changes
+  numerics, so `batch_policy.py` is in the `vllm-video` logic digest and a change re-keys the
+  stage, its certificate and its compile cache. The effective policy is recorded in the shard
+  audit row.
+- **Batch bisection** (`OfflineEngine.generate_batch`). A batch that raises is split in halves
+  and retried, recursively, so one bad request costs O(log n) generates and its batch-mates stay
+  batched. A dead engine (`EngineDead`: vLLM's `EngineDeadError` or a CUDA fault) is never
+  retried; the worker fails fast and exits.
 - **Workers** (`workers_impl/segment.py`, `workers_impl/caption.py`). `BalancedShardRunner`
   follows the full `ShardWorker` contract by mirroring `RewardShardRunner`, and reuses its
   `ShardPartSink`, `parse_index_receipt` and `VideoResolver`. Episodes run concurrently on one
@@ -121,19 +161,19 @@ episode coroutines (one event loop, ≤ max_inflight_episodes)
   model pins, the GPU and the per-camera source. The job's segment / caption **stage hashes**
   (`config/hashing.py`, which key the shard files) cover the worker's full `EngineSpec.hashed()`
   on the configured GPU (`engine.spec`: every engine kwarg incl. the per-GPU scheduler limits and
-  `dtbias_fp32`; the GPU name stays out, D11), so a GPU override with other limits gets a new
+  `dtbias_fp32`; the GPU name stays out, as `docs/PLAN.md`'s hashing rule says), so a GPU override with other limits gets a new
   key instead of resuming into old shards. The stage's own hash (engine spec, NVIDIA's sampling,
   model pins, the logic version and the `vllm-video` logic digest) is kept in
   `provenance.engine_hash`; the sink stamps the stage key as `provenance.config_hash`, as for
   rewards. A `dtbias_fp32` deploy knob does not exist yet; when one lands it must reach
-  `hashed_spec_for(..., dtbias_fp32=...)` in the hash. All new
-  modules are classified in `config/logic.py` under `vllm-video`. `engines/` and
-  `engines/patches/` are now classified directories.
+  `hashed_spec_for(..., dtbias_fp32=...)` in the hash. The engine, stage and batch-policy
+  modules are classified in `config/logic.py` under `vllm-video`; `engines/compile_cache.py` and
+  `jobs/pools.py` are classified as not output-affecting.
 
 ## Engine settings (`engines/offline_llm.py`)
 
 `EngineSpec.engine_kwargs()` builds every argument explicitly. `validate_engine_kwargs` refuses
-any missing or uncertified value. It also runs Gate C's `assert_engine_kwargs`, which requires the
+any missing or uncertified value. It also runs the capture check's (Gate C) `assert_engine_kwargs`, which requires the
 processor cache to be off.
 
 | Argument | TempSeg (merged, `derived/tempseg-merged@114a1076…`) | Captioner (BF16, `derived/captioner-bf16@fef0bbfe…`) |
@@ -142,11 +182,11 @@ processor cache to be off.
 | `gdn_prefill_backend` | `triton` | `triton` |
 | `enable_prefix_caching` | `False` | `False` |
 | `generation_config` | `vllm` | `vllm` (drops `generation_config.json`'s extra EOS 248044) |
-| `mm_processor_cache_gb` | 0 (Gate C) | 0 |
+| `mm_processor_cache_gb` | 0 (capture check) | 0 |
 | `mm_processor_kwargs` | `{"fps": 4, "max_frames": 128}` | `{"fps": 8, "max_frames": 40}` |
 | `limit_mm_per_prompt` | `{"image": 0, "video": 3}` | same |
 | `max_model_len` | 32768 | 32768 |
-| `max_num_seqs` / `max_num_batched_tokens` / `gpu_memory_utilization` | L40S 32 / 16384 / 0.90; H100 48; H200 64 | H100 16 / 16384 / 0.90; H200 32 |
+| `max_num_seqs` / `max_num_batched_tokens` / `gpu_memory_utilization` | L40S 64 / 16384 / 0.90; A100-80GB 48; H100 48; H200 64 | H100 16 / 16384 / 0.90; H200 32 |
 | `seed` | 0 | 0 |
 | sampling | greedy, 1024 tokens, `stop_token_ids=[<|im_end|>]` | greedy, 512 tokens, `stop_token_ids=[<|im_end|>]` |
 
@@ -157,12 +197,18 @@ Notes:
   asserts that the tokenizer's EOS is `<|im_end|>` for both models.
 - Forbidden arguments: quantization, LoRA, KV/Mamba dtype overrides, `renderer_num_workers` and
   `tokenizer_mode`.
-- The per-GPU limits are first guesses below the #49064 Mamba-block bound. The GPU run must confirm them.
-- `logprobs_mode` / `max_logprobs` are settable only for Gate A measurements. They change what
+- The limits are checked at build: `check_mamba_blocks` fails the engine if `max_num_seqs`
+  exceeds the Mamba cache blocks vLLM allocated (#49064). TempSeg on the L40S was raised to 64
+  for batch fill; the H100 Captioner stays at 16 until a measured run shows a higher value holds.
+- `logprobs_mode` / `max_logprobs` are settable only for the `dt_bias` drift check (Gate A). They change what
   the engine *returns* for logprob requests, not greedy outputs.
-- The startup recipe follows `docs/cold-start.md`: a t=0 `warm.start_prefetch`, plus
-  `VLLM_CACHE_ROOT`, `TRITON_CACHE_DIR`, `CUDA_CACHE_PATH` and `XDG_CACHE_HOME` under
-  `flora-cache:/balanced/<kind>[-dtbias]/`.
+- The startup recipe follows `docs/cold-start.md`: a t=0 `warm.start_prefetch`, then a keyed
+  compile cache (`engines/compile_cache.py`). A verified `flora-cache:/balanced-cc/<key>/`
+  manifest is copied to local disk, and `VLLM_CACHE_ROOT`, `TRITON_CACHE_DIR`, `CUDA_CACHE_PATH`
+  and `XDG_CACHE_HOME` point at that copy. Without one, the lab's `balanced/<kind>` cache is used
+  (same GPU and plugin flag only), or the engine compiles cold and publishes its cache once
+  (`FLORA_COMPILE_CACHE_PUBLISH=0` turns that off). A build that fails on a loaded cache is
+  retried once cold.
 - Container shapes, the same in `balanced_lab` and in the deployed pools
   (`config/presets.py`): TempSeg on L40S with 8 cores, 48 GiB (19 GB weights); the Captioner on
   H100 with 8 cores, 96 GiB (55 GB weights, hashed in full while vLLM loads). The memory limit
@@ -182,7 +228,9 @@ seen in the engine's workers.
 
 ## Tests (CPU)
 
-- `tests/unit/test_engines_microbatch.py` (15) covers:
+Test files (counts drift; run them for the current numbers):
+
+- `tests/unit/test_engines_microbatch.py` covers:
   - the all-blocked round across episodes;
   - waiting for a live but busy episode;
   - the timeout bound;
@@ -194,29 +242,32 @@ seen in the engine's workers.
   - SIGINT propagation;
   - bounded pending memory and oversized admission;
   - the closed batcher.
-- `tests/unit/test_engines_offline.py` (26) covers:
+- `tests/unit/test_engines_offline.py` covers:
   - every required argument and refused value;
-  - Gate C's cache rule;
+  - the capture check's cache rule;
   - GPU tables;
   - label and hash views;
   - NVIDIA sampling;
   - `OfflineEngine` batching with per-request isolation and `too_long` detection;
   - the dt_bias spec/env mismatch.
-- `tests/unit/test_engines_dtbias_plugin.py` (5) covers:
+- `tests/unit/test_engines_dtbias_plugin.py` covers:
   - off by default;
   - `register()` is a no-op without the flag (vLLM is never imported);
   - FP32 values are loaded exactly while the unpatched bf16 path rounds;
   - the loader is kept and the patch is idempotent;
   - the entry point is discoverable.
-- `tests/unit/test_balanced_stage.py` (11) covers:
+- `tests/unit/test_balanced_stage.py` covers:
   - NVIDIA's acceptance rules (EOS, empty output, the 32k guard on vLLM's length, `too_long`);
   - error classification;
   - the tap collecting and restoring, with one round per call set;
   - first failure in call order;
   - the record round trip;
   - the config hash (sensitive to the engine, not to the model path).
-- `tests/unit/test_balanced_workers.py` (3) covers index receipt → NVIDIA arguments and upstream
+- `tests/unit/test_balanced_workers.py` covers index receipt → NVIDIA arguments and upstream
   segment records across bisection children and config hashes.
+- `tests/unit/test_balanced_phases.py` (preparation outside the batcher),
+  `tests/unit/test_compile_cache.py` (keyed compile caches) and `tests/unit/test_pools.py`
+  (scale to zero and pre-warm).
 - `tests/conformance`: `balanced-worker[segment]` and `balanced-worker[caption]` pass all 10
   checks. They use the real runner and the real micro-batcher. The SIGINT is raised inside
   `generate_batch` in the batcher's thread.
@@ -234,7 +285,7 @@ seen in the engine's workers.
   - caption failure semantics;
   - the video kwargs and EOS checks.
 
-## GPU validation (ready to run, not run)
+## GPU validation (lab commands)
 
 ```bash
 uv run modal run src/flora_deploy/modal_app/balanced_lab.py::preflight     # CPU, cents
@@ -249,15 +300,15 @@ uv run python scripts/spend.py --app flora-balanced-lab
   warns and skips unknown names, but the vision tower's loader would `KeyError`, so confirm none
   are under `visual.` before paying for the H100;
 - the EOS tokens;
-- the episodes the GPU runs would pick: the shortest oracle-eligible episode of `human`, `yam`,
-  `single_view_robot` and `dex`.
+- the episodes the GPU runs would pick: the shortest episode of `human`, `yam`,
+  `single_view_robot` and `dex` that can be compared with the oracle.
 
 **Golden paths.** Manifest `path`s are Volume-relative (`golden/v1/...`), so the lab opens
 camera files under the mount itself (`balanced_lab.episode_inputs`). On 2026-10-22 the lab
 joined `<mount>/golden/v1` to them. Every episode raised `FileNotFoundError` and the stage sent
 zero requests. A baseline that sends zero requests now returns `error` / `no_evidence` and skips
-the plugin engine. Wave H's lab step (d2, `scripts/wave_h.py --only lab`) checks the files, the
-episodes and (d)'s segments before it starts a container.
+the plugin engine. The runbook's lab step (`scripts/wave_h.py --only lab`) checks the files, the
+episodes and the deployed job's segments before it starts a container.
 
 **Each GPU call** runs one container with a 20 min hard timeout and two child processes:
 1. **Baseline engine.**
@@ -291,26 +342,26 @@ whether its cache was warm.
 | Gate A (dt_bias FP32 vs bf16) | tempseg: max 0.375, mean 0.033765, greedy 5/6; recommendation: plugin **off** |
 <!-- /wave-h:results -->
 
-**Recommendation for Gate A until it is measured:** ship with the plugin **off**, the default.
-P1b-0's merge check already showed BF16-level drift (mean |Δlogit| ≈ 0.025) with identical greedy
+**Recommendation for the `dt_bias` drift check (Gate A):** ship with the plugin **off**, the
+default. The TempSeg merge check (`docs/tempseg-merge.md`) already showed BF16-level drift (mean |Δlogit| ≈ 0.025) with identical greedy
 JSON on real windows. The `dt_bias` rounding is one more BF16 rounding of 24/48 small vectors, and
-its effect should be of the same order or smaller. Run Gate A with the command above before P1b-2
-certifies. If the drift exceeds the oracle's cross-GPU noise, turn the plugin on (`dtbias_fp32=True`
+its effect should be of the same order or smaller. Run the drift check with the command above before `balanced` is
+certified. If the drift exceeds the oracle's cross-GPU noise, turn the plugin on (`dtbias_fp32=True`
 in the spec plus `install_entry_point` env) and certify that stack instead.
 
 ## Known limits and follow-ups
 
 - The micro-batcher packs across episodes, so batch composition differs from NVIDIA's batch-1
-  calls and changes numerics (`docs/rewarder-smoke.md`). That is allowed for `balanced`, and P1b-2
+  calls and changes numerics (`docs/rewarder-smoke.md`). That is allowed for `balanced`, and certification
   measures it against the oracle's noise.
 - The worker uses NVIDIA's `media.probe` per camera, which fully decodes each camera, plus NVIDIA's
-  decode for frames. The OPT-1 `accel` patches (decode-once, in-memory PNG, pools) are now wired
+  decode for frames. The `accel` patches (`docs/accel.md`) (decode-once, in-memory PNG, pools) are now wired
   in. `workers_impl/balanced.py` applies every registered patch (each behind its parity test;
   `FLORA_BALANCED_ACCEL=none` turns them off) and runs each episode coroutine inside
   `active.episode()`. `tests/nvlink/test_balanced_accel.py` checks that every model request
   (prompt, frames, metadata digest), every record and every audit is byte-identical with and
   without them. It runs two overlapping episodes (1-view human, 3-view YAM) on real H.264 files
   through NVIDIA's code and the Flora processors. The probe's full decode is still NVIDIA's.
-- Pre-rendering and AsyncLLM (online, `render_cmpl_async`) are out of scope. Gate C would need
-  extending first.
+- Pre-rendering and AsyncLLM (online, `render_cmpl_async`) are out of scope. The capture check
+  would need extending first.
 - `_preprocess_cmpl` is a private vLLM API, used only by the lab's L0 check.
