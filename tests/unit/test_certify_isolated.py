@@ -298,3 +298,24 @@ def test_segment_certification_is_unchanged_under_v4():
     assert certkey.GENERATOR_VERSIONS == ("4",)
     assert "3" in certkey.RETIRED_GENERATOR_VERSIONS
 
+
+
+def test_oracle_and_noise_from_the_pre_v4_code_still_pair():
+    """Order A: (b) and the noise-12 run come from the code before this change (another segcap
+    stage hash and exact key than this checkout computes). Only noise == oracle is required;
+    the candidate is bound to this checkout's key on its own."""
+    def old(recs):
+        out = []
+        for r in recs:
+            doc = {**r.provenance.cert_key, "logic_digest": "0" * 64}
+            out.append(dataclasses.replace(r, provenance=dataclasses.replace(
+                r.provenance, cert_key=doc, config_hash="9" * 64)))
+        return out
+
+    c = run(old(caption_set("exact", 12)), caption_set("balanced", 12),
+            old(caption_set("exact", 6)))
+    assert c["verdict"] == "certified", c["reasons"]
+    assert c["oracle"]["stage_hash"] == "9" * 64
+    assert c["segments_from"]["oracle_stage_hash"] == "9" * 64
+    with pytest.raises(C.CertifyError, match="repeat the oracle run"):  # noise != oracle
+        run(old(caption_set("exact", 12)), caption_set("balanced", 12), caption_set("exact", 6))
