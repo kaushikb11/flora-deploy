@@ -327,9 +327,10 @@ def test_lab_is_not_started_when_the_budget_cannot_carry_it(lab_ctx):
     ctx, recs = lab_ctx
     ctx.global_cap = 0.2  # ~250 s of L40S: under TempSeg's expected two compiles
     fake = _Lab({})
-    res = wh.run_lab(ctx, missing=lambda p: [], records=recs, lab_module=fake)
-    assert fake.spawned == [] and res["tracked_usd"] == 0.0 and not res["ok"]
-    assert all("budget left" in v["skipped"] for v in res["kinds"].values())
+    # the stop rule, raised before the lab app starts (not a skip inside a running app)
+    with pytest.raises(wh.StopRule, match=r"budget left .* \(binding: global left\)"):
+        wh.run_lab(ctx, missing=lambda p: [], records=recs, lab_module=fake)
+    assert fake.spawned == [] and fake.runs == [] and ctx.st.step("lab").current.apps == []
 
 
 # --- argv size, reuse of saved results, per-kind persistence ------------------------------------

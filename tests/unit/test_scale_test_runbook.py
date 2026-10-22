@@ -153,12 +153,15 @@ def test_spend_after_a_step_over_its_cap_stops_the_runbook(offline, tmp_path, mo
     assert offline == ["verify", "index", "plan"]
 
 
-def test_in_step_budget_is_cap_minus_earlier_attempts():
+def test_in_step_budget_is_the_attempt_cap_within_the_global_cap_left():
     st = wh.State("r", 0.0, "2026-10-22")
     s = st.step("run")
     s.attempts.append(wh.Attempt(started=1.0, status="failed", tracked_usd=4.0))
-    left = wh.step_budget(st, "run", caps=sc.caps("real"), global_cap=sc.global_cap("real"))
-    assert left == pytest.approx(sc.caps("real")["run"] - 4.0)
+    c, g = sc.caps("real"), sc.global_cap("real")
+    b = wh.budget_for(st, "run", caps=c, global_cap=g)
+    # the cap is per attempt; the earlier attempt counts against the global cap
+    assert b.usd == pytest.approx(min(c["run"], g - 4.0))
+    assert wh.step_budget(st, "run", caps=c, global_cap=g) == b.usd
 
 
 def test_modal_modes_need_yes_spend(offline, tmp_path):

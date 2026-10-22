@@ -719,11 +719,15 @@ def save_state(st: State, path: Path = STATE) -> None:
     rb.save_state(st, path)
 
 
+Budget, Decision = rb.Budget, rb.Decision
+budget_for, reserve_for = rb.budget_for, rb.reserve_for
+
+
 def check_before(st: State, step: str, proj: Projection, *,
-                 caps: Mapping[str, float] = CAPS_USD, global_cap: float = GLOBAL_CAP_USD
-                 ) -> None:
-    """The **upper** projection must fit the step cap and the global cap left (H2)."""
-    rb.check_before(st, step, proj, caps=caps, global_cap=global_cap)
+                 caps: Mapping[str, float] = CAPS_USD, global_cap: float = GLOBAL_CAP_USD,
+                 reserve: Mapping[str, float] | None = None) -> Budget:
+    """The **upper** projection must fit the step's budget (``_runbook.budget_for``; H2)."""
+    return rb.check_before(st, step, proj, caps=caps, global_cap=global_cap, reserve=reserve)
 
 
 def check_after(st: State, step: str, *, caps: Mapping[str, float] = CAPS_USD,
@@ -732,19 +736,40 @@ def check_after(st: State, step: str, *, caps: Mapping[str, float] = CAPS_USD,
 
 
 def step_budget(st: State, step: str, *, spent_in_step: float = 0.0,
-                caps: Mapping[str, float] = CAPS_USD, global_cap: float = GLOBAL_CAP_USD
-                ) -> float:
+                caps: Mapping[str, float] = CAPS_USD, global_cap: float = GLOBAL_CAP_USD,
+                reserve: Mapping[str, float] | None = None) -> float:
     """What the step may still spend (``_runbook.step_budget``)."""
     return rb.step_budget(st, step, spent_in_step=spent_in_step, caps=caps,
-                          global_cap=global_cap)
+                          global_cap=global_cap, reserve=reserve)
 
 
 def gpu_deadline_s(st: State, step: str, c: Container | float, *, spent_in_step: float = 0.0,
                    slack_s: float = CLIENT_SLACK_S, caps: Mapping[str, float] = CAPS_USD,
-                   global_cap: float = GLOBAL_CAP_USD) -> float:
+                   global_cap: float = GLOBAL_CAP_USD,
+                   reserve: Mapping[str, float] | None = None) -> float:
     """Wall seconds still affordable at ``c``'s $/s in this step (``_runbook.gpu_deadline_s``)."""
     return rb.gpu_deadline_s(st, step, c, spent_in_step=spent_in_step, slack_s=slack_s,
-                             caps=caps, global_cap=global_cap)
+                             caps=caps, global_cap=global_cap, reserve=reserve)
+
+
+def decide(st: State, plan: str, step: str, projections: Mapping[str, Projection], *,
+           only: str | None = None) -> Decision:
+    """The decision the dry run, ``--status`` and a real run take for ``step``
+    (``_runbook.decide``, on the plan's caps and global cap), with the command that acts on it."""
+    gcap = plan_global_cap(plan, projections, st.override_for(plan))
+    d = rb.decide(st, PLANS[plan], step, projections, caps=plan_caps(plan, projections),
+                  global_cap=gcap)
+    run = f"uv run python scripts/wave_h.py --plan {plan} --yes-spend" + (
+        f" --only {only}" if only else "")
+    if d.action == "run":
+        d.command = run
+    elif d.action == "wait":
+        d.command = f"after {rb.utc(d.clears_at)}: {run}"
+    elif d.action == "stop" and d.budget is not None and d.budget.binding != "attempt cap":
+        short = projections[step].usd_upper - d.budget.usd
+        need = math.ceil((gcap + short) * 20 - 1e-9) / 20
+        d.command = f"{run} --global-cap {need:.2f}  (only with the user's approval)"
+    return d
 
 
 # ---------------------------------------------------------------------------------------------
@@ -922,17 +947,28 @@ class Ctx:
     global_cap: float = GLOBAL_CAP_USD  # the plan's (plan_global_cap)
     spec: PlanSpec = field(default_factory=lambda: SPECS[DEFAULT_PLAN])
     caps: dict[str, float] = field(default_factory=lambda: dict(CAPS_USD))  # plan_caps
+    # the plan's steps and projections: what the global cap keeps for its later steps
+    plan_steps: tuple[str, ...] = ()
+    projections: Mapping[str, Projection] | None = None
 
     @property
     def episodes(self) -> tuple[str, ...]:
         return episodes_in(self.manifest, self.spec.episodes)
 
+    def reserve(self, step: str) -> dict[str, float]:
+        return reserve_for(self.st, self.plan_steps, step, self.projections)
+
+    def budget_of(self, step: str, **kw: Any) -> Budget:
+        """The running attempt's budget: the same rule as the stop rule before it."""
+        return budget_for(self.st, step, caps=self.caps, global_cap=self.global_cap,
+                          reserve=self.reserve(step), **kw)
+
     def deadline_s(self, step: str, c: Container | float, **kw: Any) -> float:
         return gpu_deadline_s(self.st, step, c, caps=self.caps, global_cap=self.global_cap,
-                              **kw)
+                              reserve=self.reserve(step), **kw)
 
     def budget(self, step: str, **kw: Any) -> float:
-        return step_budget(self.st, step, caps=self.caps, global_cap=self.global_cap, **kw)
+        return self.budget_of(step, **kw).usd
 
     def sh(self, args: list[str], *, timeout: float = 1800, check: bool = True):
         return h0.sh(args, cwd=self.work, timeout=timeout, check=check,
@@ -1673,6 +1709,14 @@ def run_lab(ctx: Ctx, *, missing: Callable[[Iterable[str]], list[str]] | None = 
     rdir = LAB_OUT
     rdir.mkdir(parents=True, exist_ok=True)
     fns = {"tempseg": lab.run_tempseg, "captioner": lab.run_captioner}
+    first = todo[0]  # a reused TempSeg result always had requests in
+    limit = min(LAB_DEADLINE_S[first],
+                ctx.deadline_s("lab", LAB[first], slack_s=LAB_SLACK_S))
+    if limit < LAB_EXPECTED_S[first]:  # the stop rule, before the app starts: charged $0
+        b = ctx.budget_of("lab")
+        raise StopRule(f"lab: budget left ${b.usd:.2f} allows {limit:.0f} s of the {first} "
+                       f"call, under the {LAB_EXPECTED_S[first]:.0f} s it needs (binding: "
+                       f"{b.binding}); no lab app started")
     # the app is noted only now: a precondition failure above charged $0
     with _lab_app(ctx, lab, modal, name):
         for kind in todo:
@@ -1979,11 +2023,8 @@ def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
     for name in steps:
         p = projections[name]
         s = st.steps.get(name, StepState())
-        rule = "ok"
-        try:
-            check_before(st, name, p, caps=caps, global_cap=gcap)
-        except StopRule as e:
-            rule = f"STOP: {e}"
+        d = decide(st, plan, name, projections, only=only)
+        rule = {"run": "ok", "done": "done"}.get(d.action) or f"{d.action.upper()}: {d.message}"
         out(f"  {title[name]:66s} [{s.status}] cap ${caps[name]:.2f}  nominal "
             f"${p.usd:.2f}  upper ${p.usd_upper:.2f}  rule: {rule}")
         for i in p.items:
@@ -2041,7 +2082,8 @@ def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
         out(f"  NOT HONEST AT ${gcap:.2f}: the upper total needs a global cap of at "
             f"least ${honest['global']:.2f} (per step: "
             + ", ".join(f"{s} ${honest[s]:.2f}" for s in steps) + "); the runbook stops at the "
-            "first step whose upper projection no longer fits the cap left")
+            "first step whose upper projection, with the later steps' kept for them, no longer "
+            "fits the cap left")
 
 
 def app_name(run_id: str, step: str, attempt: int) -> str:
@@ -2185,7 +2227,7 @@ def main(argv: list[str] | None = None) -> int:
     save_state(st, args.state)
     os.chdir(args.work)  # relative input.path is hashed against the cwd: plan where flora runs
     ctx = Ctx(st, manifest, args.work, state_path=args.state, global_cap=gcap, spec=spec,
-              caps=caps)
+              caps=caps, plan_steps=PLANS[args.plan], projections=projections)
     rc = 0
     for name in PLANS[args.plan]:
         if args.only and name != args.only:
@@ -2197,15 +2239,15 @@ def main(argv: list[str] | None = None) -> int:
         refresh_billing(st)  # every app seen so far, before the step (H3)
         p = projections[name]
         s.projected_usd, s.projected_upper_usd = p.usd, p.usd_upper
-        try:
-            check_before(st, name, p, caps=caps, global_cap=gcap)
-        except StopRule as e:
+        d = decide(st, args.plan, name, projections, only=args.only)
+        if not d.runs:
             s.status, rc = "stopped", 3
-            s.notes.append(f"stop rule before: {e}")
+            s.notes.append(f"stop rule before: {d.message}")
+            print(f"{d.action} {name}: {d.message}" + (f"\n  next: {d.command}" if d.command
+                                                          else ""))
             break
         att = Attempt(started=time.time(), rate_usd_per_s=p.peak_usd_per_s,
-                      budget_usd=round(step_budget(st, name, caps=caps, global_cap=gcap), 4),
-                      slack_s=STEP_SLACK_S.get(name, CLIENT_SLACK_S),
+                      budget_usd=d.budget.usd, slack_s=STEP_SLACK_S.get(name, CLIENT_SLACK_S),
                       hard_timeout_s=STEP_HARD_TIMEOUT_S.get(name))
         s.attempts.append(att)
         s.status = "running"
@@ -2219,6 +2261,11 @@ def main(argv: list[str] | None = None) -> int:
             att.report_error = bool(res.get("report_error"))
             att.status = s.status = ("done" if res.get("ok") else
                                      "needs_pin" if res.get("needs_pin") else "failed")
+        except StopRule as e:  # an in-step stop rule raised before any app started
+            att.status = s.status = "stopped"
+            att.tracked_usd = 0.0
+            s.notes.append(f"stop rule before: {e}")
+            rc = 3
         except Exception as e:  # noqa: BLE001 - recorded; the runbook stops
             att.status = s.status = "failed"
             if att.apps:
@@ -2238,6 +2285,8 @@ def main(argv: list[str] | None = None) -> int:
         except StopRule as e:
             s.notes.append(f"stop rule after: {e}")
             rc = 3
+            break
+        if s.status == "stopped":
             break
         if s.status == "needs_pin":
             print(pin_instructions(s.result))

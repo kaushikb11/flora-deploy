@@ -15,7 +15,7 @@ import os
 import subprocess
 import threading
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -292,50 +292,180 @@ class StopRule(RuntimeError):
     """The runbook stops here (projected or actual spend over a cap)."""
 
 
+@dataclass(frozen=True)
+class Budget:
+    """What one attempt of a step may spend, and which term binds it (``binding``: ``"attempt
+    cap"``, ``"global left"`` or ``"reserve for <steps>"``). ``terms``: every term, in $."""
+
+    usd: float
+    binding: str
+    terms: dict[str, float]
+    reserved_for: tuple[str, ...] = ()
+
+
+def reserve_for(st: State, steps: Sequence[str], step: str,
+                projections: Mapping[str, Any] | None) -> dict[str, float]:
+    """The upper projections of the plan's steps after ``step`` that are not done yet: what the
+    global cap keeps for them."""
+    if not projections or step not in steps:
+        return {}
+    out = {}
+    for s in steps[list(steps).index(step) + 1:]:
+        p = projections.get(s)
+        if p is not None and (st.steps.get(s) or StepState()).status != "done" \
+                and p.usd_upper > 0:
+            out[s] = round(float(p.usd_upper), 4)
+    return out
+
+
+def budget_for(st: State, step: str, *, caps: Mapping[str, float], global_cap: float,
+               reserve: Mapping[str, float] | None = None, spent_in_step: float = 0.0
+               ) -> Budget:
+    """The one budget rule (the stop rule before a step, the attempt's budget and its in-step
+    deadlines all use it): ``min(attempt cap, global cap - spent outside this attempt -
+    reserve for the plan's later steps) - spent_in_step``. ``caps[step]`` is a per-attempt
+    ceiling: earlier attempts count against the global cap, not against it."""
+    cap = float(caps[step])
+    spent = st.spent_outside(step)
+    left = global_cap - spent
+    kept = round(sum((reserve or {}).values()), 4)
+    allowance = left - kept
+    terms = {"attempt cap": cap, "global cap": global_cap, "spent": spent, "global left": left,
+             "reserve": kept, "allowance": allowance}
+    if cap <= allowance + 1e-9:
+        binding, usd = "attempt cap", cap
+    elif kept > 0 and cap <= left + 1e-9:
+        binding, usd = f"reserve for {', '.join(reserve or {})}", allowance
+    else:
+        binding, usd = "global left", allowance
+    return Budget(round(max(0.0, usd - spent_in_step), 4), binding, terms,
+                  tuple(reserve or {}))
+
+
+def _held_note(st: State) -> str:
+    held = st.held()
+    if not held:
+        return ""
+    return "; held until billing covers them: " + ", ".join(
+        f"{n} attempt {i} ${a.charged(st.watermark):.2f} (tracked ${a.tracked_usd:.2f}, about "
+        f"{utc(a.hold_clears_at())})" for n, i, a in held)
+
+
+def over_budget(step: str, proj: Any, b: Budget, st: State | None = None) -> str:
+    """Why ``proj``'s upper projection does not fit ``b``, naming the binding term."""
+    t, up = b.terms, proj.usd_upper
+    if b.binding == "attempt cap":
+        why = (f"{step}: upper projection ${up:.2f} (nominal ${proj.usd:.2f}) is over its cap "
+               f"${t['attempt cap']:.2f} (binding: attempt cap)")
+    elif b.binding == "global left":
+        why = (f"{step}: upper projection ${up:.2f} is over the global budget left "
+               f"(${t['global left']:.2f} of ${t['global cap']:.2f}, ${t['spent']:.2f} spent"
+               + (f", ${t['reserve']:.2f} kept for {', '.join(b.reserved_for)}"
+                  if t["reserve"] > 0 else "") + "; binding: global left)")
+    else:
+        why = (f"{step}: upper projection ${up:.2f} is over the global budget left after the "
+               f"reserve (${t['allowance']:.2f}: ${t['global left']:.2f} of "
+               f"${t['global cap']:.2f} left, ${t['spent']:.2f} spent, ${t['reserve']:.2f} kept "
+               f"for {', '.join(b.reserved_for)}; binding: {b.binding})")
+    return why + (_held_note(st) if st is not None else "")
+
+
 def check_before(st: State, step: str, proj: Any, *, caps: Mapping[str, float],
-                 global_cap: float) -> None:
-    """The **upper** projection must fit the step cap and the global cap left (H2)."""
-    cap = caps[step]
-    up = proj.usd_upper
-    if up > cap + 1e-9:
-        raise StopRule(f"{step}: upper projection ${up:.2f} (nominal ${proj.usd:.2f}) is over "
-                       f"its cap ${cap:.2f}")
-    left = global_cap - st.spent
-    if up > left + 1e-9:
-        raise StopRule(f"{step}: upper projection ${up:.2f} is over the global budget left "
-                       f"(${left:.2f} of ${global_cap:.2f}, ${st.spent:.2f} spent)")
+                 global_cap: float, reserve: Mapping[str, float] | None = None) -> Budget:
+    """The **upper** projection must fit the step's budget (:func:`budget_for`; H2). Returns
+    the budget the attempt gets."""
+    b = budget_for(st, step, caps=caps, global_cap=global_cap, reserve=reserve)
+    if proj.usd_upper > b.usd + 1e-9:
+        raise StopRule(over_budget(step, proj, b, st))
+    return b
+
+
+def attempt_spent(st: State, step: str) -> float:
+    """What the step's latest attempt spent: its charge, or the step's billed cost over what its
+    earlier attempts were charged when that is larger."""
+    s = st.step(step)
+    if not s.attempts:
+        return float(s.billed_usd or 0.0)
+    earlier = sum(a.charged(st.watermark) for a in s.attempts[:-1])
+    return max(s.attempts[-1].charged(st.watermark), (s.billed_usd or 0.0) - earlier)
 
 
 def check_after(st: State, step: str, *, caps: Mapping[str, float], global_cap: float) -> None:
+    """After an attempt: what it spent must fit the per-attempt cap, and the cumulative spend
+    the global cap."""
     s = st.step(step)
-    spent = s.spent_at(st.watermark)
+    spent = attempt_spent(st, step)
     if spent > caps[step] + 1e-9:
-        raise StopRule(f"{step}: spent ${spent:.2f} (tracked ${s.tracked_usd:.2f}, billed "
+        raise StopRule(f"{step}: attempt {max(1, len(s.attempts))} spent ${spent:.2f} (tracked "
+                       f"${s.attempts[-1].tracked_usd if s.attempts else 0:.2f}, step billed "
                        f"${s.billed_usd or 0:.2f}) is over its cap ${caps[step]:.2f}")
     if st.spent > global_cap + 1e-9:
         raise StopRule(f"spent ${st.spent:.2f} in all is over the global cap ${global_cap:.2f}")
 
 
 def step_budget(st: State, step: str, *, spent_in_step: float = 0.0, caps: Mapping[str, float],
-                global_cap: float) -> float:
-    """What the step may still spend: its cap minus its earlier attempts, and the global cap
-    left, minus what this attempt already spent."""
-    s = st.step(step)
-    cur = s.current
-    earlier = s.spent_at(st.watermark) - (cur.charged(st.watermark) if cur else 0.0)
-    return max(0.0, min(caps[step] - earlier, global_cap - st.spent_outside(step))
-               - spent_in_step)
+                global_cap: float, reserve: Mapping[str, float] | None = None) -> float:
+    """What the running attempt may still spend (:func:`budget_for`)."""
+    return budget_for(st, step, caps=caps, global_cap=global_cap, reserve=reserve,
+                      spent_in_step=spent_in_step).usd
 
 
 def gpu_deadline_s(st: State, step: str, c: Any, *, spent_in_step: float = 0.0,
                    slack_s: float = CLIENT_SLACK_S, caps: Mapping[str, float],
-                   global_cap: float) -> float:
+                   global_cap: float, reserve: Mapping[str, float] | None = None) -> float:
     """Wall seconds still affordable at ``c``'s $/s (anything with ``usd_per_s()``, or a $/s
     figure) in this step, keeping ``slack_s`` of it for the cancel / stop that follows the
     deadline (H2)."""
     rate = c if isinstance(c, float | int) else c.usd_per_s()
-    left = step_budget(st, step, spent_in_step=spent_in_step, caps=caps, global_cap=global_cap)
+    left = step_budget(st, step, spent_in_step=spent_in_step, caps=caps, global_cap=global_cap,
+                       reserve=reserve)
     return max(0.0, left - slack_s * rate) / rate
+
+
+@dataclass
+class Decision:
+    """What the runbook does next with one step: ``run`` (with ``budget``), ``done`` (skip),
+    ``stop`` (the stop rule refuses it) or ``wait`` (refused only while held attempts are
+    charged over their tracked cost; it fits once billing covers them, about ``clears_at``)."""
+
+    step: str
+    action: str
+    budget: Budget | None = None
+    message: str = ""
+    reasons: list[str] = field(default_factory=list)
+    clears_at: float | None = None
+    command: str | None = None
+
+    @property
+    def runs(self) -> bool:
+        return self.action == "run"
+
+
+def decide(st: State, steps: Sequence[str], step: str, projections: Mapping[str, Any], *,
+           caps: Mapping[str, float], global_cap: float) -> Decision:
+    """The one decision the dry run, ``--status`` and a real run all take for ``step`` (of the
+    plan's ``steps``) on the state as it is."""
+    s = st.steps.get(step) or StepState()
+    if s.status == "done":
+        return Decision(step, "done", message=f"{step}: done")
+    proj = projections[step]
+    b = budget_for(st, step, caps=caps, global_cap=global_cap,
+                   reserve=reserve_for(st, steps, step, projections))
+    reasons = [f"{n} attempt {i} charged ${a.charged(st.watermark):.2f} (tracked "
+               f"${a.tracked_usd:.2f}): {'killed' if a.status == 'killed' else 'unreported'}, "
+               f"held until billing covers it, about {utc(a.hold_clears_at())}"
+               for n, i, a in st.held()]
+    if proj.usd_upper <= b.usd + 1e-9:
+        return Decision(step, "run", b, f"{step}: runs with ${b.usd:.2f} (binding: {b.binding})",
+                        reasons)
+    msg = over_budget(step, proj, b, st)
+    excess = sum(a.charged(st.watermark) - a.tracked_usd for _, _, a in st.held())
+    if b.binding != "attempt cap" and excess > 0 and \
+            proj.usd_upper <= min(b.terms["attempt cap"], b.usd + excess) + 1e-9:
+        when = max(a.hold_clears_at() for _, _, a in st.held())
+        return Decision(step, "wait", b, msg + f"; it fits once billing covers the held "
+                        f"attempts, about {utc(when)}", reasons, when)
+    return Decision(step, "stop", b, msg, reasons)
 
 
 # ---------------------------------------------------------------------------------------------

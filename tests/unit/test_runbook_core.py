@@ -292,3 +292,122 @@ def test_every_attempt_of_every_step_has_its_own_app_name():
     st.step("lab").attempts += [wh.Attempt(0.0, "failed"), wh.Attempt(1.0)]
     assert ctx.app_name() == "flora-wh-102207184317-lab-a2"
     assert ctx.app_name("merge") == "flora-wh-102207184317-lab-a2-merge"
+
+
+# --- WP5: one budget rule, one decision ---------------------------------------------------------
+
+RETRY_AT = 1792650123.10  # 06:22:03 UTC (11:52 IST): today's lab retry, attempt 2
+
+
+def _at_the_retry(*, stopped: bool) -> dict:
+    """The state as the 11:52 retry found it: lab attempt 1 crashed, billing read then."""
+    d = today()
+    lab = d["steps"]["lab"]
+    lab["status"], lab["attempts"] = "failed", lab["attempts"][:1]
+    if stopped:  # what the runbook records now: the app.run() block exited, the slack
+        lab["attempts"][0].update(stopped_at=lab["attempts"][0]["finished"],
+                                  slack_s=wh.LAB_SLACK_S)
+    d["billed_at"] = RETRY_AT - 60  # read before the step: no watermark, the lag rule
+    return d
+
+
+def _replay(monkeypatch, tmp_path, d, argv=()):
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps(d))
+    monkeypatch.setattr(wh, "load_manifest", lambda offline, version="golden/v1":
+                        wh.offline_manifest(wh.DURATION_HEADROOM, version))
+    monkeypatch.setattr(wh, "refresh_billing", lambda st, **kw: False)  # billing as it was
+    monkeypatch.setattr(wh, "LAB_OUT", tmp_path / "lab")  # no saved lab results
+    monkeypatch.setattr(wh, "REPORT", tmp_path / "runbook.md")
+    monkeypatch.chdir(tmp_path)
+    seen = {}
+
+    def lab(ctx):
+        seen["budget"] = ctx.budget_of("lab")
+        seen["attempt"] = ctx.st.step("lab").current.budget_usd
+        return {"ok": True, "tracked_usd": 1.2441, "apps": [ctx.app_name()]}
+
+    monkeypatch.setitem(wh.RUNNERS, "lab", lab)
+    rc = wh.main(["--yes-spend", "--only", "lab", "--state", str(state), "--work",
+                  str(tmp_path / "work"), *argv])
+    return rc, seen, wh.load_state(state)
+
+
+def test_replay_todays_lab_retry_runs_at_the_approved_global_cap(monkeypatch, tmp_path):
+    d = _at_the_retry(stopped=True)
+    st = wh.State.from_json(d)
+    a1 = st.steps["lab"].attempts[0]
+    assert a1.held(st.watermark) and a1.charged(st.watermark) == pytest.approx(0.84, abs=0.005)
+    m = wh.offline_manifest(wh.DURATION_HEADROOM)
+    ps = wh.plan_projections("balanced-only", m)
+    dec = wh.decide(st, "balanced-only", "lab", ps)
+    # G = $7.90 (cap_override): the lab gets its whole per-attempt cap and runs. The 11:52 rule
+    # (cap - earlier attempts: $2.35 - $2.35) gave it $0 and skipped it inside the step.
+    assert dec.action == "run" and dec.budget.binding == "attempt cap"
+    assert dec.budget.usd == pytest.approx(wh.CAPS_USD["lab"])
+    assert dec.budget.usd >= ps["lab"].usd_upper
+    assert dec.budget.terms["global cap"] == 7.9
+    rc, seen, after = _replay(monkeypatch, tmp_path, d)
+    assert rc == 0 and after.steps["lab"].status == "done"
+    # the stop rule, the attempt's budget and the in-step budget are the same number
+    assert seen["attempt"] == seen["budget"].usd == dec.budget.usd
+    assert after.steps["lab"].attempts[-1].apps == ["flora-wh-102207184317-lab-a2"]
+
+
+def test_replay_runs_even_from_the_state_as_it_was_recorded(monkeypatch, tmp_path):
+    """Without a recorded stop, attempt 1 is still held at its $2.35 budget, but earlier
+    attempts no longer eat into the per-attempt cap: $7.90 - $5.55 spent leaves $2.35."""
+    d = _at_the_retry(stopped=False)
+    st = wh.State.from_json(d)
+    assert st.steps["lab"].attempts[0].charged(st.watermark) == pytest.approx(2.35)
+    rc, seen, _after = _replay(monkeypatch, tmp_path, d)
+    assert rc == 0 and seen["budget"].usd >= wh.project(
+        "lab", wh.offline_manifest(wh.DURATION_HEADROOM)).usd_upper
+
+
+def test_the_stop_message_names_the_binding_term():
+    m = wh.offline_manifest(wh.DURATION_HEADROOM)
+    ps = wh.plan_projections("balanced-only", m)
+    st = wh.State("r", 0.0, "x")
+    spent = wh.Attempt(0.0, "done", finished=1.0, tracked_usd=3.0)
+    st.step("tempseg").attempts.append(spent)
+    st.cap_override = 7.0
+    # $4.00 left: (d) fits it alone, but the cap keeps the lab's upper projection for later
+    d = wh.decide(st, "balanced-only", "balanced", ps)
+    assert d.action == "stop" and d.budget.binding == "reserve for lab"
+    assert "binding: reserve for lab" in d.message and "kept for lab" in d.message
+    assert d.budget.terms["reserve"] == pytest.approx(ps["lab"].usd_upper)
+    assert wh.decide(st, "balanced-only", "lab", ps).runs  # the last step keeps nothing back
+    spent.tracked_usd = 5.0  # $2.00 left
+    d = wh.decide(st, "balanced-only", "lab", ps)
+    assert d.action == "stop" and "binding: global left" in d.message
+    assert "--global-cap 7.35" in d.command and "approval" in d.command
+    big = wh.Projection("lab")
+    big.add("x", wh.LAB["captioner"], 4000.0)
+    with pytest.raises(wh.StopRule, match=r"over its cap \$2.35 \(binding: attempt cap\)"):
+        wh.check_before(wh.State("r", 0.0, "x"), "lab", big)
+
+
+def test_a_stop_that_only_held_attempts_cause_is_a_wait_with_its_clear_time():
+    m = wh.offline_manifest(wh.DURATION_HEADROOM)
+    ps = wh.plan_projections("balanced-only", m)
+    st = wh.State.from_json(_at_the_retry(stopped=False))
+    st.cap_override = 6.5  # $6.50 - $5.55 spent: no room while attempt 1 holds $2.35
+    d = wh.decide(st, "balanced-only", "lab", ps)
+    assert d.action == "wait" and d.clears_at == st.steps["lab"].attempts[0].hold_clears_at()
+    assert "lab attempt 1 $2.35" in d.message and d.message.endswith("UTC")
+    assert d.command.startswith("after 2026-10-22 06:15 UTC: ")
+    assert any("held until billing covers it" in r for r in d.reasons)
+
+
+def test_dry_run_rule_and_the_real_runs_budget_use_one_formula():
+    m = wh.offline_manifest(wh.DURATION_HEADROOM, "golden/v2")
+    ps = wh.plan_projections("certified", m)
+    st = wh.State("r", 0.0, "x", plan="certified")
+    caps, g = wh.plan_caps("certified", ps), wh.plan_global_cap("certified", ps)
+    for s in wh.PLANS["certified"]:
+        d = wh.decide(st, "certified", s, ps)
+        res = wh.reserve_for(st, wh.PLANS["certified"], s, ps)
+        assert d.runs and d.budget.usd == wh.check_before(
+            st, s, ps[s], caps=caps, global_cap=g, reserve=res).usd == wh.step_budget(
+            st, s, caps=caps, global_cap=g, reserve=res)

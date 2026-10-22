@@ -390,8 +390,13 @@ def test_retries_add_instead_of_overwriting():
     s.attempts.append(wh.Attempt(0.0, "failed", finished=10.0, tracked_usd=2.00))
     s.attempts.append(wh.Attempt(20.0, "done", finished=30.0, tracked_usd=1.90))
     assert s.spent == pytest.approx(3.90) and st.spent == pytest.approx(3.90)
-    with pytest.raises(wh.StopRule, match="exact_e2e"):
-        wh.check_after(st, "exact_e2e")  # $3.90 > $3.30
+    # the step cap is a per-attempt ceiling ($1.90 fits $3.30); retries count globally
+    wh.check_after(st, "exact_e2e")
+    with pytest.raises(wh.StopRule, match="global cap"):
+        wh.check_after(st, "exact_e2e", global_cap=3.50)
+    s.attempts.append(wh.Attempt(40.0, "done", finished=50.0, tracked_usd=3.40))
+    with pytest.raises(wh.StopRule, match="exact_e2e: attempt 3 spent"):
+        wh.check_after(st, "exact_e2e", global_cap=20.0)  # $3.40 > $3.30
 
 
 def test_legacy_state_files_keep_their_spend(tmp_path):
