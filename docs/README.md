@@ -18,6 +18,7 @@ Start with the repository [`README.md`](../README.md) (users) or [`PLAN.md`](PLA
 | [`export.md`](export.md) | `flora export --to lerobot`: which labels go where in the dataset copy, and alignment rules | user |
 | [`output-format.md`](output-format.md) | Every field a finished job writes (JSONL, Parquet, `summary.json`, exclusions); checked against the code by a test | user, contributor |
 | [`certification.md`](certification.md) | How a `balanced` certificate is computed, what it binds to, and when it unlocks a preset | user, maintainer |
+| [`certificate-check.md`](certificate-check.md) | Reviewer brief: the independent check of a written certificate (`scripts/cert_check.py`), how to read it, and what blocks publishing | maintainer |
 | [`certificate-freeze.md`](certificate-freeze.md) | What a committed certificate freezes, how to tell whether a change affects it (the CI certificate-drift check), and the re-certification workflow; with the current freeze listing | contributor, maintainer |
 | [`ci.md`](ci.md) | What each CI gate protects against, and how to run the gates locally | contributor |
 | [`wave-h-runbook.md`](wave-h-runbook.md) | The GPU measurement-session runbook ("Wave H"): steps, caps, stop rules, spend accounting | maintainer |
