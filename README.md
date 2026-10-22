@@ -2,9 +2,22 @@
 
 **Turn robot and human-demonstration videos into training labels, at dataset scale.**
 
-flora-deploy runs NVIDIA's [Flora](https://research.nvidia.com/labs/gear/flora/) models in your own
-[Modal](https://modal.com) account. Point it at a LeRobot dataset or a folder of MP4s and get back,
-for every episode:
+![One episode split into numbered subtasks on a timeline, each with its caption](docs/img/hero.png)
+
+- **NVIDIA's [Flora](https://research.nvidia.com/labs/gear/flora/) models, in your own
+  [Modal](https://modal.com) account.** Subtasks, captions and rewards for a LeRobot dataset or a
+  folder of MP4s, one command per step, scaling to zero when the job ends.
+- **Checked against NVIDIA's own code.** The `exact` preset runs it as the reference. The faster
+  `balanced` preset (vLLM on L40S + H100) is measured against it on 12 human episodes:
+  segment boundary error 0.009 s (NVIDIA vs itself: 0.007 s), 85% of captions byte-identical.
+  Rewards run NVIDIA's own engine.
+- **Priced before it runs.** `flora plan` estimates the cost of your dataset, `flora run` stops at
+  your budget, and `flora resume` picks up where a job stopped.
+
+The code is Apache-2.0; the Flora models are licensed by NVIDIA for non-commercial research only
+([`NOTICE.md`](NOTICE.md)). No GPU yet? [Try it locally in two minutes](#try-it-in-two-minutes).
+
+For every episode you get:
 
 | Stage | You get | Example |
 |---|---|---|
