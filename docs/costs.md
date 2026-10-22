@@ -15,16 +15,16 @@ of startup however much video it labels. These are the planner's estimates (the 
 <!-- cost-table:short -->
 | Video-hours | Episodes | Segment + caption, per video-hour | Job | Wall-clock | + rewards, per video-hour | Job |
 |---|---|---|---|---|---|---|
-| 0.05 | 3 | **$20.00** ($13.60-$29.80) | $1.00 | 8 min | **$34.80** ($23.60-$51.80) | $1.74 |
-| 0.5 | 30 | **$7.06** ($4.74-$10.56) | $3.53 | 33 min | **$9.52** ($6.22-$14.74) | $4.76 |
-| 1 | 60 | **$6.34** ($4.24-$9.50) | $6.34 | 60 min | **$8.11** ($5.26-$12.68) | $8.11 |
-| 10 | 600 | **$5.69** ($3.80-$8.54) | $56.91 | 9.2 h | **$6.85** ($4.39-$10.82) | $68.52 |
-| 100 | 6,000 | **$5.63** ($3.75-$8.44) | $563 | 90.7 h | **$6.73** ($4.30-$10.63) | $673 |
+| 0.05 | 3 | **$21.00** ($14.20-$31.20) | $1.05 | 9 min | **$35.80** ($24.20-$53.20) | $1.79 |
+| 0.5 | 30 | **$6.86** ($4.60-$10.26) | $3.43 | 32 min | **$9.32** ($6.08-$14.44) | $4.66 |
+| 1 | 60 | **$6.07** ($4.06-$9.09) | $6.07 | 57 min | **$7.85** ($5.08-$12.27) | $7.85 |
+| 10 | 600 | **$5.37** ($3.58-$8.04) | $53.65 | 8.6 h | **$6.53** ($4.17-$10.33) | $65.25 |
+| 100 | 6,000 | **$5.29** ($3.53-$7.94) | $529 | 85.5 h | **$6.39** ($4.08-$10.14) | $639 |
 
 One container per stage, cold starts, Modal list prices. Bold: the estimate; in brackets: its range from the error bands below. Rewards are terminal + dense (`reward.rubric` is not measured yet). What each rate rests on:
 
-- `segment`: GPU work 0.367 container-s per video-s, measured (n=1, ±50%); startup 300 s, measured (n=1, ±50%)
-- `caption`: GPU work 0.906 container-s per video-s, measured (n=1, ±50%); startup 325 s, measured (n=1, ±50%)
+- `segment`: GPU work 0.342 container-s per video-s, measured (n=1, ±50%); startup 295 s, measured (n=1, ±50%)
+- `caption`: GPU work 0.854 container-s per video-s, measured (n=1, ±50%); startup 373 s, measured (n=1, ±50%)
 - `reward.terminal`: GPU work 0.055 container-s per video-s, measured (±100%); startup 229 s, measured (±50%)
 - `reward.dense`: GPU work 0.165 container-s per video-s, measured (±100%); startup 229 s, measured (±50%)
 <!-- /cost-table:short -->
@@ -42,8 +42,8 @@ more per video-hour than a single-camera one:
 <!-- cost-table:cameras -->
 | Cameras per episode | 1 video-hour, per video-hour | 100 video-hours, per video-hour |
 |---|---|---|
-| 1 | **$6.34** ($4.24-$9.50) | **$5.63** ($3.75-$8.44) |
-| 3 | **$9.84** ($6.57-$14.75) | **$9.13** ($6.08-$13.69) |
+| 1 | **$6.07** ($4.06-$9.09) | **$5.29** ($3.53-$7.94) |
+| 3 | **$9.36** ($6.25-$14.01) | **$8.58** ($5.72-$12.86) |
 
 Segment + caption, one container per stage, cold starts. 3-view GPU work is the 1-view rate times `segment` x2.56, `caption` x1.42: an estimate, not measured on 3-view episodes (yam certification prep: docs/golden-manifest-v3-yam.md, scripts/wave_h.py three_view_scale, 2026-10-22). Only the share of the work spent generating text grows with the longer three-view prompt; decoding and frame preparation are kept at 1x. `flora plan` applies the same multipliers and says so.
 <!-- /cost-table:cameras -->
@@ -54,7 +54,7 @@ The README quotes the cost of GPU work alone, with no startup or idle time. A ve
 tends towards it:
 
 <!-- cost-table:busy -->
-**$5.61 per video-hour** (segment + caption; $6.70 with rewards)
+**$5.28 per video-hour** (segment + caption; $6.37 with rewards)
 <!-- /cost-table:busy -->
 
 `flora plan` gives the all-in estimate for your dataset: the rows above, worked out for your
@@ -87,9 +87,9 @@ Segment + caption, one container per stage, per video-hour:
 <!-- cost-table:breakdown -->
 | Video-hours | Startup | GPU work | Idle at the end | Orchestrator | Total per video-hour |
 |---|---|---|---|---|---|
-| 0.05 | $13.73 (69%) | $5.61 (28%) | $0.74 (4%) | $0.00 (0%) | **$20.00** |
-| 1 | $0.69 (11%) | $5.61 (89%) | $0.04 (1%) | $0.00 (0%) | **$6.34** |
-| 100 | $0.01 (0%) | $5.61 (100%) | $0.00 (0%) | $0.01 (0%) | **$5.63** |
+| 0.05 | $15.00 (71%) | $5.28 (25%) | $0.74 (4%) | $0.00 (0%) | **$21.00** |
+| 1 | $0.75 (12%) | $5.28 (87%) | $0.04 (1%) | $0.00 (0%) | **$6.07** |
+| 100 | $0.01 (0%) | $5.28 (100%) | $0.00 (0%) | $0.01 (0%) | **$5.29** |
 
 Idle at the end is an estimate (17 s per container), not yet confirmed on a live job. Everything else comes from the measured rates above.
 <!-- /cost-table:breakdown -->
@@ -116,7 +116,7 @@ Prices: Modal list prices (modal.com/pricing, pinned 2026-10-21). Rates: planner
 Each job pays startup again for every stage, so many small jobs cost much more than one big one.
 
 <!-- cost-table:batching -->
-10 separate jobs of 0.05 video-hours cost about **$10.00**; the same 0.5 video-hours as one job cost about **$3.53** (segment + caption, one container per stage).
+10 separate jobs of 0.05 video-hours cost about **$10.50**; the same 0.5 video-hours as one job cost about **$3.43** (segment + caption, one container per stage).
 <!-- /cost-table:batching -->
 
 If you have several small datasets, gather their videos into one input (for example one
@@ -131,9 +131,9 @@ over as many GPUs as `modal.max_gpus` allows, so it picks more containers when y
 <!-- cost-table:gpus -->
 | Video-hours | 1 container per stage | `max_gpus: 4` | `max_gpus: 10` |
 |---|---|---|---|
-| 0.5 | $7.06, 33 min (1+1) | $9.00, 16 min (1+3) | $13.82, 9 min (3+7) |
-| 10 | $5.69, 9.2 h (1+1) | $5.78, 3.8 h (1+3) | $6.02, 1.4 h (3+7) |
-| 100 | $5.63, 90.7 h (1+1) | $5.63, 36.8 h (1+3) | $5.65, 13.0 h (3+7) |
+| 0.5 | $6.86, 32 min (1+1) | $9.06, 15 min (1+3) | $14.42, 10 min (3+7) |
+| 10 | $5.37, 8.6 h (1+1) | $5.47, 3.5 h (1+3) | $5.74, 1.3 h (3+7) |
+| 100 | $5.29, 85.5 h (1+1) | $5.30, 34.3 h (1+3) | $5.33, 12.3 h (3+7) |
 
 Each cell: cost per video-hour, wall-clock and the containers `flora plan` picks (segment + caption).
 <!-- /cost-table:gpus -->
@@ -172,9 +172,9 @@ batch fill has been measured yet, so the columns below are estimates:
 <!-- cost-table:levers -->
 | Video-hours | Today (cold) | Warm start | Batch fill | Both |
 |---|---|---|---|---|
-| 0.05 | **$20.00** ($13.60-$29.80) | **$13.80** ($9.00-$21.00) | no gain (too few episodes to fill a batch) | no gain (too few episodes to fill a batch) |
-| 1 | **$6.34** ($4.24-$9.50) | **$6.02** ($4.01-$9.05) | **$4.07** ($2.73-$6.09) | **$3.75** ($2.50-$5.65) |
-| 100 | **$5.63** ($3.75-$8.44) | **$5.62** ($3.75-$8.43) | **$3.36** ($2.24-$5.03) | **$3.35** ($2.24-$5.03) |
+| 0.05 | **$21.00** ($14.20-$31.20) | **$13.40** ($8.80-$20.40) | no gain (too few episodes to fill a batch) | no gain (too few episodes to fill a batch) |
+| 1 | **$6.07** ($4.06-$9.09) | **$5.69** ($3.79-$8.55) | **$4.14** ($2.77-$6.19) | **$3.75** ($2.50-$5.65) |
+| 100 | **$5.29** ($3.53-$7.94) | **$5.29** ($3.53-$7.93) | **$3.36** ($2.24-$5.04) | **$3.35** ($2.24-$5.03) |
 
 - Today: the measured rates and cold startups above.
 - Warm start: segment startup 150 s, estimate (placeholder, ±60%); caption startup 180 s, estimate (placeholder, ±60%). Not measured yet.

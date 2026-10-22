@@ -192,14 +192,14 @@
       "kind": "segment",
       "cameras": "*",
       "concurrency": 1,
-      "container_s_per_video_s": 0.367,
+      "container_s_per_video_s": 0.342,
       "uncertainty": 0.5,
       "status": "measured",
       "image": "img_vllm (vllm 0.24.0)",
       "requires": [],
       "excludes": [],
-      "provenance": "Wave H-lite run 102207184317, `preset: balanced` deployed with flora deploy/run: n=1 job(s) (178.2 video s) on L40S, busy container-s per video-s 0.367 from one job: no range, so the error band is ±50%; excludes @enter (startup row) and idle (docs/wave-h-report.md (Wave H-lite run 102207184317))",
-      "source": "docs/wave-h-report.md (Wave H-lite run 102207184317)",
+      "provenance": "Wave H-lite run 10221548f1b8, `preset: balanced` deployed with flora deploy/run: n=1 job(s) (235.8 video s) on L40S, busy container-s per video-s 0.342 from one job: no range, so the error band is ±50%; excludes @enter (startup row) and idle (docs/wave-h-report.md (Wave H-lite run 10221548f1b8))",
+      "source": "docs/wave-h-report.md (Wave H-lite run 10221548f1b8)",
       "date": "2026-10-22",
       "n": 1
     },
@@ -208,14 +208,14 @@
       "kind": "caption",
       "cameras": "*",
       "concurrency": 1,
-      "container_s_per_video_s": 0.906,
+      "container_s_per_video_s": 0.854,
       "uncertainty": 0.5,
       "status": "measured",
       "image": "img_vllm (vllm 0.24.0)",
       "requires": [],
       "excludes": [],
-      "provenance": "Wave H-lite run 102207184317, `preset: balanced` deployed with flora deploy/run: n=1 job(s) (178.2 video s) on H100, busy container-s per video-s 0.906 from one job: no range, so the error band is ±50%; excludes @enter (startup row) and idle (docs/wave-h-report.md (Wave H-lite run 102207184317))",
-      "source": "docs/wave-h-report.md (Wave H-lite run 102207184317)",
+      "provenance": "Wave H-lite run 10221548f1b8, `preset: balanced` deployed with flora deploy/run: n=1 job(s) (235.8 video s) on H100, busy container-s per video-s 0.854 from one job: no range, so the error band is ±50%; excludes @enter (startup row) and idle (docs/wave-h-report.md (Wave H-lite run 10221548f1b8))",
+      "source": "docs/wave-h-report.md (Wave H-lite run 10221548f1b8)",
       "date": "2026-10-22",
       "n": 1
     }
@@ -242,26 +242,26 @@
     {
       "preset": "balanced",
       "kind": "segment",
-      "startup_s": 300.5,
+      "startup_s": 295.4,
       "uncertainty": 0.5,
       "status": "measured",
       "compile_cache": "cold",
       "n": 1,
-      "provenance": "Wave H-lite run 102207184317: spawn to first attempt of n=1 fresh L40S container(s), 300 s, one container: no range, so the error band is ±50% (docs/wave-h-report.md (Wave H-lite run 102207184317))",
+      "provenance": "Wave H-lite run 10221548f1b8: spawn to first attempt of n=1 fresh L40S container(s), 295 s, one container: no range, so the error band is ±50% (docs/wave-h-report.md (Wave H-lite run 10221548f1b8))",
       "date": "2026-10-22",
-      "source": "docs/wave-h-report.md (Wave H-lite run 102207184317)"
+      "source": "docs/wave-h-report.md (Wave H-lite run 10221548f1b8)"
     },
     {
       "preset": "balanced",
       "kind": "caption",
-      "startup_s": 325.0,
+      "startup_s": 372.6,
       "uncertainty": 0.5,
       "status": "measured",
       "compile_cache": "cold",
       "n": 1,
-      "provenance": "Wave H-lite run 102207184317: spawn to first attempt of n=1 fresh H100 container(s), 325 s, one container: no range, so the error band is ±50% (docs/wave-h-report.md (Wave H-lite run 102207184317))",
+      "provenance": "Wave H-lite run 10221548f1b8: spawn to first attempt of n=1 fresh H100 container(s), 373 s, one container: no range, so the error band is ±50% (docs/wave-h-report.md (Wave H-lite run 10221548f1b8))",
       "date": "2026-10-22",
-      "source": "docs/wave-h-report.md (Wave H-lite run 102207184317)"
+      "source": "docs/wave-h-report.md (Wave H-lite run 10221548f1b8)"
     },
     {
       "preset": "balanced",

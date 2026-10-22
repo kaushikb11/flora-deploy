@@ -32,8 +32,8 @@ flora results caption
 ## Label your own data
 
 <!-- wave-h:certified -->
-Accuracy certificates: none yet, so `balanced` segmentation and captioning records say `certified: false`.
-Rewards run NVIDIA's own engine, as `exact` does, and need none.
+Accuracy certificates: segmentation for `human` data (`L40S`).
+Rewards run NVIDIA's own engine, as `exact` does, and need none. Everything else runs uncertified.
 <!-- /wave-h:certified -->
 
 What flora-deploy doesn't do yet, and what is still an estimate: [`docs/limitations.md`](docs/limitations.md).
@@ -101,8 +101,9 @@ output:
 ```
 
 <!-- wave-h:allow-uncertified -->
-`allow_uncertified: true` lets `balanced` run segmentation and captioning without accuracy certificates.
-None exist yet, so it is required for them.
+`allow_uncertified: true` runs the stages that have no accuracy certificate for your embodiment and GPU;
+their records say `certified: false`. Certified today: segmentation for `human` data (`L40S`).
+A config whose every stage is certified does not need it; `flora doctor` tells you.
 <!-- /wave-h:allow-uncertified -->
 
 **Cameras.** Flora reads one camera view, or three (`main`, `left_wrist`, `right_wrist`). If your
@@ -141,7 +142,7 @@ GPU produced it. Field reference: [`docs/output-format.md`](docs/output-format.m
 a finished job actually spent. Segmentation runs on an L40S, captioning and rewards on H100s.
 
 <!-- wave-h:cost -->
-`balanced` costs about **$5.61 per video-hour** of GPU work (±50%) for segmentation + captioning,
+`balanced` costs about **$5.28 per video-hour** of GPU work (±50%) for segmentation + captioning (`exact`: $25.35),
 measured 2026-10-22 at Modal list prices. Startup (a few minutes per container), idle time and
 rewards are extra and dominate small jobs: `flora plan` shows the all-in estimate for your dataset.
 <!-- /wave-h:cost -->

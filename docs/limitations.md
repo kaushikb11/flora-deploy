@@ -12,14 +12,15 @@ run NVIDIA's own engine in both presets, so they count as the reference and need
 <!-- limitations:certification -->
 | Embodiment | `segment` (L40S) | `caption` (H100!) | `reward.terminal` (H100!) | `reward.dense` (H100!) | `reward.rubric` (H100!) |
 |---|---|---|---|---|---|
-| `human` | not yet | not yet | reference | reference | reference |
+| `human` | **certified** | not yet | reference | reference | reference |
 | `yam` | not yet | not yet | reference | reference | reference |
 | `yam32` | not yet | not yet | reference | reference | reference |
 | `dex` | not yet | not yet | reference | reference | reference |
 | `tianji` | not yet | not yet | reference | reference | reference |
 
-Nothing is certified yet, so `balanced` segmentation and captioning need `allow_uncertified: true`
-and their records say `certified: false`.
+Certified today: `segment` for `human`.
+Every other `balanced` segmentation or captioning stage needs `allow_uncertified: true`,
+and its records say `certified: false`.
 <!-- /limitations:certification -->
 
 Certification sets exist for `human` ([v2](golden-manifest-v2.md)) and `yam`

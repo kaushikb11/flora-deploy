@@ -337,10 +337,10 @@ whether its cache was warm.
 <!-- wave-h:results (owned by scripts/wave_h_finalize.py) -->
 | Item | Result (Wave H-lite, 2026-10-22; `docs/wave-h-report.md`) |
 |---|---|
-| L0 in-engine (ids, grid vs HF) | tempseg: pass (6/6 ids, 6/6 grid); captioner: missing |
-| Segments / captions end to end on golden episodes | 1 `balanced` job(s) through `flora deploy` / `flora run` (run `102207184317`); certificate **deferred** |
-| Throughput, $/video-h vs `exact` | **$5.61/video-h** ±50%, list prices |
-| Gate A (dt_bias FP32 vs bf16) | tempseg: max 0.375, mean 0.033765, greedy 5/6; recommendation: plugin **off** |
+| L0 in-engine (ids, grid vs HF) | tempseg: pass (6/6 ids, 6/6 grid); captioner: pass (6/6 ids, 6/6 grid) |
+| Segments / captions end to end on golden episodes | 1 `balanced` job(s) through `flora deploy` / `flora run` (run `10221548f1b8`); certificate **fail** |
+| Throughput, $/video-h vs `exact` | **$5.28/video-h** ±50% vs `exact` $25.35 (4.8x cheaper), list prices, measured |
+| Gate A (dt_bias FP32 vs bf16) | tempseg: max 0.25, mean 0.034514, greedy 4/6; captioner: max 0.25, mean 0.019797, greedy 6/6; recommendation: plugin **off** |
 <!-- /wave-h:results -->
 
 **Recommendation for the `dt_bias` drift check (Gate A):** ship with the plugin **off**, the
