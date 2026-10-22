@@ -287,6 +287,7 @@ def test_deploy_then_run_with_zero_flags_on_a_prepared_config(tmp_path, monkeypa
     monkeypatch.chdir(a.tmp)
     monkeypatch.delenv("FLORA_STORE", raising=False)
     monkeypatch.setattr(deploy_mod, "_deploy", lambda modal_app, plan: "ap-fake")
+    monkeypatch.setattr(deploy_mod, "_ensure_volume", lambda name, env: None)  # no Modal
 
     def _record(plan, rec):
         rel = deployment_path(plan.app_name)
