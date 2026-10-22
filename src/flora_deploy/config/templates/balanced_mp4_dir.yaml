@@ -1,5 +1,6 @@
 # flora.yaml: label a directory of MP4 episodes with the `balanced` preset (vLLM engines).
-# Every key is documented in balanced_lerobot.yaml. Unknown keys are an error.
+# Common keys are documented in balanced_lerobot.yaml;
+# the full list is in src/flora_deploy/config/schema.py. Unknown keys are an error.
 
 project: my-mp4-labels
 
@@ -46,7 +47,9 @@ pipeline:
 
 # One pool per stage (see balanced_lerobot.yaml). With rewards, add e.g.
 #   reward.terminal: {gpu: H100!, max_containers: 1}
-# and raise modal.max_gpus to cover it.
+#   reward.dense: {gpu: H100!, max_containers: 1}
+# (both run in one worker class, so their gpu, gpu_count and max_inputs must agree) and raise
+# modal.max_gpus to cover them.
 resources:
   segment: {gpu: L40S, max_containers: 2}    # 2 x L40S
   caption: {gpu: H100!, max_containers: 2}   # 2 x H100!

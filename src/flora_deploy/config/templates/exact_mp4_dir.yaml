@@ -1,7 +1,9 @@
 # flora.yaml: REFERENCE / CERTIFICATION template. Labels a directory of MP4 episodes with
 # NVIDIA's own pipeline (`exact` preset), the reference `balanced` is certified against. For
 # everyday labelling start from balanced_mp4_dir.yaml.
-# Every key is documented in `flora init --template exact_lerobot`. Unknown keys are an error.
+# Common keys are documented in `flora init --template exact_lerobot`;
+# the full list is in src/flora_deploy/config/schema.py.
+# Unknown keys are an error.
 
 project: my-mp4-labels
 
@@ -26,13 +28,14 @@ input:
   stage_to: volume://flora-results/inputs/my-mp4-labels
 
 pipeline:
-  stages: [segment, caption]        # add reward.terminal / reward.dense for rewards
+  stages: [segment, caption]        # add reward.terminal / reward.dense for rewards (and raise
+                                    # modal.max_gpus by 2)
   embodiment: human                 # human | yam | yam32 | dex | tianji
   episode_instruction:
     source: fixed                   # dataset_task | fixed | none
     text: Fold the towel.
   envelope: warn                    # warn | enforce | ignore
-  # determinism: nvidia             # nvidia | deterministic (D-1, a different reference)
+  # determinism: nvidia             # nvidia | deterministic (a different reference; see docs/determinism.md)
 
 resources:
   segcap: {max_containers: 2}       # 2 x H200 (the preset's GPU)
