@@ -16,8 +16,11 @@ temperature 1, TP=2 on ``H100!:2``, medoid selection; ``stages.rubric``) through
 carries one rubric (``pipeline.rubric``, hashed into the stage hash), so each episode task has
 its own rubric, written for this smoke in our own words (:data:`RUBRICS`; never NVIDIA's
 examples: ``tests/nvlink/test_license_content.py`` checks this file), its own config, job and
-app. The jobs run one after the other, each a step with its own stop rule; ``--only <task>``
-runs one of them (one cold start).
+app. The jobs are independent: up to ``--max-parallel`` (default 3) run at once, each a step
+with its own stop rule, reserving its budget against the global cap while it runs
+(``_runbook.run_parallel``); ``check`` waits for all of them (:func:`step_deps`).
+``--max-parallel 1`` runs them one after the other, as before. ``--only <task>`` runs one of
+them (one cold start).
 
 **What it measures** (per job, then pooled in step ``check``, which spends $0):
 
@@ -277,6 +280,12 @@ def global_cap(projs: Mapping[str, wh.Projection], steps: Iterable[str],
     up = round(sum(projs[s].usd_upper for s in steps), 6)
     derived = round(math.ceil(up * 10 - 1e-9) / 10, 2)
     return max(derived, override) if override is not None else derived
+
+
+def step_deps(steps: Sequence[str]) -> dict[str, tuple[str, ...]]:
+    """What each step needs done first: the jobs nothing (each its own config, job, app and
+    staged episode), ``check`` every job of the run (it pools their records)."""
+    return {CHECK: tuple(s for s in steps if s != CHECK)}
 
 
 def planned(only: str | None) -> tuple[str, ...]:
@@ -968,7 +977,8 @@ def render_report(st: wh.State, projs: Mapping[str, wh.Projection], caps: Mappin
 
 def print_plan(st: wh.State, projs: Mapping[str, wh.Projection], caps: Mapping[str, float],
                gcap: float, steps: Sequence[str], manifest: Mapping[str, Any],
-               out: Callable[[str], None] = print) -> None:
+               out: Callable[[str], None] = print,
+               max_parallel: int = rb.DEFAULT_MAX_PARALLEL) -> None:
     t = titles()
     c = rubric_container()
     start, start_up, basis = startup_s()
@@ -990,6 +1000,9 @@ def print_plan(st: wh.State, projs: Mapping[str, wh.Projection], caps: Mapping[s
     nominal = sum(projs[s].usd for s in steps)
     upper = sum(projs[s].usd_upper for s in steps)
     out(f"  total: nominal ${nominal:.2f}, upper ${upper:.2f}; global cap ${gcap:.2f}")
+    wall = {n: (0.0, 0.0) if (st.steps.get(n) or wh.StepState()).status == "done"
+            else (projs[n].wall_s(), projs[n].wall_s(upper=True)) for n in steps}
+    out(rb.wall_line(steps, step_deps(steps), wall, max_parallel))
     out("  note: max_tokens 20480 x 9 samples can run longer than the placeholder rate's upper; "
         "the in-step deadline (budget left / $/s, minus the client slack) cancels the job")
 
@@ -1015,7 +1028,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--keep", action="store_true", help="keep this run's two Volumes")
     ap.add_argument("--state", type=Path, default=STATE)
     ap.add_argument("--work", type=Path, default=OUT / "work")
+    ap.add_argument("--max-parallel", type=int, default=rb.DEFAULT_MAX_PARALLEL, metavar="N",
+                    help=f"run up to N rubric jobs at once (default {rb.DEFAULT_MAX_PARALLEL}; "
+                         "check waits for them); each reserves its budget against the global "
+                         "cap while it runs. 1: one after the other, as before")
     args = ap.parse_args(argv)
+    if args.max_parallel < 1:
+        ap.error("--max-parallel must be at least 1")
     if args.offline and args.yes_spend:
         ap.error("--offline is for the dry run (a run stages the real files)")
 
@@ -1042,7 +1061,7 @@ def main(argv: list[str] | None = None) -> int:
     work = args.work.resolve()
     jobs = [JOBS_BY_TASK[s] for s in steps if s in JOBS_BY_TASK]
     pre = preconditions(manifest, jobs or list(JOBS), work, st.run_id)
-    print_plan(st, projs, caps, gcap, steps, manifest)
+    print_plan(st, projs, caps, gcap, steps, manifest, max_parallel=args.max_parallel)
     for k, v in pre.items():
         print(f"  PRECONDITION {k}: " + "; ".join(v))
     if not pre:
@@ -1082,7 +1101,8 @@ def main(argv: list[str] | None = None) -> int:
                                              global_cap=gcap),
             check_after=lambda name: wh.check_after(st, name, caps=caps, global_cap=gcap),
             refresh=lambda s: wh.refresh_billing(s),  # looked up per call (tests patch it)
-            keep_going=lambda name: name == CHECK)
+            keep_going=lambda name: name == CHECK, deps=step_deps(steps),
+            max_parallel=args.max_parallel)
     finally:
         for n in cleanup(st.apps_seen, st.run_id, keep=args.keep):
             print(f"  cleanup: {n}")

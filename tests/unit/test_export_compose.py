@@ -292,7 +292,7 @@ def test_store_from_uri(tmp_path, monkeypatch):
 
     seen = {}
 
-    def from_name(name, environment_name=None, version=None):
+    def from_name(name, environment_name=None, version=None, create_if_missing=False):
         seen.update(name=name, env=environment_name, version=version)
         return FakeClientVolume()
 

@@ -10,13 +10,17 @@ older callers keep using ``wave_h.State`` and friends.
 
 from __future__ import annotations
 
+import copy
+import io
 import json
 import os
+import queue
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +32,11 @@ HEARTBEAT_S = 30.0
 CLIENT_SLACK_S = 240  # per app: client timeout margin, then cancel + app stop
 # A state from before the cap override was scoped to a plan: the plan it was set on.
 LEGACY_CAP_PLAN = "balanced-only"
+# ``--max-parallel``'s default: at most this many steps run at once. It counts steps, not GPUs:
+# the certified plan's three independent steps (b), (f) and (d) hold 4 GPUs at once, (b)'s and
+# (f)'s H200 (one app each) beside (d)'s L40S + H100. GPUs are capped across apps by
+# ``gpu_caps`` (``wave_h.py --max-gpus``), not by this.
+DEFAULT_MAX_PARALLEL = 3
 
 
 # ---------------------------------------------------------------------------------------------
@@ -55,6 +64,16 @@ class Attempt:
     stopped_at: float | None = None
     slack_s: float | None = None  # stop -> container gone (None: CLIENT_SLACK_S)
     hard_timeout_s: float | None = None  # its containers cannot outlive started + this
+    # a parallel run (``--max-parallel`` > 1): what this attempt reserved against the global cap
+    # when it started (its budget). Its in-step deadlines use this alone (:func:`budget_for`).
+    # None: a sequential run (budgets recomputed in-step, as always).
+    reserved_usd: float | None = None
+
+    def outstanding(self, through: float | None) -> float:
+        """Of a running attempt: what it may still spend past its charge so far (its budget
+        less that; the global cap keeps it while it runs)."""
+        budget = self.budget_usd if self.reserved_usd is None else self.reserved_usd
+        return round(max(0.0, budget - self.charged(through)), 4)
 
     @property
     def last_activity(self) -> float:
@@ -171,6 +190,9 @@ class State:
     billed_through: float | None = None
     cap_override_by: str | None = None  # who approved cap_override (``--yes-spend``), and when
     cap_override_at: float | None = None
+    # a parallel run's steps still to start (never saved): the global cap keeps their upper
+    # projections for them, as it keeps the plan's later steps' (:func:`reserve_for`)
+    queued: set[str] = field(default_factory=set, compare=False, repr=False)
 
     @property
     def watermark(self) -> float | None:
@@ -199,6 +221,16 @@ class State:
             return None
         return self.cap_override
 
+    def running(self) -> dict[str, Attempt]:
+        """The steps with a running attempt (a parallel run has several), and that attempt."""
+        return {n: s.current for n, s in list(self.steps.items()) if s.current is not None}
+
+    def reservations(self, exclude: str | None = None) -> dict[str, float]:
+        """Per running step (but ``exclude``): what the global cap keeps for it while it runs,
+        its budget less its charge so far (:meth:`Attempt.outstanding`)."""
+        return {n: a.outstanding(self.watermark) for n, a in self.running().items()
+                if n != exclude}
+
     def spent_outside(self, step: str) -> float:
         """Cumulative spend minus ``step``'s running attempt (in-step deadlines add their own)."""
         cur = self.step(step).current
@@ -214,20 +246,20 @@ class State:
                 "plan": self.plan, "billed_through": self.billed_through,
                 "cap_override_by": self.cap_override_by,
                 "cap_override_at": self.cap_override_at,
-                "steps": {k: asdict(v) for k, v in self.steps.items()}}
+                "steps": {k: _step_json(v) for k, v in self.steps.items()}}
 
     @classmethod
     def from_json(cls, d: Mapping[str, Any]) -> State:
         steps = {}
         for k, v in d.get("steps", {}).items():
             v = dict(v)
-            atts = [Attempt(**a) for a in v.pop("attempts", [])]
+            atts = [Attempt(**_known(Attempt, a)) for a in v.pop("attempts", [])]
             legacy = float(v.pop("tracked_usd", 0.0) or 0.0)  # pre-attempts state files
             started, finished = v.pop("started", None), v.pop("finished", None)
             if legacy and not atts:
                 atts = [Attempt(started=started or 0.0, finished=finished, tracked_usd=legacy,
                                 status=v.get("status", "failed"))]
-            steps[k] = StepState(**{**v, "attempts": atts})
+            steps[k] = StepState(**{**_known(StepState, v), "attempts": atts})
         return cls(d["run_id"], d["created"], d["billing_since"],
                    dict(d.get("billing_baseline", {})), steps, d.get("billed_total"),
                    d.get("billed_at"), d.get("cap_override"), d.get("cap_override_plan"),
@@ -267,6 +299,28 @@ class State:
         return sorted(set(apps))
 
 
+# Attempt fields added after state files were already in use: left out of the JSON while unset,
+# so a state a sequential run writes stays loadable by code from before them (review 15 M2;
+# that code builds ``Attempt(**a)`` and fails on any key it does not know).
+_OMIT_UNSET = ("reserved_usd",)
+
+
+def _step_json(s: StepState) -> dict[str, Any]:
+    d = asdict(s)
+    for a in d["attempts"]:
+        for k in _OMIT_UNSET:
+            if a.get(k) is None:
+                a.pop(k, None)
+    return d
+
+
+def _known(cls: type, d: Mapping[str, Any]) -> dict[str, Any]:
+    """``d`` without the keys ``cls`` has no field for: a state written by newer code loads
+    (its extra fields dropped) instead of failing on an unexpected keyword."""
+    names = {f.name for f in fields(cls)}
+    return {k: v for k, v in d.items() if k in names}
+
+
 def new_state() -> State:
     import uuid
 
@@ -283,11 +337,24 @@ def load_state(path: Path) -> State:
 _SAVE_LOCK = threading.RLock()
 
 
+def _dump(st: State) -> str:
+    """The state as JSON. In a parallel run another step's thread may grow a dict or list of
+    the state while it is read (``RuntimeError``: changed size during iteration): read again."""
+    for _ in range(19):
+        try:
+            return json.dumps(st.to_json(), indent=1, sort_keys=True, default=str)
+        except RuntimeError:
+            time.sleep(0.01)
+    return json.dumps(st.to_json(), indent=1, sort_keys=True, default=str)
+
+
 def save_state(st: State, path: Path) -> None:
+    """Write the state atomically, one writer at a time (``_SAVE_LOCK``): every step's thread,
+    its heartbeat and the scheduler save through here."""
     with _SAVE_LOCK:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(st.to_json(), indent=1, sort_keys=True, default=str))
+        tmp.write_text(_dump(st))
         os.replace(tmp, path)
 
 
@@ -315,13 +382,18 @@ def reserve_for(st: State, steps: Sequence[str], step: str,
                 caps: Mapping[str, float] | None = None) -> dict[str, float]:
     """The upper projections of the plan's steps after ``step`` that are not done yet (each at
     most its attempt cap: a step over its cap never runs), what the global cap keeps for
-    them."""
+    them. A parallel run also keeps them for its queued steps before ``step``
+    (:attr:`State.queued`), and none for a running step: :meth:`State.reservations` keeps
+    what it may still spend instead."""
     if not projections or step not in steps:
         return {}
     out = {}
-    for s in steps[list(steps).index(step) + 1:]:
+    order = list(steps)
+    at = order.index(step)
+    running = st.running()
+    for s in [x for x in order[:at] if x in st.queued] + order[at + 1:]:
         p = projections.get(s)
-        if p is None or (st.steps.get(s) or StepState()).status == "done":
+        if p is None or (st.steps.get(s) or StepState()).status == "done" or s in running:
             continue
         up = float(p.usd_upper) if caps is None or s not in caps else min(float(p.usd_upper),
                                                                           float(caps[s]))
@@ -335,17 +407,34 @@ def budget_for(st: State, step: str, *, caps: Mapping[str, float], global_cap: f
                ) -> Budget:
     """The one budget rule (the stop rule before a step, the attempt's budget and its in-step
     deadlines all use it): ``min(attempt cap, global cap - spent outside this attempt -
-    reserve for the plan's later steps) - spent_in_step``. ``caps[step]`` is a per-attempt
-    ceiling: earlier attempts count against the global cap, not against it."""
+    what the other running steps may still spend - reserve for the plan's later steps) -
+    spent_in_step``. ``caps[step]`` is a per-attempt ceiling: earlier attempts count against
+    the global cap, not against it.
+
+    Running steps (a parallel run): each reserved its budget when it started, so the check is
+    ``spent + every running step's reservation + this step's upper <= global cap`` (less the
+    reserve). A running attempt that reserved (``Attempt.reserved_usd``) gets its own
+    reservation in-step, never more: the steps started after it relied on that."""
     cap = float(caps[step])
+    cur = (st.steps.get(step) or StepState()).current
     spent = st.spent_outside(step)
-    left = global_cap - spent
+    running = st.reservations(exclude=step)
+    held = round(sum(running.values()), 4)
+    left = global_cap - spent - held
     kept = round(sum((reserve or {}).values()), 4)
     allowance = left - kept
     terms = {"attempt cap": cap, "global cap": global_cap, "spent": spent, "global left": left,
              "reserve": kept, "allowance": allowance}
+    if held > 0:
+        terms["running"] = held
+    if cur is not None and cur.reserved_usd is not None:
+        terms["reservation"] = cur.reserved_usd
+        return Budget(round(max(0.0, cur.reserved_usd - spent_in_step), 4), "reservation",
+                      terms, tuple(reserve or {}))
     if cap <= allowance + 1e-9:
         binding, usd = "attempt cap", cap
+    elif held > 0 and cap <= allowance + held + 1e-9:
+        binding, usd = f"running {', '.join(running)}", allowance
     elif kept > 0 and cap <= left + 1e-9:
         binding, usd = f"reserve for {', '.join(reserve or {})}", allowance
     else:
@@ -366,19 +455,30 @@ def _held_note(st: State) -> str:
 def over_budget(step: str, proj: Any, b: Budget, st: State | None = None) -> str:
     """Why ``proj``'s upper projection does not fit ``b``, naming the binding term."""
     t, up = b.terms, proj.usd_upper
+    run = f", ${t['running']:.2f} reserved by the running steps" if t.get("running") else ""
     if b.binding == "attempt cap":
         why = (f"{step}: upper projection ${up:.2f} (nominal ${proj.usd:.2f}) is over its cap "
                f"${t['attempt cap']:.2f} (binding: attempt cap)")
     elif b.binding == "global left":
         why = (f"{step}: upper projection ${up:.2f} is over the global budget left "
                f"(${t['global left']:.2f} of ${t['global cap']:.2f}, ${t['spent']:.2f} spent"
+               + run + (f", ${t['reserve']:.2f} kept for {', '.join(b.reserved_for)}"
+                        if t["reserve"] > 0 else "") + "; binding: global left)")
+    elif b.binding.startswith("running"):
+        why = (f"{step}: upper projection ${up:.2f} is over the global budget left while other "
+               f"steps run (${t['allowance']:.2f}: ${t['global cap']:.2f} cap, "
+               f"${t['spent']:.2f} spent{run}"
                + (f", ${t['reserve']:.2f} kept for {', '.join(b.reserved_for)}"
-                  if t["reserve"] > 0 else "") + "; binding: global left)")
+                  if t["reserve"] > 0 else "") + f"; binding: {b.binding})")
+    elif b.binding == "reservation":
+        why = (f"{step}: upper projection ${up:.2f} is over its reservation "
+               f"${t['reservation']:.2f} (binding: reservation)")
     else:
         why = (f"{step}: upper projection ${up:.2f} is over the global budget left after the "
                f"reserve (${t['allowance']:.2f}: ${t['global left']:.2f} of "
-               f"${t['global cap']:.2f} left, ${t['spent']:.2f} spent, ${t['reserve']:.2f} kept "
-               f"for {', '.join(b.reserved_for)}; binding: {b.binding})")
+               f"${t['global cap']:.2f} left, ${t['spent']:.2f} spent{run}, "
+               f"${t['reserve']:.2f} kept for {', '.join(b.reserved_for)}; binding: "
+               f"{b.binding})")
     return why + (_held_note(st) if st is not None else "")
 
 
@@ -644,10 +744,11 @@ class Heartbeat:
     attempt's tracked spend and save the state, so a killed process leaves it behind (H3)."""
 
     def __init__(self, st: State, attempt: Attempt, path: Path, *, every: float = HEARTBEAT_S,
-                 clock: Callable[[], float] = time.time):
+                 clock: Callable[[], float] = time.time, step: str = ""):
         self.st, self.attempt, self.path, self.every, self.clock = st, attempt, path, every, clock
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True, name="wave-h-heartbeat")
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name=f"heartbeat-{step}" if step else "wave-h-heartbeat")
 
     def beat(self) -> None:
         now = self.clock()
@@ -706,6 +807,38 @@ def _status_of(res: Mapping[str, Any]) -> str:
     return "done" if res.get("ok") else "failed"
 
 
+def _execute(st: State, name: str, s: StepState, att: Attempt, c: Any, *, state_path: Path,
+             run: Callable[[str, Any], Mapping[str, Any]],
+             status_of: Callable[[Mapping[str, Any]], str],
+             on_error: Callable[[str, Attempt, BaseException], None]) -> int:
+    """One attempt of ``name`` under its heartbeat: record its result (``status_of``) or its
+    error (``on_error``), its end and its apps. Returns 3 when an in-step stop rule raised,
+    else 0. A sequential run calls it in line, a parallel run in the step's own thread."""
+    rc = 0
+    try:
+        with Heartbeat(st, att, state_path, step=name):
+            res = run(name, c)
+        s.result = dict(res)
+        att.tracked_usd = round(float(res.get("tracked_usd") or 0.0), 4)
+        att.report_error = bool(res.get("report_error"))
+        att.status = s.status = status_of(res)
+    except StopRule as e:  # an in-step stop rule raised before any app started
+        att.status = s.status = "stopped"
+        att.tracked_usd = 0.0
+        att.notes.append(f"stop rule: {e}")
+        note_stop(s, f"stop rule before: {e}")
+        rc = 3
+    except Exception as e:  # noqa: BLE001 - recorded; the runbook stops
+        att.status = s.status = "failed"
+        on_error(name, att, e)
+        att.notes.append(f"error: {e!r}")
+    att.finished = time.time()
+    for a in s.result.get("apps", ()):
+        if a not in att.apps:
+            att.apps.append(a)
+    return rc
+
+
 def run_steps(st: State, steps: Iterable[str], *, state_path: Path, ctx: Any,
               run: Callable[[str, Any], Mapping[str, Any]], projection: Callable[[str], Any],
               decide: Callable[[str, Any], Decision], check_after: Callable[[str], None],
@@ -718,14 +851,30 @@ def run_steps(st: State, steps: Iterable[str], *, state_path: Path, ctx: Any,
                   charge_unknown_if_started),
               after: Callable[[str, StepState], int | None] | None = None,
               keep_going: Callable[[str], bool] | None = None,
-              out: Callable[[str], None] = print) -> int:
+              out: Callable[[str], None] = print,
+              deps: Mapping[str, Sequence[str]] | None = None,
+              max_parallel: int = 1,
+              gpus: Mapping[str, Mapping[str, int]] | None = None,
+              gpu_caps: Mapping[str, int] | None = None) -> int:
     """Run ``steps`` in order, each under the same rules: skip a done step (``skip`` says why
     another is skipped), re-read billing (``refresh``), take :func:`decide`'s verdict (a stop
     or wait ends the run, exit 3), start an attempt with the decision's budget and a heartbeat,
     record its result (``status_of``) or its error (``on_error``), re-read billing, then the
     stop rule after it (``check_after``). ``refuse``: a reason to refuse a step after its
     decision (exit 1); ``after``: an exit code that ends the run after a step (e.g. a pin);
-    ``keep_going``: steps whose failure does not end the run. Returns the exit code."""
+    ``keep_going``: steps whose failure does not end the run. Returns the exit code.
+
+    ``max_parallel`` > 1 runs independent steps at once (:func:`run_parallel`, ``deps``: the
+    steps each one needs done first; ``gpus`` / ``gpu_caps``: :func:`gpu_wait`). 1 (the
+    default) is the sequential loop below, unchanged.
+    """
+    if max_parallel > 1:
+        return run_parallel(st, steps, state_path=state_path, ctx=ctx, run=run,
+                            projection=projection, decide=decide, check_after=check_after,
+                            refresh=refresh, skip=skip, refuse=refuse, attempt_kw=attempt_kw,
+                            status_of=status_of, on_error=on_error, after=after,
+                            keep_going=keep_going, out=out, deps=deps or {},
+                            max_parallel=max_parallel, gpus=gpus, gpu_caps=gpu_caps)
     rc = 0
     for name in steps:
         s = st.step(name)
@@ -755,27 +904,9 @@ def run_steps(st: State, steps: Iterable[str], *, state_path: Path, ctx: Any,
         s.status = "running"
         ctx.step = name
         save_state(st, state_path)
-        try:
-            with Heartbeat(st, att, state_path):
-                res = run(name, ctx)
-            s.result = dict(res)
-            att.tracked_usd = round(float(res.get("tracked_usd") or 0.0), 4)
-            att.report_error = bool(res.get("report_error"))
-            att.status = s.status = status_of(res)
-        except StopRule as e:  # an in-step stop rule raised before any app started
-            att.status = s.status = "stopped"
-            att.tracked_usd = 0.0
-            att.notes.append(f"stop rule: {e}")
-            note_stop(s, f"stop rule before: {e}")
+        if _execute(st, name, s, att, ctx, state_path=state_path, run=run, status_of=status_of,
+                    on_error=on_error):
             rc = 3
-        except Exception as e:  # noqa: BLE001 - recorded; the runbook stops
-            att.status = s.status = "failed"
-            on_error(name, att, e)
-            att.notes.append(f"error: {e!r}")
-        att.finished = time.time()
-        for a in s.result.get("apps", ()):
-            if a not in att.apps:
-                att.apps.append(a)
         if refresh is not None:
             refresh(st)
         save_state(st, state_path)
@@ -795,3 +926,311 @@ def run_steps(st: State, steps: Iterable[str], *, state_path: Path, ctx: Any,
             if not (keep_going and keep_going(name)):
                 break
     return rc
+
+
+# ---------------------------------------------------------------------------------------------
+# Parallel steps (``--max-parallel``)
+
+
+class StepLog(io.TextIOBase):
+    """``sys.stdout`` while steps run in threads: each line a step's thread prints is prefixed
+    with ``[<step>] `` (whole lines only, so two steps never interleave inside a line)."""
+
+    def __init__(self, base: Any):
+        self.base = base
+        self._local = threading.local()
+        self._lock = threading.Lock()
+
+    @property
+    def prefix(self) -> str:
+        return getattr(self._local, "prefix", "")
+
+    @prefix.setter
+    def prefix(self, value: str) -> None:
+        self._local.prefix = value
+        self._local.buf = ""
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, text: str) -> int:
+        pre = self.prefix
+        if not pre:
+            with self._lock:
+                return self.base.write(text)
+        lines = (getattr(self._local, "buf", "") + text).split("\n")
+        self._local.buf = lines.pop()
+        if lines:
+            with self._lock:
+                self.base.write("".join(f"{pre}{ln}\n" for ln in lines))
+        return len(text)
+
+    def flush(self) -> None:
+        with self._lock:
+            self.base.flush()
+
+    def end(self) -> None:
+        """The step's thread is done: print what it left without a newline."""
+        rest = getattr(self._local, "buf", "")
+        if rest and self.prefix:
+            with self._lock:
+                self.base.write(f"{self.prefix}{rest}\n")
+        self._local.buf = ""
+
+
+def deps_within(name: str, deps: Mapping[str, Sequence[str]], selected: Iterable[str]
+                ) -> list[str]:
+    """``name``'s dependencies among the steps this run runs (``--only`` leaves the others to
+    the runner's own preconditions)."""
+    sel = set(selected)
+    return [d for d in deps.get(name, ()) if d in sel]
+
+
+def gpu_wait(name: str, running: Iterable[str], gpus: Mapping[str, Mapping[str, int]],
+             caps: Mapping[str, int]) -> str | None:
+    """Why ``name`` must wait for a running step to free GPUs, or None if it fits.
+
+    ``gpus``: per step, the GPUs it holds at once, by type (``{"H200": 1}``). ``caps``: the
+    most held at once across every running step's apps, per type, and ``"total"`` over all
+    types. (A Modal app's ``max_gpus`` caps that app only; nothing else caps GPUs across apps.)
+    With nothing running a step always fits: waiting would never end."""
+    need, running = gpus.get(name) or {}, list(running)
+    if not need or not running:
+        return None
+    held: dict[str, int] = {}
+    for n in running:
+        for t, k in (gpus.get(n) or {}).items():
+            held[t] = held.get(t, 0) + k
+    use = {**{t: held.get(t, 0) + k for t, k in need.items()},
+           "total": sum(held.values()) + sum(need.values())}
+    over = [f"{t} {use[t]} > {caps[t]}" for t in sorted(use) if t in caps and use[t] > caps[t]]
+    return f"GPU cap ({', '.join(over)})" if over else None
+
+
+def run_parallel(st: State, steps: Iterable[str], *, state_path: Path, ctx: Any,
+                 run: Callable[[str, Any], Mapping[str, Any]],
+                 projection: Callable[[str], Any], decide: Callable[[str, Any], Decision],
+                 check_after: Callable[[str], None],
+                 refresh: Callable[[State], Any] | None = None,
+                 skip: Callable[[str, StepState], str | None] | None = None,
+                 refuse: Callable[[str, StepState], str | None] | None = None,
+                 attempt_kw: Callable[[str], Mapping[str, Any]] | None = None,
+                 status_of: Callable[[Mapping[str, Any]], str] = _status_of,
+                 on_error: Callable[[str, Attempt, BaseException], None] = (
+                     charge_unknown_if_started),
+                 after: Callable[[str, StepState], int | None] | None = None,
+                 keep_going: Callable[[str], bool] | None = None,
+                 out: Callable[[str], None] = print,
+                 deps: Mapping[str, Sequence[str]] | None = None,
+                 max_parallel: int = DEFAULT_MAX_PARALLEL,
+                 gpus: Mapping[str, Mapping[str, int]] | None = None,
+                 gpu_caps: Mapping[str, int] | None = None) -> int:
+    """:func:`run_steps` with up to ``max_parallel`` steps at once, each in its own thread
+    with its own copy of ``ctx`` (``ctx.step`` its name), heartbeat and ``[<step>]`` log
+    prefix. A step starts once every step it needs (``deps``) is done or skipped, in plan
+    order, under the same decision as a sequential run, which now also counts what the running
+    steps may still spend (:func:`budget_for`): the attempt **reserves** its budget against the
+    global cap until it ends. A step refused only while others run waits for one of them to
+    end and is decided again; refused with none running, it stops the run (exit 3), as
+    sequentially. What ends a sequential run (a stop rule, a refusal, ``after``, a failure not
+    in ``keep_going``) starts no further step here; the running ones finish and are recorded.
+    A step whose dependency failed or stopped is not started. ``gpus`` / ``gpu_caps``: a step
+    that would take the running steps over a GPU cap (:func:`gpu_wait`) waits for one of them
+    to end, and a later independent step may start meanwhile; with none running it starts (its
+    own app's ``max_gpus`` bounds it). Returns the exit code."""
+    deps = deps or {}
+    order = list(steps)
+    for name in order:  # every StepState exists before a thread reads the state
+        st.step(name)
+    pending = list(order)
+    resolved: set[str] = set()  # done or skipped: what needs it may start
+    ended: dict[str, str] = {}  # did not end done: its status
+    running: dict[str, threading.Thread] = {}
+    codes: dict[str, int] = {}
+    finished: queue.Queue[str] = queue.Queue()
+    waiting: set[str] = set()
+    gpu_waiting: set[str] = set()
+    rc, halted = 0, False
+    log = StepLog(sys.stdout)
+
+    def worker(name: str, s: StepState, att: Attempt, c: Any) -> None:
+        log.prefix = f"[{name}] "
+        try:
+            codes[name] = _execute(st, name, s, att, c, state_path=state_path, run=run,
+                                   status_of=status_of, on_error=on_error)
+        except BaseException as e:  # noqa: BLE001 - never leave the scheduler waiting
+            att.status = s.status = "failed"
+            att.notes.append(f"error: {e!r}")
+            att.finished = time.time()
+            codes[name] = 0
+        finally:
+            log.end()
+            finished.put(name)
+
+    def start(name: str) -> bool:
+        """Decide ``name`` and start it. False: it waits (refused while others run) or the
+        run halts."""
+        nonlocal rc, halted
+        s = st.step(name)
+        if refresh is not None:
+            refresh(st)
+        p = projection(name)
+        s.projected_usd, s.projected_upper_usd = p.usd, p.usd_upper
+        st.queued = {n for n in pending if n != name}
+        d = decide(name, p)
+        if not d.runs:
+            if running:
+                if name not in waiting:
+                    waiting.add(name)
+                    out(f"wait {name}: {d.message} (decided again when "
+                        f"{', '.join(running)} ends)")
+                return False
+            s.status, rc, halted = "stopped", 3, True
+            note_stop(s, f"stop rule before: {d.message}")
+            out(f"{d.action} {name}: {d.message}" + (f"\n  next: {d.command}" if d.command
+                                                     else ""))
+            pending.remove(name)
+            ended[name] = s.status
+            return False
+        if refuse is not None and (no := refuse(name, s)):
+            s.notes.append(f"refused: {no}")
+            out(f"refuse {name}: {no}")
+            rc, halted = 1, True
+            pending.remove(name)
+            ended[name] = s.status
+            return False
+        att = Attempt(started=time.time(), rate_usd_per_s=p.peak_usd_per_s,
+                      budget_usd=d.budget.usd, reserved_usd=d.budget.usd,
+                      **(attempt_kw(name) if attempt_kw else {}))
+        s.attempts.append(att)
+        s.status = "running"
+        pending.remove(name)
+        waiting.discard(name)
+        c = copy.copy(ctx)
+        if hasattr(c, "step"):
+            c.step = name
+        save_state(st, state_path)
+        out(f"start {name}: reserves ${d.budget.usd:.2f} of the global cap ({d.message})"
+            + (f"; running: {', '.join(running)}" if running else ""))
+        th = threading.Thread(target=worker, args=(name, s, att, c), daemon=True,
+                              name=f"step-{name}")
+        running[name] = th
+        th.start()
+        return True
+
+    old, sys.stdout = sys.stdout, log
+    try:
+        while True:
+            if not halted:
+                for name in list(pending):
+                    if halted or len(running) >= max_parallel:
+                        break
+                    s = st.step(name)
+                    why = skip(name, s) if skip else ("done" if s.status == "done" else None)
+                    if why:
+                        out(f"skip {name}: {why}")
+                        pending.remove(name)
+                        resolved.add(name)
+                        continue
+                    need = deps_within(name, deps, order)
+                    bad = [d for d in need if d in ended]
+                    if bad:
+                        pending.remove(name)
+                        ended[name] = "blocked"
+                        out(f"blocked {name}: needs " + ", ".join(
+                            f"{d} ({ended[d]})" for d in bad))
+                        continue
+                    if not all(d in resolved for d in need):
+                        continue
+                    if gpus and gpu_caps and (
+                            why := gpu_wait(name, running, gpus, gpu_caps)):
+                        if name not in gpu_waiting:
+                            gpu_waiting.add(name)
+                            out(f"wait {name}: {why} (started when {', '.join(running)} "
+                                "ends)")
+                        continue
+                    start(name)
+            st.queued = set(pending)
+            if not running:
+                break
+            name = finished.get()
+            running.pop(name).join()
+            s = st.step(name)
+            if codes.get(name):
+                rc = codes[name]
+            if refresh is not None:
+                refresh(st)
+            save_state(st, state_path)
+            if s.status == "done":
+                resolved.add(name)
+            try:
+                check_after(name)
+            except StopRule as e:
+                note_stop(s, f"stop rule after: {e}")
+                out(f"stop after {name}: {e}")
+                rc, halted = 3, True
+                continue
+            if s.status == "stopped":
+                halted = True
+                ended[name] = s.status
+                continue
+            if after is not None and (code := after(name, s)) is not None:
+                rc, halted = code, True
+                continue
+            if s.status != "done":
+                rc = 1
+                ended[name] = s.status
+                if not (keep_going and keep_going(name)):
+                    halted = True
+    finally:
+        sys.stdout = old
+        st.queued = set()
+    if pending:
+        out("not started: " + ", ".join(pending) + (" (the run stopped)" if halted else
+                                                     " (a step they need did not finish)"))
+    return rc
+
+
+def wall_clock(steps: Sequence[str], deps: Mapping[str, Sequence[str]],
+               wall_s: Mapping[str, float], max_parallel: int = 1) -> float:
+    """The wall seconds ``steps`` take (each ``wall_s[step]``), started in plan order as soon
+    as what they need is done, at most ``max_parallel`` at once: what :func:`run_parallel`
+    does (1: one after the other, their sum)."""
+    order = list(steps)
+    pending, done = list(order), {}
+    running: list[tuple[float, str]] = []
+    t = 0.0
+    while pending or running:
+        for name in list(pending):
+            if len(running) >= max(1, max_parallel):
+                break
+            if all(d in done for d in deps_within(name, deps, order)):
+                pending.remove(name)
+                running.append((t + float(wall_s.get(name, 0.0)), name))
+        if not running:
+            break  # what is left needs a step that never runs
+        running.sort()
+        t, name = running.pop(0)
+        done[name] = t
+    return max(done.values(), default=0.0)
+
+
+def chain(steps: Sequence[str]) -> dict[str, tuple[str, ...]]:
+    """Dependencies that run ``steps`` one after the other (each needs the one before)."""
+    order = list(steps)
+    return {s: (order[i - 1],) if i else () for i, s in enumerate(order)}
+
+
+def wall_line(steps: Sequence[str], deps: Mapping[str, Sequence[str]],
+              wall: Mapping[str, tuple[float, float]],
+              max_parallel: int = DEFAULT_MAX_PARALLEL, label: str | None = None) -> str:
+    """The dry run's wall-clock line: sequential vs ``--max-parallel`` (nominal / upper;
+    ``label``: what the second figure is called)."""
+    def mins(i: int, n: int) -> float:
+        return wall_clock(steps, deps, {s: w[i] for s, w in wall.items()}, n) / 60
+
+    seq, par = (mins(0, 1), mins(1, 1)), (mins(0, max_parallel), mins(1, max_parallel))
+    gain = seq[0] / par[0] if par[0] > 0 else 1.0
+    name = label or f"--max-parallel {max_parallel}"
+    return (f"  wall-clock (nominal / upper): sequential {seq[0]:.0f} / {seq[1]:.0f} min; "
+            f"{name} {par[0]:.0f} / {par[1]:.0f} min ({gain:.1f}x, same cost)")

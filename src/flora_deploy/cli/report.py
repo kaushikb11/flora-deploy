@@ -97,26 +97,44 @@ def _rest(r: dict, job: str) -> None:
     from flora_deploy import sdk
 
     e = r["errors"]
-    _p(f"errors: {e['files']} error file(s)" + (
-        f", by kind {e['by_kind']}, episodes set aside {len(e['poison_pills'])}, excused "
-        f"{e['excused']}, missing {e['missing']}" if "by_kind" in e else ""))
+    parts = [f"{e['files']} error file(s)"] if e["files"] else []
+    if "by_kind" in e:
+        parts += [f"{k} {v}" for k, v in e["by_kind"].items() if v]
+        if e["poison_pills"]:
+            parts.append(f"episodes set aside {len(e['poison_pills'])}")
+        for what, key in (("skipped", "excused"), ("missing", "missing")):
+            nz = {k: v for k, v in (e.get(key) or {}).items() if v}
+            if nz:
+                parts.append(f"{what} " + ", ".join(f"{k} {v}" for k, v in nz.items()))
+    _p("errors: " + ("; ".join(parts) if parts else "none"))
     for prob in [*e.get("problems", []), *e["notes"]][:10]:
         _p(f"  [yellow]{escape(prob)}[/yellow]")
     c = r["certification"]
-    _p(f"certification: preset {c['preset']} " + (
-        "(uncertified until its accuracy certificates exist)" if c["needs_certificate"]
-        else "(reference by construction)"))
-    for stage, s in c["stages"].items():
+    fake = c["stages"] and all(set(s["uncertified_reasons"]) == {"fake_models"}
+                               for s in c["stages"].values())
+    if fake:
+        _p("certification: none (fake models)")
+    else:
+        _p(f"certification: preset {c['preset']} " + (
+            "(uncertified until its accuracy certificates exist)" if c["needs_certificate"]
+            else "(NVIDIA's own code: certified unless an episode says otherwise)"))
+    for stage, s in ({} if fake else c["stages"]).items():
         share = "-" if s["certified_share"] is None else f"{s['certified_share']:.1%}"
         reasons = ", ".join(f"{k}={v}" for k, v in s["uncertified_reasons"].items())
         _p(f"  {stage}: certified {share}" + (f" (uncertified: {escape(reasons)})" if reasons
                                               else ""))
     if r["composed"]:
-        _p(f"outputs ({escape(r['store'])}):")
+        import posixpath
+
+        from flora_deploy.cli._app import short_hashes
+
+        paths = [p for fmts in r["outputs"].values() for p in fmts.values()]
+        top = posixpath.dirname(posixpath.commonprefix(paths) + "x") if paths else ""
+        _p(f"outputs in {escape(short_hashes(top))}/ (full paths: `flora report --json`):")
         for stage, fmts in r["outputs"].items():
-            for fmt, path in fmts.items():
-                _p(f"  {stage} {fmt}: {escape(path)}")
-        _p(f"  summary: {escape(r['summary'])}")
+            _p(f"  {stage}: " + ", ".join(escape(short_hashes(p[len(top) + 1:] if top else p))
+                                         for p in fmts.values()))
+        _p(f"  summary: {escape(short_hashes(r['summary']))}")
     else:
         _p(f"not composed yet: `flora compose --job {escape(job)} --store {escape(r['store'])}`")
     raise typer.Exit(code=sdk.exit_code(r["state"]))

@@ -384,8 +384,10 @@ waits for the user's go-ahead and cap.
 ```
 uv run python scripts/golden_stage.py --version golden/v2 --verify-only  # golden/v2 is staged
 uv run python scripts/wave_h.py --plan certified --dry-run                # plan, prices, caps
-uv run python scripts/wave_h.py --plan certified --yes-spend              # b -> f -> d -> d2 -> e
+uv run python scripts/wave_h.py --plan certified --yes-spend              # b, f, d at once; d2; e
+uv run python scripts/wave_h.py --plan certified --yes-spend --max-parallel 1  # one at a time
 uv run python scripts/wave_h.py --plan certified --yes-spend --only noise # one step (resumes)
+uv run python scripts/wave_h.py --plan certified --status                 # running steps too
 ```
 
 ### What it needs, and how each need is met
@@ -398,7 +400,7 @@ uv run python scripts/wave_h.py --plan certified --yes-spend --only noise # one 
 | at least 10 candidate episodes of the pool | 12 golden/v2 `human` episodes (`docs/golden-manifest-v2.md`): 10 plus 2 spares, all run. (b) and (d) refuse before any app unless all 12 are staged (and the selection has at least 10, with a noise subset of at least 5 inside it) |
 | at most 2 oracle episodes unlabelled by the candidate (the spares) | (d) runs exactly (b)'s episodes; every paired episode counts, none is chosen |
 | oracle and candidate uids pair | **every job stages one data dir**, `cert-human`. Episode uids are `<data dir>--<episode id>`, and `--plan full` staged one dir per step, so its uids never paired and every certificate it could make had coverage 0 |
-| a noise run pairing at least 5 of the oracle's episodes, same stage hash, key, GPU and determinism | (f) re-indexes **(b)'s own config and data dir** with `flora index --limit 6`. The stage hash covers the config and the whole input dir, not the index, so it is (b)'s. The six noise episodes (`noise_subset` in the selection plus one spare) are named `n-<id>` and the rest `x-<id>`, so they sort first. Before any app starts, (f) checks that the index holds exactly those six (count and video seconds). Same H200, `nvidia` mode, a new job id |
+| a noise run pairing at least 5 of the oracle's episodes, same stage hash, key, GPU and determinism | (f) re-indexes **(b)'s config** (the same inputs, with its own `project`, so its own job and app; the project is not hashed) **and data dir** with `flora index --limit 6`, and checks before any app that its stage hashes are (b)'s. The stage hash covers the config and the whole input dir, not the index, so it is (b)'s. The six noise episodes (`noise_subset` in the selection plus one spare) are named `n-<id>` and the rest `x-<id>`, so they sort first. Before any app starts, (f) checks that the index holds exactly those six (count and video seconds). Same H200, `nvidia` mode, a new job id |
 | L0 passing for `segment` and `caption`, under the candidate's engine settings | the lab's JSON (d2). It is **skipped only when already done for the current engine settings**: `balanced-<kind>.json` with L0 rows that all pass, Gate A requests, no error, the pool's GPU and the `engine_hashes` of today's engines (`lab_already_done`). The lab files from before batch fill carry no hash, so the certified run runs (d2) again, priced. L0 is per model kind, not per episode. (d2) runs against (d)'s job on the golden/v1 six (its deadlines were measured on them) |
 | no preempted engine record; evidence for warm and cold compiles | the engine limits fit a full batch of worst-case requests; every record carries `engine_preemptions` and `compile_cache`. (d) ends with the **cold witness**: (d)'s config re-indexed to the 6 noise episodes and run with `FLORA_COMPILE_CACHE=off` (one container per kind forced cold); (e) passes it as `--witness` and needs it |
 | the candidate key equals this checkout's | (e) certifies with the derived content digests (d)'s workers verified, from the commit that ran (d) |
@@ -408,7 +410,7 @@ uv run python scripts/wave_h.py --plan certified --yes-spend --only noise # one 
 | Step | What | GPU | Stop rule (cap) | Nominal | Upper |
 |---|---|---|---|---|---|
 | b | exact oracle, 12 episodes, 250.2 s, `nvidia` mode, one app | H200 | $4.20 | $2.74 | $4.17 |
-| f | noise: 6 of (b)'s episodes, 102.3 s, (b)'s config and data dir, new job id | H200 | $2.15 | $1.24 | $2.15 |
+| f | noise: 6 of (b)'s episodes, 102.3 s, (b)'s config (own project and app) and data dir, new job id | H200 | $2.15 | $1.24 | $2.15 |
 | d | `balanced` via the real `flora deploy` / `flora run`, the 12 episodes, then the forced-cold job on the 6 noise episodes | L40S + H100 | $4.55 | $2.50 | $4.51 |
 | d2 | lab L0 + Gate A, **skipped at $0 when already done for the current engine settings** | L40S, then H100 | $2.35 (or $0) | $1.74 (or $0) | $2.31 (or $0) |
 | e | `flora certify` per stage, then `scripts/wave_h_finalize.py --write` | CPU | $0 | $0 | $0 |
@@ -422,6 +424,32 @@ forced-cold job pays one more cold compile per pool. The lab files written befor
 engine-settings hash was recorded carry no hash, so today's certified run runs (d2), and the
 "lab runs" total applies.
 
+- **Parallel steps** (`--max-parallel N`, default 3). b, f and d are independent and run at
+  once; d2 waits for d (the Captioner half reads (d)'s segment records, and the lab writes the
+  `flora-cache` engines (d)'s workers seed from); e waits for all four (`wave_h.CERT_DEPS`).
+  f used to share (b)'s app (the same config, so the same deployed app name: one `modal app
+  stop` would stop both jobs); it now has its own project and app, with (b)'s stage hash. Each
+  step runs in its own thread with its own heartbeat and `[<step>]` log prefix. A starting
+  step **reserves** its budget against the global cap: it starts only if `spent + every
+  running step's reservation + its upper projection + the steps still to start <= global
+  cap`, and its in-step deadlines use its own reservation alone. When it ends, the reservation
+  becomes its tracked, then billed, spend. A step refused only while others run waits for one
+  of them to end. A killed process leaves every running step `running` in the state; the next
+  run marks them all killed. A failed step starts nothing new; the running ones finish and
+  are recorded. (e) certifies the finished steps' jobs only. The dry run prints the expected
+  wall-clock both ways (offline: 91 min one at a time, 49 min with `--max-parallel 3`; with d2
+  already done, 65 and 29 min); `--status` lists the running steps and their reservations.
+  `--max-parallel 1` is the sequential run, unchanged.
+- **GPUs at once.** `--max-parallel` counts steps, not GPUs. With b, f and d running, the run
+  holds **4 GPUs: 2x H200** (b and f, one container each, each in its own app) plus d's L40S
+  and H100. Each app's `max_gpus: 4` caps that app only. `--max-gpus` caps the GPUs held
+  across every running step's apps (`wave_h.CERT_GPUS`): `N` for the total (default 4, the
+  peak, so it never holds a step back) or `TYPE=N` for one type. A step that does not fit
+  waits for a running one to end, and a later independent step may start in the meantime.
+  Before a parallel run, confirm the workspace runs two H200s at once. If it would queue the
+  second one, that queue time counts against f's in-step deadline, so pass
+  `--max-gpus H200=1`: f then starts when b ends (d still runs beside b). The dry run's
+  wall-clock estimate does not model `--max-gpus`.
 - **Caps.** Each step's cap is its own upper projection rounded up to $0.05 (`plan_caps`), and
   the global cap is the sum of the upper projections rounded up to $0.10 (`plan_global_cap`).
   Both are derived from the measured rates and printed by the dry run. `--global-cap` can only
@@ -447,8 +475,8 @@ engine-settings hash was recorded carry no hash, so today's certified run runs (
   all 12 episodes are single view, so it is probably pessimistic.
 - **Exact cold start: measured.** It is 103 s @enter ±100% per job (an earlier smoke measured
   78 s; `docs/reference-smoke.md`, `docs/cold-start.md`).
-  (b) and (f) are each a cold start, because the oracle's app is stopped before (f) deploys it
-  again. Image pull and scheduling are not in the measured startup; the +100% and the 240 s of
+  (b) and (f) are each a cold start: (f) deploys its own app, and the oracle's is stopped when
+  its job is composed. Image pull and scheduling are not in the measured startup; the +100% and the 240 s of
   client slack per app cover them.
 - **Balanced:** the measured n=1 rates (segment 0.367 on L40S, caption 0.906 on H100, ±50%) and
   the measured cold startups (300 s and 325 s, `compile_cache: cold`). A warm compile cache

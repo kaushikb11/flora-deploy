@@ -46,8 +46,8 @@ def test_run_streams_to_done_then_status_report_logs(deployed):
     assert js["state"] == "done" and js["composed"]
     rep = job_cmd(deployed, "report")
     assert rep.exit_code == 0, rep.output
-    assert "per video-hour" in rep.output and "caption jsonl:" in rep.output
-    assert "reference by construction" in rep.output
+    assert "per video-hour" in rep.output and "caption: caption.jsonl" in rep.output
+    assert "certification: none (fake models)" in rep.output
     rj = json.loads(job_cmd(deployed, "report", "--json").output)
     assert rj["usd_per_video_hour"] > 0
     lg = job_cmd(deployed, "logs", "--kind", "orchestrator")

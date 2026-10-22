@@ -58,6 +58,7 @@ import dataclasses
 import hashlib
 import json
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
@@ -350,6 +351,10 @@ class LocalRunner:
         self.media_root: Path | None = self.dataset_root
         self._spawner: LocalSpawner | None = None
         self.last_outcome = "running"
+        # progress: episodes started per shard kind (the fake engines' per-episode hooks)
+        self._started: dict[str, int] = {}
+        self._started_lock = threading.Lock()
+        self._shards_done = 0
 
     # -- events -----------------------------------------------------------------------------
     def _event(self, e: dict) -> None:
@@ -359,13 +364,54 @@ class LocalRunner:
             return  # one line per wait, not one per poll
         if name == "lease_held":
             self._lease_logged = True
+        if not self.verbose and self._progress_event(e):
+            return
         if self.verbose or name in NOTABLE:
             detail = {k: v for k, v in e.items() if k not in ("event", "job_id", "t", "holder")}
             self.log(f"  [{name}] " + " ".join(f"{k}={v}" for k, v in sorted(detail.items())))
 
+    def _shard(self, shard_id: Any) -> Any:
+        return next((s for s in (self.manifest.shards if self.manifest else ())
+                     if s.shard_id == shard_id), None)
+
+    def _progress_event(self, e: dict) -> bool:
+        """A plain progress line for the common events (``True``: handled)."""
+        name = e.get("event")
+        if name in ("spawned", "shard_done"):
+            s = self._shard(e.get("shard_id"))
+            what = f"{s.kind} shard ({len(s.episodes)} episodes)" if s else "a shard"
+            if name == "spawned":
+                self.log(f"  started {what}")
+            else:
+                self._shards_done += 1
+                total = len(self.manifest.shards) if self.manifest else "?"
+                self.log(f"  finished {what}: {self._shards_done}/{total} shards done")
+            return True
+        if name == "done" and not e.get("dead") and not e.get("problems"):
+            self.log(f"  all {e.get('shards')} shards finished")
+            return True
+        return False
+
+    def note_started(self, kind: str) -> None:
+        """One more episode of ``kind`` started (progress)."""
+        with self._started_lock:
+            self._started[kind] = self._started.get(kind, 0) + 1
+
+    def progress_line(self, elapsed_s: float) -> str:
+        """``running 1m20s: segment 12/50, ... episodes started; 1/4 shards done``."""
+        planned: dict[str, int] = {}
+        for sh in (self.manifest.shards if self.manifest else ()):
+            planned[sh.kind] = planned.get(sh.kind, 0) + len(sh.episodes)
+        with self._started_lock:
+            parts = [f"{k} {min(self._started.get(k, 0), n)}/{n}" for k, n in planned.items()]
+        m, sec = divmod(int(elapsed_s), 60)
+        total = len(self.manifest.shards) if self.manifest else 0
+        return (f"running {m}m{sec:02d}s: " + ", ".join(parts) + " episodes started; "
+                f"{self._shards_done}/{total} shards done")
+
     # -- steps -----------------------------------------------------------------------------
     def index(self) -> dict[str, Any]:
-        from flora_deploy.jobs.indexing import IndexJob, open_dataset, run_index
+        from flora_deploy.jobs.indexing import IndexJob, open_dataset
 
         ijob = IndexJob.from_config(self.cfg, self.job_id)
         if self.dataset_root is not None:
@@ -380,7 +426,7 @@ class LocalRunner:
             files = open_dataset(ijob.dataset, work=work, staged=True)
         self.media_root = Path(files.root).resolve()  # NVIDIA wants absolute video paths
         quiet = (lambda m: None) if not self.verbose else self.log
-        summary = run_index(ijob, self.store, files, log=quiet)
+        summary = self._run_index(ijob, files, log=quiet)
         c = summary["counts"]
         self.log(f"index: {c['episodes']} episodes, {c['indexed']} indexed, "
                  f"{c['source_error']} source errors, {c['failed']} failed "
@@ -388,9 +434,32 @@ class LocalRunner:
         self.index_summary = summary
         return summary
 
+    def _run_index(self, job: Any, files: Any, *, log: Callable[[str], None]) -> dict:
+        """``jobs.indexing.run_index``, plus a few progress lines on ``self.log`` (how many
+        episodes and source files, then one per unit) while ``log`` keeps the per-episode lines
+        quiet. This lives here, not in ``jobs/indexing.py``: that module is in the logic digest,
+        so even a print-only change there changes every stage hash (review 15 M1)."""
+        from flora_deploy.jobs.indexing import finish_index, index_unit, plan_index
+
+        t0 = time.monotonic()
+        job, units = plan_index(job, files)
+        total = sum(len(u.episodes) for u in units)
+        nfiles = len({f for u in units for f in u.files})
+        where = f"; Hub files are downloaded to {files.root} once" if job.dataset.repo else ""
+        plural = "" if nfiles == 1 else "s"
+        self.log(f"index: {total} episodes in {nfiles} source file{plural}{where}")
+        rows: list[dict] = []
+        for i, unit in enumerate(units, 1):
+            rows += index_unit(job, unit, files, self.store, log=log)
+            if len(units) > 1:
+                self.log(f"index: {len(rows)}/{total} episodes (unit {i}/{len(units)})")
+        return finish_index(job, rows, self.store, units=len(units),
+                            run={"mode": "local", "wall_s": round(time.monotonic() - t0, 3)})
+
     # Price spend as the ``--fake-models`` Modal app's CPU containers (``RunSettings.
     # fake_models``) rather than the pool GPUs, which local budget tests exercise.
     bill_as_fake_app = False
+    progress_every_s = 15.0  # a "running ..." line this often while shards run
 
     def plan(self) -> Manifest:
         """Plan as ``sdk.submit`` does (``jobs.planning.plan_job``), then write the run spec."""
@@ -485,7 +554,8 @@ class LocalRunner:
             return fake_balanced_runner(
                 kind, store, media_root=media, gpu=pool.gpu, certificate=FAKE_CERTIFICATE,
                 default_task=instr.text, local_dir=local_dir, container_id=container_id,
-                before=checkpoint, rejects=nv_rejects, on_shard=note_episodes,
+                before=lambda uid: (checkpoint(uid), self.note_started(kind)),
+                rejects=nv_rejects, on_shard=note_episodes,
                 call_id=call_id, fatal=_container_exit,
                 stamp=CS.fake_stamp(kind, cenv, gpu=pool.gpu))
         if kind == "segcap":
@@ -495,7 +565,8 @@ class LocalRunner:
                 instruction_text=instr.text, media_root=media, local_dir=local_dir,
                 container_id=container_id)
             s = CS.with_stamps(s, cenv, fake=True)
-            return SegcapShardRunner(store, FakeSegcapEngine(), s, call_id=call_id,
+            engine = FakeSegcapEngine(on_episode=lambda _uid: self.note_started(kind))
+            return SegcapShardRunner(store, engine, s, call_id=call_id,
                                      fatal=_container_exit)
         from flora_deploy.config.schema import rubric_spec
 
@@ -515,6 +586,7 @@ class LocalRunner:
             ep = from_index(ref)
             self.registry.add(ep.videos, ref.uid)
             note_episodes(1)
+            self.note_started(kind)
             return ep
 
         runner.episode_for = episode
@@ -591,7 +663,17 @@ class LocalRunner:
                 waited = True
             time.sleep(min(0.2, self.lease_ttl_s / 5))
         limit = crash_after_ticks if crash else max_ticks
-        out = TickDriver(orch).run_until_idle(sleep=time.sleep,
+        t0 = last = time.monotonic()
+
+        def sleep(seconds: float) -> None:  # the driver's poll sleep, plus a heartbeat line
+            nonlocal last
+            time.sleep(seconds)
+            now = time.monotonic()
+            if now - last >= self.progress_every_s:
+                last = now
+                self.log(self.progress_line(now - t0))
+
+        out = TickDriver(orch).run_until_idle(sleep=sleep,
                                               poll_interval_s=self.poll_interval_s,
                                               max_ticks=limit)
         result: str = out.result
@@ -622,8 +704,7 @@ class LocalRunner:
             res = compose(self.store, self.job_id, partial=True, **kw)
         s = res.summary
         for stage, c in s["stages"].items():
-            self.log(f"compose: {stage}: {c['records']} records, missing {c['missing']}, "
-                     f"excused {c['excused']}")
+            self.log(f"compose: {stage}: {c['records']} records{_gaps(c)}")
         return s
 
     def close(self) -> None:
@@ -723,16 +804,29 @@ def launch_local(job: Any, *, reason: str = "resume") -> str:
     return call_id
 
 
+def _gaps(c: Mapping[str, Any]) -> str:
+    """``, 1 missing, 2 skipped (...)`` for a stage's composed counts; empty when complete."""
+    out = f", {c['missing']} missing" if c.get("missing") else ""
+    if c.get("excused"):
+        out += f", {c['excused']} skipped (rejected by the model, or not planned)"
+    return out
+
+
 def summary_lines(res: LocalRunResult, *, results_cmd: str | None = None) -> list[str]:
     """Human-readable result summary (the CLI prints it). ``results_cmd``: how to read the
     results back (default: the fully spelled-out `flora results` command)."""
+    why = "" if res.outcome == res.state else f" (orchestrator: {res.outcome})"
     lines = [f"job {res.job_id} (config {res.config_hash[:12]}): {res.state.upper()} "
-             f"in {res.wall_s:.1f} s (orchestrator: {res.outcome})"]
+             f"in {res.wall_s:.1f} s{why}"]
     sp = res.spawner
     if sp:
-        lines.append(f"calls {sp['calls']} {sp['states']}, containers {sp['containers']}, "
-                     f"preemptions {sp['preemptions']}, crashes {sp['crashes']}, python "
-                     f"failures {sp['python_failures']}")
+        trouble = [f"{sp[k]} {w}" for k, w in (("preemptions", "preempted"),
+                                                 ("crashes", "crashed"),
+                                                 ("python_failures", "failed")) if sp[k]]
+        ok = sp["states"].get("success", 0)
+        lines.append(f"workers: {sp['calls']} shard runs ({ok} succeeded"
+                     + "".join(f", {t}" for t in trouble)
+                     + f") on {sp['containers']} local stand-in containers")
     if res.faults:
         fired = _count(f"{f['fault']}:{f['target']}" for f in res.faults)
         lines.append("faults fired: " + ", ".join(f"{k} x{v}" for k, v in fired.items()))
@@ -741,12 +835,20 @@ def summary_lines(res: LocalRunResult, *, results_cmd: str | None = None) -> lis
     s = res.summary
     if s:
         for stage, c in s["stages"].items():
-            share = "-" if c["certified_share"] is None else f"{c['certified_share']:.0%}"
-            lines.append(f"  {stage}: {c['records']}/{c['expected']} records, missing "
-                         f"{c['missing']}, excused {c['excused']}, certified {share}")
-        lines.append(f"  shards {s['shards']}, episodes set aside {len(s['poison_pills'])}, errors "
-                     f"{s['errors']['by_kind'] or 0}, duplicates resolved "
-                     f"{s['duplicates_resolved']}, conflicts {len(s['conflicts'])}")
+            lines.append(f"  {stage}: {c['records']}/{c['expected']} episodes labelled"
+                         + _gaps(c) + ("" if not c["certified_share"] else
+                                       f", {c['certified_share']:.0%} certified"))
+        shards = s["shards"]
+        extra = [f"{n} {state}" for state, n in shards.items() if state != "done"]
+        tail = [f"episodes set aside {len(s['poison_pills'])} (they crashed their worker "
+                "every time)"] if s["poison_pills"] else []
+        if s["errors"]["by_kind"]:
+            tail.append("episode errors " + ", ".join(
+                f"{k} {v}" for k, v in s["errors"]["by_kind"].items()))
+        if s["conflicts"]:
+            tail.append(f"{len(s['conflicts'])} conflicting duplicate records")
+        lines.append(f"  shards: {shards.get('done', 0)} done" + "".join(f", {x}" for x in extra)
+                     + "".join(f"; {x}" for x in tail))
     if res.state == "budget_stopped":
         lines.append("budget stop: continue with `flora run --local --fake-models --resume "
                      "--budget USD` (or `flora resume <job> --budget-usd USD --store <store>`)")

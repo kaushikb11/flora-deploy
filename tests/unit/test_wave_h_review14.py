@@ -64,7 +64,7 @@ def _fake_jobs(monkeypatch, tmp_path, calls):
         return cfg, f"wave-h-r-{job}"
 
     def run_job(ctx, step, cfg, job_id, **kw):
-        calls.append(("run", job_id, os.environ.get("FLORA_COMPILE_CACHE"),
+        calls.append(("run", job_id, ctx.env.get("FLORA_COMPILE_CACHE"),
                       kw.get("spent_in_step")))
         return {"app": f"app-{job_id}", "job_id": job_id, "state": "done", "spend": 0.25}
 

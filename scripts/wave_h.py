@@ -21,8 +21,9 @@ oracle's and balanced's episode uids (``<data dir>--<episode id>``) never pair.
 
 ``certified`` (:class:`PlanSpec`, ``docs/wave-h-runbook.md`` "The certified run") makes
 ``balanced`` certified for ``human``: b (exact oracle on the 12 golden/v2 episodes, default
-mode, H200) -> f (noise: 6 of them, the selection's 5 plus one spare, the oracle's own config
-and data dir re-indexed with ``flora index --limit 6``, so the same stage hash) -> d (balanced
+mode, H200) -> f (noise: 6 of them, the selection's 5 plus one spare, the oracle's config with
+its own project, so its own job and app, and its data dir re-indexed with ``flora index --limit
+6``, so the same stage hash: :func:`run_cert_noise`) -> d (balanced
 on the 12, the real ``flora deploy`` / ``flora run``, then the **cold witness**: the same config
 re-run on the noise subset with ``FLORA_COMPILE_CACHE=off``, one container per kind forced
 cold) -> d2 (the lab, skipped only when its evidence exists **for the current engine
@@ -31,6 +32,21 @@ then ``wave_h_finalize.py --write`` when both are ``certified``: :func:`run_flor
 Every job stages one data dir (:data:`CERT_DATA`). Its caps are each step's upper projection
 rounded up to $0.05 (:func:`plan_caps`), its global cap their sum rounded up to $0.10; its
 state, work dir and records live under ``reports/wave-h/certified/``.
+
+**Parallel steps** (``--max-parallel N``, default 3; certified only: the other plans are one
+chain). b, f and d are independent and run at once; d2 waits for d, e for all four
+(:data:`CERT_DEPS`, which says why). Each step runs in its own thread with its own heartbeat
+and ``[<step>]`` log prefix, under the same stop rule as a sequential run, which also counts
+the running steps: a starting step **reserves** its budget against the global cap (``spent +
+every running step's reservation + its upper + the reserve for the steps still to start <=
+global cap``), and its in-step deadlines use that reservation alone; on finish the
+reservation becomes its tracked, then billed, spend. A step refused only while others run
+waits for one to end. ``--max-parallel 1`` is the sequential run, unchanged. (e) certifies the
+finished steps' jobs only (:func:`finished_view`). The dry run prints the expected wall-clock
+both ways; ``--status`` the running steps and their reservations. ``--max-parallel`` counts
+steps, not GPUs: b, f and d hold **4 GPUs** at once, 2 of them H200 (:data:`CERT_GPUS`);
+``--max-gpus`` caps the GPUs held across the running steps' apps (default 4, the peak; e.g.
+``--max-gpus H200=1`` runs f after b).
 
 ``--embodiment`` (``certified`` only; default ``human``) picks the certified plan's embodiment
 (:data:`CERT_SPECS`): ``yam`` runs the same steps on golden/v3-yam (12 three-view episodes,
@@ -73,7 +89,8 @@ e. ``certify``: offline provisional certification of ``balanced`` from (b) + (d)
 f. ``noise``: (b)'s job **repeated** (same config file, staged data, stage hash, GPU and
    default mode; a new job id): the noise floor; (e) is re-evaluated. Its episodes are a subset
    of the oracle's (Fix-Cert H2) by being all of them: the input content is hashed, so a strict
-   subset would be another stage hash, which ``flora certify`` refuses.
+   subset would be another stage hash, which ``flora certify`` refuses. (The certified plan's
+   (f) has its own project, job and app, beside (b): :func:`run_cert_noise`.)
 
 (The step letters keep their earlier names; the reward step was dropped with the yam job.)
 
@@ -130,9 +147,10 @@ import math
 import os
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -167,9 +185,52 @@ NOISE_EPISODES = EPISODES  # (f) repeats the oracle job: all of its episodes
 PLANS: dict[str, tuple[str, ...]] = {
     "balanced-only": ("tempseg", "preflight", "balanced", "lab"),
     "full": ("tempseg", "preflight", "exact_e2e", "balanced", "lab", "certify", "noise"),
-    # The certified run (module docstring): b -> f -> d -> (d2, skipped when done) -> e.
+    # The certified run (module docstring): b, f, d -> (d2 after d, skipped when done) -> e
+    # (in this order with --max-parallel 1; b, f and d at once otherwise: CERT_DEPS).
     "certified": ("exact_e2e", "noise", "balanced", "lab", "certify"),
 }
+# What each step needs done first (``--max-parallel``; ``_runbook.run_parallel``). The
+# certified plan: (b), (f) and (d) are independent (one data dir, staged once:
+# :func:`stage_data`). (f) used to share (b)'s app: the same config file, so the same deployed
+# app name (``factory.app_name_for``: project + stage hashes), and beside (b) one ``modal app
+# stop`` of it would stop the other's job. It now has its own app: (b)'s config with its own
+# project (per attempt, as the cold witness has; the project is not hashed, so the stage hash
+# stays (b)'s, checked before any app: :func:`run_cert_noise`). Each job was its own cold
+# start anyway ((b)'s app is stopped when its job is composed), so the noise floor is measured
+# as before. (d2) needs (d): the Captioner half reads (d)'s segment records, both halves run on
+# (d)'s episodes, and the lab writes the ``flora-cache`` engines (d)'s workers seed from (a lab
+# beside (d) would warm (d)'s cold compile). (e) needs them all. The other plans are one chain
+# (each step needs the one before): they run as they always did.
+CERT_DEPS: dict[str, tuple[str, ...]] = {
+    "exact_e2e": (), "noise": (), "balanced": (), "lab": ("balanced",),
+    "certify": ("exact_e2e", "noise", "balanced", "lab")}
+# The GPUs each certified step holds at once (``--max-gpus``; ``_runbook.gpu_wait``): (b) and
+# (f) one H200 container each (``max_containers: 1``, one app each), (d) its two pools at once
+# (L40S segment + H100 caption, one container each; the cold witness runs after), (d2) one GPU
+# at a time (L40S, then H100), (e) none. With b, f and d at once the peak is 4 GPUs, 2 of them
+# H200. A Modal app's ``max_gpus`` caps that app only, and ``--max-parallel`` counts steps.
+CERT_GPUS: dict[str, dict[str, int]] = {
+    "exact_e2e": {"H200": 1}, "noise": {"H200": 1}, "balanced": {"L40S": 1, "H100": 1},
+    "lab": {"L40S": 1}, "certify": {}}
+DEFAULT_MAX_GPUS = 4  # the certified plan's peak: the default never holds a step back
+
+
+def parse_gpu_caps(specs: Sequence[str] | None) -> dict[str, int]:
+    """``--max-gpus`` values (``N`` for the total, ``TYPE=N`` per GPU type) -> caps."""
+    caps = {"total": DEFAULT_MAX_GPUS}
+    for spec in specs or ():
+        kind, _, n = spec.rpartition("=")
+        if not n.isdigit() or int(n) < 1:
+            raise ValueError(f"--max-gpus {spec!r}: want N or TYPE=N with N >= 1")
+        caps[kind.strip() or "total"] = int(n)
+    return caps
+
+
+def plan_deps(plan: str) -> dict[str, tuple[str, ...]]:
+    """Per step of ``plan``, the steps it needs done first."""
+    return dict(CERT_DEPS) if plan == "certified" else rb.chain(PLANS[plan])
+
+
 DEFAULT_PLAN = "balanced-only"
 DEFERRED_NOTE = "deferred to the certified run"
 CERTIFIED = "certified"
@@ -464,14 +525,35 @@ class Projection:
     # The upper the plan's global cap is derived from, when it differs from ``usd_upper`` (a
     # lab step that reuses saved results: the cap stays what the whole step was planned at).
     cap_usd_upper: float | None = None
+    # wall-clock: items of one group run at the same time (``what`` -> group); ``wall``
+    # overrides the step's (nominal, upper) wall seconds (scale_test's run: its schedule)
+    groups: dict[str, str] = field(default_factory=dict)
+    wall: tuple[float, float] | None = None
 
-    def add(self, what: str, c: Container, seconds: float, *, upper_s: float | None = None
-            ) -> None:
+    def add(self, what: str, c: Container, seconds: float, *, upper_s: float | None = None,
+            group: str | None = None) -> None:
         self.items.append({"what": what, "gpu": c.gpu or "cpu", "seconds": round(seconds, 1),
                            "upper_seconds": round(upper_s or seconds, 1),
                            "usd_per_h": round(c.usd_per_h(), 3),
                            "usd": round(c.usd_per_s() * seconds, 4),
                            "usd_upper": round(c.usd_per_s() * (upper_s or seconds), 4)})
+        if group is not None:
+            self.groups[what] = group
+
+    def wall_s(self, upper: bool = False) -> float:
+        """The step's wall seconds: its items one after the other, but the items of one group
+        at the same time (the longest of them)."""
+        if self.wall is not None:
+            return float(self.wall[1 if upper else 0])
+        key = "upper_seconds" if upper else "seconds"
+        total, spans = 0.0, {}
+        for i in self.items:
+            g = self.groups.get(i["what"])
+            if g is None:
+                total += i[key]
+            else:
+                spans[g] = max(spans.get(g, 0.0), i[key])
+        return round(total + sum(spans.values()), 1)
 
     @property
     def usd(self) -> float:
@@ -652,16 +734,16 @@ def project(step: str, manifest: Mapping[str, Any], spec: PlanSpec | None = None
         seg, cap = pool_container("segment", "balanced"), pool_container("caption", "balanced")
         secs = balanced_job_seconds(v, scale=sc or None)
         p.add(f"balanced segment {job} ({len(eps)} ep, {v:.1f} s{work('segment')}, cold "
-              "compile)", seg, secs["segment"][0], upper_s=secs["segment"][1])
+              "compile)", seg, secs["segment"][0], upper_s=secs["segment"][1], group="job")
         p.add(f"balanced caption {job} ({len(eps)} ep, {v:.1f} s{work('caption')}, cold "
-              "compile)", cap, secs["caption"][0], upper_s=secs["caption"][1])
+              "compile)", cap, secs["caption"][0], upper_s=secs["caption"][1], group="job")
         if spec.shared_data:  # certified: the forced-cold job on the noise subset
             neps = [i for i in spec.noise if i in dur]
             nv = sum(dur[i] for i in neps)
             ws = balanced_job_seconds(nv, scale=sc or None)
             for kind, c in (("segment", seg), ("caption", cap)):
                 p.add(f"cold witness {kind} {job} ({len(neps)} ep, {nv:.1f} s{work(kind)}, "
-                      "forced cold)", c, ws[kind][0], upper_s=ws[kind][1])
+                      "forced cold)", c, ws[kind][0], upper_s=ws[kind][1], group="witness")
             if witness_only:  # (d)'s job is done: the witness alone re-runs
                 full = p.usd_upper
                 p.items = [i for i in p.items if i["what"].startswith("cold witness")]
@@ -1139,6 +1221,9 @@ class Ctx:
     # the plan's steps and projections: what the global cap keeps for its later steps
     plan_steps: tuple[str, ...] = ()
     projections: Mapping[str, Projection] | None = None
+    # added to the environment of this step's commands only (the cold witness's
+    # FLORA_COMPILE_CACHE=off): never os.environ, which a step beside it would inherit
+    env: dict[str, str] = field(default_factory=dict)
 
     @property
     def episodes(self) -> tuple[str, ...]:
@@ -1161,7 +1246,7 @@ class Ctx:
 
     def sh(self, args: list[str], *, timeout: float = 1800, check: bool = True):
         return h0.sh(args, cwd=self.work, timeout=timeout, check=check,
-                     log=self.work / "wave-h.log")
+                     log=self.work / "wave-h.log", **({"env": self.env} if self.env else {}))
 
     def note_app(self, name: str) -> None:
         """Record an app in the running attempt *before* it can spend (H3). A new app means
@@ -1440,6 +1525,13 @@ def stage_local(ctx: Ctx, data: str, ids: Sequence[str]) -> Path:
     return root
 
 
+# The certified plan's jobs share one data dir: (b) and (d), which may run at once, stage it
+# one at a time, and it is uploaded once per run (a second upload would rewrite the files a
+# running job reads).
+_STAGE_LOCK = threading.Lock()
+_UPLOADED: set[tuple[str, str]] = set()
+
+
 def _stage_job(ctx: Ctx, job: str, ids: Sequence[str], *, embodiment: str,
                stages: tuple[str, ...], budget: float, preset: str = "exact",
                resources: dict[str, str] | None = None,
@@ -1448,20 +1540,40 @@ def _stage_job(ctx: Ctx, job: str, ids: Sequence[str], *, embodiment: str,
     """Fetch, upload, write the config, ``flora index --local`` + mirror, ``flora plan``.
     ``data``: the data directory (default ``job``); the certified plan stages every job from
     one (:data:`CERT_DATA`), so their episode uids pair."""
-    run = ctx.st.run_id
     data = data or job
-    stage_local(ctx, data, ids)
-    h0.upload_dir(MEDIA_VOLUME, ctx.work / data, f"{run}/{data}")
-    job_id = f"wave-h-{run}-{job}"
+    stage_data(ctx, data, ids)
+    text, job_id = config_text(ctx, job, embodiment=embodiment, stages=stages, budget=budget,
+                               preset=preset, resources=resources, derived=derived, data=data)
     cfg = ctx.work / f"flora-{job}.yaml"
-    cfg.write_text(h0.config_text(project=job_id, data_dir=data, embodiment=embodiment,
-                                  stages=stages, store_volume=STORE_VOLUME,
-                                  media_volume=MEDIA_VOLUME, run_id=run, budget_usd=budget,
-                                  resources=resources, tag="flora-wave-h", preset=preset,
-                                  derived=derived,
-                                  header="Wave H-lite; generated by scripts/wave_h.py"))
+    cfg.write_text(text)
     _index(ctx, cfg, job_id, job)
     return cfg, job_id
+
+
+def stage_data(ctx: Ctx, data: str, ids: Sequence[str]) -> None:
+    """``work/<data>/`` staged (:func:`stage_local`) and uploaded to the media Volume, one step
+    at a time and uploaded once per process (:data:`_STAGE_LOCK`)."""
+    run = ctx.st.run_id
+    with _STAGE_LOCK:
+        stage_local(ctx, data, ids)
+        key = (str(ctx.work / data), f"{run}/{data}")
+        if key not in _UPLOADED:
+            h0.upload_dir(MEDIA_VOLUME, ctx.work / data, f"{run}/{data}")
+            _UPLOADED.add(key)
+
+
+def config_text(ctx: Ctx, job: str, *, embodiment: str, stages: tuple[str, ...], budget: float,
+                preset: str = "exact", resources: dict[str, str] | None = None,
+                derived: dict[str, str] | None = None, data: str | None = None
+                ) -> tuple[str, str]:
+    """A job's config text and job id (``wave-h-<run>-<job>``, also its ``project``)."""
+    run = ctx.st.run_id
+    job_id = f"wave-h-{run}-{job}"
+    return h0.config_text(project=job_id, data_dir=data or job, embodiment=embodiment,
+                          stages=stages, store_volume=STORE_VOLUME, media_volume=MEDIA_VOLUME,
+                          run_id=run, budget_usd=budget, resources=resources,
+                          tag="flora-wave-h", preset=preset, derived=derived,
+                          header="Wave H-lite; generated by scripts/wave_h.py"), job_id
 
 
 def _index(ctx: Ctx, cfg: Path, job_id: str, tag: str, *, limit: int | None = None) -> None:
@@ -1542,17 +1654,26 @@ def _jobs_result(jobs: Mapping[str, Mapping[str, Any]], n: int) -> dict[str, Any
             "apps": [r["app"] for r in jobs.values() if "app" in r]}
 
 
-def run_exact(ctx: Ctx, step: str = "exact_e2e") -> dict[str, Any]:
-    """(b): the oracle, default mode, one app."""
-    require_tempseg_pin(ctx)  # every GPU step runs from the pinned commit
+def oracle_job(ctx: Ctx, step: str = "exact_e2e") -> dict[str, Any]:
+    """(b)'s job: its name, episodes and config inputs. (b) runs it; the certified (f) builds
+    the same config from them (:func:`run_cert_noise`), so the same stage hash."""
     derived = resolve_receipts(["captioner_bf16"])
     eps = ctx.episodes
     if ctx.spec.shared_data:  # certified: every episode, at least the certificate's minimum
         eps = balanced_episodes(ctx.manifest, ctx.spec, side="(b)")
-    cfg, job_id = _stage_job(ctx, f"{step}-{ctx.spec.embodiment}", eps,
-                             embodiment=ctx.spec.embodiment,
-                             stages=("segment", "caption"), budget=ctx.caps[step],
-                             derived=derived, data=ctx.spec.data_dir(step))
+    return {"job": f"{step}-{ctx.spec.embodiment}", "ids": eps,
+            "embodiment": ctx.spec.embodiment, "stages": ("segment", "caption"),
+            "budget": ctx.caps[step], "derived": derived, "data": ctx.spec.data_dir(step)}
+
+
+def run_exact(ctx: Ctx, step: str = "exact_e2e") -> dict[str, Any]:
+    """(b): the oracle, default mode, one app."""
+    require_tempseg_pin(ctx)  # every GPU step runs from the pinned commit
+    o = oracle_job(ctx, step)
+    eps = o["ids"]
+    cfg, job_id = _stage_job(ctx, o["job"], eps, embodiment=o["embodiment"],
+                             stages=o["stages"], budget=o["budget"], derived=o["derived"],
+                             data=o["data"])
     r = _run_job(ctx, step, cfg, job_id, determinism=ORACLE_DETERMINISM,
                  usd_per_s=pool_container("segcap").usd_per_s(), spent_in_step=0.0,
                  side="exact")
@@ -1653,16 +1774,11 @@ def run_cold_witness(ctx: Ctx, cfg: Path, rate: float, *, spent: float) -> dict[
     if got:
         return {"job_id": job_id, "state": "skipped", "error": f"witness index: {got}",
                 "spend": 0.0, "compile_cache": "off"}
-    prev = os.environ.get(COMPILE_CACHE_ENV)
-    os.environ[COMPILE_CACHE_ENV] = "off"
-    try:
-        r = _run_job(ctx, "balanced", wcfg, job_id, determinism=ORACLE_DETERMINISM,
-                     usd_per_s=rate, spent_in_step=spent, side="witness")
-    finally:
-        if prev is None:
-            os.environ.pop(COMPILE_CACHE_ENV, None)
-        else:
-            os.environ[COMPILE_CACHE_ENV] = prev
+    # in this step's commands' environment only (Ctx.env): a step running beside it keeps
+    # its compile cache
+    wctx = replace(ctx, env={**ctx.env, COMPILE_CACHE_ENV: "off"})
+    r = _run_job(wctx, "balanced", wcfg, job_id, determinism=ORACLE_DETERMINISM,
+                 usd_per_s=rate, spent_in_step=spent, side="witness")
     return {**r, "compile_cache": "off", "episodes": len(ctx.spec.noise)}
 
 
@@ -2113,9 +2229,63 @@ def run_certify(ctx: Ctx, noise: Mapping[str, float] | None = None) -> dict[str,
             "apps": []}
 
 
+def stage_hashes(cfg: Path) -> dict[str, str]:
+    """The stage hashes ``flora deploy`` plans ``cfg`` with (``factory.plan_app``; local)."""
+    from flora_deploy.config.receipts import resolve
+    from flora_deploy.config.schema import load_config
+    from flora_deploy.modal_app.factory import plan_app
+
+    c = load_config(cfg)
+    return dict(plan_app(c, determinism=ORACLE_DETERMINISM,
+                         derived_receipts=resolve(c)).stage_hashes)
+
+
+def run_cert_noise(ctx: Ctx) -> dict[str, Any]:
+    """The certified (f): (b)'s job repeated on the noise subset, **beside** (b). Its config is
+    (b)'s (:func:`oracle_job`: the same inputs, data dir and staged data) with its own
+    ``project`` (``wave-h-<run>-noise-<embodiment>-a<attempt>``), so its own job and app, as
+    the cold witness has: the project is not hashed, so the stage hash is (b)'s, which is
+    checked before any app (against (b)'s recorded hashes too, once (b) ran). Then ``flora
+    index --limit`` on it indexes exactly the noise subset, and it runs in default mode."""
+    require_tempseg_pin(ctx)
+    o = oracle_job(ctx)
+    emb = ctx.spec.embodiment
+    n = max(1, len(ctx.st.step("noise").attempts))
+    job_id = f"wave-h-{ctx.st.run_id}-noise-{emb}-a{n}"
+    tag = f"noise-{emb}"
+    stage_data(ctx, o["data"], o["ids"])
+    text, _ = config_text(ctx, o["job"], embodiment=emb, stages=o["stages"],
+                          budget=o["budget"], derived=o["derived"], data=o["data"])
+    ocfg, cfg = ctx.work / f"flora-{tag}-oracle.yaml", ctx.work / f"flora-{tag}.yaml"
+    ocfg.write_text(text)
+    cfg.write_text(witness_config_text(text, job_id))
+    want = stage_hashes(ocfg)
+    ran = (((ctx.st.steps.get("exact_e2e") or StepState()).result.get("jobs") or {})
+           .get(NOISE_JOB) or {}).get("stage_hashes")
+    got = stage_hashes(cfg)
+    if got != want or (ran and dict(ran) != got):  # before any app: charged $0
+        raise RuntimeError(f"noise: stage hashes {got} are not (b)'s ({ran or want})")
+    limit = ctx.spec.noise_limit
+    _index(ctx, cfg, job_id, tag, limit=limit)
+    if limit is not None:  # before any app: the index must hold exactly the noise subset
+        why = noise_index_problems(ctx.work / f"summary-{tag}.json", ctx.manifest, ctx.spec)
+        if why:
+            raise RuntimeError(f"noise index: {why}")
+    r = _run_job(ctx, "noise", cfg, job_id, determinism=ORACLE_DETERMINISM,
+                 usd_per_s=pool_container("segcap").usd_per_s(), spent_in_step=0.0,
+                 side="noise")
+    res = _jobs_result({NOISE_JOB: r}, 1)
+    res["episodes"] = len(ctx.spec.noise) if limit is not None else len(o["ids"])
+    res["stage_hashes_of_oracle"] = True  # checked above
+    return res
+
+
 def run_noise(ctx: Ctx) -> dict[str, Any]:
     """(f): (b)'s job repeated: its own config file and staged data (same stage hash, so the
-    same app), a new job id, default mode; all of its episodes (module docstring)."""
+    same app), a new job id, default mode; all of its episodes (module docstring). The
+    certified plan's runs beside (b) instead (:func:`run_cert_noise`)."""
+    if ctx.spec.name == CERTIFIED:
+        return run_cert_noise(ctx)
     oracle = ctx.st.step("exact_e2e").result.get("jobs", {}).get(NOISE_JOB) or {}
     if not oracle.get("cfg"):
         raise RuntimeError(f"noise repeats (b)'s {NOISE_JOB} job, which has not run")
@@ -2135,8 +2305,6 @@ def run_noise(ctx: Ctx) -> dict[str, Any]:
     res = _jobs_result({NOISE_JOB: r}, 1)
     res["episodes"] = len(ctx.spec.noise) if limit is not None else len(ctx.episodes)
     res["same_app_as_oracle"] = r.get("app") == oracle.get("app")
-    if ctx.spec.name == CERTIFIED:  # (e) runs flora certify on the exported records
-        return res
     ctx.st.step("noise").result = res  # so _job_rows can read this step's job
     exact = _job_rows(ctx, "exact_e2e")
     noise_rows = _job_rows(ctx, "noise")
@@ -2167,6 +2335,19 @@ def noise_index_problems(summary: Path, manifest: Mapping[str, Any], spec: PlanS
 
 
 CERT_STAGES = ("segment", "caption")
+RECORD_STEPS = ("exact_e2e", "noise", "balanced")  # the steps whose jobs' records (e) reads
+
+
+def finished_view(st: State) -> State:
+    """A copy of ``st`` in which a record-producing step (:data:`RECORD_STEPS`) that is not
+    ``done`` has no result: what (e) exports and certifies. A failed or killed attempt's jobs
+    (a partial result, or a step another process still runs) never reach a certificate."""
+    view = copy.deepcopy(st)
+    for name in RECORD_STEPS:
+        s = view.steps.get(name)
+        if s is not None and s.status != "done":
+            s.result = {}
+    return view
 
 
 def run_flora_certify(ctx: Ctx, *, finalize: Any = None, sh: Callable[..., Any] | None = None,
@@ -2174,7 +2355,8 @@ def run_flora_certify(ctx: Ctx, *, finalize: Any = None, sh: Callable[..., Any] 
     """(e) of the certified plan, on CPU ($0): export the oracle's, the noise run's and
     balanced's records (``wave_h_finalize.fetch_records``, a Volume read), then ``flora
     certify`` per stage (``wave_h_finalize.certify_all``: the oracle, the noise run, the L0 JSON
-    and the derived content digests (d)'s workers verified, stamped with the run's own time).
+    and the derived content digests (d)'s workers verified, stamped with the run's own time),
+    of the **finished** steps only (:func:`finished_view`).
     Done only when **every** stage is ``certified``; then ``scripts/wave_h_finalize.py --write``
     (rates, certificates, report, docs) for this state. Otherwise nothing is written and the
     step fails with what is missing (``missing_for_certified``)."""
@@ -2183,11 +2365,12 @@ def run_flora_certify(ctx: Ctx, *, finalize: Any = None, sh: Callable[..., Any] 
     paths = finalize.Paths(root=ROOT, state=ctx.state_path, records=ctx.spec.records,
                            lab=lab_dir or LAB_OUT)
     save_state(ctx.st, ctx.state_path)
-    finalize.fetch_records(paths, ctx.st)  # every job's records, freshly (no container)
+    done = finished_view(ctx.st)  # only the finished steps' jobs (a parallel run: see there)
+    finalize.fetch_records(paths, done)  # every job's records, freshly (no container)
     out_dir = ctx.work / "certify"
     out_dir.mkdir(parents=True, exist_ok=True)
-    outcomes = finalize.certify_all(paths, ctx.st, out_dir,
-                                    derived=finalize.derived_content_used(ctx.st))
+    outcomes = finalize.certify_all(paths, done, out_dir,
+                                    derived=finalize.derived_content_used(done))
     stages: dict[str, Any] = {}
     for o in outcomes:
         c = o.get("cert") or {}
@@ -2299,9 +2482,40 @@ def _numbers_only(d: Any) -> Any:
 # ---------------------------------------------------------------------------------------------
 
 
+def letter(title: str) -> str:
+    """A step title's letter (``"d2. lab ..."`` -> ``"d2"``)."""
+    return title.split(".")[0]
+
+
+def max_parallel_for(plan: str, only: str | None, requested: int) -> int:
+    """The steps a run starts at once: ``--max-parallel`` for the certified plan's steps; 1
+    for ``--only`` and for the other plans (one chain: nothing to run beside)."""
+    return max(1, requested) if plan == CERTIFIED and not only else 1
+
+
+def wall_lines(st: State, projections: Mapping[str, Projection], plan: str,
+               steps: Sequence[str], title: Mapping[str, str],
+               max_parallel: int = rb.DEFAULT_MAX_PARALLEL) -> list[str]:
+    """The dry run's wall-clock lines: the steps' order (what each needs) and the expected
+    wall-clock one after the other vs ``--max-parallel`` (a done step takes none)."""
+    deps = plan_deps(plan)
+    wall = {s: (0.0, 0.0) if (st.steps.get(s) or StepState()).status == "done"
+            else (projections[s].wall_s(), projections[s].wall_s(upper=True)) for s in steps}
+    order = "; ".join(f"{letter(title[s])} after " + ", ".join(letter(title[d]) for d in need)
+                      for s in steps if (need := rb.deps_within(s, deps, steps)))
+    first = [letter(title[s]) for s in steps if not rb.deps_within(s, deps, steps)]
+    out = [f"  order: {', '.join(first)} first" + (f"; {order}" if order else ""),
+           rb.wall_line(steps, deps, wall, max_parallel)]
+    if plan == CERTIFIED and wall.get("lab", (0.0, 0.0))[0] > 0:  # the lab may be skipped
+        out.append(rb.wall_line(steps, deps, {**wall, "lab": (0.0, 0.0)}, max_parallel)
+                   .replace("wall-clock", "with d2 skipped (lab already done)", 1))
+    return out
+
+
 def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
                manifest: Mapping[str, Any] | None = None, plan: str = DEFAULT_PLAN,
-               only: str | None = None, spec: PlanSpec | None = None) -> None:
+               only: str | None = None, spec: PlanSpec | None = None,
+               max_parallel: int = rb.DEFAULT_MAX_PARALLEL) -> None:
     steps = (only,) if only else PLANS[plan]
     spec = spec or SPECS[plan]
     gcap = plan_global_cap(plan, projections, st.override_for(plan))
@@ -2352,7 +2566,8 @@ def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
             f"{e.container_s_per_video_s:g} container-s/video-s +/-{e.uncertainty:.0%} (H200, "
             f"default mode, c={e.concurrency}, {e.date}) and the measured @enter "
             f"{su.startup_s:g} s +/-{su.uncertainty:.0%} per job (each job is its own cold "
-            "start: the oracle's app is stopped before (f) deploys it again). Image pull and "
+            "start: (f) deploys its own app, and the oracle's is stopped when its job is "
+            "composed). Image pull and "
             "scheduling are not in the measured startup; the upper bound's +100% and the "
             f"{CLIENT_SLACK_S} s client slack cover them")
         out("  assumption: certified plan caps are each step's own upper projection rounded "
@@ -2408,6 +2623,9 @@ def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
     how = global_cap_label(st, plan, projections)
     out(f"  total: nominal ${nominal:.2f}, upper ${upper:.2f} (incl. {CLIENT_SLACK_S} s client "
         f"slack per app); global cap ${gcap:.2f} ({how})")
+    for line in wall_lines(st, projections, plan, steps, title,
+                           max_parallel_for(plan, only, max_parallel)):
+        out(line)
     honest = honest_caps({s: projections[s] for s in steps})
     if upper > gcap + 1e-9:
         out(f"  NOT HONEST AT ${gcap:.2f}: the upper total needs a global cap of at "
@@ -2475,8 +2693,12 @@ def simulate_run_start(st: State, *, out: Callable[[str], None] = print) -> None
 
 def next_decision(st: State, plan: str, projections: Mapping[str, Projection],
                   only: str | None = None, embodiment: str = EMBODIMENT) -> Decision | None:
-    """The decision a run takes first: the first step (of ``--only`` or the plan) not done."""
+    """The decision a run takes first: the first step (of ``--only`` or the plan) not done,
+    and not running in a parallel run (one that reserved: it is shown as running)."""
     for name in (only,) if only else PLANS[plan]:
+        cur = (st.steps.get(name) or StepState()).current
+        if cur is not None and cur.reserved_usd is not None:
+            continue
         d = decide(st, plan, name, projections, only=only, embodiment=embodiment)
         if d.action != "done":
             return d
@@ -2528,6 +2750,8 @@ def print_status(st: State, projections: Mapping[str, Projection], *, plan: str,
             + ("" if s.billed_usd is None else f"  billed ${s.billed_usd:.2f}") + why)
     for line in held_lines(st):
         out(line)
+    for line in running_lines(st, plan, title, only):
+        out(line)
     d = next_decision(st, plan, projections, only, spec.embodiment)
     if d is None:
         out("  next: nothing (every step is done)")
@@ -2538,6 +2762,33 @@ def print_status(st: State, projections: Mapping[str, Projection], *, plan: str,
     if d.command:
         out(f"    command: {d.command}")
     return d
+
+
+def running_lines(st: State, plan: str, title: Mapping[str, str], only: str | None = None
+                  ) -> list[str]:
+    """``--status``: the running steps (a parallel run has several) with what each reserved
+    against the global cap, what it charged so far and what is still kept for it; then the
+    steps a run could start beside them (what they need is done)."""
+    wm, out = st.watermark, []
+    running = st.running()
+    for name, a in running.items():
+        res = a.budget_usd if a.reserved_usd is None else a.reserved_usd
+        out.append(f"  running: {letter(title.get(name, name))} {name}: reserved ${res:.2f}, "
+                   f"charged ${a.charged(wm):.2f} so far, ${a.outstanding(wm):.2f} still kept "
+                   f"(heartbeat {rb.utc(a.last_activity)})")
+    if running:
+        out.append(f"  reserved by running steps: ${sum(st.reservations().values()):.2f} "
+                   f"(spent ${st.spent:.2f})")
+    steps = (only,) if only else PLANS[plan]
+    deps = plan_deps(plan)
+    ready = [s for s in steps if s not in running
+             and (st.steps.get(s) or StepState()).status != "done"
+             and all((st.steps.get(d) or StepState()).status == "done"
+                     for d in rb.deps_within(s, deps, steps))]
+    if running or len(ready) > 1:
+        out.append("  ready to start: " + (", ".join(ready) or "none")
+                   + " (what each needs is done)")
+    return out
 
 
 def load_manifest(offline: bool, version: str = "golden/v1") -> dict[str, Any]:
@@ -2582,7 +2833,26 @@ def main(argv: list[str] | None = None) -> int:
                     help="default: the plan's (reports/wave-h/state.json; certified: "
                          "reports/wave-h/certified/state.json)")
     ap.add_argument("--work", type=Path, default=None)
+    ap.add_argument("--max-parallel", type=int, default=rb.DEFAULT_MAX_PARALLEL, metavar="N",
+                    help="certified: run up to N independent steps at once (default "
+                         f"{rb.DEFAULT_MAX_PARALLEL}: b, f and d at once, d2 after d, e last); "
+                         "each reserves its budget against the global cap while it runs. It "
+                         "counts steps, not GPUs: b, f and d hold 4 GPUs at once (2x H200, "
+                         "L40S, H100); see --max-gpus. 1: one after the other, as before")
+    ap.add_argument("--max-gpus", action="append", metavar="N|TYPE=N", default=None,
+                    help="certified, with --max-parallel > 1: the most GPUs held at once across "
+                         f"every running step's apps (default {DEFAULT_MAX_GPUS}, the peak); "
+                         "TYPE=N caps one GPU type, e.g. --max-gpus H200=1 runs f after b (for "
+                         "a workspace that would queue a second H200, which eats into f's "
+                         "in-step deadline). A step that does not fit waits for one to end. "
+                         "Repeatable")
     args = ap.parse_args(argv)
+    if args.max_parallel < 1:
+        ap.error("--max-parallel must be at least 1")
+    try:
+        args.gpu_caps = parse_gpu_caps(args.max_gpus)
+    except ValueError as e:
+        ap.error(str(e))
     try:
         spec = spec_for(args.plan, args.embodiment)
     except KeyError:
@@ -2658,7 +2928,8 @@ def main(argv: list[str] | None = None) -> int:
         print_status(st, projections, plan=args.plan, only=args.only, state_path=args.state,
                      spec=spec)
         return 0
-    print_plan(st, projections, manifest=manifest, plan=args.plan, only=args.only, spec=spec)
+    print_plan(st, projections, manifest=manifest, plan=args.plan, only=args.only, spec=spec,
+               max_parallel=args.max_parallel)
     report = spec.report or REPORT
     if args.report:
         report.parent.mkdir(parents=True, exist_ok=True)
@@ -2701,7 +2972,9 @@ def main(argv: list[str] | None = None) -> int:
                                  "hard_timeout_s": STEP_HARD_TIMEOUT_S.get(name)},
         status_of=lambda res: ("done" if res.get("ok") else
                                "needs_pin" if res.get("needs_pin") else "failed"),
-        after=after)
+        after=after, deps=plan_deps(args.plan),
+        max_parallel=max_parallel_for(args.plan, args.only, args.max_parallel),
+        gpus=CERT_GPUS if args.plan == CERTIFIED else None, gpu_caps=args.gpu_caps)
     save_state(st, args.state)
     report.parent.mkdir(parents=True, exist_ok=True)
     report.write_text(render_report(st, projections, plan=args.plan, spec=spec))

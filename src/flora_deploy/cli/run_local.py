@@ -57,8 +57,9 @@ def run(
     budget: Annotated[float | None, typer.Option(
         "--budget", help="USD budget override (default: modal.budget_usd).")] = None,
     sample_data: Annotated[bool, typer.Option(
-        "--sample-data", help="Write a synthetic mp4_dir dataset to input.path first, if it "
-                              "does not exist.")] = False,
+        "--sample-data", help="Write a synthetic dataset (mp4_dir or lerobot_v3, as "
+                              "input.format says) to input.path first, if it does not "
+                              "exist.")] = False,
     as_json: Annotated[bool, typer.Option("--json", help="Print the result as JSON.")] = False,
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Print every event.")] = False,
 ) -> None:
@@ -68,6 +69,7 @@ def run(
     from flora_deploy.config.schema import ConfigError, load_config
     from flora_deploy.local import LocalRunError, parse_faults, run_local, sample_dataset
     from flora_deploy.local.runner import summary_lines
+    from flora_deploy.local.sample import sample_lerobot
 
     if not local:
         raise _fail("`flora run` on Modal is not wired yet; use `flora run --local "
@@ -86,13 +88,14 @@ def run(
     except ValueError as e:
         raise _fail(str(e)) from None
     if sample_data:
-        if cfg.input.repo is not None or cfg.input.format != "mp4_dir":
-            raise _fail("--sample-data writes an mp4_dir dataset; set input.format: mp4_dir "
-                        "and a local input.path")
+        make = {"mp4_dir": sample_dataset, "lerobot_v3": sample_lerobot}.get(cfg.input.format)
+        if cfg.input.repo is not None or make is None:
+            raise _fail("--sample-data writes an mp4_dir or lerobot_v3 dataset; set "
+                        "input.format to one of them and a local input.path")
         p = Path(str(cfg.input.path)).expanduser()
         root = p if p.is_absolute() else config.parent / p
         if not root.exists():
-            sample_dataset(root)
+            make(root)
             console.print(f"sample data: {escape(str(root))}")
 
     def log(msg: str) -> None:

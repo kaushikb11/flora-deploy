@@ -435,13 +435,12 @@ def build_option(req: PlanRequest, table: RateTable, rates: Rates, preset: str, 
             f"{k.kind} x{f:.2f}" for k in kinds for c2, f in k.camera_scale if c2 == c)
             for c in sorted({c for k in kinds for c, _f in k.camera_scale}))
         flags.append(f"camera scaling ({cs.status}, {cs.date}): {what}, for the longer "
-                     "multi-view prompts, on rates measured on another layout ("
-                     f"{table.source} camera_scaling; {cs.source})")
+                     "multi-view prompts, on rates measured on another layout")
     unscaled = sorted({c for k in kinds for c in k.unscaled})
-    if unscaled:
+    if unscaled:  # name the kinds, so it never reads as contradicting the line above
         flags.append("no camera scaling for " + ", ".join(f"{c}-view" for c in unscaled)
-                     + f" episodes in {table.source}: priced at rates measured on another "
-                     "layout, likely an underestimate")
+                     + " episodes of " + ", ".join(k.kind for k in kinds if k.unscaled)
+                     + ": priced at rates measured on another layout, likely an underestimate")
     warm = [k for k in kinds if k.startup_cache == "warm"]
     if warm:
         what = "assumed (--assume-warm)" if req.assume_warm else "a published compile cache"

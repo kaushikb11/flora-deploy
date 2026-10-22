@@ -1,7 +1,7 @@
 """``BucketStore``: an S3-compatible bucket (AWS S3, Cloudflare R2, GCS via its S3 interop with
 HMAC keys) as the job's state of record (PLAN.md D6).
 
-``boto3`` is optional and imported only when no ``client`` is passed (``pip install boto3``).
+``boto3`` is optional and imported only when no ``client`` is passed (:data:`BOTO3_INSTALL`).
 R2 and GCS need ``endpoint_url`` (``https://<account>.r2.cloudflarestorage.com``,
 ``https://storage.googleapis.com``).
 
@@ -16,6 +16,10 @@ from collections.abc import Iterator
 from typing import Any
 
 from flora_deploy.jobs.stores.local import check_list_prefix, check_rel_path
+
+# How to add boto3 to the environment flora runs in (the README installs it with `uv tool`).
+BOTO3_INSTALL = ("uv tool install --force --with boto3 git+https://github.com/kaushikb11/"
+                 "flora-deploy (or `pip install boto3` in flora's environment)")
 
 _MISSING = {"404", "NoSuchKey", "NotFound"}
 
@@ -39,7 +43,7 @@ class BucketStore:
             try:
                 import boto3  # optional dependency
             except ImportError as e:  # pragma: no cover - depends on the environment
-                raise ImportError("BucketStore needs boto3 (pip install boto3) or client=") from e
+                raise ImportError(f"an s3:// store needs boto3: {BOTO3_INSTALL}") from e
             client = boto3.client("s3", endpoint_url=endpoint_url, region_name=region_name)
         self.client = client
 

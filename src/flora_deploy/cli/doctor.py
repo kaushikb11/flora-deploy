@@ -236,7 +236,9 @@ def _probe_bucket(scheme: str, bucket: str, prefix: str, key: str, data: bytes) 
         import boto3
         from botocore.exceptions import NoCredentialsError
     except ImportError:
-        return "skip:boto3 is not installed here (pip install boto3)"
+        from flora_deploy.jobs.stores.bucket import BOTO3_INSTALL
+
+        return f"skip:boto3 is not installed here ({BOTO3_INSTALL})"
     endpoint = os.environ.get("AWS_ENDPOINT_URL")
     if scheme == "gs" and not endpoint:
         endpoint = "https://storage.googleapis.com"

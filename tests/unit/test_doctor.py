@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,7 +17,13 @@ from flora_deploy.config.pins import PINS_BY_KEY, RUNTIME
 from flora_deploy.config.schema import load_config
 from flora_deploy.layout import RECEIPT_NAME, snapshot_dirname
 
-EXAMPLE = Path(__file__).resolve().parents[2] / "examples" / "lerobot_small" / "flora.yaml"
+EXAMPLE_FILE = Path(__file__).resolve().parents[2] / "examples" / "lerobot_small" / "flora.yaml"
+ALL_OK_SINK = "s3://my-bucket/flora/lerobot-small"
+# The suite runs on the example with an S3 sink, so the bucket checks are exercised (the example
+# itself ships a Volume sink: test_newcomer2_dx).
+EXAMPLE = Path(tempfile.mkdtemp(prefix="doctor-example-")) / "flora.yaml"
+EXAMPLE.write_text(EXAMPLE_FILE.read_text().replace("volume://flora-results/lerobot-small",
+                                                    ALL_OK_SINK, 1))
 SNAPSHOTS = [snapshot_dirname(p) for p in PINS_BY_KEY.values()]
 
 
@@ -92,8 +99,6 @@ def write_cfg(tmp_path: Path, **edits) -> Path:
     p.write_text(text)
     return p
 
-
-ALL_OK_SINK = "s3://my-bucket/flora/lerobot-small"
 
 
 def test_all_pass_on_the_example(tempseg_pinned):
