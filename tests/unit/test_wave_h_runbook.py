@@ -390,8 +390,13 @@ def test_retries_add_instead_of_overwriting():
     s.attempts.append(wh.Attempt(0.0, "failed", finished=10.0, tracked_usd=2.00))
     s.attempts.append(wh.Attempt(20.0, "done", finished=30.0, tracked_usd=1.90))
     assert s.spent == pytest.approx(3.90) and st.spent == pytest.approx(3.90)
-    with pytest.raises(wh.StopRule, match="exact_e2e"):
-        wh.check_after(st, "exact_e2e")  # $3.90 > $3.30
+    # the step cap is a per-attempt ceiling ($1.90 fits $3.30); retries count globally
+    wh.check_after(st, "exact_e2e")
+    with pytest.raises(wh.StopRule, match="global cap"):
+        wh.check_after(st, "exact_e2e", global_cap=3.50)
+    s.attempts.append(wh.Attempt(40.0, "done", finished=50.0, tracked_usd=3.40))
+    with pytest.raises(wh.StopRule, match="exact_e2e: attempt 3 spent"):
+        wh.check_after(st, "exact_e2e", global_cap=20.0)  # $3.40 > $3.30
 
 
 def test_legacy_state_files_keep_their_spend(tmp_path):
@@ -579,9 +584,14 @@ def test_step0_builds_checks_reports_the_digest_and_stops_for_the_pin(tmp_path):
     assert res["needs_pin"] and not res["ok"] and res["content_sha256"] == "e" * 64
     runs = [c for c in ctx.cmds if c[:2] == ["modal", "run"]]
     assert [c[c.index("--step") + 1] for c in runs] == ["merge", "equivalence"]
-    assert runs[0][2].endswith("convert_app.py::tempseg")
-    assert ["modal", "app", "stop", "--yes", wh.TEMPSEG_APP] in ctx.cmds
-    assert st.step("tempseg").current.apps == [wh.TEMPSEG_APP]  # noted before it spent
+    names = ["flora-wh-r-tempseg-a1-merge", "flora-wh-r-tempseg-a1-equivalence"]
+    assert [c[:4] for c in runs] == [["modal", "run", "-n", n] for n in names]  # own names
+    assert runs[0][4].endswith("convert_app.py::tempseg")
+    # each app looked up by its name and stopped (the fake lists none: stopped by name too)
+    assert ["modal", "app", "list", "--json"] in ctx.cmds
+    assert all(["modal", "app", "stop", "--yes", n] in ctx.cmds for n in names)
+    assert ["modal", "app", "stop", "--yes", wh.TEMPSEG_APP] not in ctx.cmds
+    assert st.step("tempseg").current.apps == names  # noted before they spent
     assert "e" * 64 in wh.pin_instructions(res) and "DERIVED_PINS" in wh.pin_instructions(res)
     # re-run before pinning: never rebuilds what it already reported
     st.step("tempseg").result = res

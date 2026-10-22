@@ -76,20 +76,25 @@ with ``config.receipts.unpinned_message`` (``plan_app`` refuses it too, review 1
 **Spend.** Every attempt of a step is kept (:class:`Attempt`); a step's spend is the sum over its
 attempts, so a retry adds instead of overwriting. Tracked cost is container-seconds x list $/h
 (``flora report`` for the jobs, the lab's own wall time), and while a step runs a heartbeat stores
-``elapsed x the step's peak $/s`` so a killed process leaves its spend behind. An attempt that was
-killed, or whose ``flora report`` failed, is charged the most it was allowed to spend (its
-budget) until billing, read again before every step for **every** app seen so far, is at least
-:data:`BILLING_LAG_S` past it. An attempt that failed **before it noted any app** started
-nothing and is charged $0 (review 10 L1). The global figure is ``max(sum of charged attempts,
-billed delta of all apps)``; the global cap is checked on it.
+``elapsed x the step's peak $/s`` so a killed process leaves its spend behind. Each attempt runs
+its own app (:func:`app_name`), so billing is attributed per attempt. An attempt that was
+killed, or whose ``flora report`` failed, is held until billing covers it (the watermark of the
+billing rows' ``interval_start``, read again before every step for **every** app seen so far).
+Until then it is charged its peak $/s over the time it ran plus its stop slack when its stop
+was confirmed, else its budget (``_runbook.Attempt.bounded_usd``). An attempt that failed
+**before it noted any app** started nothing and is charged $0 (review 10 L1). The global figure
+is ``max(sum of charged attempts, billed delta of all apps)``; the global cap is checked on it.
 
-**Stop rules.** Before a step: its **upper** projection (upper rate quantiles, every cold start,
-the scale-down tail and :data:`CLIENT_SLACK_S` per app) must fit its cap and the global cap minus
-the cumulative spend. During a step: GPU wall time is bounded by ``(remaining step cap - slack x
-$/s) / $/s`` (``flora run --budget`` plus a client-side deadline that cancels the job and stops
-the app; lab and conversion calls get the same deadline as their timeout). After a step:
-tracked/billed spend over the step cap or the global cap stops the runbook. The dry run prints
-nominal and upper costs per step.
+**Stop rules** (``scripts/_runbook.py``: one ``budget_for`` and one ``decide`` for the stop rule,
+the attempt's budget, its in-step deadlines, the dry run and ``--status``). An attempt may spend
+``min(step cap, global cap - spent - the upper projections of the plan's later steps)``: the step
+cap is a per-attempt ceiling. Before a step its **upper** projection (upper rate quantiles,
+every cold start, the scale-down tail and :data:`CLIENT_SLACK_S` per app) must fit that. During
+a step GPU wall time is bounded by ``(budget - slack x $/s) / $/s`` (``flora run --budget`` plus
+a client-side deadline that cancels the job and stops the app; lab and conversion calls get the
+same deadline as their timeout). After a step: the attempt's spend over its cap, or the total
+over the global cap, stops the runbook. The dry run prints nominal and upper costs per step and
+the decision a run takes; ``--status`` adds the holds, who approved the cap and the next command.
 
 **State** is ``reports/wave-h/state.json`` (git-ignored: it names private episodes). Per job it
 records what ``scripts/wave_h_finalize.py`` reads: ``state``, ``spend``, ``video_s``, ``cfg``,
@@ -107,22 +112,23 @@ step's apps are stopped first).
 from __future__ import annotations
 
 import argparse
+import contextlib
+import copy
 import json
 import math
 import os
 import subprocess
 import sys
-import threading
 import time
-import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import _runbook as rb  # noqa: E402 - state, billing, heartbeat, stop rules (shared)
 import h0_rehearsal as h0  # noqa: E402 - the same staging and configs as H0
 
 STATE = ROOT / "reports" / "wave-h" / "state.json"
@@ -286,9 +292,9 @@ TEMPSEG_APP = "flora-convert"  # modal_app/convert_app.py
 MERGE_EXPECTED_S, MERGE_MAX_S = 300, 1200  # v2: FP64 merge, "a few minutes" (tempseg-merge.md)
 EQUIV_EXPECTED_S, EQUIV_MAX_S = 240, 600  # v1: 142 s + image start on one L40S
 IDLE_AFTER_JOB_S = 30  # last receipt -> compose -> `modal app stop`
-CLIENT_SLACK_S = 240  # per app: `flora run` timeout margin, then cancel + `modal app stop`
-BILLING_LAG_S = 3600  # Modal billing covers complete hours only
-HEARTBEAT_S = 30.0
+CLIENT_SLACK_S = rb.CLIENT_SLACK_S  # per app: `flora run` timeout, then cancel + app stop
+BILLING_LAG_S = rb.BILLING_LAG_S  # a state without a billing watermark: the old lag rule
+HEARTBEAT_S = rb.HEARTBEAT_S
 ORACLE_DETERMINISM = "nvidia"  # Fix-Cert: oracle and noise run in NVIDIA's default mode
 NOISE_JOB = JOB  # the oracle job (f) repeats
 NEEDS_PIN = 4  # exit code: step 0 built TempSeg; pin its content digest, then re-run
@@ -703,300 +709,93 @@ def titles(plan: str) -> dict[str, str]:
     return CERT_TITLES if plan == CERTIFIED else TITLES
 
 
-@dataclass
-class Attempt:
-    """One run of a step (module docstring, "Spend")."""
-
-    started: float
-    status: str = "running"  # running | done | failed | stopped | killed | needs_pin
-    finished: float | None = None
-    heartbeat: float | None = None
-    rate_usd_per_s: float = 0.0  # the step's peak burn (heartbeat estimate)
-    budget_usd: float = 0.0  # the most this attempt was allowed to spend
-    tracked_usd: float = 0.0  # final: report / wall time; while running: the heartbeat estimate
-    apps: list[str] = field(default_factory=list)
-    report_error: bool = False
-    notes: list[str] = field(default_factory=list)
-
-    @property
-    def last_activity(self) -> float:
-        return self.finished or self.heartbeat or self.started
-
-    def charged(self, billed_at: float | None) -> float:
-        """Tracked cost, or the attempt's budget while it cannot be known (killed, no report)
-        and billing has not caught up with it."""
-        if self.status == "killed" or self.report_error:
-            reconciled = billed_at is not None and billed_at - self.last_activity >= BILLING_LAG_S
-            if not reconciled:
-                return max(self.tracked_usd, self.budget_usd)
-        return self.tracked_usd
-
-
-@dataclass
-class StepState:
-    status: str = "pending"  # pending | running | done | failed | stopped | needs_pin
-    projected_usd: float | None = None
-    projected_upper_usd: float | None = None
-    billed_usd: float | None = None  # billed delta of the apps only this step used
-    attempts: list[Attempt] = field(default_factory=list)
-    notes: list[str] = field(default_factory=list)
-    result: dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def tracked_usd(self) -> float:
-        return round(sum(a.tracked_usd for a in self.attempts), 4)
-
-    def charged(self, billed_at: float | None = None) -> float:
-        return round(sum(a.charged(billed_at) for a in self.attempts), 4)
-
-    def spent_at(self, billed_at: float | None = None) -> float:
-        return max(self.charged(billed_at), self.billed_usd or 0.0)
-
-    @property
-    def spent(self) -> float:
-        return self.spent_at(None)
-
-    @property
-    def current(self) -> Attempt | None:
-        return self.attempts[-1] if self.attempts and self.attempts[-1].status == "running" \
-            else None
-
-    @property
-    def apps(self) -> list[str]:
-        return sorted({a for x in self.attempts for a in x.apps})
-
-
-@dataclass
-class State:
-    run_id: str
-    created: float
-    billing_since: str
-    billing_baseline: dict[str, float] = field(default_factory=dict)
-    steps: dict[str, StepState] = field(default_factory=dict)
-    billed_total: float | None = None  # billed delta over every app seen so far
-    billed_at: float | None = None  # when billing was last read
-    cap_override: float | None = None  # a global cap the user approved (--global-cap)
-    # the plan that cap was approved for: it never carries over to another plan. ``None`` in a
-    # state from before the scope was saved: the default plan, the only one it was set on
-    cap_override_plan: str | None = None
-    # the global cap the last --yes-spend run gated its steps on, and its plan (what
-    # wave_h_finalize.py reports; review 12 F6)
-    gate_cap: float | None = None
-    gate_cap_plan: str | None = None
-    plan: str | None = None  # the plan this state was run under (wave_h_finalize.py reads it)
-
-    def step(self, name: str) -> StepState:
-        return self.steps.setdefault(name, StepState())
-
-    @property
-    def apps_seen(self) -> list[str]:
-        return sorted({a for s in self.steps.values() for a in s.apps})
-
-    @property
-    def spent(self) -> float:
-        """The cumulative figure the global cap is checked on (module docstring)."""
-        tracked = sum(s.spent_at(self.billed_at) for s in self.steps.values())
-        return round(max(tracked, self.billed_total or 0.0), 4)
-
-    def override_for(self, plan: str) -> float | None:
-        """The approved global cap override, if it was approved for ``plan``."""
-        if self.cap_override is None or (self.cap_override_plan or DEFAULT_PLAN) != plan:
-            return None
-        return self.cap_override
-
-    def spent_outside(self, step: str) -> float:
-        """Cumulative spend minus ``step``'s running attempt (in-step deadlines add their own)."""
-        cur = self.step(step).current
-        own = cur.charged(self.billed_at) if cur is not None else 0.0
-        return round(max(0.0, self.spent - own), 4)
-
-    def to_json(self) -> dict[str, Any]:
-        return {"run_id": self.run_id, "created": self.created,
-                "billing_since": self.billing_since, "billing_baseline": self.billing_baseline,
-                "billed_total": self.billed_total, "billed_at": self.billed_at,
-                "cap_override": self.cap_override, "cap_override_plan": self.cap_override_plan,
-                "gate_cap": self.gate_cap, "gate_cap_plan": self.gate_cap_plan,
-                "plan": self.plan,
-                "steps": {k: asdict(v) for k, v in self.steps.items()}}
-
-    @classmethod
-    def from_json(cls, d: Mapping[str, Any]) -> State:
-        steps = {}
-        for k, v in d.get("steps", {}).items():
-            v = dict(v)
-            atts = [Attempt(**a) for a in v.pop("attempts", [])]
-            legacy = float(v.pop("tracked_usd", 0.0) or 0.0)  # pre-attempts state files
-            started, finished = v.pop("started", None), v.pop("finished", None)
-            if legacy and not atts:
-                atts = [Attempt(started=started or 0.0, finished=finished, tracked_usd=legacy,
-                                status=v.get("status", "failed"))]
-            steps[k] = StepState(**{**v, "attempts": atts})
-        return cls(d["run_id"], d["created"], d["billing_since"],
-                   dict(d.get("billing_baseline", {})), steps, d.get("billed_total"),
-                   d.get("billed_at"), d.get("cap_override"), d.get("cap_override_plan"),
-                   d.get("gate_cap"), d.get("gate_cap_plan"), d.get("plan"))
-
-    def mark_killed(self) -> list[str]:
-        """Attempts left ``running`` by a killed process: ``killed`` (charged their budget
-        until billing reconciles them), their step ``failed`` (retried). Returns their apps."""
-        apps: list[str] = []
-        for name, s in self.steps.items():
-            for a in s.attempts:
-                if a.status == "running":
-                    a.status = "killed"
-                    a.notes.append("process killed while running; charged its budget until "
-                                   "billing reconciles it")
-                    apps += a.apps
-            if s.status == "running":
-                s.status = "failed"
-                s.notes.append(f"{name}: the previous run was killed mid-step")
-        return sorted(set(apps))
+# The state, billing reads, heartbeat and stop rules live in scripts/_runbook.py (shared with
+# scale_test.py and rubric_smoke.py); re-exported here, with this runbook's defaults.
+Attempt, StepState, State, StopRule, Heartbeat = (rb.Attempt, rb.StepState, rb.State,
+                                                   rb.StopRule, rb.Heartbeat)
+_SAVE_LOCK = rb._SAVE_LOCK
+billed_delta = rb.billed_delta
 
 
 def load_state(path: Path = STATE) -> State:
-    if path.exists():
-        return State.from_json(json.loads(path.read_text()))
-    return State(run_id=time.strftime("%m%d%H%M") + uuid.uuid4().hex[:4], created=time.time(),
-                 billing_since=time.strftime("%Y-%m-%d", time.gmtime(time.time() - 86400)))
-
-
-_SAVE_LOCK = threading.RLock()
+    return rb.load_state(path)
 
 
 def save_state(st: State, path: Path = STATE) -> None:
-    with _SAVE_LOCK:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(st.to_json(), indent=1, sort_keys=True, default=str))
-        os.replace(tmp, path)
+    rb.save_state(st, path)
 
 
-class StopRule(RuntimeError):
-    """The runbook stops here (projected or actual spend over a cap)."""
+Budget, Decision = rb.Budget, rb.Decision
+budget_for, reserve_for = rb.budget_for, rb.reserve_for
 
 
 def check_before(st: State, step: str, proj: Projection, *,
-                 caps: Mapping[str, float] = CAPS_USD, global_cap: float = GLOBAL_CAP_USD
-                 ) -> None:
-    """The **upper** projection must fit the step cap and the global cap left (H2)."""
-    cap = caps[step]
-    up = proj.usd_upper
-    if up > cap + 1e-9:
-        raise StopRule(f"{step}: upper projection ${up:.2f} (nominal ${proj.usd:.2f}) is over "
-                       f"its cap ${cap:.2f}")
-    left = global_cap - st.spent
-    if up > left + 1e-9:
-        raise StopRule(f"{step}: upper projection ${up:.2f} is over the global budget left "
-                       f"(${left:.2f} of ${global_cap:.2f}, ${st.spent:.2f} spent)")
+                 caps: Mapping[str, float] = CAPS_USD, global_cap: float = GLOBAL_CAP_USD,
+                 reserve: Mapping[str, float] | None = None) -> Budget:
+    """The **upper** projection must fit the step's budget (``_runbook.budget_for``; H2)."""
+    return rb.check_before(st, step, proj, caps=caps, global_cap=global_cap, reserve=reserve)
 
 
 def check_after(st: State, step: str, *, caps: Mapping[str, float] = CAPS_USD,
                 global_cap: float = GLOBAL_CAP_USD) -> None:
-    s = st.step(step)
-    spent = s.spent_at(st.billed_at)
-    if spent > caps[step] + 1e-9:
-        raise StopRule(f"{step}: spent ${spent:.2f} (tracked ${s.tracked_usd:.2f}, billed "
-                       f"${s.billed_usd or 0:.2f}) is over its cap ${caps[step]:.2f}")
-    if st.spent > global_cap + 1e-9:
-        raise StopRule(f"spent ${st.spent:.2f} in all is over the global cap ${global_cap:.2f}")
+    rb.check_after(st, step, caps=caps, global_cap=global_cap)
 
 
 def step_budget(st: State, step: str, *, spent_in_step: float = 0.0,
-                caps: Mapping[str, float] = CAPS_USD, global_cap: float = GLOBAL_CAP_USD
-                ) -> float:
-    """What the step may still spend: its cap minus its earlier attempts, and the global cap
-    left, minus what this attempt already spent."""
-    s = st.step(step)
-    cur = s.current
-    earlier = s.spent_at(st.billed_at) - (cur.charged(st.billed_at) if cur else 0.0)
-    return max(0.0, min(caps[step] - earlier, global_cap - st.spent_outside(step))
-               - spent_in_step)
+                caps: Mapping[str, float] = CAPS_USD, global_cap: float = GLOBAL_CAP_USD,
+                reserve: Mapping[str, float] | None = None) -> float:
+    """What the step may still spend (``_runbook.step_budget``)."""
+    return rb.step_budget(st, step, spent_in_step=spent_in_step, caps=caps,
+                          global_cap=global_cap, reserve=reserve)
 
 
 def gpu_deadline_s(st: State, step: str, c: Container | float, *, spent_in_step: float = 0.0,
                    slack_s: float = CLIENT_SLACK_S, caps: Mapping[str, float] = CAPS_USD,
-                   global_cap: float = GLOBAL_CAP_USD) -> float:
-    """Wall seconds still affordable at ``c``'s $/s (a container or a $/s figure) in this step,
-    keeping ``slack_s`` of it for the cancel / stop that follows the deadline (H2)."""
-    rate = c if isinstance(c, float | int) else c.usd_per_s()
-    left = step_budget(st, step, spent_in_step=spent_in_step, caps=caps, global_cap=global_cap)
-    return max(0.0, left - slack_s * rate) / rate
+                   global_cap: float = GLOBAL_CAP_USD,
+                   reserve: Mapping[str, float] | None = None) -> float:
+    """Wall seconds still affordable at ``c``'s $/s in this step (``_runbook.gpu_deadline_s``)."""
+    return rb.gpu_deadline_s(st, step, c, spent_in_step=spent_in_step, slack_s=slack_s,
+                             caps=caps, global_cap=global_cap, reserve=reserve)
+
+
+def decide(st: State, plan: str, step: str, projections: Mapping[str, Projection], *,
+           only: str | None = None) -> Decision:
+    """The decision the dry run, ``--status`` and a real run take for ``step``
+    (``_runbook.decide``, on the plan's caps and global cap), with the command that acts on it."""
+    gcap = plan_global_cap(plan, projections, st.override_for(plan))
+    d = rb.decide(st, PLANS[plan], step, projections, caps=plan_caps(plan, projections),
+                  global_cap=gcap)
+    run = f"uv run python scripts/wave_h.py --plan {plan} --yes-spend" + (
+        f" --only {only}" if only else "")
+    if d.action == "run":
+        d.command = run
+    elif d.action == "wait":
+        d.command = f"after {rb.utc(d.clears_at)}: {run}"
+    elif d.action == "stop" and d.budget is not None and d.budget.binding != "attempt cap":
+        short = projections[step].usd_upper - d.budget.usd
+        need = math.ceil((gcap + short) * 20 - 1e-9) / 20
+        d.command = f"{run} --global-cap {need:.2f}  (only with the user's approval)"
+    return d
 
 
 # ---------------------------------------------------------------------------------------------
-# Billing (scripts/spend.py)
+# Billing (scripts/spend.py, through _runbook)
 
 
 def billed_by_app(since: str) -> dict[str, float]:
-    import spend  # scripts/spend.py
-
-    out: dict[str, float] = {}
-    for row in spend.report(since):
-        name = row.get("description") or row.get("Description") or "?"
-        out[name] = out.get(name, 0.0) + float(row.get("cost") or row.get("Cost") or 0)
-    return out
-
-
-def billed_delta(st: State, apps: Iterable[str], now: Mapping[str, float] | None = None
-                 ) -> float | None:
-    if now is None:
-        try:
-            now = billed_by_app(st.billing_since)
-        except Exception:  # noqa: BLE001 - billing is a cross-check; tracking still applies
-            return None
-    return round(sum(now.get(a, 0.0) - st.billing_baseline.get(a, 0.0) for a in set(apps)), 4)
+    return rb.billed_by_app(since)
 
 
 def refresh_billing(st: State, *, now: Mapping[str, float] | None = None,
                     clock: Callable[[], float] = time.time) -> bool:
-    """Re-read billing for every app seen so far (H3): the global billed total, and per step
-    the billed delta of the apps only that step used (shared apps count globally only)."""
+    """Re-read billing for every app seen so far (H3; ``_runbook.refresh_billing``). False when
+    billing cannot be read (tracking still applies)."""
     if now is None:
         try:
             now = billed_by_app(st.billing_since)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 - billing is a cross-check; tracking still applies
             return False
-    st.billed_total = billed_delta(st, st.apps_seen, now)
-    owners: dict[str, set[str]] = {}
-    for name, s in st.steps.items():
-        for a in s.apps:
-            owners.setdefault(a, set()).add(name)
-    for name, s in st.steps.items():
-        mine = [a for a in s.apps if owners.get(a) == {name}]
-        s.billed_usd = billed_delta(st, mine, now) if mine else s.billed_usd
-    st.billed_at = clock()
-    return True
-
-
-class Heartbeat:
-    """While a step runs: every ``every`` seconds, store ``elapsed x peak $/s`` as the running
-    attempt's tracked spend and save the state, so a killed process leaves it behind (H3)."""
-
-    def __init__(self, st: State, attempt: Attempt, path: Path, *, every: float = HEARTBEAT_S,
-                 clock: Callable[[], float] = time.time):
-        self.st, self.attempt, self.path, self.every, self.clock = st, attempt, path, every, clock
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True, name="wave-h-heartbeat")
-
-    def beat(self) -> None:
-        now = self.clock()
-        a = self.attempt
-        a.heartbeat = now
-        a.tracked_usd = round(max(a.tracked_usd, (now - a.started) * a.rate_usd_per_s), 4)
-        save_state(self.st, self.path)
-
-    def _run(self) -> None:
-        while not self._stop.wait(self.every):
-            self.beat()
-
-    def __enter__(self) -> Heartbeat:
-        self.beat()
-        self._thread.start()
-        return self
-
-    def __exit__(self, *exc: Any) -> None:
-        self._stop.set()
-        self._thread.join(timeout=5)
+    return rb.refresh_billing(st, now=now, clock=clock)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1154,27 +953,63 @@ class Ctx:
     global_cap: float = GLOBAL_CAP_USD  # the plan's (plan_global_cap)
     spec: PlanSpec = field(default_factory=lambda: SPECS[DEFAULT_PLAN])
     caps: dict[str, float] = field(default_factory=lambda: dict(CAPS_USD))  # plan_caps
+    # the plan's steps and projections: what the global cap keeps for its later steps
+    plan_steps: tuple[str, ...] = ()
+    projections: Mapping[str, Projection] | None = None
 
     @property
     def episodes(self) -> tuple[str, ...]:
         return episodes_in(self.manifest, self.spec.episodes)
 
+    def reserve(self, step: str) -> dict[str, float]:
+        return reserve_for(self.st, self.plan_steps, step, self.projections, self.caps)
+
+    def budget_of(self, step: str, **kw: Any) -> Budget:
+        """The running attempt's budget: the same rule as the stop rule before it."""
+        return budget_for(self.st, step, caps=self.caps, global_cap=self.global_cap,
+                          reserve=self.reserve(step), **kw)
+
     def deadline_s(self, step: str, c: Container | float, **kw: Any) -> float:
         return gpu_deadline_s(self.st, step, c, caps=self.caps, global_cap=self.global_cap,
-                              **kw)
+                              reserve=self.reserve(step), **kw)
 
     def budget(self, step: str, **kw: Any) -> float:
-        return step_budget(self.st, step, caps=self.caps, global_cap=self.global_cap, **kw)
+        return self.budget_of(step, **kw).usd
 
     def sh(self, args: list[str], *, timeout: float = 1800, check: bool = True):
         return h0.sh(args, cwd=self.work, timeout=timeout, check=check,
                      log=self.work / "wave-h.log")
 
     def note_app(self, name: str) -> None:
-        """Record an app in the running attempt *before* it can spend (H3)."""
+        """Record an app in the running attempt *before* it can spend (H3). A new app means
+        the attempt is no longer known to be stopped."""
         cur = self.st.step(self.step).current if self.step else None
-        if cur is not None and name not in cur.apps:
-            cur.apps.append(name)
+        if cur is not None:
+            if name not in cur.apps:
+                cur.apps.append(name)
+            cur.stopped_at = None
+            save_state(self.st, self.state_path)
+
+    def app_name(self, part: str = "") -> str:
+        """This attempt's own app name (:func:`app_name`), ``part`` appended for a step that
+        starts more than one app (step 0: merge, then equivalence)."""
+        n = max(1, len(self.st.step(self.step).attempts))
+        return app_name(self.st.run_id, self.step, n) + (f"-{part}" if part else "")
+
+    def note_app_id(self, app_id: str | None) -> None:
+        """Record a started app's id (``ap-...``): it is stopped and billed by id."""
+        cur = self.st.step(self.step).current if self.step else None
+        if cur is not None and app_id and app_id not in cur.app_ids:
+            cur.app_ids.append(app_id)
+            save_state(self.st, self.state_path)
+
+    def confirm_stop(self) -> None:
+        """Every app the running attempt started is confirmed stopped (the ``with app.run()``
+        block exited, or a stop returned 0): until billing covers it, a failure is charged its
+        tracked time plus the slack, not its budget (``_runbook.Attempt.bounded_usd``)."""
+        cur = self.st.step(self.step).current if self.step else None
+        if cur is not None:
+            cur.stopped_at = time.time()
             save_state(self.st, self.state_path)
 
     def receipt_rows(self) -> list[dict[str, Any]]:
@@ -1262,26 +1097,42 @@ def equivalence_ok(res: Mapping[str, Any]) -> tuple[bool, dict[str, Any]]:
     return ok, summary
 
 
-def _modal_run(ctx: Ctx, target: str, args: list[str], *, limit: float, out: Path
-               ) -> tuple[dict[str, Any] | None, float, str | None]:
-    """``modal run <target> <args> --out <out>`` with a client deadline; the app is stopped
-    after it either way. Returns (result JSON, wall s, error)."""
+def _modal_run(ctx: Ctx, target: str, args: list[str], *, limit: float, out: Path,
+               name: str) -> tuple[dict[str, Any] | None, float, str | None]:
+    """``modal run -n <name> <target> <args> --out <out>`` with a client deadline: the run's
+    own app name (billing reports it as the app's description). The app is then stopped by
+    id (``modal app stop <name>`` finds no ephemeral app) either way, and its id recorded.
+    Returns (result JSON, wall s, error)."""
     t0 = time.time()
     err = None
+    ctx.note_app(name)
     try:
-        ctx.sh(["modal", "run", target, *args, "--out", str(out)], timeout=limit, check=True)
+        ctx.sh(["modal", "run", "-n", name, target, *args, "--out", str(out)], timeout=limit,
+               check=True)
     except subprocess.TimeoutExpired:
         err = f"client deadline {limit:.0f} s"
     except RuntimeError as e:
         err = str(e)
     finally:
-        ctx.sh(["modal", "app", "stop", "--yes", TEMPSEG_APP], check=False, timeout=120)
+        run = _sh_runner(ctx)
+        ids = rb.app_ids_named(name, rb.list_apps(run) or [])
+        for i in ids:
+            ctx.note_app_id(i)
+        if rb.stop_apps([name], ids, run=run):
+            ctx.confirm_stop()
     wall = time.time() - t0
     try:
         res = json.loads(out.read_text()) if out.exists() and err is None else None
     except ValueError as e:
         res, err = None, f"unreadable {out.name}: {e}"
     return res, wall, err
+
+
+def _sh_runner(ctx: Ctx) -> Callable[..., Any]:
+    """``ctx.sh`` in the shape ``_runbook.stop_apps`` calls ``subprocess.run``."""
+    def run(args: list[str], **kw: Any) -> Any:
+        return ctx.sh(args, check=False, timeout=kw.get("timeout", 120))
+    return run
 
 
 def run_tempseg(ctx: Ctx) -> dict[str, Any]:
@@ -1307,15 +1158,16 @@ def run_tempseg(ctx: Ctx) -> dict[str, Any]:
                     "apps": [], "built": False}
     target = str(ROOT / "src" / "flora_deploy" / "modal_app" / "convert_app.py") + "::tempseg"
     spent = 0.0
-    ctx.note_app(TEMPSEG_APP)
-    out: dict[str, Any] = {"apps": [TEMPSEG_APP], "built": True}
+    names = {"merge": ctx.app_name("merge"), "equivalence": ctx.app_name("equivalence")}
+    ctx.note_app(names["merge"])
+    out: dict[str, Any] = {"apps": [names["merge"]], "built": True}
     rdir = ctx.work
     limit = min(MERGE_MAX_S, ctx.deadline_s("tempseg", MERGE, slack_s=LAB_SLACK_S))
     if limit < 120:
         return {**out, "ok": False, "error": f"budget left allows {limit:.0f} s",
                 "tracked_usd": 0.0}
     merge, wall, err = _modal_run(ctx, target, ["--step", "merge", "--force"], limit=limit,
-                                  out=rdir / "tempseg-merge.json")
+                                  out=rdir / "tempseg-merge.json", name=names["merge"])
     spent += MERGE.usd_per_s() * wall
     out["merge"] = {"wall_s": round(wall, 1), "error": err,
                     "receipt": (merge or {}).get("receipt_sha256")}
@@ -1326,8 +1178,9 @@ def run_tempseg(ctx: Ctx) -> dict[str, Any]:
     if limit < 120:
         return {**out, "ok": False, "error": f"budget left allows {limit:.0f} s for the "
                 "equivalence check", "tracked_usd": spent}
+    out["apps"].append(names["equivalence"])
     eq, wall, err = _modal_run(ctx, target, ["--step", "equivalence"], limit=limit,
-                               out=rdir / "tempseg-equivalence.json")
+                               out=rdir / "tempseg-equivalence.json", name=names["equivalence"])
     spent += EQUIV.usd_per_s() * wall
     ok, summary = equivalence_ok(eq or {}) if not err else (False, {"error": err})
     out.update(equivalence={**summary, "wall_s": round(wall, 1)}, equivalence_ok=ok)
@@ -1371,13 +1224,13 @@ def run_preflight(ctx: Ctx) -> dict[str, Any]:
 
     require_tempseg_pin(ctx)
     t0 = time.time()
-    ctx.note_app("flora-balanced-lab")
-    with modal.enable_output(), lab.app.run():
+    name = ctx.app_name()
+    with _lab_app(ctx, lab, modal, name):
         out = lab.preflight.remote()
     wall = time.time() - t0
     ok = all(out.get(k, {}).get("receipt") for k in ("tempseg", "captioner"))
     return {"ok": ok, "wall_s": round(wall, 1), "tracked_usd": PREFLIGHT.usd_per_s() * wall,
-            "apps": ["flora-balanced-lab"],
+            "apps": [name],
             "facts": {k: {kk: v.get(kk) for kk in ("receipt", "eos_token",
                                                     "extra_state_prefixes")}
                       for k, v in out.items() if isinstance(v, dict)}}
@@ -1477,8 +1330,10 @@ def _run_job(ctx: Ctx, step: str, cfg: Path, job_id: str, *, determinism: str,
             out["rc"] = "deadline"
             ctx.sh([fl, "cancel", job_id, "--config", str(cfg)], check=False, timeout=120)
     finally:
-        ctx.sh(["modal", "app", "stop", "--yes", plan.app_name], check=False, timeout=120)
+        p = ctx.sh(["modal", "app", "stop", "--yes", plan.app_name], check=False, timeout=120)
         out["stopped_at"] = time.time()
+        if getattr(p, "returncode", 1) == 0:  # a deployed app: stopped by its name
+            ctx.confirm_stop()
     rep = ctx.sh([fl, "report", job_id, "--config", str(cfg), "--json"], check=False,
                  timeout=900)
     try:
@@ -1759,6 +1614,24 @@ def lab_reuse(st: State, spec: PlanSpec | None = None) -> tuple[str, ...]:
                  if reusable_lab_result(k, st.run_id, eps, segments_from=sf) is not None)
 
 
+@contextlib.contextmanager
+def _lab_app(ctx: Ctx, lab: Any, modal: Any, name: str):
+    """``lab.app.run(name=name)`` (Modal's output on): the attempt's own app name, which
+    billing reports as its description, noted before it can spend, and its app id once it
+    runs. The app stops when the block exits, which is recorded as a confirmed stop."""
+    ctx.note_app(name)
+    raised: BaseException | None = None
+    with modal.enable_output(), lab.app.run(name=name):
+        ctx.note_app_id(getattr(lab.app, "app_id", None))
+        try:
+            yield
+        except BaseException as e:  # noqa: BLE001 - re-raised once the app has stopped
+            raised = e
+    ctx.confirm_stop()  # reached only when app.run()'s exit (the app's stop) did not raise
+    if raised is not None:
+        raise raised
+
+
 def _lab_kind_summary(res: Mapping[str, Any], wall: float, usd: float) -> dict[str, Any]:
     base = res.get("baseline", {}) if isinstance(res, Mapping) else {}
     err = res.get("error") or base.get("error")
@@ -1819,10 +1692,11 @@ def run_lab(ctx: Ctx, *, missing: Callable[[Iterable[str]], list[str]] | None = 
         out["note"] = f"no lab container started; charged $0; {NO_EVIDENCE}"
         return {"ok": False, **out, "tracked_usd": 0.0, "apps": []}
     spent = 0.0
+    name = ctx.app_name()
 
     def persist() -> None:  # each kind's summary lands in the state as soon as it returns
         ctx.st.step("lab").result = {"ok": False, "partial": True, **out, "tracked_usd": spent,
-                                     "apps": ["flora-balanced-lab"] if todo else []}
+                                     "apps": [name] if todo else []}
         save_state(ctx.st, ctx.state_path)
 
     for kind in LAB:
@@ -1840,9 +1714,17 @@ def run_lab(ctx: Ctx, *, missing: Callable[[Iterable[str]], list[str]] | None = 
 
     rdir = LAB_OUT
     rdir.mkdir(parents=True, exist_ok=True)
-    ctx.note_app("flora-balanced-lab")  # only now: a precondition failure above charged $0
     fns = {"tempseg": lab.run_tempseg, "captioner": lab.run_captioner}
-    with modal.enable_output(), lab.app.run():
+    first = todo[0]  # a reused TempSeg result always had requests in
+    limit = min(LAB_DEADLINE_S[first],
+                ctx.deadline_s("lab", LAB[first], slack_s=LAB_SLACK_S))
+    if limit < LAB_EXPECTED_S[first]:  # the stop rule, before the app starts: charged $0
+        b = ctx.budget_of("lab")
+        raise StopRule(f"lab: budget left ${b.usd:.2f} allows {limit:.0f} s of the {first} "
+                       f"call, under the {LAB_EXPECTED_S[first]:.0f} s it needs (binding: "
+                       f"{b.binding}); no lab app started")
+    # the app is noted only now: a precondition failure above charged $0
+    with _lab_app(ctx, lab, modal, name):
         for kind in todo:
             fn, c = fns[kind], LAB[kind]
             limit = min(LAB_DEADLINE_S[kind],
@@ -1883,7 +1765,7 @@ def run_lab(ctx: Ctx, *, missing: Callable[[Iterable[str]], list[str]] | None = 
     if bad:
         out["error"] = "; ".join(f"{k}: {v}" for k, v in bad.items())
     return {"ok": not bad and len(out["kinds"]) == 2, **out, "tracked_usd": spent,
-            "apps": ["flora-balanced-lab"]}
+            "apps": [name]}
 
 
 def _job_rows(ctx: Ctx, step: str) -> dict[str, dict[str, list[dict]]]:
@@ -2094,6 +1976,8 @@ def render_report(st: State, projections: Mapping[str, Projection], *,
             continue
         lines += ["", f"## {title[name]}", "", f"Status: {s.status}."]
         lines += [f"- {n}" for n in s.notes]
+        if s.attempts:  # only the latest attempt's notes: older errors are history
+            lines += [f"- attempt {len(s.attempts)}: {n}" for n in s.attempts[-1].notes]
         res = {k: v for k, v in s.result.items() if k not in ("apps",)}
         if res:
             lines += ["", "```json", json.dumps(_numbers_only(res), indent=1, default=str)[:6000],
@@ -2128,6 +2012,8 @@ def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
         f"({' -> '.join(title[s].split('.')[0] for s in steps)}): spent ${st.spent:.2f} of "
         f"${gcap:.2f} (billing read "
         f"{'never' if st.billed_at is None else time.ctime(st.billed_at)})")
+    for line in held_lines(st):
+        out(line)
     if manifest is not None:
         eps, miss = (episodes_in(manifest, spec.episodes),
                      missing_episodes(manifest, spec.episodes))
@@ -2145,11 +2031,8 @@ def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
     for name in steps:
         p = projections[name]
         s = st.steps.get(name, StepState())
-        rule = "ok"
-        try:
-            check_before(st, name, p, caps=caps, global_cap=gcap)
-        except StopRule as e:
-            rule = f"STOP: {e}"
+        d = decide(st, plan, name, projections, only=only)
+        rule = {"run": "ok", "done": "done"}.get(d.action) or f"{d.action.upper()}: {d.message}"
         out(f"  {title[name]:66s} [{s.status}] cap ${caps[name]:.2f}  nominal "
             f"${p.usd:.2f}  upper ${p.usd_upper:.2f}  rule: {rule}")
         for i in p.items:
@@ -2207,7 +2090,123 @@ def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
         out(f"  NOT HONEST AT ${gcap:.2f}: the upper total needs a global cap of at "
             f"least ${honest['global']:.2f} (per step: "
             + ", ".join(f"{s} ${honest[s]:.2f}" for s in steps) + "); the runbook stops at the "
-            "first step whose upper projection no longer fits the cap left")
+            "first step whose upper projection, with the later steps' kept for them, no longer "
+            "fits the cap left")
+
+
+def app_name(run_id: str, step: str, attempt: int) -> str:
+    """The app name of one attempt of one step: ``flora-wh-<run>-<step>-a<n>`` (Modal's
+    billing reports it per app, so each attempt's spend is its own)."""
+    return f"flora-wh-{run_id}-{step.replace('_', '-')}-a{attempt}"
+
+
+# Per step: stop -> container gone (the lab and conversion calls end with their client timeout;
+# a deployed job with ``flora run``'s), and the hard limit its containers cannot outlive.
+STEP_SLACK_S = {"tempseg": LAB_SLACK_S, "preflight": LAB_SLACK_S, "lab": LAB_SLACK_S}
+STEP_HARD_TIMEOUT_S = {"lab": 2 * LAB_TIMEOUT_S}  # two calls, one after the other
+
+
+stop_killed = rb.stop_killed
+
+
+def held_lines(st: State) -> list[str]:
+    """One line per attempt charged over its tracked cost until billing covers it."""
+    return [f"  held: {name} attempt {i} charged ${a.charged(st.watermark):.2f} (tracked "
+            f"${a.tracked_usd:.2f}) until billing covers it, about {rb.utc(a.hold_clears_at())}"
+            for name, i, a in st.held()]
+
+
+DEAD_HEARTBEAT_S = 3 * HEARTBEAT_S  # a running attempt silent this long: its process is gone
+
+
+def approver() -> str:
+    """Who approved a ``--global-cap`` (the login running ``--yes-spend``)."""
+    import getpass
+
+    try:
+        return getpass.getuser()
+    except Exception:  # noqa: BLE001 - no login name: still recorded as approved
+        return "unknown"
+
+
+note_stop = rb.note_stop
+
+
+def simulate_run_start(st: State, *, out: Callable[[str], None] = print) -> None:
+    """On a copy of the state (the dry run, ``--status``): what ``--yes-spend`` does before its
+    first step, without writing or stopping anything. It reads the billing baseline when there
+    is none and billing (read-only), and takes the apps of killed attempts as stopped now (a
+    run stops them by id first; if that stop fails, the run charges them their budget)."""
+    if not st.billing_baseline:
+        try:
+            st.billing_baseline = dict(billed_by_app(st.billing_since))
+        except Exception as e:  # noqa: BLE001
+            out(f"note: billing unavailable ({e!r}); tracking only")
+    now = time.time()
+    for a in st.killed_unstopped():
+        a.stopped_at = now
+        out(f"note: a run first stops {', '.join(a.app_ids or a.apps)} (left by a killed run) "
+            "by id; this preview assumes that stop succeeds")
+    refresh_billing(st)
+
+
+def next_decision(st: State, plan: str, projections: Mapping[str, Projection],
+                  only: str | None = None) -> Decision | None:
+    """The decision a run takes first: the first step (of ``--only`` or the plan) not done."""
+    for name in (only,) if only else PLANS[plan]:
+        d = decide(st, plan, name, projections, only=only)
+        if d.action != "done":
+            return d
+    return None
+
+
+def print_status(st: State, projections: Mapping[str, Projection], *, plan: str,
+                 only: str | None = None, state_path: Path | None = None,
+                 out: Callable[[str], None] = print) -> Decision | None:
+    """``--status``: spend, holds, the cap in force and the next decision (on a copy)."""
+    gcap = plan_global_cap(plan, projections, st.override_for(plan))
+    caps, title = plan_caps(plan, projections), titles(plan)
+    out(f"Wave H-lite run {st.run_id}, plan {plan}" + (f", state {state_path}" if state_path
+                                                       else ""))
+    basis = ("from the billing rows" if st.billed_through is not None else
+             f"by the {BILLING_LAG_S} s lag rule: no rows kept yet")
+    out(f"  billing: read {rb.utc(st.billed_at)}, complete through {rb.utc(st.watermark)} "
+        f"({basis})")
+    ov = st.override_for(plan)
+    approved = ""
+    if ov is not None:
+        approved = (f"; --global-cap ${ov:.2f} approved by {st.cap_override_by} at "
+                    f"{rb.utc(st.cap_override_at)}" if st.cap_override_by else
+                    f"; --global-cap ${ov:.2f} approved (who and when not recorded)")
+    out(f"  global cap ${gcap:.2f} ({global_cap_label(st, plan, projections)}{approved}), "
+        f"derived ${plan_global_cap(plan, projections):.2f}")
+    wm = st.watermark
+    tracked = sum(s.tracked_usd for s in st.steps.values())
+    charged = sum(s.charged(wm) for s in st.steps.values())
+    out(f"  spent ${st.spent:.2f}: tracked ${tracked:.2f}, charged ${charged:.2f}, billed "
+        + ("-" if st.billed_total is None else f"${st.billed_total:.2f}"))
+    for name in (only,) if only else PLANS[plan]:
+        s = st.steps.get(name) or StepState()
+        last = s.attempts[-1] if s.attempts else None
+        err = next((n for n in reversed(last.notes) if n.startswith(("error", "stop rule"))),
+                   None) if last else None
+        stop = next((n for n in s.notes if n.startswith("stop rule")), None)
+        why = f"  [{err or stop}]" if (err or stop) and s.status != "done" else ""
+        out(f"  {title[name]:66s} {s.status:9s} cap ${caps[name]:.2f}  attempts "
+            f"{len(s.attempts)}  charged ${s.charged(wm):.2f}  tracked ${s.tracked_usd:.2f}"
+            + ("" if s.billed_usd is None else f"  billed ${s.billed_usd:.2f}") + why)
+    for line in held_lines(st):
+        out(line)
+    d = next_decision(st, plan, projections, only)
+    if d is None:
+        out("  next: nothing (every step is done)")
+        return None
+    out(f"  next: {d.step}: {d.action}: {d.message}")
+    for r in d.reasons:
+        out(f"    because {r}")
+    if d.command:
+        out(f"    command: {d.command}")
+    return d
 
 
 def load_manifest(offline: bool, version: str = "golden/v1") -> dict[str, Any]:
@@ -2229,6 +2228,9 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--report", action="store_true",
                    help="rewrite reports/wave-h/runbook.md from the state (never "
                         "docs/wave-h-report.md: wave_h_finalize.py owns it)")
+    g.add_argument("--status", action="store_true",
+                   help="where the run stands: spend, held attempts and when they clear, the "
+                        "cap and who approved it, and the next decision (reads; never writes)")
     ap.add_argument("--plan", choices=tuple(PLANS), default=DEFAULT_PLAN,
                     help="balanced-only (default): steps 0, a, d; full: every step; "
                          "certified: b, f, d, (d2), e on golden/v2 (its own state)")
@@ -2259,11 +2261,17 @@ def main(argv: list[str] | None = None) -> int:
     if st.plan is not None and st.plan != args.plan and CERTIFIED in (st.plan, args.plan):
         print(f"refused: {args.state} was run under plan {st.plan}, not {args.plan}")
         return 2
+    preview = args.dry_run or args.status or not (args.yes_spend or args.report)
+    if preview:  # the dry run and --status decide on a copy: the state file is never written
+        st = copy.deepcopy(st)
     if args.plan == CERTIFIED:
         st.plan = CERTIFIED
     if adopt_balanced_job(st):
         print("note: (d)'s deployed job is done; (d) counts as done and its lab is step lab")
-    killed_apps = st.mark_killed() if args.yes_spend else []
+    if args.yes_spend:
+        st.mark_killed()
+    elif preview:  # what a run would find: a heartbeat this old is a dead process
+        st.mark_killed(stale_before=time.time() - DEAD_HEARTBEAT_S)
     manifest = load_manifest(args.offline, spec.golden)
     miss = missing_episodes(manifest, spec.episodes)
     if miss:
@@ -2287,6 +2295,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             st.cap_override, st.cap_override_plan = round(args.global_cap, 2), args.plan
             if args.yes_spend:  # only a run approves it; a dry run only shows its effect
+                st.cap_override_by, st.cap_override_at = approver(), time.time()
                 save_state(st, args.state)
                 print(f"global cap for plan {args.plan} raised to ${st.cap_override:.2f} "
                       "(user-approved; saved in the state)")
@@ -2294,6 +2303,11 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"dry run: would raise the global cap for plan {args.plan} to "
                       f"${st.cap_override:.2f}; not saved (pass --yes-spend to approve it)")
     gcap = plan_global_cap(args.plan, projections, st.override_for(args.plan))
+    if preview and not args.offline:  # what a run reads first (billing is read-only)
+        simulate_run_start(st)
+    if args.status:
+        print_status(st, projections, plan=args.plan, only=args.only, state_path=args.state)
+        return 0
     print_plan(st, projections, manifest=manifest, plan=args.plan, only=args.only)
     report = spec.report or REPORT
     if args.report:
@@ -2313,72 +2327,30 @@ def main(argv: list[str] | None = None) -> int:
             st.billing_baseline = billed_by_app(st.billing_since)
         except Exception as e:  # noqa: BLE001
             print(f"billing baseline unavailable ({e!r}); tracking only")
-    for app in killed_apps:  # a killed run may have left them up
-        subprocess.run(["modal", "app", "stop", "--yes", app], capture_output=True, text=True)
-        print(f"stopped {app} (left by a killed run)")
+    stop_killed(st)
     st.gate_cap, st.gate_cap_plan = gcap, args.plan  # the cap this run gates on
     save_state(st, args.state)
     os.chdir(args.work)  # relative input.path is hashed against the cwd: plan where flora runs
     ctx = Ctx(st, manifest, args.work, state_path=args.state, global_cap=gcap, spec=spec,
-              caps=caps)
-    rc = 0
-    for name in PLANS[args.plan]:
-        if args.only and name != args.only:
-            continue
-        s = st.step(name)
-        if s.status == "done":
-            print(f"skip {name}: done")
-            continue
-        refresh_billing(st)  # every app seen so far, before the step (H3)
-        p = projections[name]
-        s.projected_usd, s.projected_upper_usd = p.usd, p.usd_upper
-        try:
-            check_before(st, name, p, caps=caps, global_cap=gcap)
-        except StopRule as e:
-            s.status, rc = "stopped", 3
-            s.notes.append(f"stop rule before: {e}")
-            break
-        att = Attempt(started=time.time(), rate_usd_per_s=p.peak_usd_per_s,
-                      budget_usd=round(step_budget(st, name, caps=caps, global_cap=gcap), 4))
-        s.attempts.append(att)
-        s.status = "running"
-        ctx.step = name
-        save_state(st, args.state)
-        try:
-            with Heartbeat(st, att, args.state):
-                res = runner(args.plan, name)(ctx)
-            s.result = res
-            att.tracked_usd = round(float(res.get("tracked_usd") or 0.0), 4)
-            att.report_error = bool(res.get("report_error"))
-            att.status = s.status = ("done" if res.get("ok") else
-                                     "needs_pin" if res.get("needs_pin") else "failed")
-        except Exception as e:  # noqa: BLE001 - recorded; the runbook stops
-            att.status = s.status = "failed"
-            if att.apps:
-                att.report_error = True  # what it spent is unknown: charged its budget
-            else:  # L1: failed before it started any app: nothing to charge
-                att.tracked_usd = 0.0
-                att.notes.append("failed before any app started: charged $0")
-            s.notes.append(f"error: {e!r}")
-        att.finished = time.time()
-        for a in s.result.get("apps", ()):
-            if a not in att.apps:
-                att.apps.append(a)
-        refresh_billing(st)
-        save_state(st, args.state)
-        try:
-            check_after(st, name, caps=caps, global_cap=gcap)
-        except StopRule as e:
-            s.notes.append(f"stop rule after: {e}")
-            rc = 3
-            break
+              caps=caps, plan_steps=PLANS[args.plan], projections=projections)
+    def after(name: str, s: StepState) -> int | None:
         if s.status == "needs_pin":
             print(pin_instructions(s.result))
-            rc = NEEDS_PIN
-            break
-        if s.status != "done":
-            rc = 1
-            break
+            return NEEDS_PIN
+        return None
+
+    rc = rb.run_steps(
+        st, [n for n in PLANS[args.plan] if not args.only or n == args.only],
+        state_path=args.state, ctx=ctx, run=lambda name, c: runner(args.plan, name)(c),
+        projection=projections.__getitem__,
+        decide=lambda name, p: decide(st, args.plan, name, projections, only=args.only),
+        check_after=lambda name: check_after(st, name, caps=caps, global_cap=gcap),
+        refresh=lambda s: refresh_billing(s),  # looked up per call (tests patch it)
+        attempt_kw=lambda name: {"slack_s": STEP_SLACK_S.get(name, CLIENT_SLACK_S),
+                                 "hard_timeout_s": STEP_HARD_TIMEOUT_S.get(name)},
+        status_of=lambda res: ("done" if res.get("ok") else
+                               "needs_pin" if res.get("needs_pin") else "failed"),
+        after=after)
     save_state(st, args.state)
     report.parent.mkdir(parents=True, exist_ok=True)
     report.write_text(render_report(st, projections, plan=args.plan))

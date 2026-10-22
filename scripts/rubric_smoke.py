@@ -81,6 +81,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import _runbook as rb  # noqa: E402 - the step loop, decisions, stop by id (shared)
 import h0_rehearsal as h0  # noqa: E402 - the same staging and config text as H0 / Wave H
 import wave_h as wh  # noqa: E402 - spend accounting and stop rules, reused
 
@@ -621,16 +622,32 @@ class Ctx:
     step: str = ""
     log: Callable[[str], None] = print
     apps: list[str] = field(default_factory=list)
+    # the run's steps and projections: what the global cap keeps for the later steps
+    steps: tuple[str, ...] = ()
+    projections: Mapping[str, wh.Projection] | None = None
 
     def sh(self, args: list[str], *, timeout: float = 1800, check: bool = True):
         return h0.sh(args, cwd=self.work, timeout=timeout, check=check,
                      log=self.work / "rubric-smoke.log")
 
+    def reserve(self, step: str) -> dict[str, float]:
+        return rb.reserve_for(self.st, self.steps, step, self.projections, self.caps)
+
     def note_app(self, name: str) -> None:
         """Record an app in the running attempt *before* it can spend (wave_h H3)."""
         cur = self.st.step(self.step).current if self.step else None
-        if cur is not None and name not in cur.apps:
-            cur.apps.append(name)
+        if cur is not None:
+            if name not in cur.apps:
+                cur.apps.append(name)
+            cur.stopped_at = None
+            wh.save_state(self.st, self.state_path)
+
+    def confirm_stop(self) -> None:
+        """The running attempt's (deployed) app was stopped: until billing covers it, a
+        failure is charged its time plus the slack (``_runbook.Attempt.bounded_usd``)."""
+        cur = self.st.step(self.step).current if self.step else None
+        if cur is not None:
+            cur.stopped_at = time.time()
             wh.save_state(self.st, self.state_path)
 
 
@@ -714,7 +731,7 @@ def run_job(ctx: Ctx, job: Job) -> dict[str, Any]:
     c = rubric_container()
     fl = h0.flora_bin()
     budget = max(0.01, wh.step_budget(ctx.st, job.task, caps=ctx.caps,
-                                      global_cap=ctx.global_cap))
+                                      global_cap=ctx.global_cap, reserve=ctx.reserve(job.task)))
     h0.fetch_dataset(ctx.manifest, ctx.work, episodes={job.task: (job.episode,)},
                      poison_job=None)
     h0.upload_dir(media_volume(run), ctx.work / job.task, f"{run}/{job.task}")
@@ -728,7 +745,8 @@ def run_job(ctx: Ctx, job: Job) -> dict[str, Any]:
     ctx.sh([fl, "plan", "--config", str(cfg_path), "--index", str(summary)])
     cfg = load_config(cfg_path)
     plan = plan_app(cfg, determinism=DETERMINISM)
-    deadline = wh.gpu_deadline_s(ctx.st, job.task, c, caps=ctx.caps, global_cap=ctx.global_cap)
+    deadline = wh.gpu_deadline_s(ctx.st, job.task, c, caps=ctx.caps, global_cap=ctx.global_cap,
+                                 reserve=ctx.reserve(job.task))
     out: dict[str, Any] = {"app": plan.app_name, "job_id": jid, "cfg": str(cfg_path),
                            "deadline_s": round(deadline), "budget_usd": round(budget, 4),
                            "stage_hash": plan.stage_hashes[KIND], "episodes": [job.episode],
@@ -748,8 +766,10 @@ def run_job(ctx: Ctx, job: Job) -> dict[str, Any]:
             out["rc"] = "deadline"
             ctx.sh([fl, "cancel", jid, "--config", str(cfg_path)], check=False, timeout=120)
     finally:
-        ctx.sh(["modal", "app", "stop", "--yes", plan.app_name], check=False, timeout=120)
+        p = ctx.sh(["modal", "app", "stop", "--yes", plan.app_name], check=False, timeout=120)
         out["stopped_at"] = time.time()
+        if getattr(p, "returncode", 1) == 0:  # a deployed app: stopped by its name
+            ctx.confirm_stop()
     rep = ctx.sh([fl, "report", jid, "--config", str(cfg_path), "--json"], check=False,
                  timeout=900)
     try:
@@ -960,11 +980,8 @@ def print_plan(st: wh.State, projs: Mapping[str, wh.Projection], caps: Mapping[s
         f"${c.usd_per_h():.2f}/h; startup {start:.0f} s (upper {start_up:.0f} s; {basis})")
     for name in steps:
         p, s = projs[name], st.steps.get(name, wh.StepState())
-        try:
-            wh.check_before(st, name, p, caps=caps, global_cap=gcap)
-            rule = "ok"
-        except wh.StopRule as e:
-            rule = f"STOP: {e}"
+        d = rb.decide(st, steps, name, projs, caps=caps, global_cap=gcap)  # what a run decides
+        rule = {"run": "ok", "done": "done"}.get(d.action) or f"{d.action.upper()}: {d.message}"
         out(f"  {t[name]:58s} [{s.status}] cap ${caps[name]:.2f}  nominal ${p.usd:.2f}  "
             f"upper ${p.usd_upper:.2f}  rule: {rule}")
         for i in p.items:
@@ -1009,7 +1026,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"rates.json: {KIND} {row['container_s_per_video_s']} container-s per video-s, "
               f"measured (n={row['n']}, ±{row['uncertainty']:.0%})")
         return 0
-    killed = st.mark_killed() if args.yes_spend else []
+    if args.yes_spend:
+        st.mark_killed()
     manifest = load_manifest(args.offline)
     projs = projections(manifest)
     caps = caps_for(projs)
@@ -1049,66 +1067,22 @@ def main(argv: list[str] | None = None) -> int:
             st.billing_baseline = wh.billed_by_app(st.billing_since)
         except Exception as e:  # noqa: BLE001
             print(f"billing baseline unavailable ({e!r}); tracking only")
-    for app in killed:
-        subprocess.run(["modal", "app", "stop", "--yes", app], capture_output=True, text=True)
+    rb.stop_killed(st)  # by id where it has one; a deployed app by its name
     wh.save_state(st, args.state)
     os.chdir(work)  # a relative input.path is hashed against the cwd: plan where flora runs
-    ctx = Ctx(st, manifest, work, caps, gcap, state_path=args.state)
-    rc = 0
+    ctx = Ctx(st, manifest, work, caps, gcap, state_path=args.state, steps=tuple(steps),
+              projections=projs)
     try:
-        for name in steps:
-            s = st.step(name)
-            if s.status == "done":
-                print(f"skip {name}: done")
-                continue
-            wh.refresh_billing(st)
-            p = projs[name]
-            s.projected_usd, s.projected_upper_usd = p.usd, p.usd_upper
-            try:
-                wh.check_before(st, name, p, caps=caps, global_cap=gcap)
-            except wh.StopRule as e:
-                s.status, rc = "stopped", 3
-                s.notes.append(f"stop rule before: {e}")
-                break
-            att = wh.Attempt(started=time.time(), rate_usd_per_s=p.peak_usd_per_s,
-                             budget_usd=round(wh.step_budget(st, name, caps=caps,
-                                                             global_cap=gcap), 4))
-            s.attempts.append(att)
-            s.status, ctx.step = "running", name
-            wh.save_state(st, args.state)
-            try:
-                with wh.Heartbeat(st, att, args.state):
-                    res = (run_check(ctx) if name == CHECK
-                           else run_job(ctx, JOBS_BY_TASK[name]))
-                s.result = res
-                att.tracked_usd = round(float(res.get("tracked_usd") or 0.0), 4)
-                att.report_error = bool(res.get("report_error"))
-                att.status = s.status = "done" if res.get("ok") else "failed"
-            except Exception as e:  # noqa: BLE001 - recorded; the runbook stops
-                att.status = s.status = "failed"
-                if att.apps:
-                    att.report_error = True  # unknown spend: charged its budget
-                else:
-                    att.tracked_usd = 0.0
-                    att.notes.append("failed before any app started: charged $0")
-                s.notes.append(f"error: {e!r}")
-            att.finished = time.time()
-            for a in s.result.get("apps", ()):
-                if a not in att.apps:
-                    att.apps.append(a)
-            wh.refresh_billing(st)
-            wh.save_state(st, args.state)
-            try:
-                wh.check_after(st, name, caps=caps, global_cap=gcap)
-            except wh.StopRule as e:
-                s.notes.append(f"stop rule after: {e}")
-                rc = 3
-                break
-            if s.status != "done" and name != CHECK:
-                rc = 1
-                break
-            if s.status != "done":
-                rc = 1
+        rc = rb.run_steps(
+            st, steps, state_path=args.state, ctx=ctx,
+            run=lambda name, c: (run_check(c) if name == CHECK
+                                 else run_job(c, JOBS_BY_TASK[name])),
+            projection=projs.__getitem__,
+            decide=lambda name, p: rb.decide(st, steps, name, projs, caps=caps,
+                                             global_cap=gcap),
+            check_after=lambda name: wh.check_after(st, name, caps=caps, global_cap=gcap),
+            refresh=lambda s: wh.refresh_billing(s),  # looked up per call (tests patch it)
+            keep_going=lambda name: name == CHECK)
     finally:
         for n in cleanup(st.apps_seen, st.run_id, keep=args.keep):
             print(f"  cleanup: {n}")

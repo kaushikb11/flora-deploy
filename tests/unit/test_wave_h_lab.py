@@ -218,15 +218,17 @@ class _Lab:
     """A fake ``balanced_lab`` module: records what was spawned."""
 
     def __init__(self, results):
-        self.results, self.spawned = results, []
-        self.app = SimpleNamespace(run=self._run)
+        self.results, self.spawned, self.runs = results, [], []
+        self.app = SimpleNamespace(run=self._run, app_id=None)
         self.run_tempseg = SimpleNamespace(spawn=lambda *a: self._spawn("tempseg", a))
         self.run_captioner = SimpleNamespace(spawn=lambda *a: self._spawn("captioner", a))
         self.episode_inputs, self.volume_paths = lab.episode_inputs, lab.volume_paths
 
-    def _run(self):
+    def _run(self, *, name=None):
         import contextlib
 
+        self.runs.append(name)  # App.run(name=...): billing reports it as the description
+        self.app.app_id = f"ap-fake{len(self.runs)}"
         return contextlib.nullcontext()
 
     def _spawn(self, kind, args):
@@ -284,7 +286,7 @@ def test_lab_zero_requests_fails_loudly_and_skips_the_captioner(lab_ctx):
     assert res["kinds"]["captioner"]["usd"] == 0.0 and "zero requests" in res[
         "kinds"]["captioner"]["skipped"]
     assert res["tracked_usd"] == pytest.approx(res["kinds"]["tempseg"]["usd"], abs=1e-4)
-    assert res["apps"] == ["flora-balanced-lab"]
+    assert res["apps"] == [f"flora-wh-{ctx.st.run_id}-lab-a1"] == fake.runs
     # an "ok"-looking result without L0 / Gate A is no evidence either (the 2026-10-22 shape)
     silent = {"baseline": {"l0": [], "batcher": {"requests": 0}},
               "gate_a": {"requests": 0, "positions": 0}}
@@ -304,16 +306,31 @@ def test_lab_runs_d_s_episodes_with_d_s_segments_and_the_cold_deadlines(lab_ctx)
     assert a1[2] == a2[2] == list(wh.EPISODES)
     assert a1[4] is None and set(a2[4]) == set(wh.EPISODES)  # captioner: (d)'s segments
     assert json.loads((wh.LAB_OUT / "balanced-captioner.json").read_text())["gate_a"]
-    assert ctx.st.step("lab").current.apps == ["flora-balanced-lab"]
+    cur = ctx.st.step("lab").current
+    assert cur.apps == [f"flora-wh-{ctx.st.run_id}-lab-a1"] == fake.runs  # its own name
+    assert cur.app_ids == ["ap-fake1"] and cur.stopped_at is not None  # the block exited
+
+
+def test_a_crashed_lab_call_still_confirms_the_stop_and_names_the_attempt(lab_ctx):
+    ctx, recs = lab_ctx
+    ctx.st.step("lab").attempts.insert(0, wh.Attempt(0.0, "failed"))  # this is attempt 2
+    fake = _Lab({"tempseg": _good("tempseg")})
+    fake._spawn = lambda kind, args: (_ for _ in ()).throw(BlockingIOError(36, "too long"))
+    fake.run_tempseg = SimpleNamespace(spawn=lambda *a: fake._spawn("tempseg", a))
+    with pytest.raises(BlockingIOError):
+        wh.run_lab(ctx, missing=lambda p: [], records=recs, lab_module=fake)
+    cur = ctx.st.step("lab").current
+    assert fake.runs == [f"flora-wh-{ctx.st.run_id}-lab-a2"] and cur.stopped_at is not None
 
 
 def test_lab_is_not_started_when_the_budget_cannot_carry_it(lab_ctx):
     ctx, recs = lab_ctx
     ctx.global_cap = 0.2  # ~250 s of L40S: under TempSeg's expected two compiles
     fake = _Lab({})
-    res = wh.run_lab(ctx, missing=lambda p: [], records=recs, lab_module=fake)
-    assert fake.spawned == [] and res["tracked_usd"] == 0.0 and not res["ok"]
-    assert all("budget left" in v["skipped"] for v in res["kinds"].values())
+    # the stop rule, raised before the lab app starts (not a skip inside a running app)
+    with pytest.raises(wh.StopRule, match=r"budget left .* \(binding: global left\)"):
+        wh.run_lab(ctx, missing=lambda p: [], records=recs, lab_module=fake)
+    assert fake.spawned == [] and fake.runs == [] and ctx.st.step("lab").current.apps == []
 
 
 # --- argv size, reuse of saved results, per-kind persistence ------------------------------------

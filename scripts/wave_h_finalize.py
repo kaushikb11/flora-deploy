@@ -591,25 +591,36 @@ def step_status(st: wh.State, name: str) -> str:
     return s.status
 
 
+def billing_final_after(st: wh.State, s: wh.StepState) -> float:
+    """When billing will cover every attempt of ``s``: with the rows' watermark, the end of
+    the billing hour of its latest attempt (``Attempt.hold_clears_at``); in a state without
+    one, :data:`wave_h.BILLING_LAG_S` after it."""
+    a = max(s.attempts, key=lambda x: x.settle_point)
+    if st.billed_through is None:
+        return a.settle_point + wh.BILLING_LAG_S
+    return a.hold_clears_at()
+
+
 def billing_rows(st: wh.State) -> tuple[list[list[str]], list[str]]:
     rows, warnings = [], []
+    wm = st.watermark  # billing is complete up to here (the rows' interval_start)
     for name in wh.STEPS:
         s = st.steps.get(name)
         if s is None:
             continue
-        last = max((a.last_activity for a in s.attempts), default=None)
+        last = max((a.settle_point for a in s.attempts), default=None)
         if s.billed_usd is None:
             billing = "shared app: global total only" if s.apps else "no app"
-        elif st.billed_at is None or last is None:
+        elif st.billed_at is None or last is None or wm is None:
             billing = "not read"
-        elif st.billed_at - last < wh.BILLING_LAG_S:
-            billing = (f"partial: read {st.billed_at - last:.0f} s after the step; final "
-                       f"after {utc(last + wh.BILLING_LAG_S)}")
-            warnings.append(f"{name}: billing was read {st.billed_at - last:.0f} s after the "
-                            f"step (< {wh.BILLING_LAG_S} s lag): billed "
-                            f"{usd(s.billed_usd)} vs tracked {usd(s.tracked_usd)} is partial; "
-                            f"re-run the runbook's billing read after "
-                            f"{utc(last + wh.BILLING_LAG_S)}, then this script")
+        elif wm < last:
+            final = utc(billing_final_after(st, s))
+            billing = (f"partial: read {st.billed_at - last:.0f} s after the step, billed "
+                       f"through {utc(wm)}; final after {final}")
+            warnings.append(f"{name}: billing covers up to {utc(wm)}, before the step's last "
+                            f"activity {utc(last)}: billed {usd(s.billed_usd)} vs tracked "
+                            f"{usd(s.tracked_usd)} is partial; re-run the runbook's billing "
+                            f"read after {final}, then this script")
         else:
             gap = (s.billed_usd or 0.0) - s.tracked_usd
             if (abs(gap) > BILLING_MISMATCH_USD
@@ -622,7 +633,7 @@ def billing_rows(st: wh.State) -> tuple[list[list[str]], list[str]]:
                 billing = "reconciled"
         rows.append([wh.TITLES[name], step_status(st, name), str(len(s.attempts)),
                      usd(wh.CAPS_USD[name]),
-                     usd(s.tracked_usd), usd(s.charged(st.billed_at)), usd(s.billed_usd),
+                     usd(s.tracked_usd), usd(s.charged(st.watermark)), usd(s.billed_usd),
                      billing])
     return rows, warnings
 
@@ -832,18 +843,19 @@ def render_report(f: Findings) -> str:
          "git-ignored `reports/wave-h/`.", "",
          f"Run `{st.run_id}`, finished {utc(run_stamp(st))}.", "", "## Spend per step", "",
          "Tracked: container-seconds x list $/h from `flora report` (the lab: its wall time). "
-         "Charged: tracked, or a killed / unreported attempt at its budget until billing is "
-         f"read {wh.BILLING_LAG_S} s after it. Billed: the billed delta of the apps only that "
-         "step used (`scripts/spend.py`).", ""]
+         "Charged: tracked, or a killed / unreported attempt at its bound (its time plus the "
+         "stop slack, once its stop was confirmed) or else its budget, until billing covers it "
+         "(the billing rows' `interval_start` watermark). Billed: the billed delta of the apps "
+         "only that step used (`scripts/spend.py`).", ""]
     L += table(["step", "status", "attempts", "cap", "tracked", "charged", "billed", "billing"],
                f.billing)
     tracked = sum(s.tracked_usd for s in st.steps.values())
-    charged = sum(s.charged(st.billed_at) for s in st.steps.values())
+    charged = sum(s.charged(st.watermark) for s in st.steps.values())
     L += ["", f"Total: **{usd(st.spent)}** of the {usd(global_cap(st))} global cap: the "
           "larger of charged and billed, the figure the runbook gates on.", "",
           f"- tracked {usd(tracked)}: container-seconds x list $/h of every attempt;",
-          f"- charged {usd(charged)}: tracked, with a killed or unreported attempt at its budget "
-          f"until billing is read {wh.BILLING_LAG_S} s after it"
+          f"- charged {usd(charged)}: tracked, with a killed or unreported attempt at its bound "
+          "or budget until billing covers it"
           + (f" ({usd(charged - tracked)} over tracked)" if charged - tracked > 0.005 else "")
           + ";",
           f"- billed {usd(st.billed_total)}: Modal's billed delta of every app (read "
