@@ -261,13 +261,14 @@ DERIVED_PINS: tuple[DerivedPin, ...] = (
         content_sha256="d4c1bea5dbd3e49746a81279df2f27b904fdd2f4a71322df266201c72de0327e",
         proven_with=(("torch", "2.11.0"), ("transformers", "5.8.1"), ("safetensors", "0.7.0")),
     ),
-    # Merger v2 (fixed-order FP64 merge, docs/tempseg-merge.md): not built yet. Pin its content
-    # digest after a v2 build and its equivalence check.
+    # Merger v2 (fixed-order FP64 merge, docs/tempseg-merge.md): built 2026-10-22 by wave_h step 0
+    # (flora-weights:/derived/tempseg-merged@114a1076..., receipt file sha256 9cb1f755...);
+    # equivalence on an L40S: identical inputs and greedy ids, verify_gdn PASS on both checkpoints.
     DerivedPin(
         key="tempseg-merged",
         source_key="tempseg",
         converter_version=2,
-        content_sha256=None,
+        content_sha256="6356ab8c1499096512e1aa2a3aff4bfe4fcce9d67cce78a57e9a8484ef579303",
         proven_with=(("torch", "2.11.0"), ("transformers", "5.8.1"), ("safetensors", "0.7.0")),
     ),
 )

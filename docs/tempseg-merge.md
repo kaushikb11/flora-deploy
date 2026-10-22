@@ -224,3 +224,22 @@ uv run modal run src/flora_deploy/modal_app/convert_app.py::tempseg --step equiv
   (archive/PLAN-v3.md §9).
 - Building merger v2, re-running the equivalence check on it, and pinning its content digest
   (`DERIVED_PINS["tempseg-merged"].content_sha256`).
+
+## Merger v2 build and equivalence (2026-10-22)
+
+Built by `scripts/wave_h.py` step 0 on Modal (CPU merge, then the equivalence check on an L40S),
+against NVIDIA's unmerged TempSeg (`Session.load('tempseg')`, FP32 LoRA, BF16 autocast).
+
+| Check | Result |
+|---|---|
+| Model inputs on 2 real golden windows | identical |
+| Greedy token ids and decoded JSON | identical |
+| `verify_gdn` (FP32 `A_log` / `dt_bias`) vs base and merged checkpoints | PASS on both |
+| Merged files verify | yes |
+| Logit drift, teacher-forced (max / mean abs) | 0.34-0.38 / 0.027-0.033 |
+| Logit drift, fixed prompts and random tokens (mean abs) | 0.021-0.026 |
+| Unmerged run repeated (A vs A) | 0.0 (deterministic) |
+
+The drift is at BF16 rounding level and matches the v1 merge check. Pinned content digest:
+`6356ab8c1499096512e1aa2a3aff4bfe4fcce9d67cce78a57e9a8484ef579303` (receipt file sha256
+`9cb1f755778da2716f190b40d71a401567061bee697c2b6b34073052ea4ae678`).

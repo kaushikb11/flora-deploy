@@ -268,8 +268,14 @@ def test_balanced_step_does_not_read_the_oracle_state(monkeypatch, tmp_path):
 
 
 def test_pin_instructions_name_the_exact_one_line_edit():
+    import re
+
     pins = SCRIPTS.parent / wh.PINS_FILE
-    src = pins.read_text()
+    real = pins.read_text()
+    i = real.index('key="tempseg-merged"')
+    # the file as it stood before the 2026-10-22 pin: the instructions are for that state
+    src = real[:i] + re.sub(r'content_sha256="[0-9a-f]{64}",', "content_sha256=None,",
+                            real[i:], count=1)
     old, new = wh.pin_edit("e" * 64)
     assert src.count(old + "\n") == 1  # the one unpinned line: tempseg-merged's
     block = src[src.index('key="tempseg-merged"'):]

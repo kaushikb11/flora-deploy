@@ -22,6 +22,18 @@ PINNED = "0e91e467c7ffdb636573e779672d11b203571f7869ca94317f1005eb700d9c65"  # a
 TEMPSEG = "a" * 64
 runner = CliRunner()
 
+@pytest.fixture(autouse=True)
+def _tempseg_unpinned(monkeypatch):
+    """These tests build synthetic TempSeg receipts: run them in the not-yet-pinned state the
+    tests describe, whatever the real pin is (pinned 2026-10-22)."""
+    from dataclasses import replace as _replace
+
+    from flora_deploy.config.pins import DERIVED_PINS_BY_KEY as _PINS
+
+    monkeypatch.setitem(_PINS, "tempseg-merged",
+                        _replace(_PINS["tempseg-merged"], content_sha256=None))
+
+
 
 def template_text(name: str) -> str:
     return (resources.files("flora_deploy.config") / "templates" / name).read_text()

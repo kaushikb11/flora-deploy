@@ -25,6 +25,18 @@ from tests.fakes.derived import captioner_receipt
 runner = CliRunner()
 TEMPLATE = "exact_mp4_dir.yaml"
 
+@pytest.fixture(autouse=True)
+def _tempseg_unpinned(monkeypatch):
+    """These tests build synthetic TempSeg receipts: run them in the not-yet-pinned state the
+    tests describe, whatever the real pin is (pinned 2026-10-22)."""
+    from dataclasses import replace as _replace
+
+    from flora_deploy.config.pins import DERIVED_PINS_BY_KEY as _PINS
+
+    monkeypatch.setitem(_PINS, "tempseg-merged",
+                        _replace(_PINS["tempseg-merged"], content_sha256=None))
+
+
 
 def receipt_bytes(name: str, **changes) -> bytes:
     b = dv.DERIVED_BUILDS[name]
