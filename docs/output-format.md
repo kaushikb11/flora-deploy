@@ -367,7 +367,9 @@ ds = load_dataset("parquet", data_files={"caption": "caption.parquet",
 # or the nested records: load_dataset("json", data_files="caption.jsonl")
 ```
 
-From Python with the store directly:
+From Python with the store directly. `store_from_uri` takes the job-store spelling of
+`output.sink`: `s3://...` as is, `modal-volume://name/dir` for a `volume://name/dir` sink, and a
+local path for `flora run --local` (`flora-local-store/` next to `flora.yaml`):
 
 ```python
 from flora_deploy.export.results import iter_records, load_parquet, store_from_uri

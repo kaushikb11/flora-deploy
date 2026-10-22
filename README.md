@@ -55,16 +55,23 @@ To start from a working config instead, see [`examples/`](examples/): `lerobot_s
 ```bash
 flora init                 # writes flora.yaml; set your dataset and output location
 flora doctor               # checks your setup without spending anything
-flora prepare              # one-time: downloads the models into your Modal account
-flora index                # scans the dataset
+flora prepare              # one-time, on Modal: downloads the models, builds derived weights
+flora index                # scans the dataset (Modal CPUs, a few cents)
 flora plan                 # shows cost and time before anything runs
 flora deploy && flora run  # labels the dataset, streaming progress
 flora results caption      # or segment, reward.terminal, reward.dense
 ```
 
+`flora prepare --dry-run` lists what `flora prepare` would download and build, with the build's
+estimated cost, and builds nothing.
+
+`flora index --local` scans on your machine for free instead, but still writes its receipts to
+`output.sink`. With a Modal Volume sink, create the Volume first (`flora doctor` prints the
+command) or run plain `flora index` once, which creates it.
+
 `flora run` stops before it would exceed your budget, and `flora resume` picks up where a stopped
-or interrupted job left off. GPUs start when the job starts and scale to zero when it ends (a 2 s
-idle window once a stage has no work left); captioning GPUs boot while segmentation finishes.
+or interrupted job left off. GPUs start when the job starts and scale to zero when it ends (about
+17 s after a stage has no work left); captioning GPUs boot while segmentation finishes.
 
 ## Configuration
 
@@ -78,7 +85,7 @@ allow_uncertified: true           # for stages without an accuracy certificate (
 
 modal:
   budget_usd: 25                  # hard spending cap for the job
-  max_gpus: 6
+  max_gpus: 4
 
 input:
   format: lerobot_v3              # lerobot_v21 | lerobot_v3 | mp4_dir
@@ -112,10 +119,15 @@ scores = pd.read_parquet("terminal.parquet")       # flora results reward.termin
 labels = captions.merge(scores[["uid", "terminal_score"]], on="uid")
 ```
 
+pandas is not a flora-deploy dependency: install it (`pip install pandas`) where you read the
+files. `caption.parquet` has one row per subtask and `terminal.parquet` one per episode, so the
+merge repeats each episode's score on its subtasks.
+
 Training on LeRobot? `flora export --to lerobot --out labeled/ --allow-uncertified` writes the
 labels into a copy of your dataset: subtasks and success scores per episode, dense rewards per
 frame ([`docs/export.md`](docs/export.md)). The flag is needed while `balanced` segment/caption
-are uncertified, and is recorded in the export.
+are uncertified, and is recorded in the export. It needs a LeRobot input, so the local demo (a
+folder of MP4s) has nothing to export into.
 
 Every record has a `uid` (the episode) to join stages on, plus provenance: which models, engine and
 GPU produced it. Field reference: [`docs/output-format.md`](docs/output-format.md).
@@ -164,6 +176,9 @@ set aside and reported, so one bad video never sinks a job. Commands and exit co
 [`docs/cli.md`](docs/cli.md).
 
 ## Python
+
+The SDK imports `flora_deploy`, which `uv tool install` keeps in its own environment. To use it
+from your scripts, install the package into their environment with the `pip install` form above.
 
 ```python
 from flora_deploy import sdk
