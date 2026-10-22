@@ -1565,6 +1565,10 @@ class Ctx:
     def run(self) -> str:
         return self.st.run_id
 
+    def app_name(self, step: str) -> str:
+        """This attempt's own ephemeral app name (:func:`app_name`)."""
+        return app_name(self.run, step, max(1, len(self.st.step(self.step or step).attempts)))
+
     @property
     def cfg(self) -> Path:
         return self.work / "flora.yaml"
@@ -1583,6 +1587,13 @@ class Ctx:
 
     def store_args(self) -> list[str]:
         return ["--store", self.store_uri, "--config", str(self.cfg)]
+
+
+def app_name(run_id: str, step: str, attempt: int) -> str:
+    """One attempt's own app name: ``flora-st-<run>-<step>-a<n>``. Billing reports spend per
+    app name; a shared name (``flora-index``) would mix in any other run's index in that hour
+    (``wave_h.app_name`` names its apps ``flora-wh-...`` for the same reason)."""
+    return f"flora-st-{run_id}-{step.replace('_', '-')}-a{attempt}"
 
 
 def _flora() -> str:
@@ -1635,9 +1646,11 @@ def run_index(ctx: Ctx) -> dict[str, Any]:
     summary = ctx.work / "summary.json"
     t0 = time.time()
     if ctx.mode == "real":
-        ctx.note_app("flora-index")
+        name = ctx.app_name("index")  # its own app: billing attributes it to this run only
+        ctx.note_app(name)
         ctx.sh([fl, "index", "--config", str(ctx.cfg), "--job", ctx.job_id, "--store",
-                ctx.store_uri, "--out", str(summary), *index_limit_args()], timeout=3600)
+                ctx.store_uri, "--out", str(summary), "--app-name", name,
+                *index_limit_args()], timeout=3600)
         usd = project("index", "real").items[0]["usd_per_h"] / 3600 * (time.time() - t0)
     else:
         local_store = ctx.work / "store"

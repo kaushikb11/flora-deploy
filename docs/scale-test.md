@@ -400,6 +400,10 @@ chaos, the same schedule costs $7.89 and takes 31 minutes.
 - **Retries:** an attempt that is killed or unreported is charged its whole budget until billing
   is an hour past it. A retry soon after such an attempt is therefore refused by design (see
   `docs/wave-h-runbook.md`).
+- **App names:** billing reports spend per app name, so the `real` index step runs
+  `flora index --app-name flora-st-<run>-index-a<n>` rather than the shared `flora-index`. Another
+  index run in the same hour (another runbook, or a plain `flora index`) is then never billed to
+  this run.
 
 For comparison, `flora plan` (offline, same rates, cold) picks the same layout for the full
 test:

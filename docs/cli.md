@@ -118,6 +118,7 @@ flora index [OPTIONS]
 | `--work` |  | --local: where Hub files are downloaded (default: input.stage_to or ~/.cache/flora-deploy/datasets). |
 | `--force`, `--no-force` | --no-force | Re-index episodes that have receipts. |
 | `--out` |  | Also write the summary here (default: summary.json next to the config, where `flora plan` reads it). |
+| `--app-name` (env `FLORA_INDEX_APP`) |  | Modal app name of this index run (default: flora-index). Billing reports spend per app name, so give each run its own to attribute it. |
 
 ### `flora plan`
 
