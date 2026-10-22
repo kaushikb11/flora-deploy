@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -21,6 +22,8 @@ from typing import Any
 
 BILLING_LAG_S = 3600  # a state without a billing watermark: billing is this far behind its read
 HOUR_S = 3600.0  # Modal bills by the hour: a row's interval_start is the start of its hour
+# How long after an hour ends its billing rows are expected (only for "clears at" times).
+BILLING_SETTLE_S = 15 * 60
 HEARTBEAT_S = 30.0
 CLIENT_SLACK_S = 240  # per app: client timeout margin, then cancel + app stop
 # A state from before the cap override was scoped to a plan: the plan it was set on.
@@ -47,15 +50,52 @@ class Attempt:
     notes: list[str] = field(default_factory=list)
     app_ids: list[str] = field(default_factory=list)  # Modal app ids (``ap-...``) it started
     billed_usd: float | None = None  # billed cost of its own apps (None: not attributable)
+    # when every app it started was confirmed stopped (the ``with app.run()`` block exited, or a
+    # stop by id returned 0); None: not known to be stopped
+    stopped_at: float | None = None
+    slack_s: float | None = None  # stop -> container gone (None: CLIENT_SLACK_S)
+    hard_timeout_s: float | None = None  # its containers cannot outlive started + this
 
     @property
     def last_activity(self) -> float:
         return self.finished or self.heartbeat or self.started
 
     @property
+    def slack(self) -> float:
+        return float(CLIENT_SLACK_S if self.slack_s is None else self.slack_s)
+
+    def _run_end(self) -> float | None:
+        """The latest its containers can have run until (before the slack); None: unknown."""
+        cut = None if self.hard_timeout_s is None else self.started + self.hard_timeout_s
+        if self.stopped_at is not None:
+            return self.stopped_at if cut is None else min(self.stopped_at, cut)
+        return cut if self.status == "killed" else None
+
+    @property
     def settle_point(self) -> float:
-        """The latest time this attempt's apps can have been billed for."""
-        return self.last_activity
+        """The latest time this attempt's apps can have been billed for: its known end plus the
+        slack, else its last activity."""
+        end = self._run_end()
+        return self.last_activity if end is None else max(self.last_activity, end + self.slack)
+
+    def bounded_usd(self) -> float | None:
+        """The most a killed or unreported attempt can have cost when its end is known (a
+        confirmed stop, or its containers' hard timeout): its peak rate over the time it ran
+        plus the slack, at most its budget. None: nothing is known (charged its budget)."""
+        end = self._run_end()
+        if end is None:
+            return None
+        ran = max(self.tracked_usd, self.rate_usd_per_s * max(0.0, end - self.started))
+        return round(min(self.budget_usd, ran + self.slack * self.rate_usd_per_s), 4)
+
+    def held(self, through: float | None) -> bool:
+        """Charged more than tracked until billing covers it (killed or unreported)."""
+        return (self.status == "killed" or self.report_error) and not self.settled(through)
+
+    def hold_clears_at(self) -> float:
+        """When billing is expected to cover this attempt: the end of the billing hour holding
+        its :attr:`settle_point`, plus :data:`BILLING_SETTLE_S`."""
+        return hour_floor(self.settle_point) + HOUR_S + BILLING_SETTLE_S
 
     def settled(self, through: float | None) -> bool:
         """Billing covers every hour this attempt could have spent in (``through``: the billing
@@ -63,12 +103,14 @@ class Attempt:
         return through is not None and through >= self.settle_point
 
     def charged(self, through: float | None) -> float:
-        """Settled: the larger of tracked and its own apps' billed cost. Until then: tracked,
-        or the attempt's budget while its spend cannot be known (killed, no report)."""
+        """Settled: the larger of tracked and its own apps' billed cost. Until then: tracked;
+        a killed or unreported attempt its bound (:meth:`bounded_usd`) when its end is known,
+        else its budget."""
         if self.settled(through):
             return max(self.tracked_usd, self.billed_usd or 0.0)
         if self.status == "killed" or self.report_error:
-            return max(self.tracked_usd, self.budget_usd)
+            bound = self.bounded_usd()
+            return max(self.tracked_usd, self.budget_usd if bound is None else bound)
         return self.tracked_usd
 
 
@@ -188,16 +230,29 @@ class State:
                    d.get("gate_cap"), d.get("gate_cap_plan"), d.get("plan"),
                    billed_through=d.get("billed_through"))
 
+    def held(self) -> list[tuple[str, int, Attempt]]:
+        """``(step, attempt number, attempt)`` of every attempt charged over its tracked cost
+        until billing covers it."""
+        return [(name, i, a) for name, s in self.steps.items()
+                for i, a in enumerate(s.attempts, 1) if a.held(self.watermark)
+                and a.charged(self.watermark) > a.tracked_usd + 1e-9]
+
+    def killed_unstopped(self) -> list[Attempt]:
+        """Killed attempts whose apps are not known to be stopped."""
+        return [a for s in self.steps.values() for a in s.attempts
+                if a.status == "killed" and a.stopped_at is None and (a.apps or a.app_ids)]
+
     def mark_killed(self) -> list[str]:
-        """Attempts left ``running`` by a killed process: ``killed`` (charged their budget
-        until billing reconciles them), their step ``failed`` (retried). Returns their apps."""
+        """Attempts left ``running`` by a killed process: ``killed`` (charged their bound, or
+        their budget, until billing covers them), their step ``failed`` (retried). Returns
+        their apps."""
         apps: list[str] = []
         for name, s in self.steps.items():
             for a in s.attempts:
                 if a.status == "running":
                     a.status = "killed"
-                    a.notes.append("process killed while running; charged its budget until "
-                                   "billing reconciles it")
+                    a.notes.append("process killed while running; charged its bound (or its "
+                                   "budget) until billing covers it")
                     apps += a.apps
             if s.status == "running":
                 s.status = "failed"
@@ -320,6 +375,66 @@ def billed_by_app(since: str) -> Billing:
 
 def hour_floor(t: float) -> float:
     return (t // HOUR_S) * HOUR_S
+
+
+def utc(t: float | None) -> str:
+    return "never" if t is None else time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(t))
+
+
+# ---------------------------------------------------------------------------------------------
+# Stopping apps by id (``modal app stop <name>`` only finds deployed apps, never ephemeral ones)
+
+
+def _run(args: list[str], run: Callable[..., Any] | None) -> Any:
+    try:
+        return (run or subprocess.run)(args, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def list_apps(run: Callable[..., Any] | None = None) -> list[dict[str, Any]] | None:
+    """``modal app list --json`` (``app_id``, ``description``, ``state``, ...); None when it
+    cannot be read."""
+    p = _run(["modal", "app", "list", "--json"], run)
+    if getattr(p, "returncode", 1) != 0:
+        return None
+    try:
+        rows = json.loads(p.stdout)
+    except (TypeError, ValueError):
+        return None
+    return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else None
+
+
+def app_ids_named(name: str, apps: Iterable[Mapping[str, Any]]) -> list[str]:
+    """The ids of the listed apps whose description is ``name``."""
+    return [str(r["app_id"]) for r in apps if r.get("description") == name and r.get("app_id")]
+
+
+def _live(r: Mapping[str, Any]) -> bool:
+    return "stopped" not in str(r.get("state") or "").lower()
+
+
+def stop_app(ident: str, run: Callable[..., Any] | None = None) -> bool:
+    """``modal app stop --yes <id or deployed name>``; True when it returned 0."""
+    return getattr(_run(["modal", "app", "stop", "--yes", ident], run), "returncode", 1) == 0
+
+
+def stop_apps(names: Iterable[str], ids: Iterable[str] = (),
+              run: Callable[..., Any] | None = None) -> bool:
+    """Stop an attempt's apps by id: its recorded ids, and the live listed apps named like its
+    apps (an ephemeral app is only found by id). Returns whether every one is confirmed
+    stopped (listed as stopped, or stopped with exit code 0). When the app list cannot be read,
+    each id and each name (a deployed app's) is stopped anyway, unconfirmed."""
+    names, ids = list(dict.fromkeys(names)), list(dict.fromkeys(ids))
+    listed = list_apps(run)
+    if listed is None:
+        for ident in [*ids, *names]:
+            stop_app(ident, run)
+        return False
+    live = {str(r.get("app_id")): r for r in listed if _live(r)}
+    targets = [i for i in ids if i in live]
+    targets += [i for n in names for i in app_ids_named(n, live.values()) if i not in targets]
+    return all([stop_app(i, run) for i in targets])
 
 
 def _attempt_keys(a: Attempt) -> set[str]:

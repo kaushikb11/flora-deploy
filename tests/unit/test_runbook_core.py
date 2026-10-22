@@ -197,3 +197,83 @@ def test_a_legacy_shared_name_is_not_attributed_to_one_attempt():
     assert lab.settled(st.watermark) and lab.charged(st.watermark) == pytest.approx(0.72)
     assert st.step("lab").billed_usd is None  # shared with preflight: the global total only
     assert st.billed_total == pytest.approx(0.80) and st.spent == pytest.approx(0.80)
+
+
+# --- WP3: bounded charging, hold_clears_at, stop by id ----------------------------------------
+
+
+def _lab_attempt_1(*, stopped: bool) -> rb.Attempt:
+    """Today's lab attempt 1: crashed at 05:23:29 UTC with $0.72 tracked (heartbeat 23 s
+    earlier), its ``with app.run()`` block exited (the app stopped) as the error propagated."""
+    a = wh.Attempt(**today()["steps"]["lab"]["attempts"][0])
+    a.slack_s = wh.LAB_SLACK_S
+    a.stopped_at = a.finished if stopped else None
+    return a
+
+
+def test_todays_crashed_lab_attempt_is_charged_its_time_plus_slack_not_its_budget():
+    a = _lab_attempt_1(stopped=True)
+    through = rb.hour_floor(a.finished)  # billing covers 05:00 UTC, not the crash's hour
+    ran = (a.finished - a.started) * LAB_RATE  # 533.6 s at the Captioner's $/s
+    assert a.charged(through) == pytest.approx(ran + wh.LAB_SLACK_S * LAB_RATE, abs=1e-4)
+    assert a.charged(through) == pytest.approx(0.84, abs=0.005)  # was its $2.35 budget
+    assert a.held(through) and rb.utc(a.hold_clears_at()) == "2026-10-22 06:15 UTC"
+    # without a confirmed stop nothing bounds it: its budget, as before
+    assert _lab_attempt_1(stopped=False).charged(through) == pytest.approx(2.35)
+    # billing covers the hour: tracked (the shared legacy name gives it no billed cost)
+    assert a.charged(rb.hour_floor(a.finished) + rb.HOUR_S) == pytest.approx(0.722)
+
+
+def test_a_killed_attempt_is_bounded_by_its_stop_or_its_hard_timeout():
+    a = rb.Attempt(started=T0, status="killed", heartbeat=T0 + 300, tracked_usd=0.30,
+                   rate_usd_per_s=0.001, budget_usd=5.0, slack_s=60, apps=["x"])
+    assert a.bounded_usd() is None and a.charged(None) == 5.0  # nothing known: its budget
+    a.hard_timeout_s = 2400.0  # its containers die by then
+    assert a.charged(None) == pytest.approx(0.001 * (2400 + 60))
+    a.stopped_at = T0 + 900.0  # the next run stopped its apps by id
+    assert a.charged(None) == pytest.approx(0.001 * (900 + 60))
+    assert a.settle_point == T0 + 960.0
+    a.stopped_at = T0 + 9000.0  # a late stop: the hard timeout still bounds it
+    assert a.charged(None) == pytest.approx(0.001 * (2400 + 60))
+    a.budget_usd = 1.0
+    assert a.charged(None) == pytest.approx(1.0)  # never more than its budget
+
+
+class _Modal:
+    """``subprocess.run`` for ``modal app list --json`` / ``modal app stop``."""
+
+    def __init__(self, apps, *, list_rc=0, stop_rc=0):
+        self.apps, self.list_rc, self.stop_rc, self.calls = apps, list_rc, stop_rc, []
+
+    def __call__(self, args, **kw):
+        self.calls.append(args)
+        out = json.dumps(self.apps) if args[:3] == ["modal", "app", "list"] else ""
+        rc = self.list_rc if args[:3] == ["modal", "app", "list"] else self.stop_rc
+        return type("P", (), {"returncode": rc, "stdout": out, "stderr": ""})()
+
+
+def test_stop_apps_stops_ephemeral_apps_by_id():
+    fake = _Modal([{"app_id": "ap-1", "description": "flora-balanced-lab", "state": "ephemeral"},
+                   {"app_id": "ap-0", "description": "flora-balanced-lab", "state": "stopped"},
+                   {"app_id": "ap-9", "description": "other", "state": "deployed"}])
+    assert rb.stop_apps(["flora-balanced-lab"], ["ap-7"], run=fake)
+    stops = [c for c in fake.calls if c[:3] == ["modal", "app", "stop"]]
+    assert stops == [["modal", "app", "stop", "--yes", "ap-1"]]  # never the bare name
+    assert not rb.stop_apps(["flora-balanced-lab"], run=_Modal(fake.apps, stop_rc=1))
+    unlisted = _Modal([], list_rc=1)
+    assert not rb.stop_apps(["dep-app"], ["ap-2"], run=unlisted)  # tried, not confirmed
+    assert [c[-1] for c in unlisted.calls[1:]] == ["ap-2", "dep-app"]
+
+
+def test_the_next_run_stops_a_killed_attempts_apps_and_bounds_it():
+    st = rb.State("r", T0, "x")
+    a = rb.Attempt(started=T0, status="killed", heartbeat=T0 + 100, tracked_usd=0.1,
+                   rate_usd_per_s=0.001, budget_usd=2.0, slack_s=60, hard_timeout_s=1200.0,
+                   apps=["flora-wh-r-lab-a1"],
+                   app_ids=["ap-lab"])
+    st.step("lab").attempts.append(a)
+    wh.stop_killed(st, run=_Modal([{"app_id": "ap-lab", "description": "flora-wh-r-lab-a1",
+                                    "state": "ephemeral"}]), out=lambda s: None)
+    assert a.stopped_at is not None and a.charged(None) == pytest.approx(0.001 * (1200 + 60))
+    lines = wh.held_lines(st)
+    assert len(lines) == 1 and "lab attempt 1" in lines[0] and lines[0].endswith("UTC")

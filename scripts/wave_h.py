@@ -107,6 +107,7 @@ step's apps are stopped first).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -938,10 +939,29 @@ class Ctx:
                      log=self.work / "wave-h.log")
 
     def note_app(self, name: str) -> None:
-        """Record an app in the running attempt *before* it can spend (H3)."""
+        """Record an app in the running attempt *before* it can spend (H3). A new app means
+        the attempt is no longer known to be stopped."""
         cur = self.st.step(self.step).current if self.step else None
-        if cur is not None and name not in cur.apps:
-            cur.apps.append(name)
+        if cur is not None:
+            if name not in cur.apps:
+                cur.apps.append(name)
+            cur.stopped_at = None
+            save_state(self.st, self.state_path)
+
+    def note_app_id(self, app_id: str | None) -> None:
+        """Record a started app's id (``ap-...``): it is stopped and billed by id."""
+        cur = self.st.step(self.step).current if self.step else None
+        if cur is not None and app_id and app_id not in cur.app_ids:
+            cur.app_ids.append(app_id)
+            save_state(self.st, self.state_path)
+
+    def confirm_stop(self) -> None:
+        """Every app the running attempt started is confirmed stopped (the ``with app.run()``
+        block exited, or a stop returned 0): until billing covers it, a failure is charged its
+        tracked time plus the slack, not its budget (``_runbook.Attempt.bounded_usd``)."""
+        cur = self.st.step(self.step).current if self.step else None
+        if cur is not None:
+            cur.stopped_at = time.time()
             save_state(self.st, self.state_path)
 
     def receipt_rows(self) -> list[dict[str, Any]]:
@@ -1042,13 +1062,21 @@ def _modal_run(ctx: Ctx, target: str, args: list[str], *, limit: float, out: Pat
     except RuntimeError as e:
         err = str(e)
     finally:
-        ctx.sh(["modal", "app", "stop", "--yes", TEMPSEG_APP], check=False, timeout=120)
+        if rb.stop_apps([TEMPSEG_APP], run=_sh_runner(ctx)):
+            ctx.confirm_stop()
     wall = time.time() - t0
     try:
         res = json.loads(out.read_text()) if out.exists() and err is None else None
     except ValueError as e:
         res, err = None, f"unreadable {out.name}: {e}"
     return res, wall, err
+
+
+def _sh_runner(ctx: Ctx) -> Callable[..., Any]:
+    """``ctx.sh`` in the shape ``_runbook.stop_apps`` calls ``subprocess.run``."""
+    def run(args: list[str], **kw: Any) -> Any:
+        return ctx.sh(args, check=False, timeout=kw.get("timeout", 120))
+    return run
 
 
 def run_tempseg(ctx: Ctx) -> dict[str, Any]:
@@ -1141,6 +1169,7 @@ def run_preflight(ctx: Ctx) -> dict[str, Any]:
     ctx.note_app("flora-balanced-lab")
     with modal.enable_output(), lab.app.run():
         out = lab.preflight.remote()
+    ctx.confirm_stop()
     wall = time.time() - t0
     ok = all(out.get(k, {}).get("receipt") for k in ("tempseg", "captioner"))
     return {"ok": ok, "wall_s": round(wall, 1), "tracked_usd": PREFLIGHT.usd_per_s() * wall,
@@ -1244,8 +1273,10 @@ def _run_job(ctx: Ctx, step: str, cfg: Path, job_id: str, *, determinism: str,
             out["rc"] = "deadline"
             ctx.sh([fl, "cancel", job_id, "--config", str(cfg)], check=False, timeout=120)
     finally:
-        ctx.sh(["modal", "app", "stop", "--yes", plan.app_name], check=False, timeout=120)
+        p = ctx.sh(["modal", "app", "stop", "--yes", plan.app_name], check=False, timeout=120)
         out["stopped_at"] = time.time()
+        if getattr(p, "returncode", 1) == 0:  # a deployed app: stopped by its name
+            ctx.confirm_stop()
     rep = ctx.sh([fl, "report", job_id, "--config", str(cfg), "--json"], check=False,
                  timeout=900)
     try:
@@ -1526,6 +1557,13 @@ def lab_reuse(st: State, spec: PlanSpec | None = None) -> tuple[str, ...]:
                  if reusable_lab_result(k, st.run_id, eps, segments_from=sf) is not None)
 
 
+@contextlib.contextmanager
+def _lab_app(lab: Any, modal: Any):
+    """``lab.app.run()`` with Modal's output on; the app is stopped when the block exits."""
+    with modal.enable_output(), lab.app.run():
+        yield
+
+
 def _lab_kind_summary(res: Mapping[str, Any], wall: float, usd: float) -> dict[str, Any]:
     base = res.get("baseline", {}) if isinstance(res, Mapping) else {}
     err = res.get("error") or base.get("error")
@@ -1609,7 +1647,9 @@ def run_lab(ctx: Ctx, *, missing: Callable[[Iterable[str]], list[str]] | None = 
     rdir.mkdir(parents=True, exist_ok=True)
     ctx.note_app("flora-balanced-lab")  # only now: a precondition failure above charged $0
     fns = {"tempseg": lab.run_tempseg, "captioner": lab.run_captioner}
-    with modal.enable_output(), lab.app.run():
+    with contextlib.ExitStack() as stopped:
+        stopped.callback(ctx.confirm_stop)  # runs once the app's block below has exited
+        stopped.enter_context(_lab_app(lab, modal))
         for kind in todo:
             fn, c = fns[kind], LAB[kind]
             limit = min(LAB_DEADLINE_S[kind],
@@ -1895,6 +1935,8 @@ def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
         f"({' -> '.join(title[s].split('.')[0] for s in steps)}): spent ${st.spent:.2f} of "
         f"${gcap:.2f} (billing read "
         f"{'never' if st.billed_at is None else time.ctime(st.billed_at)})")
+    for line in held_lines(st):
+        out(line)
     if manifest is not None:
         eps, miss = (episodes_in(manifest, spec.episodes),
                      missing_episodes(manifest, spec.episodes))
@@ -1977,6 +2019,32 @@ def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
             "first step whose upper projection no longer fits the cap left")
 
 
+# Per step: stop -> container gone (the lab and conversion calls end with their client timeout;
+# a deployed job with ``flora run``'s), and the hard limit its containers cannot outlive.
+STEP_SLACK_S = {"tempseg": LAB_SLACK_S, "preflight": LAB_SLACK_S, "lab": LAB_SLACK_S}
+STEP_HARD_TIMEOUT_S = {"lab": 2 * LAB_TIMEOUT_S}  # two calls, one after the other
+
+
+def stop_killed(st: State, run: Callable[..., Any] | None = None,
+                out: Callable[[str], None] = print) -> None:
+    """Stop, by id, the apps a killed run may have left up (``modal app stop <name>`` finds no
+    ephemeral app). A confirmed stop bounds the attempt's charge (``Attempt.bounded_usd``)."""
+    for a in st.killed_unstopped():
+        if rb.stop_apps(a.apps, a.app_ids, run=run):
+            a.stopped_at = time.time()
+            out(f"stopped {', '.join(a.app_ids or a.apps)} (left by a killed run)")
+        else:
+            out(f"could not confirm {', '.join(a.app_ids or a.apps)} stopped (left by a killed "
+                "run): it stays charged its budget until billing covers it")
+
+
+def held_lines(st: State) -> list[str]:
+    """One line per attempt charged over its tracked cost until billing covers it."""
+    return [f"  held: {name} attempt {i} charged ${a.charged(st.watermark):.2f} (tracked "
+            f"${a.tracked_usd:.2f}) until billing covers it, about {rb.utc(a.hold_clears_at())}"
+            for name, i, a in st.held()]
+
+
 def load_manifest(offline: bool, version: str = "golden/v1") -> dict[str, Any]:
     if offline:
         return offline_manifest(DURATION_HEADROOM, version)
@@ -2030,7 +2098,8 @@ def main(argv: list[str] | None = None) -> int:
         st.plan = CERTIFIED
     if adopt_balanced_job(st):
         print("note: (d)'s deployed job is done; (d) counts as done and its lab is step lab")
-    killed_apps = st.mark_killed() if args.yes_spend else []
+    if args.yes_spend:
+        st.mark_killed()
     manifest = load_manifest(args.offline, spec.golden)
     miss = missing_episodes(manifest, spec.episodes)
     if miss:
@@ -2080,9 +2149,7 @@ def main(argv: list[str] | None = None) -> int:
             st.billing_baseline = billed_by_app(st.billing_since)
         except Exception as e:  # noqa: BLE001
             print(f"billing baseline unavailable ({e!r}); tracking only")
-    for app in killed_apps:  # a killed run may have left them up
-        subprocess.run(["modal", "app", "stop", "--yes", app], capture_output=True, text=True)
-        print(f"stopped {app} (left by a killed run)")
+    stop_killed(st)
     st.gate_cap, st.gate_cap_plan = gcap, args.plan  # the cap this run gates on
     save_state(st, args.state)
     os.chdir(args.work)  # relative input.path is hashed against the cwd: plan where flora runs
@@ -2106,7 +2173,9 @@ def main(argv: list[str] | None = None) -> int:
             s.notes.append(f"stop rule before: {e}")
             break
         att = Attempt(started=time.time(), rate_usd_per_s=p.peak_usd_per_s,
-                      budget_usd=round(step_budget(st, name, caps=caps, global_cap=gcap), 4))
+                      budget_usd=round(step_budget(st, name, caps=caps, global_cap=gcap), 4),
+                      slack_s=STEP_SLACK_S.get(name, CLIENT_SLACK_S),
+                      hard_timeout_s=STEP_HARD_TIMEOUT_S.get(name))
         s.attempts.append(att)
         s.status = "running"
         ctx.step = name
