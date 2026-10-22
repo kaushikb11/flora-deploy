@@ -80,7 +80,7 @@ flora doctor [OPTIONS]
 
 ### `flora prepare`
 
-Download and verify the pinned Flora snapshots in your Modal Volume, then build the derived weights the config's preset needs and record their receipts in flora.yaml.
+Download the Flora models into your Modal Volume and build derived weights (runs on Modal).
 
 ```
 flora prepare [OPTIONS]
@@ -204,7 +204,7 @@ flora run [OPTIONS]
 | `--inject` |  | Local: faults, KIND:TARGET[xN] (see flora_deploy.local.faults). |
 | `--store` |  | Modal: job store URI (default: output.sink). Local: store directory (default: &lt;config dir&gt;/flora-local-store). |
 | `--job` |  | Job id (default: project). |
-| `--resume` | off | Local: lift a budget stop (Modal: use `flora resume &lt;job&gt;`). |
+| `--resume` | off | Local: lift a budget stop (Modal: use `flora resume <job>`). |
 | `--budget` |  | USD budget override (default: modal.budget_usd). |
 | `--sample-data` | off | Local: write a synthetic dataset (as input.format says) to input.path first. |
 | `--json` | off | Print the result as JSON. |

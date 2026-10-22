@@ -279,7 +279,8 @@ def check_config(path: Path) -> tuple[Check, Any]:
             fix = ("set `allow_uncertified: true` to run the stages named above without a "
                    "certificate (their records say certified: false), or use preset exact")
         else:
-            fix = f"edit {path}; see src/flora_deploy/config/templates/ for every key"
+            fix = (f"edit {path}; `flora init --list` names the templates, and `flora init "
+                   "--template <name> example.yaml` writes one with every common key explained")
         return Check("config", "fail", f"{path} is invalid: {first}", fix), None
     return Check("config", "pass",
                  f"{path} valid (preset {cfg.preset}, license_ack {cfg.license_ack})"), cfg
@@ -388,9 +389,9 @@ def check_store(p: Probes, cfg: Any) -> list[Check]:
             out.append(Check("store.volume", "pass", f"Volume {name!r} exists"))
         elif r == "missing":  # nothing to set up: deploy makes it (create_if_missing)
             return [Check("store.volume", "pass", f"Volume {name!r} does not exist yet in "
-                          f"environment {env!r}; `flora deploy` creates it",
-                          f"or create it now: modal volume create {name} --version 2 "
-                          f"--env {env}")]
+                          f"environment {env!r}; `flora deploy` creates it (so does `flora index`)",
+                          f"`flora index --local` needs it first; create it now (free): "
+                          f"modal volume create {name} --version 2 --env {env}")]
         else:
             out.append(Check("store.volume", "warn", f"could not look up the Volume ({r})",
                              "check `modal volume list`"))
@@ -465,8 +466,9 @@ def check_weights(p: Probes, cfg: Any) -> list[Check]:
     if not have:  # nothing recorded yet: the usual state before `flora prepare`
         out.append(Check("weights.derived", "warn", "this config records no `weights.derived`; "
                          f"{', '.join(derived)} receipts are not checked",
-                         "run `flora prepare` (it builds them and records them in flora.yaml), "
-                         "or pass `--receipt name=<sha>` to deploy and run"))
+                         "run `flora prepare` (it builds them on Modal and records them in "
+                         "flora.yaml; `flora prepare --dry-run` shows the cost first), or pass "
+                         "`--receipt name=<sha>` to deploy and run"))
         return out
     have = dict(have)
     missing = [d for d in derived if not have.get(d)]

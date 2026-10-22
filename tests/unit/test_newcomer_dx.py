@@ -337,3 +337,92 @@ def test_cost_block_is_plain_and_busy_only():
     assert "`flora plan` shows the all-in estimate" in block
     assert 2 <= len(block.splitlines()) <= 3
     assert_no_jargon(block, "README cost block")
+
+
+# ---------------------------------------------------------------------------------------------
+# Second cold walk (2026-10-22): the README's own-data path before anything exists on Modal
+
+
+def test_index_local_refuses_a_missing_volume_before_downloading(tmp_path, monkeypatch):
+    """`flora index --local` on the default (volume://) sink, before `flora deploy`: one clear
+    refusal with the command that fixes it, instead of a failed receipt per episode and a
+    traceback. Nothing is downloaded."""
+    from types import SimpleNamespace
+
+    import flora_deploy.export.results as res
+    import flora_deploy.jobs.indexing as indexing
+
+    class NotFoundError(Exception):  # modal.exception.NotFoundError, matched by name
+        pass
+
+    class Vol:
+        def hydrate(self):
+            raise NotFoundError("Volume 'flora-results' not found in environment 'main'")
+
+    monkeypatch.setattr(res, "store_from_uri", lambda uri, **kw: SimpleNamespace(volume=Vol()))
+    monkeypatch.setattr(indexing, "open_dataset",
+                        lambda *a, **k: pytest.fail("downloaded before the Volume check"))
+    cfg = _write(tmp_path, template_text("local_demo"))
+    r = runner.invoke(app, ["index", "--local", "-c", str(cfg)], env={"COLUMNS": "200"})
+    assert r.exit_code == 2, r.output
+    out = " ".join(r.output.split())
+    assert "Volume 'flora-results'" in out and "does not exist yet" in out
+    assert "modal volume create flora-results --version 2" in out
+    assert "Traceback" not in r.output
+
+
+def test_results_without_a_run_says_so(tmp_path):
+    """A job that never ran: the error says what that means, not just a store path."""
+    from flora_deploy.export.results import ResultsNotFound, resolve_config_hash
+    from flora_deploy.jobs.stores import LocalStore
+
+    with pytest.raises(ResultsNotFound, match="has not been run here"):
+        resolve_config_hash(LocalStore(str(tmp_path)), "my-labels")
+    store = tmp_path / "store"
+    store.mkdir()
+    r = runner.invoke(app, ["results", "caption", "--job", "my-labels", "--store", str(store)],
+                      env={"COLUMNS": "200"})
+    assert r.exit_code == 2, r.output
+    assert "has not been run here" in r.output, r.output
+
+
+def test_store_from_uri_names_the_volume_spelling():
+    from flora_deploy.export.results import store_from_uri
+
+    with pytest.raises(ValueError, match="modal-volume://flora-results/my-labels"):
+        store_from_uri("volume://flora-results/my-labels")
+
+
+def test_plan_without_a_summary_offers_the_free_index(tmp_path):
+    cfg = _write(tmp_path, template_text("local_demo"))
+    r = runner.invoke(app, ["plan", "-c", str(cfg)], env={"COLUMNS": "200"})
+    assert r.exit_code == 2
+    assert "`flora index --local`" in " ".join(r.output.split())
+
+
+def test_results_more_rows_is_singular_for_one(demo):
+    out = _in(demo, ["results", "reward.dense", "--limit", "5"], columns="200")
+    assert "... 1 more row (" in out, out
+
+
+def test_doctor_fixes_name_commands_not_repo_paths(tmp_path):
+    from flora_deploy.cli import doctor as d
+    from tests.unit.test_doctor import FakeProbes, by_name, write_cfg
+
+    bad = _write(tmp_path, template_text("local_demo") + "\nnot_a_key: 1\n")
+    c = by_name(d.run_checks(bad, FakeProbes()))
+    assert "src/" not in c["config"].fix and "flora init --list" in c["config"].fix
+    p = write_cfg(tmp_path, **{"s3://my-bucket/flora/lerobot-small":
+                               "volume://flora-results/lerobot-small"})
+    c = by_name(d.run_checks(p, FakeProbes(volume="missing")))
+    assert "`flora index --local` needs it first" in c["store.volume"].fix
+
+
+def test_cli_docs_keep_code_spans_literal():
+    import sys
+
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import cli_docs
+
+    cell = cli_docs._cell("default: <dir> (Modal: use `flora resume <job>`)")
+    assert cell == "default: &lt;dir&gt; (Modal: use `flora resume <job>`)"

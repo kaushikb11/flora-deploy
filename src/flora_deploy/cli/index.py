@@ -48,6 +48,28 @@ def store_for_sink(sink: str) -> str:
     raise ValueError(f"sink {sink!r}: pass --store (file://, s3:// or modal-volume://)")
 
 
+def _require_volume(st, store_uri: str) -> None:
+    """``--local`` with a Modal Volume store: refuse before downloading anything when the Volume
+    does not exist yet (the index would otherwise fail every episode's receipt write, then crash
+    with a traceback). One metadata lookup, as ``flora doctor`` makes; nothing is created."""
+    vol = getattr(st, "volume", None)
+    if vol is None or not hasattr(vol, "hydrate"):
+        return
+    try:
+        vol.hydrate()
+    except Exception as e:  # noqa: BLE001 - modal.exception.NotFoundError, classified by name
+        if type(e).__name__ != "NotFoundError":
+            return  # anything else surfaces as before, from the index itself
+        from urllib.parse import urlparse
+
+        name = urlparse(store_uri).netloc
+        raise _fail(
+            f"Volume {name!r} (from {store_uri}) does not exist yet, and `flora index --local` "
+            "writes its receipts there. Create it: `modal volume create "
+            f"{name} --version 2` (free), or run `flora index` without --local once (it creates "
+            "the Volume).") from None
+
+
 def _print_summary(s: dict) -> None:
     from rich.markup import escape
 
@@ -130,6 +152,7 @@ def index(
             st = store_from_uri(store_uri, environment=cfg.modal.environment, create=True)
         except (ValueError, ImportError) as e:
             raise _fail(str(e)) from None
+        _require_volume(st, store_uri)
         local_root = None
         if cfg.input.repo is None:
             p = Path(str(cfg.input.path)).expanduser()

@@ -317,8 +317,11 @@ def prepare(
         help="Read each derived weight's receipt from the Volume (no container, no build) and "
              "print its receipt sha256 and recomputed content digest vs the pin."),
 ) -> None:
-    """Download and verify the pinned Flora snapshots in your Modal Volume, then build the
-    derived weights the config's preset needs and record their receipts in flora.yaml."""
+    """Download the Flora models into your Modal Volume and build derived weights (runs on Modal).
+
+    Downloads and verifies the pinned Flora snapshots, then builds the derived weights the
+    config's preset needs and records their receipts in flora.yaml. --dry-run shows what it
+    would do, with the build's estimated cost, and builds nothing."""
     from rich.markup import escape
 
     from flora_deploy.config.pins import PINS, PINS_BY_KEY

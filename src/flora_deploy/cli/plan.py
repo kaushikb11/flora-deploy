@@ -278,7 +278,8 @@ def plan(
             index = default_index_summary(config)
             if not index.is_file():
                 raise _fail(f"no workload: {index} not found. Run `flora index` first (it "
-                            "writes it), or give --index FILE or --video-hours H")
+                            "writes it; `flora index --local` runs it here, for free), or give "
+                            "--index FILE or --video-hours H [--episodes N]")
         if index is not None:
             workload = WorkloadSummary.from_dict(json.loads(index.read_text(encoding="utf-8")))
         elif video_hours is not None:

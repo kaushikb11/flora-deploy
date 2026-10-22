@@ -8,7 +8,9 @@
 # outputs only demonstrate the pipeline (index -> plan -> run -> compose -> results); they are
 # marked `certificate: local-fake-models` and never share a config hash with real outputs.
 # Fake-models jobs run under `<project>.fake`, so they never share job state with real jobs.
-# Common keys are documented in `flora init --template exact_lerobot`; the full list is in
+# The demo uses the `exact` stage layout (segment + caption in one `segcap` worker); `flora
+# init` writes the `balanced` config real jobs start from. Common keys are documented in
+# `flora init --template balanced_lerobot real.yaml`; the full list is in the repository's
 # src/flora_deploy/config/schema.py. Unknown keys are an error.
 
 project: local-demo

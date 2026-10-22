@@ -90,8 +90,12 @@ def commands() -> dict:
 
 
 def _cell(text: str) -> str:
-    text = text.replace("\\[", "[").replace("|", "\\|").replace("<", "&lt;").replace(">", "&gt;")
-    return " ".join(text.split())
+    text = text.replace("\\[", "[").replace("|", "\\|")
+    # Escape < and > outside code spans only: inside backticks an entity renders literally.
+    parts = text.split("`")
+    for i in range(0, len(parts), 2):
+        parts[i] = parts[i].replace("<", "&lt;").replace(">", "&gt;")
+    return " ".join("`".join(parts).split())
 
 
 def _default(p) -> str:
