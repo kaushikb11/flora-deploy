@@ -30,7 +30,7 @@ def test_engine_kwargs_are_explicit_and_valid():
     assert (kw["max_num_seqs"], kw["max_num_batched_tokens"]) == (48, 16384)
     cap = spec("captioner", "H100!").engine_kwargs()
     assert cap["mm_processor_kwargs"] == {"fps": 8, "max_frames": 40}
-    assert (cap["max_num_seqs"], cap["max_num_batched_tokens"]) == (16, 16384)
+    assert (cap["max_num_seqs"], cap["max_num_batched_tokens"]) == (11, 16384)
 
 
 @pytest.mark.parametrize(("key", "value"), [
@@ -386,15 +386,39 @@ class _LayoutLLM:
 
 def test_engine_limits_fit_the_worst_case_request():
     """Review 13 B1: the limits must fit the worst-case request (prompt + budget) in the KV
-    memory left after the weights, so a full batch never preempts. Captioner/H100 is back to
-    the lab-validated 16; TempSeg/L40S at 64 does not fit (about 55), so it is 48."""
+    memory left after the weights, so a full batch never preempts. TempSeg/L40S at 64 does not
+    fit (about 55), so it is 48. Captioner/H100 (caption pre-registration, 2026-10-23): the
+    3-view worst case is 17,920 tokens, 26 blocks of 784; 11 sequences (286 of ~313 blocks)."""
     assert O.GPU_LIMITS[("tempseg", "L40S")].max_num_seqs == 48
-    assert O.GPU_LIMITS[("captioner", "H100")].max_num_seqs == 16
+    assert O.GPU_LIMITS[("captioner", "H100")].max_num_seqs == 11
+    assert O.WORST_CASE_TOKENS == {"tempseg": 5120, "captioner": 17920}
     assert {lim.max_num_batched_tokens for lim in O.GPU_LIMITS.values()} == {16384}
     assert O.worst_case_fit("tempseg", "L40S") == 55
-    assert O.worst_case_fit("captioner", "H100") == 18
-    for kind, gpu in O.KV_FIT:
+    fit = O.BLOCK_FIT[("captioner", "H100")]
+    assert fit.pool_blocks == 313 and fit.blocks_per_seq(17920) == 26
+    assert O.worst_case_fit("captioner", "H100") == 12  # floor(313 / 26)
+    for kind, gpu in (*O.KV_FIT, *O.BLOCK_FIT):
         assert O.GPU_LIMITS[(kind, gpu)].max_num_seqs <= O.worst_case_fit(kind, gpu), (kind, gpu)
+
+
+def test_captioner_block_check_at_eleven_sequences():
+    """The build check enforces the pre-registered bound: 11 x 26 = 286 blocks of 784."""
+    s = spec("captioner", "H100!")
+    got = O.check_mamba_blocks(s, _LayoutLLM(_layout(286, block_size=784)))
+    assert (got["blocks_per_seq"], got["needed"], got["max_num_seqs"]) == (26, 286, 11)
+    assert (got["block_size"], got["gpu_memory_utilization"]) == (784, 0.9)
+    with pytest.raises(O.EngineVerifyError, match="49064"):
+        O.check_mamba_blocks(s, _LayoutLLM(_layout(285, block_size=784)))
+
+
+def test_captioner_engine_hash_changed_with_the_limit():
+    from dataclasses import replace
+
+    from flora_deploy.validate.certkey import engine_settings_hash
+
+    now = O.EngineSpec.for_gpu("captioner", "", "H100")
+    old = replace(now, limits=O.GpuLimits(16, 16384, 0.90))
+    assert engine_settings_hash(now.hashed()) != engine_settings_hash(old.hashed())
 
 
 def test_block_check_uses_the_worst_case_per_sequence_need():
