@@ -492,7 +492,14 @@ class Job:
         ledgers = _ledgers(self.store, self.job_id, self.config_hash, manifest)
         spend_usd, source, projected, eta = 0.0, "none", 0.0, None
         if hasattr(gate, "spend_report"):
-            gate.observe(budget_state_from_ledgers(ledgers, now))
+            from flora_deploy.jobs.pools import read_drains
+
+            # the orchestrator's drains and pre-warm containers too: a pre-warm container is
+            # billed from its start whether or not a call ever reached it
+            drains, prewarms = read_drains(self.store, JobPaths(self.job_id).root,
+                                           self.config_hash)
+            gate.observe(dataclasses.replace(budget_state_from_ledgers(ledgers, now),
+                                             drains=drains, prewarms=prewarms))
             rep = gate.spend_report(now)
             spend_usd, source = rep.total_usd, rep.source
             in_flight: dict[str, int] = {}
@@ -690,12 +697,17 @@ class Job:
 
         drains, prewarms = read_drains(self.store, JobPaths(self.job_id).root, self.config_hash)
         by_kind = {}
-        for kind in sorted({c.kind for c in calls}):
+        # every kind with a call or a pre-warm container: a pre-warm the job stopped before its
+        # first call is still billed (scale-lite-102223538c21's idle H100, 2026-10-22)
+        for kind in sorted({c.kind for c in calls} | (set(prewarms) & set(settings.pools))):
             mine = [c for c in calls if c.kind == kind]
+            pw = {k: v for k, v in prewarms.items() if k == kind}
             by_kind[kind] = {"calls": len(mine), "usd": round(calls_cost(
                 mine, settings, rates, now, scaledown_s=float(settings.scaledown_s),
-                warm=settings.min_containers, drains=drains,
-                prewarms={k: v for k, v in prewarms.items() if k == kind}), 4)}
+                warm=settings.min_containers, drains=drains, prewarms=pw), 4)}
+            if pw:
+                by_kind[kind]["prewarm_usd"] = round(calls_cost(
+                    [], settings, rates, now, prewarms=pw), 4)
         containers = [{"container_id": r.container_id, "gpu": r.gpu, "gpu_count": r.gpu_count,
                        "usd": round(container_cost(r, rates, now), 4),
                        "stopped": r.stopped_utc is not None, "source": "container_receipt"}
