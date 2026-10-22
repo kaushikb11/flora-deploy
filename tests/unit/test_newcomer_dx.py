@@ -426,3 +426,175 @@ def test_cli_docs_keep_code_spans_literal():
 
     cell = cli_docs._cell("default: <dir> (Modal: use `flora resume <job>`)")
     assert cell == "default: &lt;dir&gt; (Modal: use `flora resume <job>`)"
+
+
+# ---------------------------------------------------------------------------------------------
+# Third walk (2026-10-22): leftovers. The Modal Environment, a local-only doctor, readable
+# counts, help panels.
+
+
+class NotFoundError(Exception):  # modal.exception.NotFoundError, matched by name
+    pass
+
+
+def test_index_local_uses_the_configured_modal_environment(tmp_path, monkeypatch):
+    """`flora index --local` opens the sink Volume in `modal.environment`, not Modal's default
+    Environment, and the fix it prints names that Environment."""
+    from types import SimpleNamespace
+
+    import flora_deploy.export.results as res
+    import flora_deploy.jobs.indexing as indexing
+
+    seen = {}
+
+    class Vol:
+        def hydrate(self):
+            raise NotFoundError("not found")
+
+    def store_from_uri(uri, **kw):
+        seen.update(kw, uri=uri)
+        return SimpleNamespace(volume=Vol())
+
+    monkeypatch.setattr(res, "store_from_uri", store_from_uri)
+    monkeypatch.setattr(indexing, "open_dataset", lambda *a, **k: pytest.fail("downloaded"))
+    text = template_text("local_demo").replace("environment: main", "environment: staging")
+    cfg = _write(tmp_path, text)
+    r = runner.invoke(app, ["index", "--local", "-c", str(cfg)], env={"COLUMNS": "200"})
+    assert r.exit_code == 2, r.output
+    assert seen["environment"] == "staging", seen
+    out = " ".join(r.output.split())
+    assert "in Modal environment 'staging'" in out
+    assert "modal volume create flora-results --version 2 --env staging" in out
+
+
+def test_index_on_modal_runs_in_the_configured_environment(tmp_path, monkeypatch):
+    """The Modal path runs the index app in `modal.environment` too (mocked: no Modal call)."""
+    import contextlib
+    import importlib
+    from types import SimpleNamespace
+
+    import modal
+
+    runs = []
+
+    class FakeApp:
+        def run(self, **kw):
+            runs.append(kw)
+            return contextlib.nullcontext()
+
+    summary = {"counts": dict.fromkeys(
+        ("episodes", "indexed", "source_error", "failed", "resumed", "envelope_ok",
+         "out_of_envelope", "oracle_eligible", "planned"), 0),
+        "dataset": {"name": "x", "revision": "r"}, "envelope_policy": "warn", "video_s": 0.0,
+        "durations": {}, "envelope_reasons": {}, "ineligibility": {}, "source_errors": {},
+        "codecs": {}, "failed": []}
+    fake = SimpleNamespace(app=FakeApp(), run_index_remote=SimpleNamespace(
+        remote=lambda *a: summary))
+    monkeypatch.setattr(importlib, "reload", lambda m: fake)
+    monkeypatch.setattr(modal, "enable_output", contextlib.nullcontext)
+    monkeypatch.delenv("FLORA_INDEX_VOLUME", raising=False)
+    text = template_text("balanced_lerobot")
+    assert "environment: main" in text
+    cfg = _write(tmp_path, text.replace("environment: main", "environment: staging"))
+    r = runner.invoke(app, ["index", "-c", str(cfg)], env={"COLUMNS": "200"})
+    assert r.exit_code == 0, r.output
+    assert runs == [{"environment_name": "staging"}]
+
+
+class _NoModal:
+    """Doctor probes that fail the test on any Modal or Hub call."""
+
+    def __init__(self, files=None):
+        self.files = files
+
+    def __getattr__(self, name):
+        if name.startswith(("modal_", "volume_", "hf_", "store_", "certificate")):
+            return lambda *a, **k: pytest.fail(f"local-only doctor called {name}")
+        raise AttributeError(name)
+
+    def local_files(self, path, pattern):
+        return self.files
+
+
+def test_doctor_on_the_local_demo_skips_modal(tmp_path, monkeypatch):
+    """The local demo needs no Modal account: doctor makes no Modal / Hub call, reports no
+    warning or failure, and says in one line how to move the config to Modal."""
+    from flora_deploy.cli import doctor as d
+
+    cfg = _write(tmp_path, template_text("local_demo"))
+    assert d.local_only(load_config(cfg))
+    checks = d.run_checks(cfg, _NoModal(files=None))  # ./videos not written yet
+    assert [c for c in checks if c.status in ("warn", "fail")] == [], checks
+    c = {x.name: x for x in checks}
+    assert c["modal"].status == "info" and "to run on Modal" in c["modal"].fix
+    assert "flora prepare" not in " ".join(x.message + x.fix for x in checks)
+    assert c["input"].status == "info" and "--sample-data" in c["input"].fix
+    assert {x.name: x for x in d.run_checks(cfg, _NoModal(files=3))}["input"].status == "pass"
+    monkeypatch.setattr(d, "_probes_factory", lambda: _NoModal(files=None))
+    r = runner.invoke(app, ["doctor", "-c", str(cfg)], env={"COLUMNS": "200"})
+    assert r.exit_code == 0, r.output
+    assert "INFO modal" in r.output and "0 warnings, 0 failed, 3 notes" in r.output
+    assert_no_jargon(r.output, "flora doctor (local demo)")
+
+
+def test_doctor_still_checks_modal_for_a_staged_local_input():
+    """A local input.path staged to a Volume (input.stage_to) runs on Modal: full checks."""
+    from flora_deploy.cli import doctor as d
+
+    cfg = load_config(ROOT / "src/flora_deploy/config/templates/balanced_mp4_dir.yaml")
+    assert cfg.input.repo is None and not d.local_only(cfg)
+
+
+def test_counts_and_hours_render_as_text():
+    from flora_deploy.cli._app import counts_text, hours_text, per_stage_text
+    from flora_deploy.local.runner import event_text
+
+    assert counts_text({"success": 5}) == "5 success"
+    assert counts_text({"failure": 1, "success": 4, "preempted": 0}) == "4 success, 1 failure"
+    assert counts_text({}) == "none" and counts_text(None, "0") == "0"
+    assert per_stage_text({"caption": 0, "segment": 0}) == "0"
+    assert per_stage_text({"segment": 2, "caption": 1, "reward.dense": 0}) == \
+        "caption 1, segment 2"
+    assert [hours_text(h) for h in (0, 0.00001, 0.0072, 0.11, 1.0, 2.5, 12.34, 1234.5)] == \
+        ["0", "<0.0001", "0.0072", "0.11", "1", "2.5", "12.3", "1,234"]
+    assert event_text({"dead": [], "problems": [], "shards": 5}) == "shards=5"
+    assert event_text({"dead": ["a", "b"], "by": {"x": 1}, "n": None}) == "by=x:1 dead=a,b"
+
+
+def test_run_and_report_print_no_python_reprs(demo):
+    run_out = demo[1]
+    report = _in(demo, ["report"], columns="200")
+    for where, out in (("flora run --local", run_out), ("flora report", report)):
+        assert not re.search(r"\{'|\{\}|=\[\]", out), f"{where}:\n{out}"
+    assert re.search(r"calls \d+ \(\d+ success", run_out), run_out
+    assert "[done] shards=" in run_out
+    assert "excused 0; missing 0" in report and "errors: 0 error files;" in report
+
+
+def test_plan_shows_small_workloads_with_two_digits(tmp_path):
+    cfg = _write(tmp_path, template_text("local_demo"))
+    r = runner.invoke(app, ["plan", "-c", str(cfg), "--video-hours", "0.11", "--episodes", "5"],
+                      env={"COLUMNS": "200"})
+    assert r.exit_code == 0, r.output
+    assert "0.11 video-hours" in r.output, r.output
+
+
+def test_help_groups_commands_into_panels_in_workflow_order():
+    from flora_deploy.cli._app import HELP_PANELS, command_name
+
+    names = [command_name(i) for i in app.registered_commands]
+    listed = [n for ns in HELP_PANELS.values() for n in ns]
+    assert sorted(names) == sorted(listed), "every command belongs to exactly one panel"
+    assert names == listed  # `--help` lists them in panel order
+    assert all(i.rich_help_panel in HELP_PANELS for i in app.registered_commands)
+    out = runner.invoke(app, ["--help"], env={"COLUMNS": "120"}).output
+    pos = [out.index(f"─ {p} ") for p in HELP_PANELS]
+    assert pos == sorted(pos), out
+    assert out.index("─ Get started ") < out.index(" init ") < out.index("─ Run ")
+
+
+def test_readme_test_command_matches_ci():
+    """The README's contributor command is the one CI runs (`-n auto --dist loadfile`), with a
+    timing that is not the old, unreachable ~30 s."""
+    line = next(ln for ln in README.splitlines() if ln.startswith("uv run pytest"))
+    assert "-n auto --dist loadfile" in line and "~30 s" not in line, line
