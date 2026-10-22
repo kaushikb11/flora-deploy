@@ -121,7 +121,38 @@ def test_reruns_are_deterministic_and_resumable(demo, clean, tmp_path):
 # --- faults ----------------------------------------------------------------------------------
 
 
-def test_preempt_oom_poison_bisection_and_episode_errors(demo, clean, tmp_path):
+def test_preempt_oom_poison_bisection_and_episode_errors(demo, clean, tmp_path, monkeypatch):
+    """The orchestrator quarantines a crash-looping shard once it sees K unmarked starts, while
+    the K-th may still be running (D15 presumes it crashing). Whether that start reached ep003
+    and crashed, or was cancelled by the quarantine first (and marked preempted), was a race:
+    the crash count and the counted starts flaked under xdist load. The K-th start of each
+    looping shard is therefore held at ep003 until the quarantine cancels it, every time."""
+    import threading
+
+    from flora_deploy.local import engines as LE
+    from flora_deploy.local import faults as LF
+
+    k = 3  # local_demo.yaml retries.max_starts_before_quarantine
+    uid3 = next(u for u, _ in records(clean) if u.endswith("--ep003"))
+    uid5 = next(u for u, _ in records(clean) if u.endswith("--ep005"))
+    checkpoint, lock = LE.checkpoint, threading.Lock()
+    starts: dict[str, list[str]] = {}  # shard id -> its containers, in start order
+    held: set[str] = set()
+
+    def hold_kth(uid):
+        ctx = LF.current()
+        if ctx is not None and uid == uid3:
+            with lock:
+                cs = starts.setdefault(ctx.shard_id, [])
+                if ctx.container_id not in cs:
+                    cs.append(ctx.container_id)
+                kth = cs.index(ctx.container_id) + 1 == k
+            if kth:
+                held.add(ctx.shard_id)
+                assert ctx.cancelled.wait(30), "the K-th start was never cancelled"
+        checkpoint(uid)  # raises the cancel (KeyboardInterrupt) for a held start
+
+    monkeypatch.setattr(LE, "checkpoint", hold_kth)
     seg0 = shard(clean, "segcap", 0)
     res = run_local(demo, store=tmp_path / "store", faults=(
         f"preempt:{seg0},oom:ep003@segcap,nverr:ep005@reward.dense,"
@@ -133,8 +164,6 @@ def test_preempt_oom_poison_bisection_and_episode_errors(demo, clean, tmp_path):
     # was excluded per stage, so the job is completed_with_errors
     assert not s["complete"] and s["status"] == "completed_with_errors"
     assert all(st["missing"] == 0 for st in s["stages"].values())
-    uid3 = next(u for u, _ in records(clean) if u.endswith("--ep003"))
-    uid5 = next(u for u, _ in records(clean) if u.endswith("--ep005"))
     # ep003 crashed the second segcap shard every time: quarantined, bisected, then poison-pilled
     assert s["poison_pills"] == [f"{uid3}/segcap"]
     assert s["stages"]["segment"]["excused"] == s["stages"]["caption"]["excused"] == 1
@@ -143,24 +172,26 @@ def test_preempt_oom_poison_bisection_and_episode_errors(demo, clean, tmp_path):
     assert s["errors"]["by_kind"] == {"nv_failure": 1, "poison_pill": 2}
     assert res.counts("bisected") == 1 and res.counts("poisoned") == 1
     assert res.counts("call_expired") == 1 and res.counts("spawn_error") == 1
-    # D15 needs K counted starts per shard (the parent, then its ep003 child), but the K-th
-    # start can be cancelled by the quarantine before it reaches ep003 and crashes, so the crash
-    # count is >= 2 x (K - 1), not 2 x K: timing-dependent under xdist load (as Fix-8a). The
-    # start markers are the deterministic count.
-    k = 3  # local_demo.yaml retries.max_starts_before_quarantine
-    assert res.spawner["preemptions"] == 1 and res.spawner["crashes"] >= 2 * (k - 1)
+    # D15 quarantines on K starts per shard (the parent, then its ep003 child); the K-th is
+    # held until the quarantine cancels it, so exactly K - 1 starts of each crash
+    parent = next(e["shard_id"] for e in res.events if e["event"] == "bisected")
+    child = f"segcap-ep-{uid3}"
+    assert held == {parent, child}
+    assert res.spawner["preemptions"] == 1 and res.spawner["crashes"] == 2 * (k - 1)
     # its batch-mate ep002 finished before the crash and was kept, not redone
     bis = next(e for e in res.events if e["event"] == "bisected")
-    assert bis["children"] == [f"segcap-ep-{uid3}"] and len(bis["done"]) == 1
+    assert bis["children"] == [child] and len(bis["done"]) == 1
     # preempted starts never count toward D15: the first segcap shard was not quarantined
     st = LocalStore(res.store_root)
     jf = A.JobFiles(st, JOB, res.config_hash)
     marks = A.markers(jf, "segcap", seg0)
     assert any(m.preempted for m in marks)
     assert A.counted_starts(jf, "segcap", seg0) == len(marks) - 1 == 1
-    parent = next(e["shard_id"] for e in res.events if e["event"] == "bisected")
-    assert A.counted_starts(jf, "segcap", parent) >= k  # quarantined only after K starts
-    assert A.counted_starts(jf, "segcap", f"segcap-ep-{uid3}") >= k  # then poison-pilled
+    # quarantined only after K starts, then poison-pilled after K more; the K-th start of each,
+    # cancelled by the quarantine, is marked preempted and no longer counts
+    for sid in (parent, child):
+        assert A.count_starts(jf, "segcap", sid) == k
+        assert A.counted_starts(jf, "segcap", sid) == k - 1
     same_as_clean(res, clean, missing={(uid3, "segment"), (uid3, "caption"),
                                        (uid5, "reward.dense")})
 

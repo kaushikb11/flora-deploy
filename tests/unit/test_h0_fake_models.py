@@ -115,6 +115,53 @@ def test_preempt_matches():
     assert W.preempt_matches("reward.*", "reward.dense-0123")
 
 
+def test_preempt_fires_once_when_two_shards_reach_it_together(tmp_path):
+    """``preempt`` is once per target and job. Two segcap containers reaching their 2nd episode
+    together both saw no fired file and both preempted (``r.preempted == 2`` in the end-to-end
+    test below, 2 of 40 runs under xdist): the store holds both hooks inside the check until
+    both arrived (or 1 s passed), so without an atomic check-and-claim this always fires
+    twice."""
+    import threading
+
+    inner, gate = LocalStore(tmp_path), threading.Barrier(2, timeout=1.0)
+
+    class Racing:
+        def __getattr__(self, name):
+            return getattr(inner, name)
+
+        def exists(self, path):
+            if "/fake_faults/fired/" in path:
+                try:
+                    gate.wait()
+                except threading.BrokenBarrierError:
+                    pass
+            return inner.exists(path)
+
+    store, job = Racing(), "j.fake"
+    inner.put_bytes(W.fake_faults_path(job), json.dumps({"preempt": {"segcap": 2}}).encode())
+    fired: list[str] = []
+
+    def container(shard_id):
+        def preempt(_wait):
+            fired.append(shard_id)
+            raise KeyboardInterrupt
+
+        hook = W.FakeFaultHook(store, preempt_fn=preempt, sleep=lambda s: None)
+        hook.start_shard(job, shard_id)
+        try:
+            for uid in ("ds--a", "ds--b"):
+                hook.before_episode(uid)
+        except KeyboardInterrupt:
+            pass
+
+    ts = [threading.Thread(target=container, args=(f"segcap-{c * 16}",)) for c in "ab"]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(10)
+    assert len(fired) == 1, fired
+
+
 def test_fake_workers_refuse_outside_a_fake_app():
     with pytest.raises(W.PreflightError, match=W.FAKE_MODELS_ENV):
         W.fake_preflight({"FLORA_STORE_KIND": "local", "FLORA_STORE_ROOT": "/nonexistent"})
