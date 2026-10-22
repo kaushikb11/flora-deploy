@@ -9,7 +9,7 @@ from typing import Annotated
 
 import typer
 
-from flora_deploy.cli._app import app, console, term_width
+from flora_deploy.cli._app import app, console, hours_text, term_width
 
 _DUR = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd]?)\s*$", re.IGNORECASE)
 _UNIT = {"s": 1, "m": 60, "h": 3600, "d": 86400, "": 3600}
@@ -106,8 +106,8 @@ def _print_plan(cfg, workload, req, deadline_s, options, best, rates, table, con
     for g in workload.groups:
         layouts[g.cameras] = layouts.get(g.cameras, 0.0) + g.video_s
     views = ("" if set(layouts) <= {1} else " (" + ", ".join(
-        f"{c}-view {s / 3600:,.1f} h" for c, s in sorted(layouts.items())) + ")")
-    console.print(f"[bold]{escape(cfg.project)}[/bold]: {workload.video_s / 3600:,.1f} "
+        f"{c}-view {hours_text(s / 3600)} h" for c, s in sorted(layouts.items())) + ")")
+    console.print(f"[bold]{escape(cfg.project)}[/bold]: {hours_text(workload.video_s / 3600)} "
                   f"video-hours{views}, {workload.episodes:,} episodes; budget "
                   f"{_money(req.budget_usd or 0)}{dl}, max {req.max_gpus} GPUs", soft_wrap=True)
     colour = {"ok": "green", "at risk": "yellow", "infeasible": "red", "unavailable": "red",

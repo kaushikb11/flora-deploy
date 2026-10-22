@@ -17,7 +17,7 @@ from pathlib import Path
 
 import typer
 
-from flora_deploy.cli._app import app, console
+from flora_deploy.cli._app import app, console, counts_text, hours_text, per_stage_text
 from flora_deploy.cli.run import (
     ConfigOpt,
     EnvOpt,
@@ -64,7 +64,7 @@ def report(job: JobArg = None, store: StoreOpt = None,
             done = all(c["stopped"] for c in sp["containers"])
             _p(f"  containers: {len(sp['containers'])} local stand-ins, "
                + ("all finished" if done else "some still running"))
-        _p(f"video-hours: {vh['done']:.3f} done of {vh['planned']:.3f} planned")
+        _p(f"video-hours: {hours_text(vh['done'])} done of {hours_text(vh['planned'])} planned")
     else:
         _spend(sp, vh, per)
     _rest(r, job)
@@ -84,7 +84,7 @@ def _spend(sp: dict, vh: dict, per: float | None) -> None:
         for c in sp["containers"][:20]:
             _p(f"    {escape(c['container_id'])} {c['gpu'] or 'cpu'}x{c['gpu_count']} "
                f"${c['usd']:,.2f}{'' if c['stopped'] else ' (running)'}")
-    _p(f"video-hours: {vh['done']:.3f} done of {vh['planned']:.3f} planned; "
+    _p(f"video-hours: {hours_text(vh['done'])} done of {hours_text(vh['planned'])} planned; "
        + (f"${per:,.2f} per video-hour all-in" if per is not None else "$/video-hour: n/a yet"))
     if per is not None:
         _p("  all-in: GPU work plus each container's startup and idle time (`flora plan` "
@@ -97,9 +97,12 @@ def _rest(r: dict, job: str) -> None:
     from flora_deploy import sdk
 
     e = r["errors"]
-    _p(f"errors: {e['files']} error file(s)" + (
-        f", by kind {e['by_kind']}, episodes set aside {len(e['poison_pills'])}, excused "
-        f"{e['excused']}, missing {e['missing']}" if "by_kind" in e else ""))
+    files = f"{e['files']} error file" + ("" if e["files"] == 1 else "s")
+    kinds = counts_text(e.get("by_kind"), "")
+    _p(f"errors: {files}" + (f" ({kinds})" if kinds else "") + (
+        f"; episodes set aside {len(e['poison_pills'])}; "
+        f"excused {per_stage_text(e['excused'])}; missing {per_stage_text(e['missing'])}"
+        if "by_kind" in e else ""))
     for prob in [*e.get("problems", []), *e["notes"]][:10]:
         _p(f"  [yellow]{escape(prob)}[/yellow]")
     c = r["certification"]

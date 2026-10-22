@@ -361,7 +361,7 @@ class LocalRunner:
             self._lease_logged = True
         if self.verbose or name in NOTABLE:
             detail = {k: v for k, v in e.items() if k not in ("event", "job_id", "t", "holder")}
-            self.log(f"  [{name}] " + " ".join(f"{k}={v}" for k, v in sorted(detail.items())))
+            self.log(f"  [{name}] {event_text(detail)}".rstrip())
 
     # -- steps -----------------------------------------------------------------------------
     def index(self) -> dict[str, Any]:
@@ -723,14 +723,33 @@ def launch_local(job: Any, *, reason: str = "resume") -> str:
     return call_id
 
 
+def event_text(detail: Mapping[str, Any]) -> str:
+    """An orchestrator event's fields as ``key=value`` text: empty lists / maps and ``None``
+    left out (``[done] shards=5``, not ``dead=[] problems=[] shards=5``), lists joined with
+    commas, maps as ``key:value``."""
+    parts = []
+    for k, v in sorted(detail.items()):
+        if v is None or (isinstance(v, (list, tuple, set, dict)) and not v):
+            continue
+        if isinstance(v, dict):
+            v = ",".join(f"{a}:{b}" for a, b in v.items())
+        elif isinstance(v, (list, tuple, set)):
+            v = ",".join(str(x) for x in v)
+        parts.append(f"{k}={v}")
+    return " ".join(parts)
+
+
 def summary_lines(res: LocalRunResult, *, results_cmd: str | None = None) -> list[str]:
     """Human-readable result summary (the CLI prints it). ``results_cmd``: how to read the
     results back (default: the fully spelled-out `flora results` command)."""
+    from flora_deploy.cli._app import counts_text
+
     lines = [f"job {res.job_id} (config {res.config_hash[:12]}): {res.state.upper()} "
              f"in {res.wall_s:.1f} s (orchestrator: {res.outcome})"]
     sp = res.spawner
     if sp:
-        lines.append(f"calls {sp['calls']} {sp['states']}, containers {sp['containers']}, "
+        lines.append(f"calls {sp['calls']} ({counts_text(sp['states'])}), containers "
+                     f"{sp['containers']}, "
                      f"preemptions {sp['preemptions']}, crashes {sp['crashes']}, python "
                      f"failures {sp['python_failures']}")
     if res.faults:
@@ -744,8 +763,9 @@ def summary_lines(res: LocalRunResult, *, results_cmd: str | None = None) -> lis
             share = "-" if c["certified_share"] is None else f"{c['certified_share']:.0%}"
             lines.append(f"  {stage}: {c['records']}/{c['expected']} records, missing "
                          f"{c['missing']}, excused {c['excused']}, certified {share}")
-        lines.append(f"  shards {s['shards']}, episodes set aside {len(s['poison_pills'])}, errors "
-                     f"{s['errors']['by_kind'] or 0}, duplicates resolved "
+        lines.append(f"  shards {counts_text(s['shards'])}, episodes set aside "
+                     f"{len(s['poison_pills'])}, errors {counts_text(s['errors']['by_kind'], '0')}"
+                     ", duplicates resolved "
                      f"{s['duplicates_resolved']}, conflicts {len(s['conflicts'])}")
     if res.state == "budget_stopped":
         lines.append("budget stop: continue with `flora run --local --fake-models --resume "
