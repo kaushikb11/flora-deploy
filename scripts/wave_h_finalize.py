@@ -83,6 +83,13 @@ SETS = {"exact": "exact_e2e", "noise": "noise", "balanced": "balanced"}
 WITNESS = ("witness", "balanced", "witness_jobs")
 BLOCK_RESULTS = "results"
 BLOCK_COST = "cost"
+# Steps of a run that Modal billed on another workspace than the one the billing read covers:
+# their billed delta there is $0 (or unattributed), which is neither reconciled nor a mismatch.
+# Run 10221548f1b8: (b) and (f) ran on the first workspace; (d)'s first attempt was stopped
+# there (credit low, its attempt note) and the run continued on a second one, where billing
+# was read.
+BILLED_ELSEWHERE: dict[str, frozenset[str]] = {
+    "10221548f1b8": frozenset({"exact_e2e", "noise"})}
 MISSING_HELP = {
     "too_few_samples": "at least {min_samples} candidate episodes of the pool (has {n})",
     "no_noise_run": "a noise run: the oracle repeated on at least {min_noise} of these "
@@ -728,15 +735,32 @@ def billing_final_after(st: wh.State, s: wh.StepState) -> float:
     return a.hold_clears_at()
 
 
-def billing_rows(st: wh.State) -> tuple[list[list[str]], list[str]]:
+def billed_elsewhere(st: wh.State) -> frozenset[str]:
+    """The steps of ``st``'s run billed on another workspace (:data:`BILLED_ELSEWHERE`)."""
+    return BILLED_ELSEWHERE.get(st.run_id, frozenset())
+
+
+def step_letter(name: str) -> str:
+    """``b`` for step ``exact_e2e``: the letter its title starts with."""
+    return wh.TITLES[name].split(".", 1)[0]
+
+
+def billing_rows(st: wh.State, *, certify_status: str | None = None
+                 ) -> tuple[list[list[str]], list[str]]:
+    """The "Spend per step" rows and their warnings. ``certify_status``: what step (e) shows
+    once finalize has run ``flora certify`` (its per-stage verdicts), whatever the runbook
+    recorded for it."""
     rows, warnings = [], []
     wm = st.watermark  # billing is complete up to here (the rows' interval_start)
+    elsewhere = billed_elsewhere(st)
     for name in wh.STEPS:
         s = st.steps.get(name)
         if s is None:
             continue
         last = max((a.settle_point for a in s.attempts), default=None)
-        if s.billed_usd is None:
+        if name in elsewhere:
+            billing = "other workspace: not in this billing read"
+        elif s.billed_usd is None:
             billing = "shared app: global total only" if s.apps else "no app"
         elif st.billed_at is None or last is None or wm is None:
             billing = "not read"
@@ -758,7 +782,10 @@ def billing_rows(st: wh.State) -> tuple[list[list[str]], list[str]]:
                                 f"({gap:+.2f}); the list prices or the receipts are off")
             else:
                 billing = "reconciled"
-        rows.append([wh.TITLES[name], step_status(st, name), str(len(s.attempts)),
+        status = step_status(st, name)
+        if name == "certify" and certify_status:
+            status = certify_status
+        rows.append([wh.TITLES[name], status, str(len(s.attempts)),
                      usd(wh.CAPS_USD[name]),
                      usd(s.tracked_usd), usd(s.charged(st.watermark)), usd(s.billed_usd),
                      billing])
@@ -785,6 +812,33 @@ def usd_per_video_h(ms: Mapping[tuple[str, str], Measurement], preset: str
         terms.append({"kind": kind, "gpu": m.gpu, "rate": m.rate,
                       "usd_per_h": round(c.usd_per_h(), 3), "usd_per_video_h": round(t, 2)})
         unc_num += t * (m.uncertainty or 0.0)
+        total += t
+    return {"terms": terms, "usd_per_video_h": round(total, 2),
+            "uncertainty": round(unc_num / total, 2) if total else None}
+
+
+def planned_usd_per_video_h(table: Any, preset: str) -> dict[str, Any] | None:
+    """What ``flora plan`` prices ``preset``'s segment + caption work at, busy seconds only:
+    the rate ``planner/rates.json`` gives at the pool's concurrency (``RateTable.rate``, 1-view,
+    deployed features, as ``jobs.budget`` looks it up) x the pool's list price. This is the
+    figure the docs quote. A rate measured here but not written to ``rates.json`` (every
+    ``exact`` one: only the ``balanced`` slots are) is not what jobs are priced at."""
+    from flora_deploy.config.presets import get_preset
+    from flora_deploy.jobs.settings import episode_concurrency
+
+    terms, unc_num, total = [], 0.0, 0.0
+    for kind in PRESET_KINDS[preset]:
+        pool = get_preset(preset).pools[kind]
+        try:
+            e = table.rate(preset, kind, 1, episode_concurrency(kind, pool))
+        except KeyError:
+            return None
+        c = wh.pool_container(kind, preset)
+        t = 3600.0 * e.container_s_per_video_s * c.usd_per_s()
+        terms.append({"kind": kind, "gpu": strip_gpu(c.gpu), "rate": e.container_s_per_video_s,
+                      "status": e.status, "usd_per_h": round(c.usd_per_h(), 3),
+                      "usd_per_video_h": round(t, 2)})
+        unc_num += t * e.uncertainty
         total += t
     return {"terms": terms, "usd_per_video_h": round(total, 2),
             "uncertainty": round(unc_num / total, 2) if total else None}
@@ -883,6 +937,21 @@ def cert_rows(outcomes: Sequence[Mapping[str, Any]]) -> tuple[list[list[str]], l
     return rows, missing
 
 
+def outcome_verdict(o: Mapping[str, Any]) -> str:
+    if o.get("deferred"):
+        return "deferred"
+    return o["cert"]["verdict"] if o.get("cert") else "refused"
+
+
+def stage_verdicts(outcomes: Sequence[Mapping[str, Any]], *, bold: bool = False) -> str:
+    """One verdict per (stage, job): ``segment (human) certified, caption (human) fail``. A
+    stage's certificate unlocks that stage on its own, so this is what the docs state;
+    :func:`overall_verdict` (the worst of them) is for the console."""
+    b = "**" if bold else ""
+    return ", ".join(f"{o['stage']} ({o['job']}) {b}{outcome_verdict(o)}{b}"
+                     for o in outcomes) or "none"
+
+
 def overall_verdict(outcomes: Sequence[Mapping[str, Any]]) -> str:
     vs = [o["cert"]["verdict"] if o.get("cert") else "refused" for o in outcomes
           if not o.get("deferred")]
@@ -959,6 +1028,8 @@ class Findings:
     billing: list[list[str]]
     warnings: list[str]
     date: str
+    # what `flora plan` prices each preset at (planned_usd_per_video_h); the docs quote these
+    planned: dict[str, dict[str, Any] | None] = field(default_factory=dict)
 
 
 def render_report(f: Findings) -> str:
@@ -978,6 +1049,7 @@ def render_report(f: Findings) -> str:
                f.billing)
     tracked = sum(s.tracked_usd for s in st.steps.values())
     charged = sum(s.charged(st.watermark) for s in st.steps.values())
+    elsewhere = billed_elsewhere(st) & set(st.steps)
     L += ["", f"Total: **{usd(st.spent)}** of the {usd(global_cap(st))} global cap: the "
           "larger of charged and billed, the figure the runbook gates on.", "",
           f"- tracked {usd(tracked)}: container-seconds x list $/h of every attempt;",
@@ -986,7 +1058,11 @@ def render_report(f: Findings) -> str:
           + (f" ({usd(charged - tracked)} over tracked)" if charged - tracked > 0.005 else "")
           + ";",
           f"- billed {usd(st.billed_total)}: Modal's billed delta of every app (read "
-          f"{utc(st.billed_at)})."]
+          f"{utc(st.billed_at)})"
+          + (f"; steps {and_list([step_letter(n) for n in wh.STEPS if n in elsewhere])} ran "
+             "on another Modal workspace, so their billing is not in this read and their "
+             "tracked figure stands" if elsewhere else "")
+          + "."]
     if f.warnings:
         L += ["", "Warnings:", *[f"- {w}" for w in f.warnings]]
 
@@ -1033,20 +1109,45 @@ def render_report(f: Findings) -> str:
                            f"({t['kind']}, {t['gpu']})" for t in c["terms"])
         rows.append([preset, terms, f"**{usd(c['usd_per_video_h'])}** ±{c['uncertainty']:.0%}",
                      usd(run)])
-    L += table(["preset", "terms", "$/video-h (busy)", "this run (cold starts, idle, slack)"],
-               rows)
+    L += table(["preset", "terms", "$/video-h (busy, this run's rate)",
+                "this run (cold starts, idle, slack)"], rows)
     warm = run_usd_per_video_h_after_startup(st, "balanced")
-    L += ["", "$/video-h (busy) counts busy container-seconds only: steady state at scale, "
-          "without cold starts or idle time until scale-down. This run's figure is everything "
+    L += ["", "$/video-h (busy) counts busy container-seconds only, without cold starts or idle "
+          "time until scale-down: what a large job approaches if the per-video-second rate "
+          "holds at scale, a projection until a scale run measures it (`docs/scale-test.md`). "
+          "This run's figure is everything "
           "its jobs spent"
           + (f"; without the cold starts, `balanced` was {usd(warm)}/video-h (idle kept)"
              if warm is not None else "")
           + ". One small job (n=1): the band is a nominal convention, not a statistical "
           "interval."]
-    ex, bal = f.cost.get("exact"), f.cost.get("balanced")
+    rows = []
+    for preset in ("exact", "balanced"):
+        c = f.planned.get(preset)
+        if c is None:
+            rows.append([preset, "no rate", "-"])
+            continue
+        terms = " + ".join(f"{t['rate']:g} ({t['status']}) x ${t['usd_per_h']:.3f}/h "
+                           f"({t['kind']}, {t['gpu']})" for t in c["terms"])
+        rows.append([preset, terms, f"**{usd(c['usd_per_video_h'])}** ±{c['uncertainty']:.0%}"])
+    L += ["", "What `flora plan` prices (`planner/rates.json`, busy seconds only). These are the "
+          "figures the README and `docs/costs.md` quote. Only the `balanced` slots are written "
+          "from this run; an `exact` rate measured above is reported, not folded in, so "
+          "`exact` stays at its committed row.", ""]
+    L += table(["preset", "rate x pool $/h", "$/video-h (busy)"], rows)
+    run_ex, ex = f.cost.get("exact"), f.planned.get("exact")
+    if run_ex and ex and abs(run_ex["usd_per_video_h"] / ex["usd_per_video_h"] - 1) > 0.10:
+        L += ["", f"`exact` measured here ({usd(run_ex['usd_per_video_h'])}) and as priced "
+              f"({usd(ex['usd_per_video_h'])}) differ. This run's `exact` jobs are the oracle "
+              "and its noise repeat, on one app; the committed row is its own measurement "
+              "(see its `provenance` in `planner/rates.json`). Folding this run's `exact` rate "
+              "into `rates.json` is a maintainer decision; until then the docs quote the "
+              "priced figure."]
+    ex, bal = f.planned.get("exact"), f.planned.get("balanced")
     if ex and bal and bal["usd_per_video_h"]:
-        L += ["", f"`exact` / `balanced`: {ex['usd_per_video_h'] / bal['usd_per_video_h']:.1f}x "
-              "(segment + caption only; rewards are the same on both presets)."]
+        L += ["", f"`exact` / `balanced` as priced: "
+              f"{ex['usd_per_video_h'] / bal['usd_per_video_h']:.1f}x (segment + caption only; "
+              "rewards are the same on both presets)."]
 
     L += ["", "## L0 (input parity: vLLM vs NVIDIA's HF processor)", ""]
     L += table(["kind", "status", "requests", "ids equal", "render ids equal", "grid equal"],
@@ -1072,8 +1173,10 @@ def render_report(f: Findings) -> str:
 
     rows, missing = cert_rows(f.outcomes)
     L += ["", "## Certificate", "",
-          f"Overall: **{overall_verdict(f.outcomes)}**. Reference: `exact` in NVIDIA's default "
-          "mode; certificates in `src/flora_deploy/config/certificates/` (metrics only).", ""]
+          f"Per stage: {stage_verdicts(f.outcomes, bold=True)}. Each stage's certificate "
+          "unlocks that stage on its own. Reference: `exact` in NVIDIA's default mode; "
+          "certificates in `src/flora_deploy/config/certificates/` (metrics only; a `fail` is "
+          "never committed).", ""]
     L += table(["stage", "pool", "GPU", "verdict", "episodes", "noise episodes", "id"], rows)
     if missing:
         L += ["", "Missing for `certified`:", *[f"- {m}" for m in missing]]
@@ -1111,14 +1214,16 @@ def results_block(f: Findings) -> str:
     bal_jobs = [r for r in jobs_of(f.st, "balanced").values()
                 if r.get("state") in ("done", "completed_with_errors")]
     e2e = (f"{len(bal_jobs)} `balanced` job(s) through `flora deploy` / `flora run` "
-           f"(run `{f.st.run_id}`); certificate **{overall_verdict(f.outcomes)}**")
-    bal, ex = f.cost.get("balanced"), f.cost.get("exact")
+           f"(run `{f.st.run_id}`); certificate per stage: {stage_verdicts(f.outcomes)}")
+    bal, ex = f.cost.get("balanced"), f.planned.get("exact")
     if bal and ex:
         ratio = ex["usd_per_video_h"] / bal["usd_per_video_h"]
         cost = (f"**${bal['usd_per_video_h']:.2f}/video-h** ±{bal['uncertainty']:.0%} vs `exact` "
-                f"${ex['usd_per_video_h']:.2f} ({ratio:.1f}x cheaper), list prices, measured")
+                f"${ex['usd_per_video_h']:.2f} as `flora plan` prices it ({ratio:.1f}x cheaper), "
+                f"list prices, busy seconds; {projection_basis(f)}")
     elif bal:
-        cost = f"**${bal['usd_per_video_h']:.2f}/video-h** ±{bal['uncertainty']:.0%}, list prices"
+        cost = (f"**${bal['usd_per_video_h']:.2f}/video-h** ±{bal['uncertainty']:.0%}, list "
+                f"prices, busy seconds; {projection_basis(f)}")
     else:
         cost = "**not measured** (" + "; ".join(f.refusals[:2]) + ")"
     g = f.gate
@@ -1134,17 +1239,27 @@ def results_block(f: Findings) -> str:
 
 
 def cost_block(f: Findings) -> str | None:
-    bal, ex = f.cost.get("balanced"), f.cost.get("exact")
+    bal, ex = f.cost.get("balanced"), f.planned.get("exact")
     if not bal:
         return None
-    # README wording (no internal run names): the busy-only figure, said plainly to be busy-only
+    # README wording (no internal run names): the busy-only figure, said plainly to be
+    # busy-only and a projection; `exact` as `flora plan` prices it, so the two agree
     vs = f" (`exact`: ${ex['usd_per_video_h']:.2f})" if ex else ""
     return (f"`balanced` costs about **${bal['usd_per_video_h']:.2f} per video-hour** of GPU "
-            f"work (±{bal['uncertainty']:.0%}) for segmentation + captioning{vs},\n"
-            f"measured {f.date} at Modal list prices. Startup (a few minutes per container), "
-            "idle time and\n"
-            "rewards are extra and dominate small jobs: `flora plan` shows the all-in estimate "
-            "for your dataset.")
+            f"work (±{bal['uncertainty']:.0%}) for segmentation + captioning{vs}, at Modal list "
+            "prices.\n"
+            f"That is a projection: per-video-second rates {projection_basis(f)}.\n"
+            "Startup (a few minutes per container), idle time and rewards are extra and dominate "
+            "small jobs: `flora plan` shows the all-in estimate for your dataset.")
+
+
+def projection_basis(f: Findings) -> str:
+    """Where the ``balanced`` rate comes from, in plain words: ``measured on one job of 3.9
+    min of video (2026-10-22, n=1), not yet confirmed at scale``."""
+    m = f.ms[("balanced", "segment")]
+    jobs = "one job" if m.n == 1 else f"{m.n} jobs"
+    return (f"measured on {jobs} of {m.video_s / 60:.1f} min of video ({f.date}, n={m.n}), "
+            "not yet confirmed at scale")
 
 
 def and_list(items: Sequence[str]) -> str:
@@ -1256,11 +1371,18 @@ def analyze(paths: Paths, *, derived: Mapping[str, str] | None = None, cert_tmp:
                            derived=derived_content_used(st) if derived is None else derived,
                            cli=cli)
     labs = {k: lab_result(paths, st, k) for k in ("tempseg", "captioner")}
-    billing, warnings = billing_rows(st)
+    certified_by_finalize = any(o.get("cert") for o in outcomes)
+    billing, warnings = billing_rows(
+        st, certify_status=("finalize: " + stage_verdicts(outcomes)
+                            if certified_by_finalize else None))
+    priced = RateTable.from_dict(json.loads(outputs.get(paths.rates)
+                                            or paths.rates.read_text(encoding="utf-8")),
+                                 source=str(paths.rates))
     f = Findings(st=st, ms=ms, rates_ok=not refusals, refusals=refusals, outcomes=outcomes,
                  l0=l0_rows(labs), gate=gate_a(labs),
                  cost={p: usd_per_video_h(ms, p) for p in PRESET_KINDS}, billing=billing,
-                 warnings=warnings, date=date)
+                 warnings=warnings, date=date,
+                 planned={p: planned_usd_per_video_h(priced, p) for p in PRESET_KINDS})
     outputs[paths.report] = render_report(f)
     doc = paths.engines_doc.read_text(encoding="utf-8")
     outputs[paths.engines_doc] = replace_block(doc, BLOCK_RESULTS, results_block(f))
