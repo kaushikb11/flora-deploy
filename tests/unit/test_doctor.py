@@ -222,7 +222,8 @@ def test_real_certificate_status_for_balanced():
     assert all(isinstance(v, str) and "{" not in v for v in st.values())
     c = by_name(d.check_certificates(d.RealProbes(), cfg))
     assert not any(x.name == "doctor" for x in c.values())
-    assert set(c) == {f"certificates.{k}" for k in cfg.pools()}
+    named = {k for x in c for k in x.removeprefix("certificates.").split(",")}
+    assert named == set(cfg.pools())  # every kind, one line per distinct status
 
 
 @pytest.mark.parametrize("probes,name,status", [
@@ -242,8 +243,9 @@ def test_store_volume_paths(tmp_path):
     c = run(probes, p)
     assert c["store.volume"].status == "pass" and "store.secret" not in c
     assert ("write", "volume://flora-results/lerobot-small") in probes.calls
-    c = run(FakeProbes(volume="missing"), p)
-    assert c["store.volume"].status == "fail" and "modal volume create" in c["store.volume"].fix
+    c = run(FakeProbes(volume="missing"), p)  # `flora deploy` creates it: nothing to do
+    assert c["store.volume"].status == "pass" and "flora deploy" in c["store.volume"].message
+    assert "modal volume create" in c["store.volume"].fix
     assert "store.write" not in c
 
 
@@ -283,12 +285,15 @@ def test_weights_derived_paths():
 
 
 def test_certificates_paths(tmp_path):
-    c = run(FakeProbes())  # balanced, no certificates exist: a warning per shard kind
-    assert c["certificates.segment"].status == "warn"
-    assert c["certificates.caption"].status == "warn"
+    # balanced, no certificates exist, allow_uncertified: true (the README's config): the
+    # expected state, said once, not a warning per shard kind
+    c = run(FakeProbes())
+    certs = [k for k in c if k.startswith("certificates")]
+    assert len(certs) == 1 and c[certs[0]].status == "pass"
+    assert "certified: false" in c[certs[0]].message
     c = run(FakeProbes(certs={"segment": "certified", "caption": "missing"}))
     assert c["certificates.segment"].status == "pass"
-    assert c["certificates.caption"].status == "warn"
+    assert c["certificates.caption"].status == "pass"  # missing, but allowed
     exact = Path(__file__).resolve().parents[2] / "src/flora_deploy/config/templates/" \
         "exact_lerobot.yaml"
     assert run(FakeProbes(), exact)["certificates"].status == "pass"

@@ -103,7 +103,7 @@ flora index [OPTIONS]
 | Argument / option | Default | |
 |---|---|---|
 | `--config`, `-c` | `flora.yaml` | flora.yaml |
-| `--local` | off | Run in this process instead of on Modal. |
+| `--local` | off | Run in this process instead of on Modal (free; downloads the dataset here). |
 | `--job` |  | Job id (default: project). |
 | `--store` (env `FLORA_STORE`) |  | Job store: file:///dir, s3://bucket[/prefix], modal-volume://name[/prefix] (default: from output.sink). |
 | `--limit` |  | Index only the first N episodes. |

@@ -16,7 +16,7 @@ modal:
   tags: {}                          # extra key/value tags on every Modal object
 
 # exact: NVIDIA's HF code on H200 + NVIDIA's vLLM Rewarder on H100!; outputs are the reference.
-# balanced: vLLM engines on stage-separated pools. It has no Gate certificates yet, so it is
+# balanced: vLLM engines on stage-separated pools. It has no accuracy certificates yet, so it is
 # refused unless you also set `allow_uncertified: true` (outputs then are not certified).
 preset: exact
 allow_uncertified: false
@@ -45,7 +45,7 @@ pipeline:
   episode_instruction:
     source: dataset_task            # dataset_task | fixed (then set `text`) | none
                                     # (none is refused with reward stages: they need a task)
-  envelope: warn                    # warn | enforce | ignore: out-of-envelope episodes (D13)
+  envelope: warn                    # warn | enforce | ignore: episodes outside NVIDIA's tested conditions
   # determinism: nvidia             # nvidia (NVIDIA's kernels) | deterministic (D-1: cuDNN SDPA
                                     # off, a different reference); in the segcap stage hash
   # terminal_rationale: false       # true: reward.terminal also returns NVIDIA's rationale;
@@ -63,13 +63,13 @@ resources:
   reward.dense: {max_containers: 1}
 
 output:
-  sink: s3://my-bucket/flora/my-lerobot-labels   # s3:// r2:// gs:// volume:// file://
+  sink: volume://flora-results/my-lerobot-labels   # volume:// (`flora deploy` creates it), s3:// r2:// gs:// file://
   formats: [parquet, jsonl]
 
 retries:
-  max_starts_before_quarantine: 3   # then the shard is quarantined and bisected
+  max_starts_before_quarantine: 3   # then the shard is set aside and split to find the bad episode
   # A job that excludes more than this share of a stage's episodes (NVIDIA-semantics failures,
-  # poison pills) ends `completed_with_errors` instead of `done`.
+  # episodes that crash every time) ends `completed_with_errors` instead of `done`.
   max_episode_error_rate: 0.1
 
 observability:

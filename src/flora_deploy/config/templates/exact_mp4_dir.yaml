@@ -1,7 +1,7 @@
 # flora.yaml: REFERENCE / CERTIFICATION template. Labels a directory of MP4 episodes with
 # NVIDIA's own pipeline (`exact` preset), the reference `balanced` is certified against. For
 # everyday labelling start from balanced_mp4_dir.yaml.
-# Every key is documented in exact_lerobot.yaml. Unknown keys are an error.
+# Every key is documented in `flora init --template exact_lerobot`. Unknown keys are an error.
 
 project: my-mp4-labels
 

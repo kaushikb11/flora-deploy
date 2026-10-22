@@ -282,7 +282,7 @@ def test_schema_gate_reads_the_registry(tmp_path, monkeypatch):
 
     monkeypatch.setattr(certkey, "CERT_DIR", tmp_path)
     d = SCHEMA_CFG
-    with pytest.raises(ConfigError, match="no Gate certificate"):
+    with pytest.raises(ConfigError, match="no accuracy certificate"):
         parse_config(d, derived_content=CONTENT)
     cfg = parse_config(d, allow_uncertified=True)
     _write_stage(tmp_path, cfg, "segment")
@@ -297,7 +297,7 @@ def test_schema_gate_reads_the_registry(tmp_path, monkeypatch):
     with pytest.raises(ConfigError, match="segment on L40S, caption on H100!"):
         parse_config(d)
     # another embodiment is not covered (D16)
-    with pytest.raises(ConfigError, match="no Gate certificate"):
+    with pytest.raises(ConfigError, match="no accuracy certificate"):
         parse_config({**d, "pipeline": {**d["pipeline"], "embodiment": "human"}},
                      derived_content=CONTENT)
 

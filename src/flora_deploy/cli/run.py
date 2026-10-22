@@ -90,6 +90,10 @@ def _dur(s: float | None) -> str:
     return f"{s / 3600:.1f} h"
 
 
+# What `flora status` / `flora report` say instead of dollars for a `flora run --local` job.
+SIMULATED_SPEND = "spend $0 (n/a: local run, fake models; nothing charged)"
+
+
 def print_view(v: Any, *, brief: bool = False) -> None:
     """One job status (``sdk.JobView``) for humans."""
     from rich.markup import escape
@@ -97,9 +101,11 @@ def print_view(v: Any, *, brief: bool = False) -> None:
     colour = {"done": "green", "completed_with_errors": "yellow", "running": "cyan",
               "composing": "cyan", "planned": "cyan"}.get(v.state, "red")
     orch = "alive" if v.orchestrator_alive else "not running"
+    spend = (SIMULATED_SPEND if getattr(v, "simulated", False) else
+             f"spend {_money(v.spend_usd)} of {_money(v.budget_usd)} (projected "
+             f"{_money(v.projected_usd)})")
     console.print(f"[bold]{escape(v.job_id)}[/bold] [{colour}]{v.state}[/{colour}]  "
-                  f"spend {_money(v.spend_usd)} of {_money(v.budget_usd)} (projected "
-                  f"{_money(v.projected_usd)})  ETA {_dur(v.eta_s)}  active calls "
+                  f"{spend}  ETA {_dur(v.eta_s)}  active calls "
                   f"{v.active_calls}  orchestrator {orch}", soft_wrap=True)
     for kind, c in sorted(v.counts.items()):
         total = sum(c.values())
@@ -109,8 +115,9 @@ def print_view(v: Any, *, brief: bool = False) -> None:
     if brief:
         return
     console.print(f"  config {v.config_hash[:12]}  app {escape(v.app_name)}  episodes "
-                  f"{v.episodes} ({v.video_s / 3600:.3f} video-h)  spend source "
-                  f"{v.spend_source}", soft_wrap=True)
+                  f"{v.episodes} ({v.video_s / 3600:.3f} video-h)" + (
+                      "" if getattr(v, "simulated", False)
+                      else f"  spend source {v.spend_source}"), soft_wrap=True)
     for s in v.stuck:
         console.print(f"  [yellow]stuck {escape(s['shard_id'])}: {escape(s['reason'])}[/yellow]",
                       soft_wrap=True)

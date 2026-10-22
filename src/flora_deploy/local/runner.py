@@ -744,7 +744,7 @@ def summary_lines(res: LocalRunResult, *, results_cmd: str | None = None) -> lis
             share = "-" if c["certified_share"] is None else f"{c['certified_share']:.0%}"
             lines.append(f"  {stage}: {c['records']}/{c['expected']} records, missing "
                          f"{c['missing']}, excused {c['excused']}, certified {share}")
-        lines.append(f"  shards {s['shards']}, poison pills {len(s['poison_pills'])}, errors "
+        lines.append(f"  shards {s['shards']}, episodes set aside {len(s['poison_pills'])}, errors "
                      f"{s['errors']['by_kind'] or 0}, duplicates resolved "
                      f"{s['duplicates_resolved']}, conflicts {len(s['conflicts'])}")
     if res.state == "budget_stopped":

@@ -271,7 +271,7 @@ def check_config(path: Path) -> tuple[Check, Any]:
         first = next((ln.strip(" -") for ln in text.splitlines()[1:]), text)
         if "license_ack" in text:
             fix = "add `license_ack: research-only` (NVIDIA's models are research-only)"
-        elif "Gate certificate" in text:
+        elif "accuracy certificate" in text:
             fix = "set `allow_uncertified: true` (balanced has no certificates yet)"
         else:
             fix = f"edit {path}; see src/flora_deploy/config/templates/ for every key"
@@ -381,9 +381,10 @@ def check_store(p: Probes, cfg: Any) -> list[Check]:
         r = p.modal_volume(name, env)
         if r == "ok":
             out.append(Check("store.volume", "pass", f"Volume {name!r} exists"))
-        elif r == "missing":
-            return [Check("store.volume", "fail", f"Volume {name!r} does not exist in "
-                          f"environment {env!r}", f"modal volume create {name} --version 2 "
+        elif r == "missing":  # nothing to set up: deploy makes it (create_if_missing)
+            return [Check("store.volume", "pass", f"Volume {name!r} does not exist yet in "
+                          f"environment {env!r}; `flora deploy` creates it",
+                          f"or create it now: modal volume create {name} --version 2 "
                           f"--env {env}")]
         else:
             out.append(Check("store.volume", "warn", f"could not look up the Volume ({r})",
@@ -491,14 +492,30 @@ def check_certificates(p: Probes, cfg: Any) -> list[Check]:
         certs = find_certificates(cfg.preset, cfg.pools())
         status = {k: ("certified" if k in certs else "none") for k in cfg.pools()}
     out = []
+    lacking: dict[str, list[str]] = {}  # status -> kinds: one line per distinct problem
     for kind, s in sorted(status.items()):
         if s.lower() in _CERT_OK:
             out.append(Check(f"certificates.{kind}", "pass", f"{kind}: {s}"))
         else:
-            out.append(Check(f"certificates.{kind}", "warn", f"{kind}: no Gate certificate ({s})",
-                             "runs with allow_uncertified: true; use preset exact for reference "
-                             "outputs"))
+            lacking.setdefault(s, []).append(kind)
+    allowed = bool(getattr(cfg, "allow_uncertified", False))
+    for s, kinds in lacking.items():
+        name = "certificates." + (kinds[0] if len(kinds) == 1 else ",".join(kinds))
+        what = (f"{cfg.preset} has no accuracy certificate for {', '.join(kinds)} "
+                f"({_CERT_WHY.get(s, s)})")
+        if allowed:  # expected for the README's config: say it once, not as a problem
+            out.append(Check(name, "pass", what + "; runs uncertified (allow_uncertified: "
+                             "true), its records say certified: false",
+                             "use preset exact for reference outputs"))
+        else:
+            out.append(Check(name, "warn", what, "set allow_uncertified: true to run it "
+                             "uncertified, or use preset exact"))
     return out
+
+
+_CERT_WHY = {"none": "none published yet",
+             "unverified_weights": "needs the derived weights `flora prepare` builds",
+             "provisional": "only a provisional one", "fail": "its certificate failed"}
 
 
 def check_budget(cfg: Any) -> Check:

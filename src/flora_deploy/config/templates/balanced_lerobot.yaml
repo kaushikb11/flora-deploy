@@ -15,9 +15,9 @@ modal:
 
 # balanced: vLLM engines on stage-separated pools: TempSeg on an L40S, the Captioner on an
 # H100!, the Rewarder on an H100!. Workers scale from zero, so you pay only while a job runs.
-# It has no Gate certificates yet, so it needs `allow_uncertified: true` (its records are
+# It has no accuracy certificates yet, so it needs `allow_uncertified: true` (its records are
 # marked certified: false). exact: NVIDIA's own HF pipeline on an H200, the certification
-# reference (see exact_lerobot.yaml).
+# reference (`flora init --template exact_lerobot`).
 preset: balanced
 allow_uncertified: true
 
@@ -53,7 +53,7 @@ pipeline:
   episode_instruction:
     source: dataset_task            # dataset_task | fixed (then set `text`) | none
                                     # (none is refused with reward stages: they need a task)
-  envelope: warn                    # warn | enforce | ignore: out-of-envelope episodes (D13)
+  envelope: warn                    # warn | enforce | ignore: episodes outside NVIDIA's tested conditions
   # `determinism` applies to the exact preset's segcap worker only; leave it unset here.
   # terminal_rationale: false       # true: reward.terminal also returns NVIDIA's rationale;
                                     # in the reward.terminal stage hash
@@ -71,13 +71,13 @@ resources:
   reward.dense: {gpu: H100!, max_containers: 1}
 
 output:
-  sink: s3://my-bucket/flora/my-lerobot-labels   # s3:// r2:// gs:// volume:// file://
+  sink: volume://flora-results/my-lerobot-labels   # volume:// (`flora deploy` creates it), s3:// r2:// gs:// file://
   formats: [parquet, jsonl]
 
 retries:
-  max_starts_before_quarantine: 3   # then the shard is quarantined and bisected
+  max_starts_before_quarantine: 3   # then the shard is set aside and split to find the bad episode
   # A job that excludes more than this share of a stage's episodes (NVIDIA-semantics failures,
-  # poison pills) ends `completed_with_errors` instead of `done`.
+  # episodes that crash every time) ends `completed_with_errors` instead of `done`.
   max_episode_error_rate: 0.1
 
 observability:

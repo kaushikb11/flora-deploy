@@ -531,7 +531,7 @@ class FloraConfig(_Model):
             missing = [f"{k} on {p.gpu}" for k, p in pools.items() if k not in certs]
             if missing:
                 raise ValueError(
-                    f"preset {self.preset!r} has no Gate certificate for {', '.join(missing)} "
+                    f"preset {self.preset!r} has no accuracy certificate for {', '.join(missing)} "
                     "(a provisional certificate does not count; config/certificates/), so its "
                     "outputs are not certified faithful to NVIDIA's. "
                     "Use preset 'exact', or set `allow_uncertified: true` (or pass "
