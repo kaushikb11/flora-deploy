@@ -426,6 +426,18 @@ def test_prepare_cache_without_image_fingerprint(tmp_path, ba, monkeypatch):
         wc.status.reason
 
 
+def test_forced_cold_without_a_key_still_records_cold_forced(tmp_path, ba, monkeypatch):
+    """Review 14 W3: the unkeyed path keeps the forced-cold identity the witness needs."""
+    monkeypatch.setattr(ba, "_image_fp", lambda env: None)
+    logs = []
+    wc = ba.prepare_cache("caption", spec_for("caption", MODEL, "H100"), "c" * 64,
+                          {ba.COMPILE_CACHE_ENV: "off"}, mount=tmp_path,
+                          local_root=tmp_path / "l", log=logs.append)
+    assert wc.status.state == "cold" and not wc.publish_enabled
+    assert wc.status.reason == cc.FORCED_COLD and wc.status.identity() == "cold:forced"
+    assert any("fingerprint" in m for m in logs)  # why there was no key is still logged
+
+
 def test_legacy_lab_gpus_match_the_lab():
     from flora_deploy.engines.offline_llm import normalize_gpu
     from flora_deploy.modal_app import balanced_app, balanced_lab
