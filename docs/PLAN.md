@@ -20,14 +20,20 @@ hard budget cap.
   is not tuned for cost.
 - **A `balanced` stack is trusted only through a certificate** that shows it diverges from
   `exact` no more than `exact` diverges from itself ([`certification.md`](certification.md)).
-  None exists yet. Until one does, `balanced` needs `allow_uncertified: true`, and every record
-  says `certified: false` (`uncertified_stack`).
+  One is committed: **`segment` is certified for `human` on the L40S** (run `10221548f1b8`: 12
+  episodes, a 6-episode noise run and a 6-episode cold witness). **`caption` is not certified**:
+  it failed its noise-floor check, and a re-certification under rules fixed before the run is
+  planned. A stage without a certificate needs `allow_uncertified: true`, and its records say
+  `certified: false` (`uncertified_stack`).
 
 **Where we are (2026-10-22).** The job system, both presets, rewards, the certificate generator
 and its consumption, local fake-model runs and the CI gates are built and tested on CPU. GPU
 evidence exists for the `exact` path, the Rewarder, Gate C (per request), the BF16 Captioner and
-the TempSeg merge. **`balanced` has not yet run on a GPU.** The next step is one approved GPU
-session (§9). Spend so far ≈ $19 of a $50 build budget. Nothing is released; v0.x labels are
+the TempSeg merge. `balanced` has run on GPUs through the real `flora deploy` / `flora run` path
+(Wave H-lite, [`wave-h-report.md`](wave-h-report.md)): its segment and caption rates are
+measured (one small job, n=1) and segmentation is certified for `human`. Next: the caption
+re-certification and the scale test (§9). The project budget is `FLORA_PROJECT_BUDGET_USD`
+(default $50); `scripts/spend.py` reports what is left. Nothing is released; v0.x labels are
 internal milestones only.
 
 ---
@@ -45,7 +51,7 @@ internal milestones only.
 ### Presets (`config/presets.py`)
 | Preset | Status | Engines | Default pools | Use |
 |---|---|---|---|---|
-| **`balanced`** | **the product**; uncertified until P1b-2 | vLLM 0.24.0 offline `LLM` + micro-batcher (TempSeg merged FP32→BF16, Captioner BF16); Rewarder on NVIDIA's own vLLM recipe | `segment` L40S (8 cores, 48 GiB) · `caption` H100! (8, 96 GiB) · rewards H100! (8, 80 GiB) | all labeling |
+| **`balanced`** | **the product**; `segment` certified for `human` (L40S); `caption` not yet; rewards need none | vLLM 0.24.0 offline `LLM` + micro-batcher (TempSeg merged FP32→BF16, Captioner BF16); Rewarder on NVIDIA's own vLLM recipe | `segment` L40S (8 cores, 48 GiB) · `caption` H100! (8, 96 GiB) · rewards H100! (8, 80 GiB) | all labeling |
 | `exact` | the certification reference | NVIDIA's HF code via `CachedSession`, OPT-1/OPT-2 identity-proven patches | `segcap` H200 (8 cores, 96 GiB) · rewards H100! | oracle and noise runs for certification; gold labels |
 | `budget` | declared, not available | FP8 / B200 kernels | — | P4 |
 | `interactive` | declared, not available | AsyncLLM servers | — | §9 step 5 |
@@ -138,7 +144,7 @@ decision named).
 | D13 | **Envelope policy `warn`** by default: out-of-envelope episodes run and are marked `certified:false`; `enforce` skips; `ignore` clears the flag. | Data gets labeled, status stays honest. | active |
 | D14 | **Batch = offline `vllm.LLM` with a round-based micro-batcher**; online = AsyncLLM with pre-rendering. | NVIDIA's validated defaults; deterministic batch composition; AsyncLLM preprocesses on the event loop. | active for batch (`engines/microbatch.py`); online deferred to `interactive` (Gate E) |
 | D15 | **Poison pills and OOM.** Attempt markers; quarantine after K=3 starts; bisection; `errors/`; `cancel()`; `memory=(request, limit)`. | Modal retries crashes and OOMs forever. | revised: a CUDA fault or dead engine marks the shard crashed and replaces the container |
-| D16 | **A small explicit certified matrix**, certificates as metrics-only JSON, community certificates by PR. | Certification cost grows combinatorially. | revised: one certificate per (preset, kind, GPU, embodiment pool), content-addressed, with a bounded policy and revocation order ([`certification.md`](certification.md)); first targets: segment L40S, caption H100!, rewards H100!, pool `human` |
+| D16 | **A small explicit certified matrix**, certificates as metrics-only JSON, community certificates by PR. | Certification cost grows combinatorially. | revised: one certificate per (preset, kind, GPU, embodiment pool), content-addressed, with a bounded policy and revocation order ([`certification.md`](certification.md)); first targets: segment L40S, caption H100!, pool `human` (rewards run NVIDIA's own recipe in both presets, so they are the reference and need no certificate) |
 | D17 | **Never modify NVIDIA's files; improve around them**: (1) runtime wraps proven output-identical, (2) faster reimplementations behind `balanced`, certified, (3) upstream suggestions. | A modified copy is an NC derivative, fails NVIDIA's SHA manifests and destroys the reference. | active ([`upstream-suggestions.md`](upstream-suggestions.md) for form 3) |
 | **D18** | **`balanced` is the product; `exact` is the reference.** Users get `balanced` by default (template, README, planner). `exact` is kept to produce oracle and noise runs for certification and is not cost-optimised further (shard overlap was removed for this reason, [`exact-cost.md`](exact-cost.md)). | Measured `exact` is ≈ $36/video-h on H200 (§5), too costly as a product; `balanced` is the cheaper path and can be made trustworthy by certification; maintaining two optimised paths splits effort. | **new (2026-10-22)**; supersedes v3's release train (ship `exact` first as v0.1, `balanced` as v0.2) |
 
@@ -157,15 +163,18 @@ Full rules: [`certification.md`](certification.md). In short:
   digests.
 - Metrics are divergences per stage (segment IoU / boundary / count / label, caption mismatch and
   edit distance, terminal E[s] delta, dense per-step and rank divergence). Pass rule:
-  `mean(exact, balanced) <= min(cap, 1.5 x max(noise, floor) + slack)`.
+  `mean(exact, balanced) <= min(cap, max(absolute_floor, 1.5 x max(noise, floor) + slack))`
+  (`validate.certkey.metric_threshold`; the absolute floor is set only for `count_mismatch`,
+  0.10).
 - Verdicts: `fail`, `provisional` (no noise run, < 10 candidate or < 5 noise episodes, missing
   L0, incomplete coverage) or `certified`. **Only a deciding `certified` certificate unlocks a
   preset.** Provenance on every record binds it to the stack (`cert_key`, stage hash, GPU,
   embodiment); fake-model records are refused.
 - Certificates live in `src/flora_deploy/config/certificates/`, metrics only.
 
-The GPU session in §9 can produce only a **provisional** certificate (too few episodes by
-design). A `certified` one needs the step after it.
+The first GPU session (§9 step 1) could produce only a **provisional** certificate (too few
+episodes by design). The certified run after it (§9 step 2) produced the committed `segment` /
+`human` / L40S certificate; `caption` failed.
 
 ---
 
@@ -181,16 +190,19 @@ GiB-hour; live `billing.rates()` when available). Container time per video-secon
 | `exact` segcap, longest-first | H200, 8 cores, 96 GiB ($5.69/h) | 6.4 | measured (P1a-5s, one 6-episode shard) | **$36.4** |
 | `exact` segcap, plan order | same | 7.0 | measured + model | ≈ $40 |
 | `exact`, long-lived warm containers, c=8 | same | ≈ 2.5 | projected (needs a GPU measurement) | ≈ $14 |
-| `balanced` segment | L40S, 8 cores, 48 GiB ($2.71/h) | 0.5 | **placeholder, ±100%** | ≈ $1.4 |
-| `balanced` caption | H100!, 8 cores, 96 GiB ($5.10/h) | 1.0 | **placeholder, ±100%** | ≈ $5.1 |
+| `balanced` segment | L40S, 8 cores, 48 GiB ($2.71/h) | see `rates.json` | measured (Wave H-lite, one job, n=1, ±50%) | see [`costs.md`](costs.md) |
+| `balanced` caption | H100!, 8 cores, 96 GiB ($5.10/h) | see `rates.json` | measured (Wave H-lite, one job, n=1, ±50%) | see [`costs.md`](costs.md) |
 | `reward.terminal` | H100!, 8 cores, 80 GiB ($4.97/h) | 0.055 | measured (WS-H, 3 samples) | ≈ $0.27 |
 | `reward.dense` | same | 0.165 | measured (WS-H, 3 samples) | ≈ $0.82 |
 
 Startup: `exact` `@enter` 103 s (measured, conservative); Rewarder 229 s with a warm compile
-cache (measured); `balanced` 130 s per container (projected from the Rewarder recipe).
+cache (measured); `balanced` segment and caption cold starts are measured per kind
+(`planner/rates.json` startup rows; warm starts not measured yet).
 
-**The `balanced` rows are not measurements.** "About 4-6x cheaper than `exact`" is an estimate
-until the GPU session replaces the placeholders. Sources: [`exact-cost.md`](exact-cost.md),
+The `balanced` rows come from one 3.9-minute job ([`wave-h-report.md`](wave-h-report.md)). The
+numbers live in `planner/rates.json` and the generated tables of [`costs.md`](costs.md); they
+are not repeated here so they cannot go stale. Large-job behaviour is unmeasured until the
+[scale test](scale-test.md). Sources: [`exact-cost.md`](exact-cost.md),
 [`exact-worker.md`](exact-worker.md), [`perf-1.md`](perf-1.md),
 [`exact-concurrency.md`](exact-concurrency.md), [`rewarder-smoke.md`](rewarder-smoke.md),
 [`cold-start.md`](cold-start.md).
@@ -245,13 +257,15 @@ Evidence: [`determinism.md`](determinism.md), [`exact-concurrency.md`](exact-con
 
 | Gate | Question | Status |
 |---|---|---|
-| A (D5) | Does FP32 `dt_bias` drift matter? | not measured; plugin off. Measured in the lab during the GPU session |
-| B (D3) | Does the merged TempSeg serve correctly? | CPU / L40S equivalence check passed (BF16-level drift, identical greedy JSON); serving on vLLM pending the GPU session; merger v2 digest to pin |
+| A (D5) | Does FP32 `dt_bias` drift matter? | measured in Wave H-lite: max \|Δlogit\| 0.25, within the 0.5 reference; plugin stays off ([`wave-h-report.md`](wave-h-report.md)) |
+| B (D3) | Does the merged TempSeg serve correctly? | CPU / L40S equivalence check passed (BF16-level drift, identical greedy JSON); merger v2 content digest pinned (`config/pins.py`); served on vLLM in Wave H-lite (L0 pass), and its segmentation is certified for `human` |
 | C | Does vLLM see the same model inputs as NVIDIA's HF processor? | every compared request passes (127/127) with the capture-layer wrap and `mm_processor_cache_gb=0`; the gate is FAIL on two run-level criteria: the `tianji` quota and the missing `img_hfref` cross-check ([`gate-c.md`](gate-c.md)) |
-| D | Where does CPU time go? | answered for `exact` (generation 9-31% of a stage on 1080p; fixed by `accel`); `balanced` throughput to measure |
+| D | Where does CPU time go? | answered for `exact` (generation 9-31% of a stage on 1080p; fixed by `accel`); `balanced` throughput measured on one small job, at scale pending the [scale test](scale-test.md) |
 | E (D14) | Offline micro-batching vs AsyncLLM | offline is the batch default; AsyncLLM comparison moves to `interactive` |
 
-Other open items: the per-GPU `max_num_seqs` limits are first guesses below the #49064 bound;
+Other open items: the per-GPU `max_num_seqs` limits are derived from the worst-case KV fit
+(`engines/offline_llm.py` `GPU_LIMITS`: TempSeg/L40S 48, Captioner/H100 16), and raising them
+needs a measured run with zero preemptions;
 the rubric reward is deferred (TP=2, `max_model_len` 98304); the golden set has no real `dex` or
 `tianji` rig ([`golden-candidates.md`](golden-candidates.md),
 [`golden-manifest-v1.md`](golden-manifest-v1.md)).
@@ -262,7 +276,7 @@ the rubric reward is deferred (TP=2, `max_model_len` 98304); the golden set has 
 
 Each step needs the one before it. GPU steps need the user's approval and run under stop rules.
 
-### 1. GPU session (Wave H-lite) — next
+### 1. GPU session (Wave H-lite) — done
 - **Before:** review clean, CI green, and H0 passing: `scripts/h0_rehearsal.py`, the real
   factory app on Modal with fake engines in CPU containers, both presets, one preemption and one
   poison episode (≈ $0.10).
@@ -273,15 +287,18 @@ Each step needs the one before it. GPU steps need the user's approval and run un
 - **Scope (decision 2026-10-22):** one embodiment (`human`) plus the lab's L0 / Gate A checks.
   Rough estimate ≈ $3.2 nominal, ≈ $6.5 upper; the runbook's dry run prints the real
   projections and refuses a step whose upper projection does not fit its cap.
-- **Exit:** first measured `balanced` rates replace the placeholders; Gates A and B decided; a
-  provisional certificate; the deployed path is proven on GPUs.
+- **Exit (met):** measured `balanced` rates replaced the placeholders; Gates A and B decided; the
+  deployed path ran on GPUs ([`wave-h-report.md`](wave-h-report.md)).
 
-### 2. Certified
+### 2. Certified — in progress
 - Golden build sized for a `certified` verdict: ≥ 10 candidate episodes per pool and ≥ 5 noise
   episodes, starting with `human`, then `yam` and single-view robot. The full golden build (≈ $9)
   was deferred by the user and needs approval.
-- Pin TempSeg merger v2; close Gate C's run-level items; wire derived content digests through the
-  CLI / SDK lookups.
+- **Done for `human`:** run `10221548f1b8` certified `segment` on the L40S (12 episodes, a
+  6-episode noise run, a 6-episode cold witness). TempSeg merger v2 is pinned and the CLI / SDK
+  pass the derived content digests ([`certification.md`](certification.md)).
+- **Open:** `caption` failed its noise-floor check; it is re-certified under rules fixed before
+  that run. Close Gate C's run-level items; `yam` and single-view robot pools.
 - **Exit:** committed `certified` certificates; `balanced` runs without `allow_uncertified` on the
   covered pools; `flora plan` within ±25% of actual cost.
 

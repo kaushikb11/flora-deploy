@@ -117,9 +117,12 @@ uv run python scripts/wave_h.py --plan certified
 
 # 2. certify (one certificate per stage; or scripts/wave_h_finalize.py --write, which runs
 #    flora certify for every balanced job)
+#    --witness: the cold witness's records (without it the verdict is at best provisional);
+#    --generated-at: the run's own time, so a re-run reproduces the same certificate id
 flora certify -c flora.yaml --exact oracle/segment.jsonl --balanced bal/segment.jsonl \
-  --noise noise/segment.jsonl --l0 reports/wave-h/balanced-tempseg.json \
-  --derived-content tempseg_merged=<sha256>
+  --noise noise/segment.jsonl --witness witness/segment.jsonl \
+  --l0 reports/wave-h/balanced-tempseg.json \
+  --derived-content tempseg_merged=<sha256> --generated-at <run time, YYYY-MM-DDTHH:MM:SSZ>
 
 # 3. locks, then the check must pass
 uv run python scripts/cert_freeze.py --lock
@@ -151,7 +154,10 @@ of the key with its hash, the modules of the logic digest with the sha256 of the
 source, and the certificate that covers it. The hashes change with every merge on these paths,
 so they are not copied here.
 
-**No certificate is committed yet, so nothing is frozen.** What the listing covers:
+**One certificate is committed, so one row is frozen:** `balanced` / `segment` / `L40S` for
+`human` (`cert_f5d6433f….json`, lock in `certificates/freeze/`, run `10221548f1b8`). `caption`
+failed on that run and has no certificate, so its row is not frozen until it is re-certified.
+What the listing covers:
 
 - `exact`: nothing (the reference by construction).
 - `balanced` / `segment` / `L40S` and `balanced` / `caption` / `H100!`: the `vllm-offline`
@@ -159,7 +165,8 @@ so they are not copied here.
   H100), `max_num_batched_tokens` 16384 and `gpu_memory_utilization` 0.9; the TempSeg or
   Captioner NVIDIA pins; the `tempseg_merged` or `captioner_bf16` derived digest; and a cert
   logic digest over the 61 modules of the `common` + `vllm-video` groups (`engines/batch_policy.py`
-  included). The first `balanced` certificates from the certified run will freeze these two rows.
+  included). The segment row is frozen by the committed certificate; the caption row will be
+  frozen by its re-certification.
 - `balanced` / `reward.terminal`, `reward.dense`, `reward.rubric` / `H100!`: the
   `nvidia-vllm-offline` engine, the Rewarder pin, a logic digest over 30 modules (32 for
   rubric). These are the reference by identity, so no certificate will freeze them; the script

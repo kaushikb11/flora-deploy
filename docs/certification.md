@@ -2,10 +2,14 @@
 
 Status: 2026-10-22. The generator (`validate/certify.py`, `flora certify`) and its consumption
 (`validate/certkey.py`, `config/presets.find_certificates`, config validation, `plan_app`,
-`flora plan`) are built and tested on CPU. No certificate is committed yet
-(`config/certificates/` holds only its README). Real workers stamp the binding provenance below,
-so records from a run on this commit can be certified once an `exact` reference run, a noise run
-and a candidate run exist (`docs/wave-h-runbook.md`, "The certified run").
+`flora plan`) are built and tested on CPU. One certificate is committed:
+**`segment` is certified for `human` on the L40S** (`config/certificates/cert_f5d6433f….json`,
+with its freeze lock in `certificates/freeze/`), from run `10221548f1b8`: 12 candidate episodes,
+a 6-episode noise run and a 6-episode cold witness. **`caption` is not certified**: on the same
+run it failed its noise-floor check (`caption_mismatch`, `caption_edit_distance`), and a failed
+certificate is never committed. Its re-certification is planned under rules fixed before that
+run ([`wave-h-runbook.md`](wave-h-runbook.md), "The certified run";
+[`wave-h-report.md`](wave-h-report.md)).
 
 Background:
 - `exact` runs NVIDIA's own HF code with model inputs proven identical. It is the reference.
@@ -51,8 +55,8 @@ in [`limitations.md`](limitations.md#accuracy-certificates). So:
   drifted `provisional` one, or one committed without its freeze lock, only warns
   ([`certificate-freeze.md`](certificate-freeze.md)).
 
-The first `certified` certificates are meant to come from the certified run
-(`scripts/wave_h.py --plan certified`: 12 human episodes, a noise run on 5 of them;
+The committed certificate came from the certified run (`scripts/wave_h.py --plan certified`:
+12 human episodes, a noise run on 6 of them, a 6-episode cold witness;
 [`wave-h-runbook.md`](wave-h-runbook.md)).
 
 ## Method (contributors)
@@ -203,8 +207,10 @@ flips  <=  round_half_up(threshold_count_mismatch x n)        (certkey.count_fli
 
 with `n` the candidate's plus the witness's paired episodes. **Rounding:** half up, so "about
 one episode in ten" means the nearest whole episode: at 0.10, 1 flip of 10-14, 2 of 15-24.
-**2 flips in 18** (12 candidate + 6 witness, 11.1%) **pass**, 3 in 18 fail, and 2 in 14 fail.
-Without a witness the union is the candidate alone (1 in 12 passes, 2 in 12 fail). Judged per
+At the floor, **2 flips in 18** (12 candidate + 6 witness, 11.1%) **pass**, 3 in 18 fail, and 2
+in 14 fail. Without a witness the union is the candidate alone (1 in 12 passes, 2 in 12 fail).
+The threshold is the floor only when the measured noise is low; see "The committed
+certificate" below for what applied on the certified run. Judged per
 group, one flip among the witness's 6 episodes (17%) would fail a certificate that one flip in
 18 does not. The witness's **other** means (boundary error, IoU divergence, label disagreement,
 caption mismatch and edit distance) are still checked **on their own** against the same
@@ -213,17 +219,25 @@ flip. `metrics.count_flips` records the per-group figures (`groups: {<pool>, col
 {n, flips}`) and the union's (`{n, flips, rate, threshold, allowed}`); matching recomputes the
 union from them (`certkey.policy_problems`).
 
-**Why.** With zero measured noise (H200 repeats give one
-distinct text) the floors decide, and `1.5 x 0.05 = 7.5%` made a single count flip in 12
+**Why.** With zero measured noise (an earlier H200 repeat gave one distinct text) the floors
+decide, and `1.5 x 0.05 = 7.5%` made a single count flip in 12
 episodes (`1/12 = 8.3%`) a `fail` for a correct but different engine (vLLM BF16 on L40S/H100 vs
 HF on H200). A count flip also drags every interval and caption metric of that episode (an
 extra interval leaves slots unmatched, and its captions follow), so those were fatal in the same
 way. The rule now allows **up to about one episode in ten** to differ in subtask count
 (`absolute_floor` 0.10: 1 in 12 passes, 2 in 12 fail), bounds those episodes by that check
 alone, and keeps the **tight floors** below for the means over the episodes that agree. It stays
-fail-closed for real regressions: three count flips in the 18 episodes of the certified run (two
-in 12 without a witness), or a boundary error mean over 0.15 s with every count equal, in the
+fail-closed for real regressions: at the floor, three count flips in 18 episodes (two in 12
+without a witness), or a boundary error mean over 0.15 s with every count equal, in the
 candidate or in the witness, fail.
+
+**The committed certificate** (`segment`, `human`, L40S). The 10% is a floor, not the
+threshold. The threshold is `max(0.10, 1.5 x max(noise, 0.05) + slack)`, and the noise run
+measured `count_mismatch` noise of **1 flip in 6** episodes (0.1667). So the applied threshold
+is `1.5 x 0.1667 = 0.25` (recorded as 0.250001), which allows **5 of the 18** union episodes to
+flip. The run observed **1 of 18** (5.6%): 1 of the 12 candidate episodes, 0 of the 6 witness
+episodes. Three flips would have passed this certificate too. Read the figures from
+`metrics.count_flips.union` (`threshold`, `allowed`, `flips`, `n`), not from the floor.
 
 ### Policy (`certkey.POLICY`)
 
@@ -246,7 +260,7 @@ floor is below what a real regression costs:
 |---|---|---|
 | `iou_divergence` | 0.02 | 1.5 x 0.02 = 3% of total IoU, less than one interval shifted by a tick on a 3-interval episode |
 | `boundary_error_s` | 0.1 s | under half a TempSeg frame tick (4 fps = 0.25 s): a one-tick shift on every boundary still fails |
-| `count_mismatch` | 0.05 | 1.5 x 0.05 = 7.5%: on 10 episodes, no unequal count is allowed; on 20, one |
+| `count_mismatch` | 0.05 | 1.5 x 0.05 = 7.5%, below the 0.10 absolute floor, so with low noise the floor decides (1 of 10-14, 2 of 15-24); measured noise above 0.0667 raises it |
 | `label_disagreement` | 0.02 | as IoU |
 | `caption_mismatch` | 0.05 | as `count_mismatch` for whole captions |
 | `caption_edit_distance` | 0.02 | about one character in 30-50 per caption |
@@ -478,11 +492,15 @@ kind shows `unverified_weights` (fail closed).
 
 ```bash
 flora certify -c flora.yaml --exact oracle/segment.jsonl --balanced bal/segment.jsonl \
-  --noise noise/segment.jsonl --l0 reports/wave-h/balanced-tempseg.json \
-  --derived-content tempseg_merged=<sha256>
+  --noise noise/segment.jsonl --witness witness/segment.jsonl \
+  --l0 reports/wave-h/balanced-tempseg.json \
+  --derived-content tempseg_merged=<sha256> --generated-at <run time, YYYY-MM-DDTHH:MM:SSZ>
 ```
 
-(From a standalone lab run the L0 file is `reports/balanced-lab/<run>-tempseg.json`.) It prints
+Without `--witness` (records from a container forced cold) `segment` and `caption` are at best
+`provisional` (`no_witness`); `--generated-at` with the run's own time makes a re-run reproduce
+the same certificate id. `scripts/wave_h_finalize.py` passes both. (From a standalone lab run
+the L0 file is `reports/balanced-lab/<run>-tempseg.json`.) It prints
 the verdict per stage, the failing checks and where each certificate was written. Next
 to each certificate it writes a freeze lock (`freeze/<id>.json`: the full key document and
 per-module hashes) for the drift report ([`certificate-freeze.md`](certificate-freeze.md)). It
