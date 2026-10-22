@@ -80,11 +80,13 @@ def test_dry_run_numbers_fit_the_caps_honestly():
 def test_projection_counts_every_container_and_chaos_cost():
     run = sc.project("run", "real")
     whats = " | ".join(i["what"] for i in run.items)
-    assert "segment: 3 cold starts" in whats and "caption: 2 cold starts" in whats
+    n = sc.pool_sizes()
+    assert f"segment: {n['segment']} cold starts" in whats
+    assert f"caption: {n['caption']} cold starts" in whats
     assert "preemption" in whats and "reconciler gap" in whats
     # upper adds the client slack per container on top of the scale-down tail
     tail = next(i for i in run.items if i["what"].startswith("caption: idle tail"))
-    assert tail["upper_seconds"] >= 2 * (300 + sc.CLIENT_SLACK_S)
+    assert tail["upper_seconds"] >= n["caption"] * (300 + sc.CLIENT_SLACK_S)
     assert sc.run_wall_s("real", upper=True) > sc.run_wall_s("real")
     # more video costs more
     assert sc.project("run", "real", 2 * sc.VIDEO_S).usd > run.usd
@@ -101,7 +103,7 @@ def test_config_is_valid_for_every_mode(tmp_path, monkeypatch):
         cfg = load_config(p, allow_uncertified=True)
         assert cfg.preset == "balanced"
         pools = cfg.pools()
-        assert pools["segment"].max_containers == 3 and pools["caption"].max_containers == 2
+        assert pools["segment"].max_containers == 2 and pools["caption"].max_containers == 3
         if mode == "real":
             assert cfg.input.revision == sc.DATASET["revision"]
             assert cfg.input.repo == sc.DATASET["repo"]
@@ -231,13 +233,13 @@ def test_report_mode_rewrites_from_state_only(offline, tmp_path):
     state = tmp_path / "state.json"
     st = wh.load_state(state)
     st.step("report").status = "done"
-    st.step("report").result = {"criteria": [{"criterion": "end state", "value": "done",
-                                              "target": "done", "verdict": "PASS"}],
+    st.step("report").result = {"state": "done", "criteria": [{"criterion": "end state",
+                                                            "verdict": "PASS"}],
                                 "measure": {"pools": {}}}
     wh.save_state(st, state)
     assert sc.main(["--report", "--state", str(state)]) == 0
     text = (tmp_path / "report.md").read_text()
-    assert "| end state | done | done | PASS |" in text and offline == []
+    assert "| 1 | end state | done | done | PASS |" in text and offline == []
 
 
 # --------------------------------------------------------------------------------------------
@@ -322,29 +324,224 @@ def test_measure_utilization_cold_start_idle_and_pipelining():
     assert sc.first_spawn_after(files["ledgers"], 1000.0 + 400) is None
 
 
-def test_criteria_verdicts():
-    r = {"state": "done", "records": {"missing": 0, "duplicates": 0},
-         "measure": {"pools": {"segment": {"peak_concurrent": 3, "utilization": 0.7,
-                                           "time_to_peak_s": 100, "preempted_starts": 1},
-                               "caption": {"peak_concurrent": 1, "utilization": 0.5,
-                                           "time_to_peak_s": 100, "preempted_starts": 0}},
-                     "pipelining": {"first_caption_after_first_segment_s": 60,
-                                    "overlap_s": 500},
-                     "idle_share": 0.1},
-         "projection_error": {"actual_usd": 9.0, "upper_usd": 18.0, "vs_nominal": 0.1},
-         "chaos": {"preempt_segment": {}, "preempt_caption": {}},
-         "orchestrator": {"killed": True, "revive_s": 400, "revived_by": "reconciler"},
-         "timings": {"status": {"p95": 3.0}, "report_s": 5.0, "compose_s": 4.0}}
-    v = {x["criterion"]: x["verdict"] for x in sc.evaluate(r, "real")}
-    assert v["end state"] == "PASS" and v["lost/duplicate records"] == "PASS"
-    assert v["segment: autoscaled to max_containers"] == "PASS"
-    assert v["caption: autoscaled to max_containers"] == "FAIL"
-    assert v["caption: utilization (busy / container-s)"] == "FAIL"
-    assert v["caption: preemption recovered"] == "FAIL"
-    assert v["orchestrator killed -> revived by the reconciler"] == "PASS"
-    assert v["spend within the upper projection"] == "PASS"
-    local = {x["criterion"]: x["verdict"] for x in sc.evaluate(r, "local")}
-    assert local["segment: autoscaled to max_containers"] == "n.a."
+def _good_run(mode: str = "real") -> dict:
+    """A synthetic ``report`` result that passes all 14 criteria."""
+    n = sc.pool_sizes()
+    pool = {k: {"peak_concurrent": n[k], "time_to_peak_s": 100, "utilization": 0.55,
+                "utilization_working": 0.9, "preempted_starts": 1, "preempted_recovered": 1}
+            for k in sc.POOLS}
+    return {"state": "done", "records": {"missing": 0, "duplicates": 0}, "sizes": n,
+            "measure": {"pools": pool, "idle_share": 0.3, "idle_share_excl_outage": 0.1,
+                        "pipelining": {"first_caption_after_first_segment_s":
+                                       330 if mode == "real" else 7,
+                                       "overlap_s": 900}},
+            "projection_error": {"actual_usd": 11.0, "upper_usd": 19.2, "nominal_usd": 11.5,
+                                 "vs_nominal": -0.04, "billed": True},
+            "chaos": {"preempt_segment": {}, "preempt_caption": {}, "kill_orchestrator": {}},
+            "orchestrator": {"killed": True, "revive_s": 400, "revived_by": "reconciler"},
+            "timings": {"status": {"p95": 3.0}, "report_s": 5.0, "compose_s": 4.0,
+                        "compose_rc": 0}}
+
+
+def _verdicts(r: dict, mode: str = "real") -> dict[int, str]:
+    return {x["id"]: x["verdict"] for x in sc.evaluate(r, mode)}
+
+
+def test_criteria_are_the_14_of_the_doc_and_all_automatic():
+    rows = sc.evaluate(_good_run(), "real")
+    assert [x["id"] for x in rows] == list(range(1, 15))
+    assert all(x["auto"] for x in rows) and not sc.MANUAL
+    assert {x["verdict"] for x in rows} == {"PASS"}, [x for x in rows if x["verdict"] != "PASS"]
+    assert sc.criteria_summary(rows) == "14 PASS, 0 FAIL, 0 n.a. (14 of 14 automatic)"
+    # the doc's table lists the same 14, in order
+    doc = (Path(__file__).resolve().parents[2] / "docs" / "scale-test.md").read_text()
+    table = doc.split("## Success criteria", 1)[1].split("\n## ", 1)[0]
+    ids = [int(line.split("|")[1]) for line in table.splitlines()
+           if line.startswith("| ") and line.split("|")[1].strip().isdigit()]
+    assert ids == list(range(1, 15))
+
+
+def test_criteria_targets_derive_from_the_rates():
+    t = sc.criteria_targets("real")
+    r = sc.kind_rates("real", warm=False)
+    up = sc.simulate(sc.pool_sizes(), r, upper=True)
+    assert t["time_to_peak_max_s"]["caption"] == round(
+        up["pools"]["caption"].t_peak + sc.POLL_S["real"] + sc.LAUNCH_MARGIN_S)
+    assert t["time_to_peak_max_s"]["caption"] > t["time_to_peak_max_s"]["segment"]
+    assert t["pipelining_first_caption_max_s"] == round(
+        r["caption"].startup_s * (1 + r["caption"].startup_unc) + sc.LAUNCH_MARGIN_S)
+
+
+def _set(d: dict, path: str, value) -> None:
+    keys = path.split(".")
+    for k in keys[:-1]:
+        d = d[k]
+    d[keys[-1]] = value
+
+
+FAILS = {  # criterion -> edits to the good run that make it FAIL
+    1: [("state", "failed")],
+    2: [("records.missing", 1)],
+    3: [("measure.pools.caption.peak_concurrent", 2)],
+    4: [("measure.pools.segment.time_to_peak_s", 10_000)],
+    5: [("measure.pools.caption.utilization_working", 0.4)],
+    6: [("measure.pipelining.overlap_s", 0)],
+    7: [("projection_error.actual_usd", 25.0)],
+    8: [("projection_error.vs_nominal", 0.8)],
+    9: [("measure.idle_share_excl_outage", 0.2)],
+    10: [("measure.pools.segment.preempted_recovered", 0)],
+    11: [("orchestrator.revived_by", "flora resume (reconciler did not revive)")],
+    12: [("timings.status.p95", 11.0)],
+    13: [("timings.report_s", 31.0)],
+    14: [("timings.compose_rc", 1)],
+}
+
+
+@pytest.mark.parametrize("cid", sorted(FAILS))
+def test_each_criterion_fails_on_its_own(cid):
+    assert sorted(FAILS) == list(range(1, 15))
+    r = _good_run()
+    for path, v in FAILS[cid]:
+        _set(r, path, v)
+    v = _verdicts(r)
+    bad = {i for i, x in v.items() if x != "PASS"}
+    # 3 -> 4: a pool below its size has no peak to time; 1 -> 11: work must continue to done
+    expect = {1: {1, 11}, 3: {3, 4}}.get(cid, {cid})
+    assert bad == expect and v[cid] == "FAIL", v
+
+
+def test_criteria_other_fail_paths():
+    r = _good_run()
+    _set(r, "measure.pipelining.first_caption_after_first_segment_s", 10_000)
+    assert _verdicts(r)[6] == "FAIL"
+    r = _good_run()
+    _set(r, "timings.compose_s", 61.0)
+    assert _verdicts(r)[14] == "FAIL"
+    r = _good_run()
+    _set(r, "orchestrator.revive_s", sc.RECONCILE_WAIT_S + 1)
+    assert _verdicts(r)[11] == "FAIL"
+    r = _good_run()
+    del r["chaos"]["preempt_caption"]  # the chaos action never fired: no proof
+    assert _verdicts(r)[10] == "FAIL"
+    r = _good_run()
+    r["orchestrator"] = {}
+    assert _verdicts(r)[11] == "FAIL"
+    r = _good_run()
+    _set(r, "measure.pools.segment.utilization", 0.1)  # whole-life utilization: informational
+    assert _verdicts(r)[5] == "PASS"
+    r = _good_run()
+    _set(r, "measure.idle_share", 0.9)  # includes the induced outage: not judged
+    assert _verdicts(r)[9] == "PASS"
+
+
+def test_missing_data_is_a_fail_not_a_pass():
+    rows = sc.evaluate({}, "real")
+    assert {x["verdict"] for x in rows} == {"FAIL"}
+    assert all(x["reason"] for x in rows)
+
+
+def test_local_marks_container_and_money_criteria_na_with_a_reason():
+    rows = {x["id"]: x for x in sc.evaluate(_good_run("local"), "local")}
+    for i in (3, 4, 5, 7, 8, 9):
+        assert rows[i]["verdict"] == "n.a." and rows[i]["reason"]
+    for i in (1, 2, 6, 10, 11, 12, 13, 14):
+        assert rows[i]["verdict"] == "PASS", rows[i]
+
+
+def test_report_rechecks_spend_once_billing_lands():
+    st = wh.State("r1", 0.0, "")
+    run = st.step("run")
+    run.projected_usd, run.projected_upper_usd = 11.5, 19.2
+    run.attempts.append(wh.Attempt(started=0.0, tracked_usd=11.0, status="done"))
+    res = _good_run()
+    res["projection_error"].update(actual_usd=11.0, billed=False)
+    res["criteria"] = sc.evaluate(res, "real")
+    st.step("report").result = res
+    rows = {x["id"]: x for x in sc.recheck(st, "real")}
+    assert rows[7]["verdict"] == "PASS" and rows[7]["reason"].startswith("provisional")
+    run.billed_usd = 30.0  # the bill landed: over the upper projection
+    rows = {x["id"]: x for x in sc.recheck(st, "real")}
+    assert rows[7]["verdict"] == "FAIL" and rows[8]["verdict"] == "FAIL"
+    assert "(14 of 14 automatic)" in sc.render_report(st, "real", sc.projections("real"))
+
+
+# --------------------------------------------------------------------------------------------
+# Pool sizing and the warm-start variant
+
+
+def test_projection_uses_the_measured_balanced_rows_and_per_class_prices():
+    r = sc.kind_rates("real", warm=False)
+    assert r["segment"].status == r["caption"].status == "measured"
+    assert r["segment"].startup_status == r["caption"].startup_status == "measured"
+    assert r["segment"].cs_per_video_s == pytest.approx(0.367)
+    assert r["caption"].cs_per_video_s == pytest.approx(0.906)
+    assert r["segment"].startup_s == pytest.approx(300.5)
+    assert r["caption"].startup_s == pytest.approx(325.0)
+    rates = sc.container_rates("real")
+    run = sc.project("run", "real", warm=False)
+    for i in run.items:
+        kind = i["what"].split(":")[0]
+        want = rates.get(kind, rates[sc.CPU_CLASS]) * 3600
+        assert i["usd_per_h"] == pytest.approx(want, abs=1e-2), i
+
+
+def test_warm_variant_uses_a_warm_row_or_the_documented_assumption():
+    from dataclasses import replace
+
+    from flora_deploy.planner.rates import RateTable
+
+    t = RateTable.load()
+    cold = sc.kind_rates("real", t, warm=False)
+    assumed = sc.kind_rates("real", t, warm=True)
+    for k in sc.POOLS:
+        if sc.startup_row(t, k, "warm") is None:
+            assert assumed[k].startup_status == "assumed"
+            assert assumed[k].startup_s == pytest.approx(cold[k].startup_s
+                                                         * sc.WARM_STARTUP_FACTOR)
+    seg_cold = sc.startup_row(t, "segment", "cold")
+    warm_row = replace(seg_cold, startup_s=90.0, status="placeholder", compile_cache="warm")
+    t2 = replace(t, startup=(warm_row, *t.startup))
+    w = sc.kind_rates("real", t2, warm=True)
+    assert w["segment"].startup_s == 90.0 and w["segment"].startup_status == "placeholder"
+    # a warm row never leaks into the cold projection
+    assert sc.kind_rates("real", t2, warm=False)["segment"].startup_s == seg_cold.startup_s
+    assert sc.project("run", "real", warm=True).usd < sc.project("run", "real", warm=False).usd
+
+
+def test_caps_stay_cold_under_assume_warm(offline, tmp_path, capsys):
+    cold = sc.caps("real")
+    assert sc.main(["--state", str(tmp_path / "s.json"), "--assume-warm"]) == 0
+    out = capsys.readouterr().out
+    assert sc.ASSUME_WARM is False  # restored
+    assert "warm start (" in out and "cold start (" in out
+    assert sc.caps("real") == cold
+
+
+def test_simulated_schedule_pipelines_and_respects_pool_sizes():
+    r = sc.kind_rates("real", warm=False)
+    sim = sc.simulate({"segment": 2, "caption": 3}, r)
+    seg, cap = sim["pools"]["segment"], sim["pools"]["caption"]
+    assert seg.peak == 2 and cap.peak == 3
+    assert seg.busy_s == pytest.approx(sc.VIDEO_S * 0.367, rel=1e-6)
+    assert cap.busy_s == pytest.approx(sc.VIDEO_S * 0.906, rel=1e-6)
+    # captions start one caption cold start after the first segment receipt, and overlap
+    assert sim["pipelining"]["first_caption_after_first_segment_s"] == pytest.approx(325.0)
+    assert sim["pipelining"]["overlap_s"] > 0
+    assert sim["wall_s"] > seg.last_end
+    one = sc.simulate({"segment": 1, "caption": 1}, r)
+    assert one["wall_s"] > sim["wall_s"]
+
+
+def test_pool_sizing_recommends_two_segment_three_caption():
+    rows = sc.pool_sizing()
+    assert len(rows) == 16
+    rec = sc.recommend(rows)
+    assert (rec["segment"], rec["caption"]) == (2, 3)
+    assert rec["wall_upper_s"] <= sc.SIZING_TARGET_WALL_S
+    assert sc.pool_sizes() == {"segment": 2, "caption": 3}  # the configured pools
+    by = {(x["segment"], x["caption"]): x for x in rows}
+    assert by[(3, 2)]["usd"] > by[(2, 2)]["usd"]  # the old 3 + 2 is dominated by 2 + 2
+    assert by[(3, 2)]["wall_s"] == by[(2, 2)]["wall_s"]
 
 
 # --------------------------------------------------------------------------------------------
@@ -500,8 +697,9 @@ def _ts(t: float) -> str:
     return wh.time.strftime("%Y-%m-%dT%H:%M:%SZ", wh.time.gmtime(1_800_000_000.0 + t))
 
 
-def test_time_to_peak_is_measured_from_the_run_start():
+def test_time_to_peak_is_measured_from_the_run_start(monkeypatch):
     """L2: the first container's cold start counts; a peak below max_containers is no peak."""
+    monkeypatch.setitem(sc.POOLS["segment"], "max_containers", 3)
     files: dict = {"attempts": [], "receipts": [], "ledgers": []}
     cont = {}
     for i, (cid, start) in enumerate([("a", 100), ("b", 400), ("c", 700)]):
@@ -518,8 +716,8 @@ def test_time_to_peak_is_measured_from_the_run_start():
     m2 = sc.measure(files2, {}, two, run_start=1_800_000_000.0)
     assert m2["pools"]["segment"]["time_to_peak_s"] is None  # never reached 3 containers
     r = {"measure": m2, "state": "done"}
-    v = {x["criterion"]: x["verdict"] for x in sc.evaluate(r, "real")}
-    assert v["segment: time to peak"] == "FAIL"
+    v = sc.evaluate(r, "real")[3]
+    assert v["id"] == 4 and v["verdict"] == "FAIL" and v["value"]["segment"] is None
 
 
 def test_preemption_counts_only_when_the_shard_finished_later():
@@ -532,14 +730,37 @@ def test_preemption_counts_only_when_the_shard_finished_later():
     assert m["pools"]["segment"]["preempted_starts"] == 1
     assert m["pools"]["segment"]["preempted_recovered"] == 0
     r = {"measure": m, "chaos": {"preempt_segment": {}}, "state": "failed"}
-    v = {x["criterion"]: x["verdict"] for x in sc.evaluate(r, "real")}
-    assert v["segment: preemption recovered"] == "FAIL"
+    v = sc.evaluate(r, "real")[9]
+    assert v["id"] == 10 and v["verdict"] == "FAIL" and v["value"]["segment"] == "0/1"
     files["attempts"].append({"container_id": "b", "kind": "segment", "shard_id": "s1",
                               "started_utc": _ts(60)})
     files["receipts"].append({"container_id": "b", "kind": "segment", "shard_id": "s1",
                               "finished_utc": _ts(90), "episodes_done": []})
     m = sc.measure(files, {})
     assert m["pools"]["segment"]["preempted_recovered"] == 1
-    v = {x["criterion"]: x["verdict"] for x in sc.evaluate({"measure": m, "chaos": {
-        "preempt_segment": {}}}, "real")}
-    assert v["segment: preemption recovered"] == "PASS"
+    v = sc.evaluate({"measure": m, "chaos": {"preempt_segment": {}}}, "real")[9]
+    assert v["value"]["segment"] == "1/1"  # caption recorded nothing: still a FAIL
+    assert v["verdict"] == "FAIL"
+
+
+def test_measure_working_utilization_and_outage_idle():
+    """Criterion 5 counts each container from its first shard start to its last shard end;
+    criterion 9 leaves out tails that began while the killed orchestrator was down."""
+    files: dict = {"attempts": [], "receipts": [], "ledgers": []}
+    for cid, shards in (("a", [(100, 200), (300, 400)]), ("b", [(100, 500)])):
+        for i, (t0, t1) in enumerate(shards):
+            files["attempts"].append({"container_id": cid, "kind": "caption",
+                                      "shard_id": f"{cid}{i}", "started_utc": _ts(t0)})
+            files["receipts"].append({"container_id": cid, "kind": "caption",
+                                      "shard_id": f"{cid}{i}", "finished_utc": _ts(t1),
+                                      "episodes_done": []})
+    base = 1_800_000_000.0
+    cont = {"a": {"start": base, "end": base + 700}, "b": {"start": base, "end": base + 600}}
+    m = sc.measure(files, {}, cont, usd_per_s={"caption": 1.0},
+                   outage=(base + 350, base + 450))
+    cap = m["pools"]["caption"]
+    assert cap["utilization_working"] == pytest.approx(600 / 700, abs=1e-3)
+    assert cap["utilization"] == pytest.approx(600 / 1300, abs=1e-3)
+    assert m["idle_share"] == pytest.approx(400 / 1300, abs=1e-3)
+    # a's tail began at 400, inside the outage; b's at 500, after it
+    assert m["idle_share_excl_outage"] == pytest.approx(100 / 1300, abs=1e-3)
