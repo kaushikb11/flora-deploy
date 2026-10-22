@@ -10,7 +10,8 @@ Parquet table, and the other way round.
 
 * ``file:///abs/dir`` (or a bare path) → ``LocalStore``;
 * ``s3://bucket[/prefix]`` → ``BucketStore`` (boto3; endpoint from ``AWS_ENDPOINT_URL`` or
-  ``endpoint_url=`` for R2/GCS);
+  ``endpoint_url=`` for R2/GCS; ``gs://`` / ``r2://`` are refused with the way to do that,
+  ``config.schema.unsupported_sink_message``);
 * ``modal-volume://name[/path]`` → ``VolumeStore`` over the Volume's mount inside a Modal
   container (``/vol/<name>`` unless ``volume_mount=`` / ``FLORA_VOLUME_MOUNT`` says otherwise;
   no Modal API is called, Modal commits the container's writes when it exits); where it is not
@@ -43,8 +44,12 @@ class ResultsNotFound(FileNotFoundError):
 
 def store_from_uri(uri: str, *, endpoint_url: str | None = None,
                    volume_mount: str | None = None, environment: str | None = None) -> Store:
+    from flora_deploy.config.schema import unsupported_sink_message
     from flora_deploy.jobs.stores import BucketStore, ClientVolumeStore, LocalStore, VolumeStore
 
+    why = unsupported_sink_message(uri)
+    if why:
+        raise ValueError(f"store {uri!r}: {why}")
     u = urlparse(uri)
     if u.scheme in ("", "file"):
         path = unquote(u.path) if u.scheme == "file" else uri

@@ -36,6 +36,11 @@ def default_index_summary(config: Path) -> Path:
 
 def store_for_sink(sink: str) -> str:
     """``output.sink`` -> a job-store URI (``volume://`` -> ``modal-volume://``)."""
+    from flora_deploy.config.schema import unsupported_sink_message
+
+    why = unsupported_sink_message(sink)
+    if why:
+        raise ValueError(f"sink {sink!r}: {why}")
     if sink.startswith("volume://"):
         return "modal-volume://" + sink[len("volume://"):]
     if sink.startswith(("file://", "s3://", "modal-volume://")):

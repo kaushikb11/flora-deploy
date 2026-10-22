@@ -137,7 +137,7 @@ def deploy(
     config: Annotated[Path, typer.Option("--config", "-c", help="flora.yaml")] = Path("flora.yaml"),
     store: Annotated[str | None, typer.Option(
         "--store", envvar="FLORA_STORE",
-        help="Job store seen by containers: modal-volume://name\\[/path] or s3|r2|gs://bucket"
+        help="Job store seen by containers: modal-volume://name\\[/path] or s3://bucket"
              "\\[/prefix] (default: output.sink).")] = None,
     bucket_secret: Annotated[str, typer.Option(
         help="Modal Secret holding the bucket credentials.")] = "flora-bucket",
@@ -168,9 +168,11 @@ def deploy(
     from flora_deploy.config.hashing import MissingReceiptError
     from flora_deploy.config.receipts import load_certified
     from flora_deploy.config.receipts import resolve as resolve_receipts
-    from flora_deploy.config.schema import ConfigError
+    from flora_deploy.config.schema import ConfigError, unsupported_sink_message
     from flora_deploy.modal_app.factory import DeployError, deployment_record, materialize, plan_app
 
+    if store is not None and (why := unsupported_sink_message(store)):
+        raise _fail(f"store {store!r}: {why}")
     overrides = _receipts(receipt)
     try:
         cfg, content = load_certified(config, allow_uncertified=allow_uncertified,

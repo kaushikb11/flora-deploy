@@ -391,15 +391,36 @@ class ResourceOverride(_Model):
         return replace(pool, **{k: v for k, v in fields.items() if v is not None})
 
 
+# Sink schemes ``flora deploy`` could hand to containers but the client commands (``flora run``,
+# ``status``, ``results``, ``export``: ``export.results.store_from_uri``) cannot open, so they are
+# refused everywhere with :func:`unsupported_sink_message`. R2 and GCS work as ``s3://`` with
+# their S3 endpoint in ``AWS_ENDPOINT_URL`` (``jobs.stores.bucket``).
+UNSUPPORTED_SINK_SCHEMES = ("gs", "r2")
+
+
+def unsupported_sink_message(uri: str) -> str | None:
+    """Why ``uri`` cannot be a job store (``None``: its scheme is not one of the refused ones)."""
+    scheme = uri.split("://", 1)[0].lower() if "://" in uri else ""
+    if scheme not in UNSUPPORTED_SINK_SCHEMES:
+        return None
+    return (f"{scheme}:// sinks are not supported: flora's client commands (run, status, "
+            "results, export) cannot read them. Use s3:// instead; for Cloudflare R2 or Google "
+            "Cloud Storage, s3://<bucket> with the provider's S3 endpoint in AWS_ENDPOINT_URL "
+            "(in the flora-bucket Modal Secret and in your shell)")
+
+
 class OutputSection(_Model):
-    sink: str = Field(description="bucket URI (s3://, r2://, gs://) or volume://<name>/<path>")
+    sink: str = Field(description="s3://<bucket>[/prefix], volume://<name>/<path> or file://")
     formats: tuple[OutputFormat, ...] = ("parquet",)
 
     @field_validator("sink")
     @classmethod
     def _sink(cls, v: str) -> str:
-        if not re.match(r"^(s3|r2|gs|volume|file)://.+", v):
-            raise ValueError(f"sink {v!r}: use s3://, r2://, gs://, volume:// or file://")
+        why = unsupported_sink_message(v)
+        if why:
+            raise ValueError(f"sink {v!r}: {why}")
+        if not re.match(r"^(s3|volume|file)://.+", v):
+            raise ValueError(f"sink {v!r}: use s3://, volume:// or file://")
         return v
 
     @field_validator("formats")
