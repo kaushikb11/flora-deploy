@@ -21,22 +21,41 @@ Gate A engines (``raw_logits``, 20) compile exactly what the workers compile.
 
     <key name>/MANIFEST.json        the commit record: key factors, runtime facts, every file
     <key name>/<publish id>/vllm/...  one immutable tree per publish (triton/, cuda/, xdg/ too)
+    <key name>/<publish id>/cache.tar the same files as one uncompressed tar (``archive``)
 
 **Publish** (:func:`publish`): after ``@modal.enter`` and a shard's generates, a container
 whose cache was not loaded from a verified manifest takes a **lease** (``Leases``: a
 ``modal.Dict`` with put-if-absent, generation-numbered so an expired holder can be replaced
-by exactly one successor), uploads its local tree to a fresh ``<publish id>/`` (nobody else
-writes there), re-checks the lease, and only then writes ``MANIFEST.json`` (one file, atomic
-on a v2 Volume). A partial upload is invisible: without a manifest naming it, a tree is never
-read. The worker's ``flora-cache`` mount stays read-only (M7); uploads go through the Volume
-client API (``VolumeSink``).
+by exactly one successor), uploads its local tree and a tar of it (:data:`ARCHIVE`, written to
+a local temp file first and uploaded as one file, atomic per file on a v2 Volume) to a fresh
+``<publish id>/`` (nobody else writes there), re-checks the lease, and only then writes
+``MANIFEST.json`` (one file, atomic on a v2 Volume). A partial upload is invisible: without a
+manifest naming it, a tree is never read. The worker's ``flora-cache`` mount stays read-only
+(M7); uploads go through the Volume client API (``VolumeSink``). The per-file tree stays for
+readers that predate the archive. A key whose manifest has no archive (published before it)
+may be republished once, with one, under its own lease (``<key name>.archive``).
 
 **Load** (:func:`seed`): read the manifest from the read-only mount, check schema, key digest,
-factors and the container's own runtime versions, then copy every listed file to local disk
-while hashing it, into a staging directory renamed into place only when every file matched.
-Any problem (missing, unparsable, other key, other runtime, unsafe path, size or sha256
-mismatch, I/O error) returns a ``cold`` status with the reason, and the engine compiles from
-scratch into an empty directory. Nothing here raises into the worker.
+factors and the container's own runtime versions, then restore every listed file to local
+disk while hashing it, into a staging directory renamed into place only when every file
+matched. With an ``archive`` that is one sequential read of ``cache.tar`` (whose size and
+sha256 are checked too, and whose members must be exactly the manifest's files); without one,
+the files are copied in parallel (:data:`COPY_WORKERS`). Any problem (missing, unparsable,
+other key, other runtime, unsafe path, size or sha256 mismatch, I/O error) returns a ``cold``
+status with the reason, and the engine compiles from scratch into an empty directory.
+Nothing here raises into the worker.
+
+**Restore guard** (:func:`expected_restore_s`, :func:`max_restore_s`). On 2026-10-22 a warm
+L40S seed copied 1,932 files / 322 MB one at a time in ~405 s (~0.21 s per file, latency
+bound) and the warm engine then took ~140 s more: 550 s, against ~290 s for a cold compile
+(``FLORA_COMPILE_CACHE=off``). A restore pays only while restore + warm build < cold build, so
+:func:`seed` compiles cold without restoring when the manifest's expected restore time is over
+:data:`MAX_RESTORE_S` (290 − 140 = 150 s; ``FLORA_COMPILE_CACHE_MAX_RESTORE_S`` overrides it),
+and gives up a restore that is still running at that limit. Every restore logs its format,
+files, bytes, expected and actual seconds.
+
+**Legacy lab caches** (:func:`seed_legacy`) are no longer copied: the unkeyed
+``balanced/captioner`` copy (1,897 files, 403 MB) took 294 s, as long as compiling.
 
 **Determinism: a warm start is not output-neutral** (review 13 W1). A compile cache holds the
 artifacts the publishing container's compile produced, including choices that are **not** a
@@ -69,9 +88,11 @@ import json
 import os
 import re
 import shutil
+import tarfile
 import time
 import uuid
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
@@ -95,6 +116,19 @@ _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SKIP_SUFFIXES = (".lock", ".tmp", ".partial")
 NO_CACHE = "no published cache for this key"
 FORCED_COLD = "forced cold (FLORA_COMPILE_CACHE=off)"
+ARCHIVE = "cache.tar"  # the publish's files as one tar, next to its per-file tree
+ARCHIVE_LEASE_SUFFIX = ".archive"  # lease of a republish that adds an archive
+# Restore guard (module docstring). Measured 2026-10-22 on L40S (scale-lite-102223538c21 and
+# cold-human-a2): cold engine build ~290 s; warm engine build after a restore ~140 s; per-file
+# Volume copy ~0.21 s per file. Throughput of one sequential Volume read is an assumption
+# (conservative); the deadline bounds the cost of being wrong.
+COLD_BUILD_S = 290.0
+WARM_BUILD_S = 140.0
+MAX_RESTORE_S = COLD_BUILD_S - WARM_BUILD_S
+MAX_RESTORE_ENV = "FLORA_COMPILE_CACHE_MAX_RESTORE_S"
+FILE_LATENCY_S = 0.21
+READ_BYTES_PER_S = 25e6
+COPY_WORKERS = 16
 
 
 class CacheInvalid(RuntimeError):
@@ -265,15 +299,38 @@ def safe_rel(rel: str) -> str:
     return p.as_posix()
 
 
+def write_archive(files: Mapping[str, Path], dest: Path) -> tuple[dict[str, dict], dict]:
+    """Write ``files`` (relative path -> local file) as one uncompressed tar at ``dest``,
+    reading each file once: ``(entries, archive)``, the manifest's per-file size / sha256 of
+    exactly the bytes archived, and the archive's own ``{path, size, sha256}``."""
+    import io
+
+    entries: dict[str, dict] = {}
+    with tarfile.open(dest, "w", format=tarfile.PAX_FORMAT) as tf:
+        for rel, p in sorted(files.items()):
+            data = Path(p).read_bytes()
+            ti = tarfile.TarInfo(rel)
+            ti.size, ti.mode, ti.mtime = len(data), 0o644, int(Path(p).stat().st_mtime)
+            tf.addfile(ti, io.BytesIO(data))
+            entries[rel] = {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+    return entries, {"path": ARCHIVE, "size": dest.stat().st_size, "sha256": _sha256(dest)}
+
+
 def build_manifest(key: CacheKey, publish_id: str, files: Mapping[str, Path], *,
                    runtime: Mapping[str, Any], holder: str,
-                   clock: Callable[[], float] = time.time) -> dict[str, Any]:
-    entries = {rel: {"size": p.stat().st_size, "sha256": _sha256(p)}
-               for rel, p in sorted(files.items())}
-    return {"schema": SCHEMA, "key": key.name, "digest": key.digest,
-            "factors": dict(key.factors), "runtime": dict(runtime), "publish_id": publish_id,
-            "holder": holder, "created_unix": round(clock(), 3), "files": entries,
-            "total_bytes": sum(e["size"] for e in entries.values())}
+                   clock: Callable[[], float] = time.time,
+                   entries: Mapping[str, dict] | None = None,
+                   archive: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    if entries is None:
+        entries = {rel: {"size": p.stat().st_size, "sha256": _sha256(p)}
+                   for rel, p in sorted(files.items())}
+    out = {"schema": SCHEMA, "key": key.name, "digest": key.digest,
+           "factors": dict(key.factors), "runtime": dict(runtime), "publish_id": publish_id,
+           "holder": holder, "created_unix": round(clock(), 3), "files": dict(entries),
+           "total_bytes": sum(e["size"] for e in entries.values())}
+    if archive is not None:
+        out["archive"] = dict(archive)
+    return out
 
 
 def check_manifest(m: Any, key: CacheKey, runtime: Mapping[str, Any]) -> dict[str, Any]:
@@ -299,7 +356,33 @@ def check_manifest(m: Any, key: CacheKey, runtime: Mapping[str, Any]) -> dict[st
         if not (isinstance(e, dict) and isinstance(e.get("size"), int) and e["size"] >= 0
                 and isinstance(e.get("sha256"), str) and len(e["sha256"]) == 64):
             raise CacheInvalid(f"bad manifest entry for {rel!r}")
+    a = m.get("archive")
+    if a is not None and not (
+            isinstance(a, dict) and isinstance(a.get("path"), str)
+            and _SAFE_NAME.match(a["path"]) and isinstance(a.get("size"), int) and a["size"] > 0
+            and isinstance(a.get("sha256"), str) and len(a["sha256"]) == 64):
+        raise CacheInvalid(f"bad archive entry {a!r}")
     return m
+
+
+def expected_restore_s(m: Mapping[str, Any]) -> float:
+    """Seconds a restore of manifest ``m`` is expected to take (module docstring): one
+    sequential read for an archive; per-file latency over :data:`COPY_WORKERS` plus the bytes
+    otherwise."""
+    files = m.get("files") or {}
+    size = sum(int(e.get("size", 0)) for e in files.values())
+    if m.get("archive"):
+        return int(m["archive"]["size"]) / READ_BYTES_PER_S
+    return len(files) * FILE_LATENCY_S / COPY_WORKERS + size / READ_BYTES_PER_S
+
+
+def max_restore_s(env: Mapping[str, str] | None = None) -> float:
+    """The restore limit: :data:`MAX_RESTORE_S`, or ``FLORA_COMPILE_CACHE_MAX_RESTORE_S``."""
+    raw = (os.environ if env is None else env).get(MAX_RESTORE_ENV)
+    try:
+        return float(raw) if raw else MAX_RESTORE_S
+    except ValueError:
+        return MAX_RESTORE_S
 
 
 # ---------------------------------------------------------------------------------------------
@@ -321,6 +404,8 @@ class CacheStatus:
     publish_id: str | None = None
     published: dict[str, Any] | None = None
     manifest_sha256: str | None = None  # warm: sha256 of the MANIFEST.json bytes it loaded
+    format: str | None = None  # the manifest's restore path: "archive" or "files"
+    expected_s: float | None = None  # the restore guard's estimate (expected_restore_s)
 
     def identity(self) -> str:
         """Which compiled artifacts this container runs, for record provenance:
@@ -352,11 +437,108 @@ def reset_local(local: Path) -> None:
     env_for(local)
 
 
+class _HashingReader:
+    """A file object that hashes and counts every byte read through it."""
+
+    def __init__(self, f: Any):
+        self.f, self.h, self.n = f, hashlib.sha256(), 0
+
+    def read(self, size: int = -1) -> bytes:
+        b = self.f.read(size)
+        self.h.update(b)
+        self.n += len(b)
+        return b
+
+
+def _copy_verified(fi: Any, dst: Path, rel: str, e: Mapping[str, Any]) -> int:
+    """Copy ``fi`` to ``dst`` while hashing; raise unless it matches manifest entry ``e``."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    h = hashlib.sha256()
+    got = 0
+    with open(dst, "wb") as fo:
+        while chunk := fi.read(1 << 20):
+            h.update(chunk)
+            got += len(chunk)
+            fo.write(chunk)
+    if got != e["size"] or h.hexdigest() != e["sha256"]:
+        raise CacheInvalid(f"{rel}: {got} bytes sha256 {h.hexdigest()[:12]}, manifest "
+                           f"{e['size']} bytes {e['sha256'][:12]}")
+    return got
+
+
+def _over(deadline: float, limit: float) -> None:
+    if time.perf_counter() > deadline:
+        raise CacheInvalid(f"restore still running after {limit:.0f} s (a cold compile is "
+                           "faster)")
+
+
+def _restore_archive(src: Path, m: Mapping[str, Any], stage: Path, deadline: float,
+                     limit: float) -> tuple[int, int]:
+    """One sequential read of the publish's tar into ``stage``: every member a regular file of
+    the manifest, matching its entry, no member twice, none missing, and the archive's own
+    size and sha256 as published."""
+    files, a = m["files"], m["archive"]
+    seen: set[str] = set()
+    size = 0
+    with open(src / a["path"], "rb", buffering=1 << 20) as raw:
+        rd = _HashingReader(raw)
+        with tarfile.open(fileobj=rd, mode="r|") as tf:  # type: ignore[call-overload]
+            for ti in tf:
+                _over(deadline, limit)
+                if ti.isdir():
+                    continue
+                rel = safe_rel(ti.name)
+                if not ti.isreg():
+                    raise CacheInvalid(f"archive member {rel!r} is not a regular file")
+                if rel not in files or rel in seen:
+                    raise CacheInvalid(f"archive member {rel!r} is not in the manifest "
+                                       "(or appears twice)")
+                fi = tf.extractfile(ti)
+                assert fi is not None
+                size += _copy_verified(fi, stage / rel, rel, files[rel])
+                seen.add(rel)
+        while rd.read(1 << 20):  # the tar's end blocks: the whole file is hashed
+            pass
+    missing = set(files) - seen
+    if missing:
+        raise CacheInvalid(f"archive lacks {len(missing)} manifest file(s), e.g. "
+                           f"{min(missing)!r}")
+    if rd.n != a["size"] or rd.h.hexdigest() != a["sha256"]:
+        raise CacheInvalid(f"{a['path']}: {rd.n} bytes sha256 {rd.h.hexdigest()[:12]}, "
+                           f"manifest {a['size']} bytes {a['sha256'][:12]}")
+    return len(seen), size
+
+
+def _restore_files(src: Path, m: Mapping[str, Any], stage: Path, deadline: float,
+                   limit: float) -> tuple[int, int]:
+    """Copy a per-file publish into ``stage``, :data:`COPY_WORKERS` files at a time (a Volume
+    read is latency bound per file)."""
+    files = m["files"]
+
+    def one(rel: str) -> int:
+        _over(deadline, limit)
+        with open(src / rel, "rb") as fi:
+            return _copy_verified(fi, stage / safe_rel(rel), rel, files[rel])
+
+    n = size = 0
+    ex = ThreadPoolExecutor(max_workers=COPY_WORKERS, thread_name_prefix="cc-restore")
+    try:
+        for fut in as_completed([ex.submit(one, rel) for rel in files]):
+            size += fut.result()
+            n += 1
+    finally:
+        ex.shutdown(wait=True, cancel_futures=True)
+    return n, size
+
+
 def seed(key: CacheKey, mount: Path | str, local: Path, *,
          runtime: Mapping[str, Any] | None = None,
-         log: Callable[[str], None] = print) -> CacheStatus:
-    """Copy the verified cache of ``key`` from the (read-only) mount to ``local``. Never raises:
-    any failure leaves an empty ``local`` and returns ``cold`` with the reason (logged)."""
+         log: Callable[[str], None] = print,
+         max_restore: float | None = None) -> CacheStatus:
+    """Restore the verified cache of ``key`` from the (read-only) mount to ``local``. Never
+    raises: any failure, or a restore expected (or still running) past ``max_restore``
+    (:func:`max_restore_s`), leaves an empty ``local`` and returns ``cold`` with the reason
+    (logged)."""
     t0 = time.perf_counter()
     base = Path(mount) / ROOT / key.name
     mpath = base / MANIFEST
@@ -364,72 +546,65 @@ def seed(key: CacheKey, mount: Path | str, local: Path, *,
         reset_local(local)
         return CacheStatus("cold", key.name, reason=NO_CACHE)
     stage = local.parent / f".{local.name}.staging-{uuid.uuid4().hex[:8]}"
+    fmt: str | None = None
+    expected: float | None = None
     try:
         runtime = runtime_versions() if runtime is None else runtime
+        limit = max_restore_s() if max_restore is None else float(max_restore)
         raw = mpath.read_bytes()
         try:
             m = json.loads(raw)
         except ValueError as e:
             raise CacheInvalid(f"manifest is not JSON ({e})") from None
         check_manifest(m, key, runtime)
+        fmt = "archive" if m.get("archive") else "files"
+        expected = round(expected_restore_s(m), 1)
+        if expected > limit:
+            reset_local(local)
+            reason = (f"restore expected {expected:.0f} s ({fmt}, {len(m['files'])} files) "
+                      f"> {limit:.0f} s: a cold compile is faster")
+            log(f"compile cache {key.name}: not restored, compiling cold ({reason})")
+            return CacheStatus("cold", key.name, reason=reason, format=fmt, expected_s=expected,
+                               seconds=round(time.perf_counter() - t0, 2))
         src = base / m["publish_id"]
-        n = size = 0
-        for rel, e in m["files"].items():
-            dst = stage / safe_rel(rel)
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            h = hashlib.sha256()
-            got = 0
-            with open(src / rel, "rb") as fi, open(dst, "wb") as fo:
-                while chunk := fi.read(1 << 20):
-                    h.update(chunk)
-                    got += len(chunk)
-                    fo.write(chunk)
-            if got != e["size"] or h.hexdigest() != e["sha256"]:
-                raise CacheInvalid(f"{rel}: {got} bytes sha256 {h.hexdigest()[:12]}, manifest "
-                                   f"{e['size']} bytes {e['sha256'][:12]}")
-            n, size = n + 1, size + got
+        restore = _restore_archive if fmt == "archive" else _restore_files
+        n, size = restore(src, m, stage, t0 + limit, limit)
         shutil.rmtree(local, ignore_errors=True)
         local.parent.mkdir(parents=True, exist_ok=True)
         os.replace(stage, local)
         env_for(local)
-        return CacheStatus("warm", key.name, files=n, bytes=size,
-                           seconds=round(time.perf_counter() - t0, 2),
+        secs = round(time.perf_counter() - t0, 2)
+        log(f"compile cache {key.name}: restored {n} files ({size / 1e6:.1f} MB, {fmt}) in "
+            f"{secs:.1f} s (expected {expected:.0f} s, limit {limit:.0f} s)")
+        return CacheStatus("warm", key.name, files=n, bytes=size, seconds=secs,
                            publish_id=m["publish_id"],
-                           manifest_sha256=hashlib.sha256(raw).hexdigest())
+                           manifest_sha256=hashlib.sha256(raw).hexdigest(), format=fmt,
+                           expected_s=expected)
     except Exception as e:  # noqa: BLE001 - a bad cache must never stop the worker
         shutil.rmtree(stage, ignore_errors=True)
         reset_local(local)
         reason = f"{type(e).__name__}: {e}"
-        log(f"compile cache {key.name}: not used, compiling cold ({reason})")
-        return CacheStatus("cold", key.name, reason=reason[:500],
-                           seconds=round(time.perf_counter() - t0, 2))
+        secs = round(time.perf_counter() - t0, 2)
+        log(f"compile cache {key.name}: not used after {secs:.1f} s, compiling cold ({reason})")
+        return CacheStatus("cold", key.name, reason=reason[:500], seconds=secs, format=fmt,
+                           expected_s=expected)
+
+
+LEGACY_SKIPPED = "unkeyed lab cache not copied: slower than a cold compile"
 
 
 def seed_legacy(legacy: Path, local: Path, key: CacheKey, *,
                 log: Callable[[str], None] = print) -> CacheStatus:
-    """Copy an unkeyed ``balanced/<engine kind>`` lab cache (``balanced_lab.cache_env``) when
-    there is no keyed one. Not verifiable (no manifest), so it never counts as ``warm`` and the
-    container publishes a keyed cache afterwards. Safe to try because vLLM keys every artifact
-    by its own config/env/code hashes below the root and recompiles on a failed AOT load
-    (``compilation/decorators.py:_try_load_aot_compiled_fn``); the caller only offers it for
-    the lab's GPU and plugin flag (the one factor vLLM's AOT key lacks)."""
-    t0 = time.perf_counter()
-    try:
-        if not (legacy / "vllm").is_dir():
-            return CacheStatus("cold", key.name, reason=NO_CACHE)
-        shutil.rmtree(local, ignore_errors=True)
-        shutil.copytree(legacy, local, symlinks=False,
-                        ignore=shutil.ignore_patterns(*(f"*{s}" for s in _SKIP_SUFFIXES)))
-        env_for(local)
-        files = tree_files(local)
-        return CacheStatus("legacy", key.name, reason=f"unkeyed lab cache {legacy}",
-                           files=len(files), bytes=sum(p.stat().st_size for p in files.values()),
-                           seconds=round(time.perf_counter() - t0, 2))
-    except Exception as e:  # noqa: BLE001
-        reset_local(local)
-        reason = f"{type(e).__name__}: {e}"
-        log(f"compile cache {key.name}: legacy copy failed, compiling cold ({reason})")
-        return CacheStatus("cold", key.name, reason=reason[:500])
+    """No longer copies anything (module docstring, "Legacy lab caches"): the unkeyed
+    ``balanced/<engine kind>`` lab cache (``balanced_lab.cache_env``) is not verifiable and its
+    per-file copy took as long as the compile it saves (``balanced/captioner``: 1,897 files in
+    294 s on 2026-10-22). Returns ``cold`` with an empty ``local``; the container compiles and
+    publishes a keyed cache. Kept so ``modal_app.balanced_app`` (stage-hashed) stays as is."""
+    reset_local(local)
+    if not (legacy / "vllm").is_dir():
+        return CacheStatus("cold", key.name, reason=NO_CACHE)
+    log(f"compile cache {key.name}: {LEGACY_SKIPPED} ({legacy}); compiling cold")
+    return CacheStatus("cold", key.name, reason=f"{NO_CACHE}; {LEGACY_SKIPPED}")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -596,11 +771,21 @@ def publish(key: CacheKey, local: Path, sink: Sink, leases: Leases, *, holder: s
     """Publish ``local``'s tree as cache ``key`` (module docstring). Never raises; returns what
     happened (``published`` true/false and why)."""
     out: dict[str, Any] = {"key": key.name, "published": False}
+    tar: Path | None = None
     try:
-        if mount is not None and (Path(mount) / ROOT / key.name / MANIFEST).is_file():
-            out["reason"] = "a manifest already exists at mount time"
-            return out
-        lease, why = acquire(leases, key.name, holder, clock=clock)
+        lease_name = key.name
+        mpath = None if mount is None else Path(mount) / ROOT / key.name / MANIFEST
+        if mpath is not None and mpath.is_file():
+            try:
+                has_archive = bool(json.loads(mpath.read_bytes()).get("archive"))
+            except ValueError:
+                has_archive = True  # unreadable: leave it alone
+            if has_archive:
+                out["reason"] = "a manifest already exists at mount time"
+                return out
+            lease_name = key.name + ARCHIVE_LEASE_SUFFIX  # republish once, with an archive
+            out["upgrade"] = True
+        lease, why = acquire(leases, lease_name, holder, clock=clock)
         if lease is None:
             out["reason"] = why
             return out
@@ -611,10 +796,14 @@ def publish(key: CacheKey, local: Path, sink: Sink, leases: Leases, *, holder: s
             return out
         runtime = runtime_versions() if runtime is None else runtime
         publish_id = f"p{int(clock())}-{uuid.uuid4().hex[:10]}"
+        t0 = time.perf_counter()
+        tar = local.parent / f".{local.name}.{publish_id}.tar"
+        entries, archive = write_archive(files, tar)  # the manifest hashes what is archived
         manifest = build_manifest(key, publish_id, files, runtime=runtime, holder=holder,
-                                  clock=clock)
+                                  clock=clock, entries=entries, archive=archive)
         prefix = f"{ROOT}/{key.name}/{publish_id}"
-        sink.upload({f"{prefix}/{rel}": p for rel, p in files.items()})
+        sink.upload({**{f"{prefix}/{rel}": p for rel, p in files.items()},
+                     f"{prefix}/{ARCHIVE}": tar})
         if not still_held(leases, lease):
             out["reason"] = "lease lost during upload (the tree is orphaned, never read)"
             return out
@@ -623,14 +812,19 @@ def publish(key: CacheKey, local: Path, sink: Sink, leases: Leases, *, holder: s
         leases.put(lease.key, {"holder": holder, "done": True, "publish_id": publish_id,
                                "expires": float("inf")})
         out.update(published=True, publish_id=publish_id, files=len(files),
-                   bytes=manifest["total_bytes"], generation=lease.generation)
+                   bytes=manifest["total_bytes"], archive_bytes=archive["size"],
+                   generation=lease.generation)
         log(f"compile cache {key.name}: published {len(files)} files "
-            f"({manifest['total_bytes'] / 1e6:.1f} MB) as {publish_id}")
+            f"({manifest['total_bytes'] / 1e6:.1f} MB, archive {archive['size'] / 1e6:.1f} MB)"
+            f" as {publish_id} in {time.perf_counter() - t0:.1f} s")
         return out
     except Exception as e:  # noqa: BLE001 - publishing is best effort
         out["reason"] = f"{type(e).__name__}: {e}"[:500]
         log(f"compile cache {key.name}: publish failed ({out['reason']})")
         return out
+    finally:
+        if tar is not None:
+            tar.unlink(missing_ok=True)
 
 
 def published(key: CacheKey, exists: Callable[[str], bool]) -> bool:
@@ -692,9 +886,13 @@ class WorkerCache:
         self.status = CacheStatus("cold", self.key.name, reason=f"build failed: {reason}"[:500])
 
     def maybe_publish(self, engine: Any) -> dict[str, Any] | None:
-        """After a shard: publish if this container compiled (``cold`` / ``legacy``), its engine
-        ran requests and is alive, and publishing is enabled. At most one attempt."""
-        if self._done or not self.publish_enabled or self.status.state == "warm":
+        """After a shard: publish if this container compiled (``cold`` / ``legacy``), or loaded
+        a verified cache published without an archive (``format="files"``: republished once
+        with one, :func:`publish`), its engine ran requests and is alive, and publishing is
+        enabled. At most one attempt."""
+        if self._done or not self.publish_enabled:
+            return None
+        if self.status.state == "warm" and self.status.format != "files":
             return None
         stats = getattr(engine, "stats", {}) or {}
         if not stats.get("requests") or getattr(engine, "dead", None):
