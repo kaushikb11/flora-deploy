@@ -51,6 +51,10 @@ from flora_deploy.planner.rates import RateTable
 
 log = logging.getLogger(__name__)
 
+# An ended call whose attempt marker is still not listed this long after it ended never
+# started a container (or its marker is lost): stop looking (store listing lag is far shorter).
+MARKER_LAG_S = 300.0
+
 # ----------------------------------------------------------------------------------------------
 # Rates
 # ----------------------------------------------------------------------------------------------
@@ -741,6 +745,7 @@ class ProjectionBudgetGate:
     # call id -> (tick, marker or None): a live call's lookup, or a miss, re-read once per tick
     _marker_tick: dict[str, tuple[int, tuple[float, str] | None]] = field(
         default_factory=dict, init=False, repr=False)
+    _no_marker: set[str] = field(default_factory=set, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.safety_margin < 1.0:
@@ -852,14 +857,18 @@ class ProjectionBudgetGate:
 
     def _marker(self, c: CallRecord) -> tuple[float, str] | None:
         hit = self._markers.get(c.call_id)
-        if hit is not None:
+        if hit is not None or c.call_id in self._no_marker:
             return hit
         seen = self._marker_tick.get(c.call_id)
         if seen is not None and seen[0] == self._tick:
             return seen[1]
         m = self._read_marker(c)
+        now = self._state.now if self._state is not None else c.ended_at or 0.0
         if m is not None and c.ended_at is not None:
             self._markers[c.call_id] = m  # an ended call's marker is final
+            self._marker_tick.pop(c.call_id, None)
+        elif m is None and c.ended_at is not None and now - c.ended_at > MARKER_LAG_S:
+            self._no_marker.add(c.call_id)  # ended long ago without one: never started
             self._marker_tick.pop(c.call_id, None)
         else:
             self._marker_tick[c.call_id] = (self._tick, m)

@@ -236,6 +236,23 @@ def test_resume_projection(tmp_path):
     assert p.total_usd < g.limit_usd
 
 
+def test_markers_are_read_once_per_call(tmp_path):
+    """An ended call's marker is final once found; one still missing long after the call
+    ended is not looked for again (every tick would list its attempts directory)."""
+    g = build_gate(tmp_path, done=SEGMENTS_DONE, clock=lambda: RESUME)
+    g.observe(state_at_stop(live_7d63=False, now=RESUME))
+    g.effective_calibration()
+    assert set(g._markers) == {c[0] for c in CALLS}
+    bare = build_gate(tmp_path / "bare", with_markers=False, clock=lambda: RESUME)
+    bare.observe(state_at_stop(live_7d63=False, now=RESUME))
+    bare.effective_calibration()
+    assert bare._no_marker == {c[0] for c in CALLS}
+    soon = build_gate(tmp_path / "soon", with_markers=False)
+    soon.observe(state_at_stop(live_7d63=False))  # d3af and 7d63 ended < 300 s ago
+    soon.effective_calibration()
+    assert soon._no_marker == set()
+
+
 def test_starting_prewarm_is_charged_only_its_remaining_startup(tmp_path):
     """19:25:00, before any marker: the caption pre-warm container has been starting for ~74 s.
     It is one of the two caption containers (no new start for it) and only the rest of its
