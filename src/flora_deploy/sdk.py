@@ -794,15 +794,22 @@ def export_job(store: Store, job_id: str, out: str | os.PathLike[str], *,
                stages: Sequence[str] | None = None, allow_uncertified: bool = False,
                allow_fake: bool = False, include_videos: bool = False,
                push_to_hub: str | None = None, private: bool = True, hub_api: Any = None,
-               download: Any = None) -> Any:
+               download: Any = None, keep_local_paths: bool = False) -> Any:
     """``flora export --to lerobot`` (docs/export.md): ``export.lerobot.export_job``, then an
-    upload to the dataset repo ``push_to_hub`` (private unless ``private=False``)."""
+    upload to the dataset repo ``push_to_hub`` (private unless ``private=False``; refused when
+    the export names a local path). ``keep_local_paths`` records local paths in the export
+    (local use only: it cannot be combined with ``push_to_hub``)."""
     from flora_deploy.export.hub import push_to_hub as push
+    from flora_deploy.export.lerobot import ExportError
     from flora_deploy.export.lerobot import export_job as do_export
 
+    if keep_local_paths and push_to_hub:
+        raise ExportError("--keep-local-paths records this machine's paths in the export; it "
+                          "cannot be combined with --push-to-hub")
     report = do_export(store, job_id, out, config_hash=config_hash, source=source,
                        stages=stages, allow_uncertified=allow_uncertified,
-                       allow_fake=allow_fake, include_videos=include_videos, download=download)
+                       allow_fake=allow_fake, include_videos=include_videos, download=download,
+                       keep_local_paths=keep_local_paths)
     if push_to_hub:
         report.pushed = push(out, push_to_hub, private=private, api=hub_api)
     return report
