@@ -17,6 +17,10 @@ for the embodiment pools it measured. `flora certify` writes them (`validate/cer
   and per-GPU limits), NVIDIA and decode pins, derived-weight content digests, output-affecting
   modes, the logic version and the kind's certificate logic digest. Change any of these and it
   stops applying, so the stack must be re-certified.
+- **Frozen.** CI fails a change that makes a committed `certified` certificate stop matching
+  (`tests/unit/test_certificate_drift.py`). `freeze/<id>.json` is its freeze lock: the full key
+  document and per-module hashes, so the drift report names what changed. `flora certify`
+  writes it; `scripts/cert_freeze.py --lock` backfills it. See `docs/certificate-freeze.md`.
 - **Only `certified` unlocks a preset.** A `provisional` certificate (no noise run, too few
   samples, incomplete coverage or no L0) is shown by `flora plan`, but its stack still needs
   `allow_uncertified`. A `fail` certificate is never written here by default; if one is, and it

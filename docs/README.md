@@ -15,6 +15,7 @@ Start with the repository [`README.md`](../README.md) (users) or [`PLAN.md`](PLA
 | [`PLAN.md`](PLAN.md) | Build plan v4: architecture, decisions D1-D18, cost model, determinism, licensing, roadmap | contributor, maintainer |
 | [`output-format.md`](output-format.md) | Every field a finished job writes (JSONL, Parquet, `summary.json`, exclusions); checked against the code by a test | user, contributor |
 | [`certification.md`](certification.md) | How a `balanced` certificate is computed, what it binds to, and when it unlocks a preset | user, maintainer |
+| [`certificate-freeze.md`](certificate-freeze.md) | What a committed certificate freezes, how to tell whether a change affects it (the drift gate), and the re-certification workflow; with the current freeze listing | contributor, maintainer |
 | [`ci.md`](ci.md) | What each CI gate protects against, and how to run the gates locally | contributor |
 | [`wave-h-runbook.md`](wave-h-runbook.md) | The GPU session runbook: steps, caps, stop rules, spend accounting | maintainer |
 

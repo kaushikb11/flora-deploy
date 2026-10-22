@@ -12,6 +12,10 @@ Background:
 - So "faithful" can only mean: `balanced` diverges from `exact` no more than `exact` diverges from
   itself (archive/PLAN-v3.md §9, "Self-noise").
 
+Contributors: once a certificate is committed, the code its key covers is frozen. CI fails a
+change that makes a `certified` certificate stop matching. What is frozen, the drift report and
+the re-certification workflow: [`certificate-freeze.md`](certificate-freeze.md).
+
 Principle: a certificate is **derived from the records themselves** and **fails closed**.
 Anything that cannot be shown from the records refuses or downgrades the certificate.
 
@@ -280,5 +284,7 @@ flora certify -c flora.yaml --exact oracle/segment.jsonl --balanced bal/segment.
   --derived-content tempseg_merged=<sha256>
 ```
 
-It prints the verdict per stage, the failing checks and where each certificate was written. It
+It prints the verdict per stage, the failing checks and where each certificate was written. Next
+to each certificate it writes a freeze lock (`freeze/<id>.json`: the full key document and
+per-module hashes) for the drift report ([`certificate-freeze.md`](certificate-freeze.md)). It
 exits 1 if any stage fails or the records are refused (`certified: false`), 2 on bad input.
