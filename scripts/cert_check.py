@@ -1247,12 +1247,32 @@ def nv_reference(nv_root: Path | None):
     return ref if files and len(ref) else None
 
 
-def record_strings(run: Run) -> set[str]:
-    """Strings from the records that must never appear in what is published: captions, ids,
-    dataset names, source URIs, audit refs and NVIDIA's metadata and rationales. Short NVIDIA
-    metadata values ("fine", "none") are English words, so only those of 10+ characters count;
-    ids and captions count from 4 and 6 characters."""
+def record_ids(run: Run) -> set[str]:
+    """The run's private identifiers (4+ characters): every record's uid, the episode id inside
+    it (a uid is ``<data dir>--<episode id>``), its ``episode_id``, dataset, audit ref and
+    source URIs. The scan looks for these exactly **before** any hash allowance, so an episode
+    id made only of hex digits (or only of digits) is still found."""
     ids: set[str] = set()
+    for side in run.records.values():
+        for recs in side.values():
+            for r in recs.values():
+                uid = r.get("uid")
+                vals = [uid, r.get("episode_id"), r.get("dataset"), r.get("audit_ref")]
+                if isinstance(uid, str) and "--" in uid:
+                    vals.append(uid.rsplit("--", 1)[1])
+                for src in ((r.get("provenance") or {}).get("source") or {}).values():
+                    if isinstance(src, dict):
+                        vals.append(src.get("uri"))
+                ids |= {v for v in vals if isinstance(v, str) and len(v) >= 4}
+    return ids
+
+
+def record_strings(run: Run) -> set[str]:
+    """Strings from the records that must never appear in what is published: captions, ids
+    (:func:`record_ids`), dataset names, source URIs, audit refs and NVIDIA's metadata and
+    rationales. Short NVIDIA metadata values ("fine", "none") are English words, so only those
+    of 10+ characters count; ids and captions count from 4 and 6 characters."""
+    ids = record_ids(run)
     meta: set[str] = set()
 
     def walk(o: Any) -> None:
@@ -1268,12 +1288,6 @@ def record_strings(run: Run) -> set[str]:
     for side in run.records.values():
         for recs in side.values():
             for r in recs.values():
-                for k in ("uid", "episode_id", "dataset", "audit_ref"):
-                    if isinstance(r.get(k), str) and len(r[k]) >= 4:
-                        ids.add(r[k])
-                for src in ((r.get("provenance") or {}).get("source") or {}).values():
-                    if isinstance(src, dict) and isinstance(src.get("uri"), str):
-                        ids.add(src["uri"])
                 for seg in r.get("segments") or ():
                     cap = (seg.get("caption") or "").strip()
                     if len(cap) >= 6:
@@ -1323,12 +1337,36 @@ _SAFE = re.compile(r"^(cert_[0-9a-f]{32}|[0-9a-f]{12,64}|\d{4}-\d\d-\d\dT\d\d:\d
                    r"|flora-deploy [0-9][0-9A-Za-z.+\-]*|vllm-[0-9.]+-offline|[0-9.]+)\Z")
 
 
-def free_text(cert: Any, allowed: set[str]) -> list[str]:
-    """Paths of string fields (values, and keys outside our identifier shape) that are not ours."""
+# A hash-shaped string (hex digits or digits, maybe dot-separated): a record string of this
+# shape is matched as a whole token, never inside a longer hex or alphanumeric run (a sha256, a
+# cert key, a git sha), so it is found where it stands without flagging a hash that contains it.
+_HASHLIKE = re.compile(r"^[0-9a-f]+(?:\.[0-9a-f]+)*\Z")
+
+
+def _token(s: str) -> re.Pattern[str]:
+    """``s`` (lower case) standing alone: no letter, digit or ``_`` on either side, and not
+    inside a dotted number (``0.123456``, ``123456.5``)."""
+    return re.compile(r"(?<![a-z0-9_])(?<![0-9]\.)" + re.escape(s)
+                      + r"(?![a-z0-9_])(?!\.[0-9])")
+
+
+def free_text(cert: Any, allowed: set[str], ids: set[str]) -> list[str]:
+    """Paths of string fields (values, and keys outside our identifier shape) that are not ours.
+    A record id (``ids``, :func:`record_ids`) is never ours, even when it looks like a hash: it
+    is checked before the hash allowance."""
     out: list[str] = []
 
     def ok(s: str) -> bool:
-        return s in allowed or bool(_SAFE.match(s)) or bool(CACHE_ID.match(s))
+        if s in allowed:
+            return True
+        if s in ids:
+            return False
+        return bool(_SAFE.match(s)) or bool(CACHE_ID.match(s))
+
+    def key_ok(k: str) -> bool:
+        if k in ids and k not in allowed:
+            return False
+        return ok(k) or bool(re.fullmatch(r"[a-z][a-z0-9_]*", k))
 
     def walk(o: Any, path: str) -> None:
         if isinstance(o, str):
@@ -1336,7 +1374,7 @@ def free_text(cert: Any, allowed: set[str]) -> list[str]:
                 out.append(path)
         elif isinstance(o, dict):
             for k, v in o.items():
-                if not (ok(str(k)) or re.fullmatch(r"[a-z][a-z0-9_]*", str(k))):
+                if not key_ok(str(k)):
                     out.append(f"{path}.<key>")
                 walk(v, f"{path}.{k}")
         elif isinstance(o, list):
@@ -1347,17 +1385,22 @@ def free_text(cert: Any, allowed: set[str]) -> list[str]:
     return out
 
 
-def _leaks(text: str, forbidden: set[str], allowed: set[str]) -> int:
+def _leaks(text: str, forbidden: set[str], allowed: set[str], ids: set[str]) -> int:
+    """How many of ``forbidden`` and ``ids`` (:func:`record_ids`) occur in ``text``. A record
+    id is looked for first, whatever its shape; the hash allowance (:data:`_SAFE`) skips only
+    the other record strings. A hash-shaped string matches as a whole token (:func:`_token`)."""
     n = 0
     low = text.lower()
-    for s in forbidden:
-        if s in allowed or _SAFE.match(s):
+    for s in forbidden | ids:
+        if s in allowed or (s not in ids and _SAFE.match(s)):
             continue
-        if len(s) >= 8:
-            n += s.lower() in low
+        sl = s.lower()
+        if _HASHLIKE.match(sl):
+            n += bool(_token(sl).search(low))
+        elif len(s) >= 8:
+            n += sl in low
         else:
-            n += bool(re.search(r"(?<![a-z0-9_])" + re.escape(s.lower()) + r"(?![a-z0-9_])",
-                                low))
+            n += bool(re.search(r"(?<![a-z0-9_])" + re.escape(sl) + r"(?![a-z0-9_])", low))
     return n
 
 
@@ -1383,16 +1426,16 @@ def check_leakage(run: Run) -> list[Row]:
                 if (hit := ref.check(name + ".json", t)) is not None]
         rows.append(Row(C, "NVIDIA text (shingles)", FAIL if hits else PASS,
                         "; ".join(hits) or f"{len(texts)} files, {len(ref)} reference docs"))
-    forbidden = record_strings(run)
+    forbidden, ids = record_strings(run), record_ids(run)
     for stage, (_, cert) in sorted(run.certs.items()):
         allowed = our_strings(run, stage, cert)
-        free = free_text(cert, allowed)
+        free = free_text(cert, allowed, ids)
         rows.append(Row(C, f"{stage} certificate string fields", FAIL if free else PASS,
                         f"not ours: {free[:8]}" if free else "every string is ours"))
     base_allowed = set().union(*(our_strings(run, s, c) for s, (_, c) in run.certs.items())) \
         if run.certs else set()
     for name, text in texts.items():
-        n = _leaks(text, forbidden, base_allowed)
+        n = _leaks(text, forbidden, base_allowed, ids)
         rows.append(Row(C, f"{name}: record strings", FAIL if n else PASS,
                         f"{n} record string(s) found (captions, ids, metadata)" if n
                         else f"none of {len(forbidden)}"))

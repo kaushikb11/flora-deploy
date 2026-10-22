@@ -16,8 +16,10 @@ that rule adds (:data:`GAPS`), which is what the checker must say about such a c
 
 from __future__ import annotations
 
+import hashlib
 import json
 import random
+import re
 import sys
 from pathlib import Path
 
@@ -627,6 +629,113 @@ def test_free_text_in_certificate(fake):
     assert_fail(rows, "6 leakage | segment certificate string fields",
                 "6 leakage | caption certificate string fields",
                 "6 leakage | caption certificate: record strings")
+
+
+# A run whose episode ids are only hex digits (one only digits), which the hash allowance
+# (``cc._SAFE``) would otherwise let through: the private ids are found before it applies.
+HEX_IDS = (*(hashlib.sha256(f"private-{i}".encode()).hexdigest()[:16] for i in range(11)),
+           "202610229876")
+HEX_RUN = R.Options(episodes=HEX_IDS, noise=HEX_IDS[:6], flips=BASE.flips)
+
+
+@pytest.fixture(scope="module")
+def hex_base(tmp_path_factory):
+    return R.build(tmp_path_factory.mktemp("hex-run"), HEX_RUN, drift_runner=ok_runner)
+
+
+@pytest.fixture
+def hex_fake(hex_base, tmp_path):
+    return hex_base.clone(tmp_path / "run")
+
+
+def test_hex_ids_are_record_ids(hex_base):
+    ids = cc.record_ids(cc.load_run(hex_base.inp))
+    assert set(HEX_IDS) <= ids and {R.uid(e) for e in HEX_IDS} <= ids
+    assert all(cc._SAFE.match(e) for e in HEX_IDS)  # the shape the allowance skips
+
+
+def test_hex_id_run_scans_clean(hex_base):
+    """No false positive: its certificates carry sha256 digests of these uids, cert keys and
+    stage hashes, none of which is an episode id."""
+    rows = hex_base.run()
+    assert R.failing(rows) == GAPS, [(r.item, r.detail) for r in rows if r.status == cc.FAIL]
+    assert not {i for i in R.failing(rows) if i.startswith("6 leakage")}
+
+
+@pytest.mark.parametrize("eid", [HEX_IDS[2], HEX_IDS[-1], HEX_IDS[0].upper()])
+def test_hex_episode_id_in_report(hex_fake, eid):
+    with hex_fake.inp.report.open("a", encoding="utf-8") as fh:
+        fh.write(f"\nThe slowest episode was {eid}.\n")
+    assert_fail(rows_of(hex_fake), "6 leakage | report: record strings")
+
+
+def test_hex_episode_id_as_certificate_field(hex_fake):
+    hex_fake.edit_cert("segment", lambda c: c.update(slowest=HEX_IDS[3]))
+    hex_fake.edit_cert("caption", lambda c: c.update(by_episode={HEX_IDS[4]: 0.5}))
+    assert_fail(rows_of(hex_fake), "6 leakage | segment certificate string fields",
+                "6 leakage | segment certificate: record strings",
+                "6 leakage | caption certificate string fields",
+                "6 leakage | caption certificate: record strings")
+
+
+def test_hex_ids_match_whole_tokens_only():
+    eid, num = "3f9a0c4e7b21d58a", "202610229876"
+    ids = {eid, num, "a1b2c3d4"}
+    for text in (f"see {eid}.", f"`{eid}`", f"uid {eid}\n", f"{num} s", f"({num})"):
+        assert cc._leaks(text, set(), set(), ids) == 1, text
+    digest = hashlib.sha256(b"x").hexdigest()
+    for text in (f"sha256 00{eid}ff", f"cert_{eid}{'0' * 16}", f"{digest[:20]}{eid}",
+                 f"0.{num}", f"{num}.5 s", f"x{num}", "sha 00a1b2c3d4ff", f"{eid}_x"):
+        assert cc._leaks(text, set(), set(), ids) == 0, text
+    # the allowance still covers record strings that are not ids (NVIDIA metadata hashes)
+    assert cc._leaks(f"id {digest}", {digest}, set(), set()) == 0
+    assert cc._leaks(f"id {digest}", {digest}, set(), {digest}) == 1
+    assert cc.free_text({"a": eid, "b": digest, eid: 1}, set(), {eid}) == ["$.a", "$.<key>"]
+    assert cc.free_text({"a": eid}, set(), set()) == []  # without the denylist: the old gap
+
+
+def _committed_docs() -> list[Path]:
+    """Every committed Markdown/JSON/text doc and certificate (not ``reports/``)."""
+    import subprocess
+
+    out = subprocess.run(["git", "ls-files", "-z", "--", "*.md", "*.json", "*.txt"], cwd=ROOT,
+                         capture_output=True, check=True).stdout.decode()
+    keep = [ROOT / p for p in out.split("\0") if p and not p.startswith(
+        ("reports/", "research_notes/", "tests/"))]
+    return [p for p in keep if p.is_file()]
+
+
+def test_committed_docs_still_scan_clean():
+    """Regression: no hash in a committed doc or certificate (sha256 digests, cert keys, stage
+    hashes, git shas) trips the id scan, even for an id that is a piece of one of them; and the
+    certified plans' own ids (``<data dir>--<episode id>``, from the golden selections) are in
+    none of the files the scans read."""
+    import wave_h as wh
+
+    docs = _committed_docs()
+    assert any(p.name == "README.md" for p in docs) and len(docs) > 20
+    text = {p: p.read_text(encoding="utf-8", errors="replace") for p in docs}
+    pieces: set[str] = set()
+    for t in text.values():
+        for h in re.findall(r"(?<![0-9a-z])[0-9a-f]{12,64}(?![0-9a-z])", t.lower()):
+            pieces |= {h[1:], h[:-1], h[2:14]}  # proper pieces of each hash
+    pieces -= {h for t in text.values()
+               for h in re.findall(r"(?<![0-9a-z])[0-9a-f]{11,63}(?![0-9a-z])", t.lower())}
+    assert pieces
+    for p, t in text.items():
+        assert cc._leaks(t, set(), set(), pieces) == 0, p.relative_to(ROOT)
+    plan_ids: set[str] = set()
+    for emb in wh.CERT_SPECS:
+        spec = wh.spec_for(wh.CERTIFIED, emb)
+        for gid in spec.episodes:
+            eid = spec.local_id(gid)
+            plan_ids |= {eid, f"{spec.data_dir('balanced')}--{eid}"}
+    scanned = [ROOT / "README.md", *(ROOT / "docs" / n for n in (
+        "wave-h-report.md", "costs.md", "limitations.md", "cli.md")),
+        *sorted((ROOT / "src/flora_deploy/config/certificates").rglob("*.json"))]
+    for p in scanned:
+        if p.exists():
+            assert cc._leaks(p.read_text(encoding="utf-8"), set(), set(), plan_ids) == 0, p
 
 
 def test_nvidia_text_in_report(fake):
