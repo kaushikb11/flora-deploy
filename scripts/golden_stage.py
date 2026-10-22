@@ -17,7 +17,7 @@ is skipped.
 - every staged file is read back from the Volume: its size and sha256 equal the manifest's;
 - the manifest on the Volume equals the one the staging call returned (when there is one);
 - an episode the earlier version also staged (same selection entry): its files have the same
-  sha256 as there (``--compare golden/v1``, default for v2).
+  sha256 as there (``--compare golden/v1``, default for v2 and v3-yam).
 
 The manifest names private episodes and task text, so it is saved under the git-ignored
 ``reports/golden/`` only. The committed doc (``docs/golden-manifest-v2.md``) takes the numbers
@@ -104,7 +104,7 @@ def _earlier_file(before: Mapping[str, Any], ep: Mapping[str, Any], role: str) -
 
 
 def summary(manifest: Mapping[str, Any]) -> str:
-    """Numbers only, for docs/golden-manifest-v2.md."""
+    """Numbers only, for docs/golden-manifest-v2.md / -v3-yam.md."""
     from flora_deploy.validate.golden import profile_rows, summary_markdown
 
     lines = [summary_markdown(manifest), "",
@@ -133,7 +133,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--summary", action="store_true", help="print the numbers-only tables")
     ap.add_argument("--compare", default=None,
                     help="an earlier version whose shared episodes must be byte-identical "
-                         "(default for golden/v2: golden/v1)")
+                         "(default for golden/v2 and golden/v3-yam: golden/v1)")
     ap.add_argument("--only", default="", help="episode ids or dataset keys, comma-separated")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args(argv)
@@ -170,7 +170,7 @@ def main(argv: list[str] | None = None) -> int:
     if returned is not None and {k: v for k, v in returned.items() if k not in ("run",)} != {
             k: v for k, v in on_volume.items() if k != "run"}:
         problems.append("the manifest on the Volume differs from the one staging returned")
-    compare = args.compare or ("golden/v1" if args.version == "golden/v2" else None)
+    compare = args.compare or ("golden/v1" if args.version != "golden/v1" else None)
     earlier = (json.loads(read_volume(f"{prefix_for(compare)}/{MANIFEST_NAME}"))
                if compare else None)
     problems += verify(on_volume, earlier=earlier)
