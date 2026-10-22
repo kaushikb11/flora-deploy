@@ -43,6 +43,20 @@ jobs:
         run: uv lock --check
       - name: Install (dev group only, no torch)
         run: uv sync --group dev
+      # First gate after install, so a drift report is the first failure a PR shows: in the log,
+      # as ::error annotations and in the step summary (the key-document diff and the choice:
+      # revert or re-certify). CPU only; NVIDIA pins enter the key as hashes (certificate-freeze.md).
+      - name: "Gate: certificate drift (committed certificates still match the code)"
+        run: |
+          set +e
+          uv run python scripts/cert_freeze.py --check --github
+          code=$?
+          set -e
+          if [ "$code" -ne 0 ]; then
+            uv run python scripts/cert_freeze.py --check --markdown >> "$GITHUB_STEP_SUMMARY" || true
+            exit "$code"
+          fi
+          uv run pytest -q -p no:cacheprovider tests/unit/test_certificate_drift.py
       - name: "Gate: ruff"
         run: uv run ruff check .
       - name: "Gate: license guard (no NVIDIA code/prompts/weights tracked)"
