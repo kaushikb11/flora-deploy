@@ -135,7 +135,7 @@ the `balanced-only` dry run:
 |---|---|---|---|---|---|
 | 0 | TempSeg merger v2 build + equivalence, then stop for the pin | CPU + L40S | $0.75 | $0.23 | $0.72 |
 | a | balanced preflight: derived dirs, receipts, EOS ids | CPU | $0.05 | $0.00 | $0.01 |
-| d | `preset: balanced` (`allow_uncertified: true`) via `flora deploy`/`flora run`, one app, cold compile | L40S + H100 | $2.30 | $1.27 | $2.28 |
+| d | `preset: balanced` (`allow_uncertified: true`) via `flora deploy`/`flora run`, one app, cold compile | L40S + H100 | $2.35 | $1.27 | $2.28 |
 | d2 | `lab`: only against (d)'s finished job, the lab's L0 + Gate A on 6 captured requests (two cold compiles per call) | L40S, then H100 | $2.35 | $1.74 | $2.31 |
 | b | exact oracle | deferred to the certified run | | | |
 | e | offline provisional certification | deferred to the certified run | | | |

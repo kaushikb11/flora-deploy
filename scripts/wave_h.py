@@ -431,7 +431,7 @@ def spec_for(plan: str, embodiment: str = EMBODIMENT) -> PlanSpec:
 # full plan's upper total does not fit (the dry run says so, and the stop rule refuses the first
 # step whose upper projection no longer fits the cap left). Raising a cap is the user's decision.
 DURATION_HEADROOM = 0.10
-CAPS_USD = {"tempseg": 0.75, "preflight": 0.05, "exact_e2e": 3.30, "balanced": 2.30,
+CAPS_USD = {"tempseg": 0.75, "preflight": 0.05, "exact_e2e": 3.30, "balanced": 2.35,
             "lab": 2.35, "certify": 0.0, "noise": 3.30}
 GLOBAL_CAP_USD = 6.50  # --plan full; balanced-only derives its own (plan_global_cap)
 # The most --global-cap may approve: the project's whole GPU budget (review 12 F7: ``inf`` once
