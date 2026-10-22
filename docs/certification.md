@@ -72,7 +72,7 @@ Terms used below:
 | `--exact` | `exact` records of the oracle run (JSONL, `flora_labels_v1`) | yes |
 | `--balanced` | the candidate stack's records on the same episodes | yes |
 | `--noise` | the oracle run **repeated** on some of its episodes: same stage hash, key, GPU and determinism mode. `exact` vs `noise` is the noise floor. Noise episodes the oracle did not label are dropped (`metrics.noise.unpaired`), so a spare fills in | no (without it: `provisional`) |
-| `--witness` | the **cold witness**: candidate records from one container forced cold (`FLORA_COMPILE_CACHE=off`), the same stack, on some of the oracle's episodes. Checked against the same thresholds as the candidate ("Warm and cold compiles") | no |
+| `--witness` | the **cold witness**: candidate records from one container forced cold (`FLORA_COMPILE_CACHE=off`), the same stack, on some of the oracle's episodes. Its means are held to the same thresholds as the candidate's on their own; its subtask-count flips are counted together with the candidate's ("Pass rule", "Warm and cold compiles") | no |
 | `--l0` | `modal_app/balanced_lab.py` result JSON (L0 rows, Gate A and `engine_hashes`, the `certkey.engine_settings_hash` of each engine it built), one per model kind. A lab whose baseline engine hash is not the candidate's engine settings is stale (`stale_l0`) | no (without it, or stale, video stages are `provisional`) |
 | `--config` / `-c` | the candidate run's `flora.yaml`: preset, pool GPUs, output-affecting modes, embodiment | default `flora.yaml` |
 | `--derived-content NAME=SHA256` | content digest of each derived weight the kind needs (`tempseg_merged`, `captioner_bf16`): `flora prepare`'s `content_digest(receipt)`, the value `DerivedPin.content_sha256` pins | yes for `segment`/`caption` |
@@ -190,6 +190,27 @@ mean of m(exact, balanced)  <=  min(cap_m, max(absolute_floor_m, tolerance x max
 over every paired episode; for `segment` and `caption` every other metric is averaged over the
 episodes whose subtask counts agree (`count_matched`). The same rule gives `noise_m`.
 
+**Count flips are counted over the union.** For `segment` and `caption`, the `count_mismatch`
+check is not made per group but once (`class: union`), over the candidate's episodes and the
+cold witness's together: each witness episode is a sample of its own (the same episode, run in
+another container). It passes while
+
+```
+flips  <=  round_half_up(threshold_count_mismatch x n)        (certkey.count_flips_allowed)
+```
+
+with `n` the candidate's plus the witness's paired episodes. **Rounding:** half up, so "about
+one episode in ten" means the nearest whole episode: at 0.10, 1 flip of 10-14, 2 of 15-24.
+**2 flips in 18** (12 candidate + 6 witness, 11.1%) **pass**, 3 in 18 fail, and 2 in 14 fail.
+Without a witness the union is the candidate alone (1 in 12 passes, 2 in 12 fail). Judged per
+group, one flip among the witness's 6 episodes (17%) would fail a certificate that one flip in
+18 does not. The witness's **other** means (boundary error, IoU divergence, label disagreement,
+caption mismatch and edit distance) are still checked **on their own** against the same
+thresholds (`class: cold-witness`), so a systematically broken cold path fails even with no
+flip. `metrics.count_flips` records the per-group figures (`groups: {<pool>, cold-witness}:
+{n, flips}`) and the union's (`{n, flips, rate, threshold, allowed}`); matching recomputes the
+union from them (`certkey.policy_problems`).
+
 **Why.** With zero measured noise (H200 repeats give one
 distinct text) the floors decide, and `1.5 x 0.05 = 7.5%` made a single count flip in 12
 episodes (`1/12 = 8.3%`) a `fail` for a correct but different engine (vLLM BF16 on L40S/H100 vs
@@ -198,8 +219,9 @@ extra interval leaves slots unmatched, and its captions follow), so those were f
 way. The rule now allows **up to about one episode in ten** to differ in subtask count
 (`absolute_floor` 0.10: 1 in 12 passes, 2 in 12 fail), bounds those episodes by that check
 alone, and keeps the **tight floors** below for the means over the episodes that agree. It stays
-fail-closed for real regressions: two count flips in 12, or a boundary error mean over 0.15 s
-with every count equal, fail.
+fail-closed for real regressions: three count flips in the 18 episodes of the certified run (two
+in 12 without a witness), or a boundary error mean over 0.15 s with every count equal, in the
+candidate or in the witness, fail.
 
 ### Policy (`certkey.POLICY`)
 
@@ -333,10 +355,10 @@ certificate is written only with an explicit `--out-dir`.
 | `engine`, `modes`, `logic`, `pins`, `derived_weights` | from the key: engine name, versions, image and fingerprint, patches and vLLM spec; output-affecting modes; logic version and certificate logic digest; NVIDIA pin revisions; derived-weight content digests |
 | `oracle` | the oracle's `stage_hash`, `engine_spec_hash`, normalized `gpu` and `determinism` mode |
 | `episodes` | `{count, digest, uid_sha256: [...]}`: sha256 of each episode uid, never the uid |
-| `metrics` | per pool `{n, count_matched, means}`; noise and witness `{n, means, unpaired, episodes: {count, digest}}`; `coverage`; `missing`; the similarity hook's name |
+| `metrics` | per pool `{n, count_matched, means}`; noise and witness `{n, means, unpaired, episodes: {count, digest}}`; `count_flips` (`segment`/`caption`): per group `{n, flips}` and over the union `{n, flips, rate, threshold, allowed}`; `coverage`; `missing`; the similarity hook's name |
 | `thresholds` | the knobs, `noise_floor`, `absolute_floor`, and per metric `{slack, floor, absolute_floor, cap, over, threshold}` |
 | `preemptions`, `compile_cache` | `segment`/`caption`: candidate and witness records whose engine preempted / could not say; the compile caches the candidate and the witness ran, and what the evidence `covers` |
-| `checks` | `[{class, metric, value, threshold, pass}]` (`class` is the pool) |
+| `checks` | `[{class, metric, value, threshold, pass}]` (`class` is the pool, `cold-witness`, or `union` for the one `count_mismatch` check, which also carries `flips`, `n` and `allowed`) |
 | `l0`, `gate_a` | L0 status and counts; Gate A summary numbers |
 
 **Metrics only.** No caption, prompt, rationale, metadata, episode id or dataset name ever enters

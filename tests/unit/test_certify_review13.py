@@ -222,7 +222,7 @@ def test_certificate_states_the_compile_caches_its_evidence_covers():
                                   "witness": {"cold:forced": 6},
                                   "covers": sorted(["cold", "cold:forced", warm])}
     assert c["metrics"]["witness"]["n"] == 6
-    assert {ch["class"] for ch in c["checks"]} == {"yam", "cold-witness"}
+    assert {ch["class"] for ch in c["checks"]} == {"yam", "cold-witness", "union"}
     assert certkey.policy_problems(c) == []
 
 

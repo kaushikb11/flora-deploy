@@ -53,6 +53,13 @@ def current_doc(kind="segment", gpu="L40S", preset="balanced", **kw):
     return K.key_document(preset, kind, gpu, **kw)
 
 
+def no_flips(pools):
+    """``metrics.count_flips`` for 12 candidate episodes per pool, none differing in count."""
+    return {"groups": {p: {"n": 12, "flips": 0} for p in pools},
+            "union": {"n": 12 * len(pools), "flips": 0, "rate": 0.0, "threshold": 0.1,
+                      "allowed": K.count_flips_allowed(0.1, 12 * len(pools))}}
+
+
 def make_cert(doc, *, verdict="certified", gpu="L40S", pools=("human",), stamp=STAMP,
               preset=None, kind=None, tolerance=1.5):
     """A certificate body for ``doc`` that passes ``certkey.policy_problems`` (when certified)."""
@@ -74,7 +81,8 @@ def make_cert(doc, *, verdict="certified", gpu="L40S", pools=("human",), stamp=S
         "pins": {k: v["revision"] for k, v in sorted(doc["nvidia_pins"].items())},
         "derived_weights": dict(doc["derived_weights"]),
         "metrics": {"candidate": {p: {"n": 12, "means": zeros} for p in pools},
-                    "noise": {"n": 5, "means": zeros}, "coverage": 1.0, "missing": 0},
+                    "noise": {"n": 5, "means": zeros}, "coverage": 1.0, "missing": 0,
+                    "count_flips": no_flips(pools)},
         "thresholds": {"tolerance": tolerance, "min_samples": 10, "min_noise_samples": 5,
                        "max_missing": K.MAX_MISSING, "slack": {},
                        "noise_floor": {m: K.NOISE_FLOOR[m] for m in SEG_METRICS},
@@ -308,6 +316,7 @@ def test_orphan_certificates(tmp_path, change, needle):
     body = {**make_cert(doc), **change}
     body["metrics"]["candidate"] = {p: {"n": 12, "means": dict.fromkeys(SEG_METRICS, 0.0)}
                                     for p in body["covered_pools"]}
+    body["metrics"]["count_flips"] = no_flips(body["covered_pools"])
     body["id"] = K.certificate_id(body)
     commit(tmp_path, body)
     (f,) = errors(F.check(tmp_path))
