@@ -7,14 +7,27 @@ Usage::
     uv run python scripts/wave_h.py --yes-spend            # run (resumes: skips done steps)
     uv run python scripts/wave_h.py --yes-spend --only balanced
     uv run python scripts/wave_h.py --report               # rewrite reports/wave-h/runbook.md
-    uv run python scripts/wave_h.py --plan full --dry-run  # the later certified run
+    uv run python scripts/wave_h.py --plan full --dry-run  # every v1 step (cannot certify)
+    uv run python scripts/wave_h.py --plan certified --dry-run  # the certified run (golden/v2)
 
 **Plans** (``--plan``, :data:`PLANS`). ``balanced-only`` (the default; the user's decision of
 2026-10-22) runs steps 0 -> a -> d and nothing else; (b), (e) and (f) are listed as "deferred to
 the certified run" and never run. Its global cap is the sum of those three steps' upper
 projections rounded up to $0.10 (:func:`plan_global_cap`). ``full`` runs every step under
 :data:`GLOBAL_CAP_USD`. Both share the state file, so a later ``--plan full`` skips what
-``balanced-only`` finished.
+``balanced-only`` finished. ``full`` cannot certify: it stages one data dir per step, so its
+oracle's and balanced's episode uids (``<data dir>--<episode id>``) never pair.
+
+``certified`` (:class:`PlanSpec`, ``docs/wave-h-runbook.md`` "The certified run") makes
+``balanced`` certified for ``human``: b (exact oracle on the 12 golden/v2 episodes, default
+mode, H200) -> f (noise: 5 of them, the oracle's own config and data dir re-indexed with
+``flora index --limit 5``, so the same stage hash) -> d (balanced on the 12, the real ``flora
+deploy`` / ``flora run``) -> d2 (the lab, skipped when its evidence already exists:
+:func:`lab_already_done`) -> e (``flora certify`` per stage, then ``wave_h_finalize.py
+--write`` when both are ``certified``: :func:`run_flora_certify`). Every job stages one data
+dir (:data:`CERT_DATA`). Its caps are each step's upper projection rounded up to $0.05
+(:func:`plan_caps`), its global cap their sum rounded up to $0.10; its state, work dir and
+records live under ``reports/wave-h/certified/``.
 
 Six ``human`` golden episodes (:data:`EPISODES`, ``docs/golden-manifest-v1.md``), one job and one
 app per stage. Steps, in order (each with a projected-spend stop rule before it and a spend
@@ -137,9 +150,93 @@ NOISE_EPISODES = EPISODES  # (f) repeats the oracle job: all of its episodes
 PLANS: dict[str, tuple[str, ...]] = {
     "balanced-only": ("tempseg", "preflight", "balanced", "lab"),
     "full": ("tempseg", "preflight", "exact_e2e", "balanced", "lab", "certify", "noise"),
+    # The certified run (module docstring): b -> f -> d -> (d2, skipped when done) -> e.
+    "certified": ("exact_e2e", "noise", "balanced", "lab", "certify"),
 }
 DEFAULT_PLAN = "balanced-only"
 DEFERRED_NOTE = "deferred to the certified run"
+CERTIFIED = "certified"
+# --- The certified plan (golden/v2, docs/golden-manifest-v2.md) -------------------------------
+CERT_ROOT = ROOT / "reports" / "wave-h" / "certified"  # its own state, work dir and records
+CERT_GOLDEN = "golden/v2"
+CERT_DATA = "cert-human"  # ONE data dir for the oracle, noise and balanced jobs (see CertSpec)
+NOISE_PREFIX, REST_PREFIX = "n-", "x-"  # local id prefixes: the noise episodes sort first
+MIN_CERT_EPISODES = 10  # certkey.POLICY min_samples (per pool)
+MIN_NOISE_EPISODES = 5  # certkey.POLICY min_noise_samples
+
+
+def golden_selection(version: str) -> dict[str, Any]:
+    """``validate/golden_selection_<v>.json`` (package data)."""
+    from flora_deploy.validate.golden import SELECTIONS, load_selection
+
+    return load_selection(SELECTIONS[version])
+
+
+def _cert_sets() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    sel = golden_selection(CERT_GOLDEN)
+    eps = tuple(f"{e['pool']}/{e['dataset']}/{e['slug']}" for e in sel["episodes"]
+                if e["pool"] == EMBODIMENT)
+    return eps, tuple(sel.get("noise_subset") or ())
+
+
+# All 12 golden/v2 human episodes (10 for the certificate + 2 spares, all run), and the 5 the
+# noise job repeats (the selection's ``noise_subset``: one VFR HomER row and four EgoDex clips).
+CERT_EPISODES, CERT_NOISE = _cert_sets()
+
+
+@dataclass(frozen=True)
+class PlanSpec:
+    """What a plan runs on and where it keeps its state. ``balanced-only`` / ``full``: the six
+    golden/v1 episodes, ``reports/wave-h/``. ``certified``: golden/v2 and
+    ``reports/wave-h/certified/`` (its own state, so it never inherits the v1 jobs; the lab
+    evidence in ``reports/wave-h/balanced-<kind>.json`` is shared)."""
+
+    name: str
+    golden: str
+    episodes: tuple[str, ...]
+    noise: tuple[str, ...]
+    state: Path
+    work: Path
+    records: Path | None  # None: the module's RECORDS / REPORT (read when used)
+    report: Path | None
+    # certified: every job stages ONE data dir (CERT_DATA), so the oracle's, the noise run's and
+    # balanced's episode uids (``<data dir>--<episode id>``) are the same and `flora certify`
+    # can pair them. (``full`` stages one dir per step: its uids never pair; see the runbook.)
+    shared_data: bool = False
+
+    def local_id(self, gid: str) -> str:
+        """The episode id a job sees (the ``mp4_dir`` file stem). Certified: the noise episodes
+        get :data:`NOISE_PREFIX`, the rest :data:`REST_PREFIX`, so ``flora index --limit 5``
+        on the oracle's own config and data dir indexes exactly the noise subset."""
+        if not self.shared_data:
+            return h0.episode_id(gid)
+        return (NOISE_PREFIX if gid in self.noise else REST_PREFIX) + h0.episode_id(gid)
+
+    def data_dir(self, step: str) -> str:
+        return CERT_DATA if self.shared_data else f"{step}-{JOB}"
+
+    @property
+    def lab_episodes(self) -> tuple[str, ...]:
+        """The episodes the lab (d2) captures its requests on. Certified: the golden/v1 six
+        (all in golden/v2), so :data:`LAB_WORK_S` and the lab deadlines, measured on them,
+        still hold; L0 is per model kind, not per episode."""
+        return EPISODES if self.shared_data else self.episodes
+
+    @property
+    def noise_limit(self) -> int | None:
+        """``flora index --limit`` for the noise job (None: all of the oracle's episodes)."""
+        return len(self.noise) if self.shared_data and self.noise != self.episodes else None
+
+
+_V1 = {"golden": "golden/v1", "episodes": EPISODES, "noise": NOISE_EPISODES, "state": STATE,
+       "work": ROOT / "reports" / "wave-h" / "work", "records": None, "report": None}
+SPECS: dict[str, PlanSpec] = {
+    "balanced-only": PlanSpec("balanced-only", **_V1),
+    "full": PlanSpec("full", **_V1),
+    CERTIFIED: PlanSpec(CERTIFIED, CERT_GOLDEN, CERT_EPISODES, CERT_NOISE,
+                        CERT_ROOT / "state.json", CERT_ROOT / "work", CERT_ROOT / "records",
+                        CERT_ROOT / "runbook.md", shared_data=True),
+}
 # Per-step caps (USD): each step's upper projection, priced on the golden selection's expected
 # durations x (1 + DURATION_HEADROOM) (the staged human files run ~5% longer in all), rounded up
 # to 5 cents (``honest_caps``), on the shipped ``planner/rates.json`` (the balanced rows measured
@@ -268,24 +365,23 @@ def durations(manifest: Mapping[str, Any]) -> dict[str, float]:
     return {e["id"]: float(e["duration_s"]) for e in manifest["episodes"]}
 
 
-def episodes_in(manifest: Mapping[str, Any]) -> tuple[str, ...]:
-    """The :data:`EPISODES` the manifest has staged (all six, per golden-manifest-v1)."""
+def episodes_in(manifest: Mapping[str, Any], episodes: Sequence[str] = EPISODES
+                ) -> tuple[str, ...]:
+    """The ``episodes`` (default :data:`EPISODES`) the manifest has staged."""
     have = durations(manifest)
-    return tuple(e for e in EPISODES if e in have)
+    return tuple(e for e in episodes if e in have)
 
 
-def missing_episodes(manifest: Mapping[str, Any]) -> tuple[str, ...]:
+def missing_episodes(manifest: Mapping[str, Any], episodes: Sequence[str] = EPISODES
+                     ) -> tuple[str, ...]:
     have = durations(manifest)
-    return tuple(e for e in EPISODES if e not in have)
+    return tuple(e for e in episodes if e not in have)
 
 
-def offline_manifest(headroom: float = 0.0) -> dict[str, Any]:
-    """The golden selection's expected durations (``validate/golden_selection_v1.json``) as a
+def offline_manifest(headroom: float = 0.0, version: str = "golden/v1") -> dict[str, Any]:
+    """The golden selection's expected durations (``validate/golden_selection_<v>.json``) as a
     manifest, for a dry run that reads no Volume; ``headroom`` scales them up."""
-    from importlib import resources
-
-    sel = json.loads((resources.files("flora_deploy.validate")
-                      / "golden_selection_v1.json").read_text())
+    sel = golden_selection(version)
     eps = []
     for e in sel["episodes"]:
         gid = f"{e['pool']}/{e['dataset']}/{e['slug']}"
@@ -364,13 +460,17 @@ def balanced_job_seconds(video_s: float, table: Any = None, *,
     return out
 
 
-def project(step: str, manifest: Mapping[str, Any], *, reuse: Iterable[str] = ()
-            ) -> Projection:
+def project(step: str, manifest: Mapping[str, Any], spec: PlanSpec | None = None, *,
+            reuse: Iterable[str] = (), lab_done: bool = False) -> Projection:
     """What ``step`` is expected to cost (nominal rates; ``usd_upper``: upper quantiles plus
-    every cold start, scale-down tail and client slack the step can incur). ``reuse``: lab
-    kinds whose saved result is reused (:func:`lab_reuse`), priced at $0."""
+    every cold start, scale-down tail and client slack the step can incur). ``spec``: the
+    plan's episodes (default: the golden/v1 six). ``reuse``: lab kinds whose saved result is
+    reused (:func:`lab_reuse`), priced at $0. ``lab_done`` (certified plan): the lab's L0 +
+    Gate A evidence already exists (:func:`lab_already_done`), so the step starts nothing: $0
+    (and the global cap leaves it out: the step never runs)."""
+    spec = spec or SPECS[DEFAULT_PLAN]
     dur = durations(manifest)
-    eps = episodes_in(manifest)
+    eps = episodes_in(manifest, spec.episodes)
     v = sum(dur[i] for i in eps)
     p = Projection(step)
     if step == "tempseg":
@@ -395,6 +495,9 @@ def project(step: str, manifest: Mapping[str, Any], *, reuse: Iterable[str] = ()
         p.add(f"balanced caption {JOB} ({len(eps)} ep, {v:.1f} s, cold compile)", cap,
               secs["caption"][0], upper_s=secs["caption"][1])
         p.peak_usd_per_s = seg.usd_per_s() + cap.usd_per_s()
+    elif step == "lab" and lab_done:
+        p.add("balanced lab: L0 + Gate A already done (evidence present): skipped",
+              LAB["tempseg"], 0.0)
     elif step == "lab":
         reuse = set(reuse)
         full = 0.0
@@ -411,9 +514,10 @@ def project(step: str, manifest: Mapping[str, Any], *, reuse: Iterable[str] = ()
         if reuse:
             p.cap_usd_upper = round(full, 4)
     elif step == "noise":
-        nv = sum(dur[i] for i in NOISE_EPISODES if i in dur)
+        neps = [i for i in spec.noise if i in dur]
+        nv = sum(dur[i] for i in neps)
         nominal, upper = exact_job_seconds(nv)
-        p.add(f"segcap {NOISE_JOB} repeat ({len(eps)} ep, {nv:.1f} s, cold start)",
+        p.add(f"segcap {NOISE_JOB} repeat ({len(neps)} ep, {nv:.1f} s, cold start)",
               pool_container("segcap"), nominal, upper_s=upper)
         p.peak_usd_per_s = pool_container("segcap").usd_per_s()
     elif step == "certify":
@@ -481,6 +585,71 @@ def honest_caps(projections: Mapping[str, Projection]) -> dict[str, float]:
     return out
 
 
+def plan_caps(plan: str, projections: Mapping[str, Projection]) -> dict[str, float]:
+    """Per-step caps (USD). ``certified``: each step's own upper projection (measured rates on
+    the golden/v2 durations) rounded up to 5 cents (:func:`honest_caps`), so the stop rule
+    before a step is its upper price and nothing more. Other plans: :data:`CAPS_USD`."""
+    if plan != CERTIFIED:
+        return dict(CAPS_USD)
+    honest = honest_caps({s: projections[s] for s in PLANS[plan]})
+    return {**CAPS_USD, **{s: honest[s] for s in PLANS[plan]}}
+
+
+def plan_projections(plan: str, manifest: Mapping[str, Any], *, lab_done: bool = False,
+                     reuse: Iterable[str] = ()) -> dict[str, Projection]:
+    """Every step's projection on the plan's episodes (``lab_done`` only applies to
+    ``certified``: the other plans run their lab; ``reuse``: :func:`lab_reuse`)."""
+    spec = SPECS[plan]
+    return {s: project(s, manifest, spec, lab_done=lab_done and plan == CERTIFIED,
+                       reuse=reuse if s == "lab" else ()) for s in STEPS}
+
+
+def lab_already_done(lab_dir: Path | None = None) -> tuple[bool, str]:
+    """Whether the lab's L0 + Gate A evidence exists (``balanced-<kind>.json``, as step d2 or
+    ``--only lab`` writes it): per kind non-empty L0 rows, every one with equal ids and grids,
+    Gate A over at least one request, measured on the balanced pool's GPU. The certificate
+    takes L0 per model kind, not per episode (``validate.certify.l0_summary``), so the
+    certified run reuses it instead of paying two cold compiles per kind again."""
+    from flora_deploy.engines.offline_llm import EngineArgsError, normalize_gpu
+
+    lab_dir = lab_dir or LAB_OUT
+    pool = {"tempseg": "segment", "captioner": "caption"}
+    why = []
+    for kind, stage in pool.items():
+        p = lab_dir / f"balanced-{kind}.json"
+        try:
+            res = json.loads(p.read_text())
+        except (OSError, ValueError):
+            why.append(f"{kind}: no {p.name}")
+            continue
+        if not isinstance(res, dict):
+            why.append(f"{kind}: unreadable {p.name}")
+            continue
+        base = res.get("baseline") or {}
+        rows = base.get("l0") or []
+        gate = res.get("gate_a") or {}
+        err = (res.get("error") or base.get("error") or (res.get("dtbias") or {}).get("error")
+               or ("no_evidence" if res.get("no_evidence") else None))
+        if err:
+            why.append(f"{kind}: error {str(err)[:80]}")
+        if not rows:
+            why.append(f"{kind}: no L0 rows")
+        elif not all(r.get("ids_equal") is True and r.get("grid_equal") is True for r in rows):
+            why.append(f"{kind}: L0 not passing")
+        if not gate.get("requests"):
+            why.append(f"{kind}: no Gate A requests")
+        gpu = base.get("gpu") or res.get("gpu")
+        want = pool_container(stage, "balanced").gpu or ""
+        try:
+            if gpu and normalize_gpu(str(gpu)) != normalize_gpu(want):
+                why.append(f"{kind}: measured on {gpu}, not {want}")
+        except EngineArgsError:
+            why.append(f"{kind}: unknown GPU {gpu!r}")
+    if why:
+        return False, "; ".join(why)
+    return True, f"L0 + Gate A evidence in {lab_dir}/balanced-{{tempseg,captioner}}.json"
+
+
 # ---------------------------------------------------------------------------------------------
 # State and stop rules
 
@@ -493,6 +662,17 @@ TITLES = {"tempseg": "0. TempSeg merger v2 build + equivalence (CPU + L40S), the
           "lab": "d2. balanced lab L0 / Gate A on (d)'s job (L40S, then H100)",
           "certify": "e. offline provisional certification",
           "noise": "f. noise: oracle job repeated, default mode, H200"}
+CERT_TITLES = {**TITLES,
+               "exact_e2e": f"b. exact oracle, {len(CERT_EPISODES)} human episodes (golden/v2), "
+                            "nvidia mode, H200",
+               "noise": f"f. noise: {len(CERT_NOISE)} of (b)'s episodes, same config/GPU/mode",
+               "balanced": f"d. balanced via flora deploy/run, {len(CERT_EPISODES)} episodes",
+               "lab": "d2. lab L0 / Gate A (skipped when already done)",
+               "certify": "e. flora certify, then wave_h_finalize.py"}
+
+
+def titles(plan: str) -> dict[str, str]:
+    return CERT_TITLES if plan == CERTIFIED else TITLES
 
 
 @dataclass
@@ -575,6 +755,7 @@ class State:
     # wave_h_finalize.py reports; review 12 F6)
     gate_cap: float | None = None
     gate_cap_plan: str | None = None
+    plan: str | None = None  # the plan this state was run under (wave_h_finalize.py reads it)
 
     def step(self, name: str) -> StepState:
         return self.steps.setdefault(name, StepState())
@@ -607,6 +788,7 @@ class State:
                 "billed_total": self.billed_total, "billed_at": self.billed_at,
                 "cap_override": self.cap_override, "cap_override_plan": self.cap_override_plan,
                 "gate_cap": self.gate_cap, "gate_cap_plan": self.gate_cap_plan,
+                "plan": self.plan,
                 "steps": {k: asdict(v) for k, v in self.steps.items()}}
 
     @classmethod
@@ -624,7 +806,7 @@ class State:
         return cls(d["run_id"], d["created"], d["billing_since"],
                    dict(d.get("billing_baseline", {})), steps, d.get("billed_total"),
                    d.get("billed_at"), d.get("cap_override"), d.get("cap_override_plan"),
-                   d.get("gate_cap"), d.get("gate_cap_plan"))
+                   d.get("gate_cap"), d.get("gate_cap_plan"), d.get("plan"))
 
     def mark_killed(self) -> list[str]:
         """Attempts left ``running`` by a killed process: ``killed`` (charged their budget
@@ -922,9 +1104,10 @@ def job_record(report: Mapping[str, Any], *, stopped_at: float | None = None
             "containers": clip_containers(sp.get("containers") or [], stopped_at)}
 
 
-def record_paths(side: str, job: str = JOB) -> dict[str, str]:
-    """Where ``wave_h_finalize.py --fetch`` exports a job's records (its ``record_path``)."""
-    return {stage: str(RECORDS / side / job / f"{stage}.jsonl")
+def record_paths(side: str, job: str = JOB, root: Path | None = None) -> dict[str, str]:
+    """Where ``wave_h_finalize.py --fetch`` exports a job's records (its ``record_path``);
+    ``root``: the plan's records directory (default :data:`RECORDS`)."""
+    return {stage: str((root or RECORDS) / side / job / f"{stage}.jsonl")
             for stage in ("segment", "caption")}
 
 
@@ -941,10 +1124,19 @@ class Ctx:
     state_path: Path = STATE
     step: str = ""
     global_cap: float = GLOBAL_CAP_USD  # the plan's (plan_global_cap)
+    spec: PlanSpec = field(default_factory=lambda: SPECS[DEFAULT_PLAN])
+    caps: dict[str, float] = field(default_factory=lambda: dict(CAPS_USD))  # plan_caps
 
     @property
     def episodes(self) -> tuple[str, ...]:
-        return episodes_in(self.manifest)
+        return episodes_in(self.manifest, self.spec.episodes)
+
+    def deadline_s(self, step: str, c: Container | float, **kw: Any) -> float:
+        return gpu_deadline_s(self.st, step, c, caps=self.caps, global_cap=self.global_cap,
+                              **kw)
+
+    def budget(self, step: str, **kw: Any) -> float:
+        return step_budget(self.st, step, caps=self.caps, global_cap=self.global_cap, **kw)
 
     def sh(self, args: list[str], *, timeout: float = 1800, check: bool = True):
         return h0.sh(args, cwd=self.work, timeout=timeout, check=check,
@@ -1090,8 +1282,7 @@ def run_tempseg(ctx: Ctx) -> dict[str, Any]:
     ctx.note_app(TEMPSEG_APP)
     out: dict[str, Any] = {"apps": [TEMPSEG_APP], "built": True}
     rdir = ctx.work
-    limit = min(MERGE_MAX_S, gpu_deadline_s(ctx.st, "tempseg", MERGE, slack_s=LAB_SLACK_S,
-                                            global_cap=ctx.global_cap))
+    limit = min(MERGE_MAX_S, ctx.deadline_s("tempseg", MERGE, slack_s=LAB_SLACK_S))
     if limit < 120:
         return {**out, "ok": False, "error": f"budget left allows {limit:.0f} s",
                 "tracked_usd": 0.0}
@@ -1102,8 +1293,8 @@ def run_tempseg(ctx: Ctx) -> dict[str, Any]:
                     "receipt": (merge or {}).get("receipt_sha256")}
     if err:
         return {**out, "ok": False, "error": f"merge: {err}", "tracked_usd": spent}
-    limit = min(EQUIV_MAX_S, gpu_deadline_s(ctx.st, "tempseg", EQUIV, spent_in_step=spent,
-                                            slack_s=LAB_SLACK_S, global_cap=ctx.global_cap))
+    limit = min(EQUIV_MAX_S, ctx.deadline_s("tempseg", EQUIV, spent_in_step=spent,
+                                            slack_s=LAB_SLACK_S))
     if limit < 120:
         return {**out, "ok": False, "error": f"budget left allows {limit:.0f} s for the "
                 "equivalence check", "tracked_usd": spent}
@@ -1164,17 +1355,37 @@ def run_preflight(ctx: Ctx) -> dict[str, Any]:
                       for k, v in out.items() if isinstance(v, dict)}}
 
 
+def stage_local(ctx: Ctx, data: str, ids: Sequence[str]) -> Path:
+    """``work/<data>/`` as an ``mp4_dir`` of ``ids`` (``h0.fetch_dataset``), each episode named
+    by the plan's :meth:`PlanSpec.local_id` (certified: noise episodes sort first). Idempotent:
+    an episode already laid out under its local id is not fetched again."""
+    root = ctx.work / data
+    todo = [g for g in ids if not (root / f"{ctx.spec.local_id(g)}.mp4").is_file()]
+    if todo:
+        h0.fetch_dataset(ctx.manifest, ctx.work, episodes={data: tuple(todo)}, poison_job=None)
+    for g in todo:
+        base, local = h0.episode_id(g), ctx.spec.local_id(g)
+        if base != local:
+            for ext in (".mp4", ".txt"):
+                os.replace(root / f"{base}{ext}", root / f"{local}{ext}")
+    return root
+
+
 def _stage_job(ctx: Ctx, job: str, ids: Sequence[str], *, embodiment: str,
                stages: tuple[str, ...], budget: float, preset: str = "exact",
                resources: dict[str, str] | None = None,
-               derived: dict[str, str] | None = None) -> tuple[Path, str]:
-    """Fetch, upload, write the config, ``flora index --local`` + mirror, ``flora plan``."""
+               derived: dict[str, str] | None = None, data: str | None = None
+               ) -> tuple[Path, str]:
+    """Fetch, upload, write the config, ``flora index --local`` + mirror, ``flora plan``.
+    ``data``: the data directory (default ``job``); the certified plan stages every job from
+    one (:data:`CERT_DATA`), so their episode uids pair."""
     run = ctx.st.run_id
-    h0.fetch_dataset(ctx.manifest, ctx.work, episodes={job: tuple(ids)}, poison_job=None)
-    h0.upload_dir(MEDIA_VOLUME, ctx.work / job, f"{run}/{job}")
+    data = data or job
+    stage_local(ctx, data, ids)
+    h0.upload_dir(MEDIA_VOLUME, ctx.work / data, f"{run}/{data}")
     job_id = f"wave-h-{run}-{job}"
     cfg = ctx.work / f"flora-{job}.yaml"
-    cfg.write_text(h0.config_text(project=job_id, data_dir=job, embodiment=embodiment,
+    cfg.write_text(h0.config_text(project=job_id, data_dir=data, embodiment=embodiment,
                                   stages=stages, store_volume=STORE_VOLUME,
                                   media_volume=MEDIA_VOLUME, run_id=run, budget_usd=budget,
                                   resources=resources, tag="flora-wave-h", preset=preset,
@@ -1184,11 +1395,15 @@ def _stage_job(ctx: Ctx, job: str, ids: Sequence[str], *, embodiment: str,
     return cfg, job_id
 
 
-def _index(ctx: Ctx, cfg: Path, job_id: str, tag: str) -> None:
+def _index(ctx: Ctx, cfg: Path, job_id: str, tag: str, *, limit: int | None = None) -> None:
+    """``flora index --local`` into a local store, mirrored into the job store, then ``flora
+    plan``. ``limit``: index only the first N episodes of the data dir (the certified noise
+    job: the same config and data dir as the oracle, so the same stage hash)."""
     fl = h0.flora_bin()
     local = ctx.work / f"store-{tag}"
     ctx.sh([fl, "index", "--local", "--config", str(cfg), "--job", job_id, "--store",
-            f"file://{local}", "--out", str(ctx.work / f"summary-{tag}.json")])
+            f"file://{local}", "--out", str(ctx.work / f"summary-{tag}.json")]
+           + (["--limit", str(limit)] if limit is not None else []))
     h0.mirror_index(local, job_id, ctx.st.run_id, STORE_VOLUME)
     ctx.sh([fl, "plan", "--config", str(cfg), "--index", str(ctx.work / f"summary-{tag}.json")])
 
@@ -1209,16 +1424,15 @@ def _run_job(ctx: Ctx, step: str, cfg: Path, job_id: str, *, determinism: str,
     fl = h0.flora_bin()
     c = load_config(cfg)
     plan = plan_app(c, determinism=determinism, derived_receipts=resolve(c))  # refuses first
-    deadline = gpu_deadline_s(ctx.st, step, usd_per_s, spent_in_step=spent_in_step,
-                              global_cap=ctx.global_cap)
-    budget = max(0.01, step_budget(ctx.st, step, spent_in_step=spent_in_step,
-                                   global_cap=ctx.global_cap))
+    deadline = ctx.deadline_s(step, usd_per_s, spent_in_step=spent_in_step)
+    budget = max(0.01, ctx.budget(step, spent_in_step=spent_in_step))
     out: dict[str, Any] = {"app": plan.app_name, "job_id": job_id, "deadline_s": round(deadline),
                            "budget_usd": round(budget, 4), "cfg": str(cfg),
                            # what its records' provenance.config_hash must be (review 12 F5)
                            "config_hash": plan.config_hash,
                            "stage_hashes": dict(plan.stage_hashes),
-                           "preset": c.preset, "records": record_paths(side)}
+                           "preset": c.preset, "records": record_paths(side,
+                                                                       root=ctx.spec.records)}
     if deadline < 60:
         out["state"] = "skipped"
         out["error"] = f"budget left allows {deadline:.0f} s"
@@ -1261,24 +1475,38 @@ def run_exact(ctx: Ctx, step: str = "exact_e2e") -> dict[str, Any]:
     """(b): the oracle, default mode, one app."""
     require_tempseg_pin(ctx)  # every GPU step runs from the pinned commit
     derived = resolve_receipts(["captioner_bf16"])
-    cfg, job_id = _stage_job(ctx, f"{step}-{JOB}", ctx.episodes, embodiment=EMBODIMENT,
-                             stages=("segment", "caption"), budget=CAPS_USD[step],
-                             derived=derived)
+    eps = ctx.episodes
+    if ctx.spec.shared_data:  # certified: every episode, at least the certificate's minimum
+        eps = balanced_episodes(ctx.manifest, ctx.spec, side="(b)")
+    cfg, job_id = _stage_job(ctx, f"{step}-{JOB}", eps, embodiment=EMBODIMENT,
+                             stages=("segment", "caption"), budget=ctx.caps[step],
+                             derived=derived, data=ctx.spec.data_dir(step))
     r = _run_job(ctx, step, cfg, job_id, determinism=ORACLE_DETERMINISM,
                  usd_per_s=pool_container("segcap").usd_per_s(), spent_in_step=0.0,
                  side="exact")
-    r["data"] = f"{step}-{JOB}"
-    return {**_jobs_result({JOB: r}, 1), "episodes": len(ctx.episodes)}
+    r["data"] = ctx.spec.data_dir(step)
+    return {**_jobs_result({JOB: r}, 1), "episodes": len(eps)}
 
 
-def balanced_episodes(manifest: Mapping[str, Any]) -> tuple[str, ...]:
-    """(d)'s episodes: :data:`EPISODES` (the golden selection), in that order, read from
-    nothing (b) wrote. All six must be staged: refused (before any app) otherwise."""
-    miss = missing_episodes(manifest)
+def balanced_episodes(manifest: Mapping[str, Any], spec: PlanSpec | None = None, *,
+                      side: str = "(d)") -> tuple[str, ...]:
+    """(d)'s episodes: the plan's golden selection (default :data:`EPISODES`), in that order,
+    read from nothing (b) wrote. All must be staged: refused (before any app) otherwise. The
+    certified plan also needs at least :data:`MIN_CERT_EPISODES` of them, and its noise subset
+    of at least :data:`MIN_NOISE_EPISODES` inside them."""
+    spec = spec or SPECS[DEFAULT_PLAN]
+    miss = missing_episodes(manifest, spec.episodes)
     if miss:
-        raise RuntimeError(f"(d) runs all {len(EPISODES)} golden {EMBODIMENT} episodes; not "
-                           f"staged: {', '.join(miss)}")
-    return EPISODES
+        raise RuntimeError(f"{side} runs all {len(spec.episodes)} golden {EMBODIMENT} episodes; "
+                           f"not staged: {', '.join(miss)}")
+    if spec.shared_data:
+        if len(spec.episodes) < MIN_CERT_EPISODES:
+            raise RuntimeError(f"{side}: {len(spec.episodes)} episodes; a certificate needs at "
+                               f"least {MIN_CERT_EPISODES}")
+        if len(spec.noise) < MIN_NOISE_EPISODES or not set(spec.noise) <= set(spec.episodes):
+            raise RuntimeError(f"{side}: the noise subset must be at least "
+                               f"{MIN_NOISE_EPISODES} of the oracle's episodes")
+    return spec.episodes
 
 
 def run_balanced(ctx: Ctx) -> dict[str, Any]:
@@ -1289,13 +1517,14 @@ def run_balanced(ctx: Ctx) -> dict[str, Any]:
     from flora_deploy.config.schema import load_config
 
     require_tempseg_pin(ctx)
-    episodes = balanced_episodes(ctx.manifest)
+    episodes = balanced_episodes(ctx.manifest, ctx.spec)
     derived = resolve_receipts(["captioner_bf16", "tempseg_merged"], require_pin=True)
     rate = (pool_container("segment", "balanced").usd_per_s()
             + pool_container("caption", "balanced").usd_per_s())
     cfg, job_id = _stage_job(ctx, f"balanced-{JOB}", episodes, embodiment=EMBODIMENT,
-                             stages=("segment", "caption"), budget=CAPS_USD["balanced"],
-                             preset="balanced", derived=derived)
+                             stages=("segment", "caption"), budget=ctx.caps["balanced"],
+                             preset="balanced", derived=derived,
+                             data=ctx.spec.data_dir("balanced"))
     r = _run_job(ctx, "balanced", cfg, job_id, determinism=ORACLE_DETERMINISM, usd_per_s=rate,
                  spent_in_step=0.0, side="balanced")
     jobs = {JOB: r}
@@ -1355,7 +1584,8 @@ def _segment_records(ctx: Ctx, job: Mapping[str, Any]) -> list[Any]:
     match it may hold another job's records (review 12 F5)."""
     from flora_deploy.records import StageRecord
 
-    path = Path((job.get("records") or {}).get("segment") or record_paths("balanced")["segment"])
+    path = Path((job.get("records") or {}).get("segment")
+                or record_paths("balanced", root=ctx.spec.records)["segment"])
     try:
         src = json.loads(records_source_path(path).read_text())
     except (OSError, ValueError):
@@ -1369,12 +1599,13 @@ def _segment_records(ctx: Ctx, job: Mapping[str, Any]) -> list[Any]:
 
 
 def segment_provenance_problems(records: Iterable[Any], episodes: Sequence[str],
-                                binding: Mapping[str, str]) -> list[str]:
+                                binding: Mapping[str, str],
+                                local_id: Callable[[str], str] = h0.episode_id) -> list[str]:
     """Why (d)'s segment records for ``episodes`` are not (d)'s: any segment record of those
     episodes whose ``provenance.config_hash`` is not the job's segment stage hash (empty: all
-    of them are)."""
+    of them are). ``local_id``: the plan's episode id of a golden id."""
     want = binding["segment_hash"]
-    eids = {h0.episode_id(g) for g in episodes}
+    eids = {local_id(g) for g in episodes}
     bad = sorted({str(getattr(getattr(r, "provenance", None), "config_hash", None))
                   for r in records if r.episode_id in eids and r.stage == "segment"
                   and getattr(getattr(r, "provenance", None), "config_hash", None) != want})
@@ -1384,12 +1615,14 @@ def segment_provenance_problems(records: Iterable[Any], episodes: Sequence[str],
     return []
 
 
-def deployed_segments(records: Iterable[Any], episodes: Sequence[str]) -> dict[str, list[dict]]:
+def deployed_segments(records: Iterable[Any], episodes: Sequence[str],
+                      local_id: Callable[[str], str] = h0.episode_id) -> dict[str, list[dict]]:
     """Golden id -> NVIDIA segment rows (``stages.segment.rows_from_record``, what the deployed
-    caption worker feeds ``caption_*``) from (d)'s segment records, for ``episodes``."""
+    caption worker feeds ``caption_*``) from (d)'s segment records, for ``episodes``
+    (``local_id``: the plan's episode id of a golden id)."""
     from flora_deploy.stages.segment import rows_from_record
 
-    by_eid = {h0.episode_id(g): g for g in episodes}
+    by_eid = {local_id(g): g for g in episodes}
     out: dict[str, list[dict]] = {}
     for rec in records:
         g = by_eid.get(rec.episode_id)
@@ -1420,8 +1653,8 @@ def golden_missing(paths: Iterable[str]) -> list[str]:
 
 def lab_preconditions(manifest: Mapping[str, Any], episodes: Sequence[str],
                       segments: Mapping[str, Sequence[Mapping[str, Any]]], *,
-                      missing: Callable[[Iterable[str]], list[str]] = golden_missing
-                      ) -> list[str]:
+                      missing: Callable[[Iterable[str]], list[str]] = golden_missing,
+                      expected: Sequence[str] = EPISODES) -> list[str]:
     """What must hold before a lab container starts (empty: all of it). The episodes are (d)'s
     and staged; every camera file the lab child will open, at the path it will open it
     (``balanced_lab.episode_inputs``), exists on ``flora-golden``; (d)'s segments cover every
@@ -1431,8 +1664,8 @@ def lab_preconditions(manifest: Mapping[str, Any], episodes: Sequence[str],
     out = []
     if not episodes:
         return ["no episodes: (d) recorded none"]
-    if tuple(episodes) != EPISODES:
-        out.append(f"episodes differ from (d)'s {len(EPISODES)}: {list(episodes)}")
+    if tuple(episodes) != tuple(expected):
+        out.append(f"episodes differ from (d)'s {len(expected)}: {list(episodes)}")
     try:
         inputs = lab.episode_inputs(dict(manifest), list(episodes))
         paths = lab.volume_paths(inputs)
@@ -1483,10 +1716,12 @@ def reusable_lab_result(kind: str, run_id: str, episodes: Sequence[str],
     return res if ok else None
 
 
-def lab_reuse(st: State) -> tuple[str, ...]:
-    """The lab kinds whose saved result (d2) reuses (:func:`reusable_lab_result`)."""
+def lab_reuse(st: State, spec: PlanSpec | None = None) -> tuple[str, ...]:
+    """The lab kinds whose saved result (d2) reuses (:func:`reusable_lab_result`), on the
+    plan's lab episodes (:attr:`PlanSpec.lab_episodes`) of (d)'s."""
+    spec = spec or SPECS[DEFAULT_PLAN]
     bal = (st.steps.get("balanced") or StepState()).result
-    eps = bal.get("episodes") or ()
+    eps = [e for e in bal.get("episodes") or () if e in spec.lab_episodes]
     if not eps:
         return ()
     job = (bal.get("jobs") or {}).get(JOB) or {}
@@ -1520,6 +1755,11 @@ def run_lab(ctx: Ctx, *, missing: Callable[[Iterable[str]], list[str]] | None = 
     (it reads the same inputs). Each call's deadline is :data:`LAB_DEADLINE_S` (two cold
     compiles), shortened by the budget left; a call the budget cannot carry to its expected
     length is not started. Spend is each started call's wall time x list $/s."""
+    if ctx.spec.name == CERTIFIED:
+        done, why_done = lab_already_done()
+        if done:  # the certified run's "lab already done" skip: nothing starts, $0
+            return {"ok": True, "skipped": f"lab already done: {why_done}", "kinds": {},
+                    "tracked_usd": 0.0, "apps": []}
     if lab_module is None:
         from flora_deploy.modal_app import balanced_lab as lab_module
     lab = lab_module
@@ -1528,18 +1768,19 @@ def run_lab(ctx: Ctx, *, missing: Callable[[Iterable[str]], list[str]] | None = 
         raise RuntimeError("the lab runs against (d)'s finished deployed job; (d) has none "
                            "(run --only balanced first)")
     job = bal["jobs"][JOB]
-    episodes = list(bal.get("episodes") or ())
+    episodes = [e for e in bal.get("episodes") or () if e in ctx.spec.lab_episodes]
     bound: dict[str, str] | None = None
     try:
         bound = (binding or segment_binding)(ctx, job)
         recs = list((records or _segment_records)(ctx, job))
-        why = segment_provenance_problems(recs, episodes, bound)
-        segments = {} if why else deployed_segments(recs, episodes)
+        why = segment_provenance_problems(recs, episodes, bound, ctx.spec.local_id)
+        segments = {} if why else deployed_segments(recs, episodes, ctx.spec.local_id)
     except Exception as e:  # noqa: BLE001 - before any container: a precondition
         segments = {}
         why = [f"reading (d)'s segment records: {e!r}"]
     why += lab_preconditions(ctx.manifest, episodes, segments,
-                             missing=missing or golden_missing)
+                             missing=missing or golden_missing,
+                             expected=ctx.spec.lab_episodes)
     out: dict[str, Any] = {"episodes": episodes, "job_id": job["job_id"], "kinds": {},
                            "segments_from": bound,
                            "segments": {"source": "deployed job records",
@@ -1577,8 +1818,7 @@ def run_lab(ctx: Ctx, *, missing: Callable[[Iterable[str]], list[str]] | None = 
         for kind in todo:
             fn, c = fns[kind], LAB[kind]
             limit = min(LAB_DEADLINE_S[kind],
-                        gpu_deadline_s(ctx.st, "lab", c, spent_in_step=spent,
-                                       slack_s=LAB_SLACK_S, global_cap=ctx.global_cap))
+                        ctx.deadline_s("lab", c, spent_in_step=spent, slack_s=LAB_SLACK_S))
             prev = out["kinds"].get("tempseg") or {}
             if kind == "captioner" and prev.get("requests") == 0:
                 out["kinds"][kind] = {"skipped": "TempSeg sent zero requests on the same "
@@ -1686,12 +1926,21 @@ def run_noise(ctx: Ctx) -> dict[str, Any]:
     require_tempseg_pin(ctx)
     cfg = Path(oracle["cfg"])
     job_id = f"wave-h-{ctx.st.run_id}-noise-{NOISE_JOB}"
-    _index(ctx, cfg, job_id, f"noise-{NOISE_JOB}")
+    tag = f"noise-{NOISE_JOB}"
+    limit = ctx.spec.noise_limit
+    _index(ctx, cfg, job_id, tag, limit=limit)
+    if limit is not None:  # before any app: the index must hold exactly the noise subset
+        got = noise_index_problems(ctx.work / f"summary-{tag}.json", ctx.manifest, ctx.spec)
+        if got:
+            raise RuntimeError(f"noise index: {got}")
     r = _run_job(ctx, "noise", cfg, job_id, determinism=ORACLE_DETERMINISM,
                  usd_per_s=pool_container("segcap").usd_per_s(), spent_in_step=0.0,
                  side="noise")
     res = _jobs_result({NOISE_JOB: r}, 1)
+    res["episodes"] = len(ctx.spec.noise) if limit is not None else len(ctx.episodes)
     res["same_app_as_oracle"] = r.get("app") == oracle.get("app")
+    if ctx.spec.name == CERTIFIED:  # (e) runs flora certify on the exported records
+        return res
     ctx.st.step("noise").result = res  # so _job_rows can read this step's job
     exact = _job_rows(ctx, "exact_e2e")
     noise_rows = _job_rows(ctx, "noise")
@@ -1704,9 +1953,82 @@ def run_noise(ctx: Ctx) -> dict[str, Any]:
     return res
 
 
+def noise_index_problems(summary: Path, manifest: Mapping[str, Any], spec: PlanSpec) -> str:
+    """Empty when the noise job's index (``flora index --limit``) holds exactly the plan's
+    noise subset: its episode count and its video seconds (within 1%) equal theirs."""
+    try:
+        d = json.loads(summary.read_text())
+    except (OSError, ValueError) as e:
+        return f"unreadable {summary.name}: {e}"
+    n = (d.get("counts") or {}).get("episodes")
+    dur = durations(manifest)
+    want = sum(dur.get(g, 0.0) for g in spec.noise)
+    got = float(d.get("video_s") or 0.0)
+    if n != len(spec.noise) or abs(got - want) > 0.01 * max(want, 1.0):
+        return (f"{n} episodes / {got:.1f} video s indexed, not the {len(spec.noise)} noise "
+                f"episodes / {want:.1f} s")
+    return ""
+
+
+CERT_STAGES = ("segment", "caption")
+
+
+def run_flora_certify(ctx: Ctx, *, finalize: Any = None, sh: Callable[..., Any] | None = None,
+                      lab_dir: Path | None = None) -> dict[str, Any]:
+    """(e) of the certified plan, on CPU ($0): export the oracle's, the noise run's and
+    balanced's records (``wave_h_finalize.fetch_records``, a Volume read), then ``flora
+    certify`` per stage (``wave_h_finalize.certify_all``: the oracle, the noise run, the L0 JSON
+    and the derived content digests (d)'s workers verified, stamped with the run's own time).
+    Done only when **every** stage is ``certified``; then ``scripts/wave_h_finalize.py --write``
+    (rates, certificates, report, docs) for this state. Otherwise nothing is written and the
+    step fails with what is missing (``missing_for_certified``)."""
+    if finalize is None:
+        import wave_h_finalize as finalize
+    paths = finalize.Paths(root=ROOT, state=ctx.state_path, records=ctx.spec.records,
+                           lab=lab_dir or LAB_OUT)
+    save_state(ctx.st, ctx.state_path)
+    finalize.fetch_records(paths, ctx.st)  # every job's records, freshly (no container)
+    out_dir = ctx.work / "certify"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    outcomes = finalize.certify_all(paths, ctx.st, out_dir,
+                                    derived=finalize.derived_content_used(ctx.st))
+    stages: dict[str, Any] = {}
+    for o in outcomes:
+        c = o.get("cert") or {}
+        stages[o["stage"]] = {
+            "verdict": c.get("verdict"), "id": c.get("id"), "reasons": c.get("reasons"),
+            "episodes": sum(b.get("n", 0) for b in
+                            ((c.get("metrics") or {}).get("candidate") or {}).values()),
+            "noise_episodes": ((c.get("metrics") or {}).get("noise") or {}).get("n"),
+            "missing": finalize.missing_for_certified(c) if c else None,
+            "refused": o.get("refused") or o.get("deferred")}
+    ok = (set(stages) == set(CERT_STAGES)
+          and all(v["verdict"] == "certified" for v in stages.values()))
+    res: dict[str, Any] = {"ok": ok, "stages": stages, "tracked_usd": 0.0, "apps": []}
+    if not ok:
+        res["error"] = "not certified: " + "; ".join(
+            f"{k}: {v['verdict'] or v['refused']}" + (f" ({', '.join(v['missing'])})"
+                                                      if v.get("missing") else "")
+            for k, v in sorted(stages.items()))
+        return res
+    args = [sys.executable, str(ROOT / "scripts" / "wave_h_finalize.py"), "--state",
+            str(ctx.state_path), "--records", str(ctx.spec.records), "--write"]
+    p = (sh or ctx.sh)(args, timeout=1800, check=False)
+    res["finalize_rc"] = getattr(p, "returncode", None)
+    res["finalize"] = " ".join(args[1:])
+    return res
+
+
 RUNNERS: dict[str, Callable[[Ctx], dict[str, Any]]] = {
     "tempseg": run_tempseg, "preflight": run_preflight, "exact_e2e": run_exact,
     "balanced": run_balanced, "lab": run_lab, "certify": run_certify, "noise": run_noise}
+
+
+def runner(plan: str, step: str) -> Callable[[Ctx], dict[str, Any]]:
+    """The certified plan's (e) is ``flora certify`` + finalize; the rest are shared."""
+    if plan == CERTIFIED and step == "certify":
+        return run_flora_certify
+    return RUNNERS[step]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1716,6 +2038,7 @@ RUNNERS: dict[str, Callable[[Ctx], dict[str, Any]]] = {
 def render_report(st: State, projections: Mapping[str, Projection], *,
                   plan: str = DEFAULT_PLAN) -> str:
     gcap = plan_global_cap(plan, projections, st.override_for(plan))
+    caps, title = plan_caps(plan, projections), titles(plan)
     lines = ["# Wave H-lite runbook summary", "",
              "Generated by `scripts/wave_h.py` (runbook: `docs/wave-h-runbook.md`). Numbers only;",
              "`docs/wave-h-report.md` is written by `scripts/wave_h_finalize.py`.", "",
@@ -1729,18 +2052,19 @@ def render_report(st: State, projections: Mapping[str, Projection], *,
     for name in STEPS:
         s = st.steps.get(name, StepState())
         if name not in PLANS[plan] and s.status == "pending":
-            lines.append(f"| {TITLES[name]} | {DEFERRED_NOTE} | - | - | 0 | - | - |")
+            if plan != CERTIFIED:
+                lines.append(f"| {title[name]} | {DEFERRED_NOTE} | - | - | 0 | - | - |")
             continue
         p = projections.get(name)
         proj = f"${p.usd:.2f} (${p.usd_upper:.2f})" if p else "-"
         billed = f"${s.billed_usd:.2f}" if s.billed_usd is not None else "-"
-        lines.append(f"| {TITLES[name]} | {s.status} | ${CAPS_USD[name]:.2f} | {proj} | "
+        lines.append(f"| {title[name]} | {s.status} | ${caps[name]:.2f} | {proj} | "
                      f"{len(s.attempts)} | ${s.tracked_usd:.2f} | {billed} |")
     for name in STEPS:
         s = st.steps.get(name)
         if not s or s.status == "pending":
             continue
-        lines += ["", f"## {TITLES[name]}", "", f"Status: {s.status}."]
+        lines += ["", f"## {title[name]}", "", f"Status: {s.status}."]
         lines += [f"- {n}" for n in s.notes]
         res = {k: v for k, v in s.result.items() if k not in ("apps",)}
         if res:
@@ -1769,33 +2093,57 @@ def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
                manifest: Mapping[str, Any] | None = None, plan: str = DEFAULT_PLAN,
                only: str | None = None) -> None:
     steps = (only,) if only else PLANS[plan]
+    spec = SPECS[plan]
     gcap = plan_global_cap(plan, projections, st.override_for(plan))
+    caps, title = plan_caps(plan, projections), titles(plan)
     out(f"Wave H-lite run {st.run_id} ({EMBODIMENT} only), plan {plan} "
-        f"({' -> '.join(TITLES[s].split('.')[0] for s in steps)}): spent ${st.spent:.2f} of "
+        f"({' -> '.join(title[s].split('.')[0] for s in steps)}): spent ${st.spent:.2f} of "
         f"${gcap:.2f} (billing read "
         f"{'never' if st.billed_at is None else time.ctime(st.billed_at)})")
     if manifest is not None:
-        eps, miss = episodes_in(manifest), missing_episodes(manifest)
-        src = ("expected durations from the golden selection (offline, +"
-               f"{DURATION_HEADROOM:.0%})" if manifest.get("offline") else "golden manifest")
-        out(f"  episodes: {len(eps)} {EMBODIMENT} ({src}"
+        eps, miss = (episodes_in(manifest, spec.episodes),
+                     missing_episodes(manifest, spec.episodes))
+        src = (f"expected durations from the {spec.golden} selection (offline, +"
+               f"{DURATION_HEADROOM:.0%})" if manifest.get("offline")
+               else f"{spec.golden} manifest")
+        dur = durations(manifest)
+        out(f"  episodes: {len(eps)} {EMBODIMENT}, {sum(dur[e] for e in eps):.1f} video s ({src}"
             + (f"; NOT STAGED, left out: {', '.join(miss)}" if miss else "") + ")")
+        if plan == CERTIFIED:
+            nv = sum(dur.get(e, 0.0) for e in spec.noise)
+            out(f"  noise subset: {len(spec.noise)} of them, {nv:.1f} video s (`flora index "
+                f"--limit {spec.noise_limit}` on the oracle's config and data dir: the same "
+                "stage hash)")
     for name in steps:
         p = projections[name]
         s = st.steps.get(name, StepState())
         rule = "ok"
         try:
-            check_before(st, name, p, global_cap=gcap)
+            check_before(st, name, p, caps=caps, global_cap=gcap)
         except StopRule as e:
             rule = f"STOP: {e}"
-        out(f"  {TITLES[name]:66s} [{s.status}] cap ${CAPS_USD[name]:.2f}  nominal "
+        out(f"  {title[name]:66s} [{s.status}] cap ${caps[name]:.2f}  nominal "
             f"${p.usd:.2f}  upper ${p.usd_upper:.2f}  rule: {rule}")
         for i in p.items:
             out(f"      {i['what']:60s} {i['gpu']:>5s} {i['seconds']:6.0f} s / "
                 f"{i['upper_seconds']:6.0f} s x ${i['usd_per_h']:.2f}/h = ${i['usd']:.3f} "
                 f"(upper ${i['usd_upper']:.3f})")
-    for name in () if only else deferred_steps(plan):
-        out(f"  {TITLES[name]:66s} [{DEFERRED_NOTE}; never runs in plan {plan}]")
+    for name in () if only or plan == CERTIFIED else deferred_steps(plan):
+        out(f"  {title[name]:66s} [{DEFERRED_NOTE}; never runs in plan {plan}]")
+    if plan == CERTIFIED and "exact_e2e" in steps:
+        from flora_deploy.planner.rates import RateTable
+
+        t = RateTable.load()
+        e, su = t.rate("exact", "segcap", 1, 1), t.startup_for("exact", "segcap")
+        out(f"  assumption: (b) and (f) are priced on the measured exact segcap rate "
+            f"{e.container_s_per_video_s:g} container-s/video-s +/-{e.uncertainty:.0%} (H200, "
+            f"default mode, c={e.concurrency}, {e.date}) and the measured @enter "
+            f"{su.startup_s:g} s +/-{su.uncertainty:.0%} per job (each job is its own cold "
+            "start: the oracle's app is stopped before (f) deploys it again). Image pull and "
+            "scheduling are not in the measured startup; the upper bound's +100% and the "
+            f"{CLIENT_SLACK_S} s client slack cover them")
+        out("  assumption: certified plan caps are each step's own upper projection rounded "
+            "up to $0.05 (plan_caps); the global cap is their sum rounded up to $0.10")
     if "balanced" in steps:
         basis = startup_basis()
         out("  assumption: (d) is priced with a cold compile: startup segment "
@@ -1810,6 +2158,9 @@ def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
             + f" (expected x {1 + LAB_UNCERTAINTY:.2f}, <= the {LAB_TIMEOUT_S} s container "
             "timeout); the lab commits flora-cache:/balanced/<engine>[-dtbias] after each "
             "engine, so a warm cache only makes it cheaper")
+    if plan == CERTIFIED and "lab" in steps:
+        done, why = lab_already_done()
+        out(f"  lab (d2): {'already done, skipped at $0' if done else 'runs'} ({why})")
     nominal = sum(projections[s].usd for s in steps)
     upper = sum(projections[s].usd_upper for s in steps)
     how = global_cap_label(st, plan, projections)
@@ -1823,10 +2174,15 @@ def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
             "first step whose upper projection no longer fits the cap left")
 
 
-def load_manifest(offline: bool) -> dict[str, Any]:
+def load_manifest(offline: bool, version: str = "golden/v1") -> dict[str, Any]:
     if offline:
-        return offline_manifest(DURATION_HEADROOM)
-    return h0.golden_manifest()
+        return offline_manifest(DURATION_HEADROOM, version)
+    if version == "golden/v1":
+        return h0.golden_manifest()
+    import modal
+
+    vol = modal.Volume.from_name(h0.GOLDEN_VOLUME, version=2)
+    return json.loads(b"".join(vol.read_file(f"{version}/manifest.json")))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1838,7 +2194,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="rewrite reports/wave-h/runbook.md from the state (never "
                         "docs/wave-h-report.md: wave_h_finalize.py owns it)")
     ap.add_argument("--plan", choices=tuple(PLANS), default=DEFAULT_PLAN,
-                    help="balanced-only (default): steps 0, a, d; full: every step")
+                    help="balanced-only (default): steps 0, a, d; full: every step; "
+                         "certified: b, f, d, (d2), e on golden/v2 (its own state)")
     ap.add_argument("--only", choices=STEPS, help="run just this step (if not done)")
     ap.add_argument("--global-cap", type=float, default=None, metavar="USD",
                     help="raise this plan's global cap to this (a cap the user approved; "
@@ -1848,9 +2205,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--offline", action="store_true",
                     help="dry run / report: price the golden selection's expected durations "
                          "instead of reading the manifest from the Volume")
-    ap.add_argument("--state", type=Path, default=STATE)
-    ap.add_argument("--work", type=Path, default=ROOT / "reports" / "wave-h" / "work")
+    ap.add_argument("--state", type=Path, default=None,
+                    help="default: the plan's (reports/wave-h/state.json; certified: "
+                         "reports/wave-h/certified/state.json)")
+    ap.add_argument("--work", type=Path, default=None)
     args = ap.parse_args(argv)
+    spec = SPECS[args.plan]
+    args.state = args.state or spec.state
+    args.work = args.work or spec.work
     if args.offline and args.yes_spend:
         ap.error("--offline is for --dry-run / --report (a run stages the real files)")
     if args.only and args.only not in PLANS[args.plan]:
@@ -1858,17 +2220,23 @@ def main(argv: list[str] | None = None) -> int:
                  "full)")
 
     st = load_state(args.state)
+    if st.plan is not None and st.plan != args.plan and CERTIFIED in (st.plan, args.plan):
+        print(f"refused: {args.state} was run under plan {st.plan}, not {args.plan}")
+        return 2
+    if args.plan == CERTIFIED:
+        st.plan = CERTIFIED
     if adopt_balanced_job(st):
         print("note: (d)'s deployed job is done; (d) counts as done and its lab is step lab")
     killed_apps = st.mark_killed() if args.yes_spend else []
-    manifest = load_manifest(args.offline)
-    miss = missing_episodes(manifest)
+    manifest = load_manifest(args.offline, spec.golden)
+    miss = missing_episodes(manifest, spec.episodes)
     if miss:
-        print(f"note: only {len(EPISODES) - len(miss)} of the {len(EPISODES)} {EMBODIMENT} "
-              f"episodes are staged; using those (missing: {', '.join(miss)})")
-    reuse = lab_reuse(st)
-    projections = {s: project(s, manifest, reuse=reuse if s == "lab" else ())
-                   for s in STEPS}
+        print(f"note: only {len(spec.episodes) - len(miss)} of the {len(spec.episodes)} "
+              f"{EMBODIMENT} episodes are staged; using those (missing: {', '.join(miss)})")
+    lab_done = args.plan == CERTIFIED and lab_already_done()[0]
+    reuse = () if lab_done else lab_reuse(st, spec)
+    projections = plan_projections(args.plan, manifest, lab_done=lab_done, reuse=reuse)
+    caps = plan_caps(args.plan, projections)
     if reuse:
         print(f"note: lab reuses the saved {', '.join(reuse)} result(s) (evidence, run "
               f"{st.run_id}, (d)'s episodes); only the rest runs")
@@ -1891,10 +2259,11 @@ def main(argv: list[str] | None = None) -> int:
                       f"${st.cap_override:.2f}; not saved (pass --yes-spend to approve it)")
     gcap = plan_global_cap(args.plan, projections, st.override_for(args.plan))
     print_plan(st, projections, manifest=manifest, plan=args.plan, only=args.only)
+    report = spec.report or REPORT
     if args.report:
-        REPORT.parent.mkdir(parents=True, exist_ok=True)
-        REPORT.write_text(render_report(st, projections, plan=args.plan))
-        print(f"wrote {REPORT}")
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(render_report(st, projections, plan=args.plan))
+        print(f"wrote {report}")
         return 0
     if not args.yes_spend:
         print("dry run: nothing started (run with --yes-spend after the user approves)")
@@ -1914,7 +2283,8 @@ def main(argv: list[str] | None = None) -> int:
     st.gate_cap, st.gate_cap_plan = gcap, args.plan  # the cap this run gates on
     save_state(st, args.state)
     os.chdir(args.work)  # relative input.path is hashed against the cwd: plan where flora runs
-    ctx = Ctx(st, manifest, args.work, state_path=args.state, global_cap=gcap)
+    ctx = Ctx(st, manifest, args.work, state_path=args.state, global_cap=gcap, spec=spec,
+              caps=caps)
     rc = 0
     for name in PLANS[args.plan]:
         if args.only and name != args.only:
@@ -1927,20 +2297,20 @@ def main(argv: list[str] | None = None) -> int:
         p = projections[name]
         s.projected_usd, s.projected_upper_usd = p.usd, p.usd_upper
         try:
-            check_before(st, name, p, global_cap=gcap)
+            check_before(st, name, p, caps=caps, global_cap=gcap)
         except StopRule as e:
             s.status, rc = "stopped", 3
             s.notes.append(f"stop rule before: {e}")
             break
         att = Attempt(started=time.time(), rate_usd_per_s=p.peak_usd_per_s,
-                      budget_usd=round(step_budget(st, name, global_cap=gcap), 4))
+                      budget_usd=round(step_budget(st, name, caps=caps, global_cap=gcap), 4))
         s.attempts.append(att)
         s.status = "running"
         ctx.step = name
         save_state(st, args.state)
         try:
             with Heartbeat(st, att, args.state):
-                res = RUNNERS[name](ctx)
+                res = runner(args.plan, name)(ctx)
             s.result = res
             att.tracked_usd = round(float(res.get("tracked_usd") or 0.0), 4)
             att.report_error = bool(res.get("report_error"))
@@ -1961,7 +2331,7 @@ def main(argv: list[str] | None = None) -> int:
         refresh_billing(st)
         save_state(st, args.state)
         try:
-            check_after(st, name, global_cap=gcap)
+            check_after(st, name, caps=caps, global_cap=gcap)
         except StopRule as e:
             s.notes.append(f"stop rule after: {e}")
             rc = 3
@@ -1974,9 +2344,9 @@ def main(argv: list[str] | None = None) -> int:
             rc = 1
             break
     save_state(st, args.state)
-    REPORT.parent.mkdir(parents=True, exist_ok=True)
-    REPORT.write_text(render_report(st, projections, plan=args.plan))
-    print(f"wrote {REPORT}; state {args.state}")
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(render_report(st, projections, plan=args.plan))
+    print(f"wrote {report}; state {args.state}")
     return rc
 
 

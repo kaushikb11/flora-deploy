@@ -751,8 +751,10 @@ def overall_verdict(outcomes: Sequence[Mapping[str, Any]]) -> str:
 
 
 def run_plan(st: wh.State) -> str:
-    """The plan the state was run under (it is not stored): ``full`` when a step only that plan
-    runs was started, else the default ``balanced-only``."""
+    """The plan the state was run under: the one it stores (``certified`` does), else ``full``
+    when a step only that plan runs was started, else the default ``balanced-only``."""
+    if getattr(st, "plan", None) in wh.PLANS:
+        return st.plan
     for name in wh.deferred_steps(wh.DEFAULT_PLAN):
         s = st.steps.get(name)
         if s is not None and (s.attempts or s.status != "pending"):
@@ -778,11 +780,13 @@ def global_cap(st: wh.State) -> float:
     plan = run_plan(st)
     if st.gate_cap is not None and st.gate_cap_plan == plan:
         return st.gate_cap
+    spec = wh.SPECS[plan]
     override = st.override_for(plan)
-    if override is not None:
-        man = wh.offline_manifest(wh.DURATION_HEADROOM)
-        reuse = wh.lab_reuse(st)
-        today = {s: wh.project(s, man, reuse=reuse if s == "lab" else ()) for s in wh.PLANS[plan]}
+    if override is not None:  # priced as wave_h.main prices it (plan_projections)
+        man = wh.offline_manifest(wh.DURATION_HEADROOM, spec.golden)
+        lab_done = plan == wh.CERTIFIED and wh.lab_already_done()[0]
+        reuse = () if lab_done else wh.lab_reuse(st, spec)
+        today = wh.plan_projections(plan, man, lab_done=lab_done, reuse=reuse)
         return wh.plan_global_cap(plan, today, override)
     projections: dict[str, Any] = {}
     for name in wh.PLANS[plan]:
@@ -793,7 +797,8 @@ def global_cap(st: wh.State) -> float:
         if s is not None and s.projected_upper_usd is not None:
             projections[name] = SimpleNamespace(usd_upper=s.projected_upper_usd)
         else:
-            projections[name] = wh.project(name, wh.offline_manifest(wh.DURATION_HEADROOM))
+            projections[name] = wh.project(
+                name, wh.offline_manifest(wh.DURATION_HEADROOM, spec.golden), spec)
     return wh.plan_global_cap(plan, projections)
 
 

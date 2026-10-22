@@ -1,0 +1,268 @@
+{
+  "version": "golden/v2",
+  "selected": "2026-10-22",
+  "basis": "Human-only certification set for `balanced` (docs/golden-manifest-v2.md): the 6 human episodes of golden/v1 that Wave H-lite step d ran (entries unchanged), plus 6 short EgoDex v3.0 test episodes at the same pinned revision, one per new task, each from a single small concatenated file. 12 episodes: 10 for the certificate plus 2 spares for exclusions. homer_40 (59.6 s) stays out for cost.",
+  "profile_note": "profile is NVIDIA's API profile (human/yam/dex/tianji). Single-view robot episodes use 'yam': any non-human profile with one 'main' view takes NVIDIA's single-view robot path (human segmentation policy, CFR required for captions).",
+  "noise_subset": [
+    "human/wgo/homer_52",
+    "human/egodex_braid_unbraid/episode_000001",
+    "human/egodex_zip_unzip_bag/episode_000012",
+    "human/egodex_stack_unstack_cups/episode_000007",
+    "human/egodex_fold_unfold_paper_basic/episode_000011"
+  ],
+  "datasets": {
+    "wgo": {
+      "repo": "macrodata/WGO-Bench",
+      "revision": "9cfb7bb98d60a58319f4b3d7b41374eedfb7980c",
+      "format": "wgo_parquet",
+      "file": "data/annotations.parquet",
+      "license": "CC-BY-NC-SA-4.0 (HomER rows: upstream toloka/HomER has no license field)",
+      "task_source": "parquet column 'instruction'; gold 'segments' kept as annotations"
+    },
+    "egodex_add_remove_lid": {
+      "repo": "griffinlabs/EgoDex-LeRobot-v3.0",
+      "revision": "41d60b449629b2181ff5b735d31c2a2cf8b3cad8",
+      "format": "lerobot_v3",
+      "subdir": "test/add_remove_lid",
+      "license": "CC-BY-NC-ND-4.0",
+      "task_source": "meta/episodes tasks"
+    },
+    "egodex_braid_unbraid": {
+      "repo": "griffinlabs/EgoDex-LeRobot-v3.0",
+      "revision": "41d60b449629b2181ff5b735d31c2a2cf8b3cad8",
+      "format": "lerobot_v3",
+      "subdir": "test/braid_unbraid",
+      "license": "CC-BY-NC-ND-4.0",
+      "task_source": "meta/episodes tasks"
+    },
+    "egodex_make_sandwich": {
+      "repo": "griffinlabs/EgoDex-LeRobot-v3.0",
+      "revision": "41d60b449629b2181ff5b735d31c2a2cf8b3cad8",
+      "format": "lerobot_v3",
+      "subdir": "test/make_sandwich",
+      "license": "CC-BY-NC-ND-4.0",
+      "task_source": "meta/episodes tasks"
+    },
+    "egodex_pour": {
+      "repo": "griffinlabs/EgoDex-LeRobot-v3.0",
+      "revision": "41d60b449629b2181ff5b735d31c2a2cf8b3cad8",
+      "format": "lerobot_v3",
+      "subdir": "test/pour",
+      "license": "CC-BY-NC-ND-4.0",
+      "task_source": "meta/episodes tasks"
+    },
+    "egodex_zip_unzip_bag": {
+      "repo": "griffinlabs/EgoDex-LeRobot-v3.0",
+      "revision": "41d60b449629b2181ff5b735d31c2a2cf8b3cad8",
+      "format": "lerobot_v3",
+      "subdir": "test/zip_unzip_bag",
+      "license": "CC-BY-NC-ND-4.0",
+      "task_source": "meta/episodes tasks"
+    },
+    "egodex_screw_unscrew_bottle_cap": {
+      "repo": "griffinlabs/EgoDex-LeRobot-v3.0",
+      "revision": "41d60b449629b2181ff5b735d31c2a2cf8b3cad8",
+      "format": "lerobot_v3",
+      "subdir": "test/screw_unscrew_bottle_cap",
+      "license": "CC-BY-NC-ND-4.0",
+      "task_source": "meta/episodes tasks"
+    },
+    "egodex_stack_unstack_cups": {
+      "repo": "griffinlabs/EgoDex-LeRobot-v3.0",
+      "revision": "41d60b449629b2181ff5b735d31c2a2cf8b3cad8",
+      "format": "lerobot_v3",
+      "subdir": "test/stack_unstack_cups",
+      "license": "CC-BY-NC-ND-4.0",
+      "task_source": "meta/episodes tasks"
+    },
+    "egodex_insert_remove_usb": {
+      "repo": "griffinlabs/EgoDex-LeRobot-v3.0",
+      "revision": "41d60b449629b2181ff5b735d31c2a2cf8b3cad8",
+      "format": "lerobot_v3",
+      "subdir": "test/insert_remove_usb",
+      "license": "CC-BY-NC-ND-4.0",
+      "task_source": "meta/episodes tasks"
+    },
+    "egodex_fold_unfold_paper_basic": {
+      "repo": "griffinlabs/EgoDex-LeRobot-v3.0",
+      "revision": "41d60b449629b2181ff5b735d31c2a2cf8b3cad8",
+      "format": "lerobot_v3",
+      "subdir": "test/fold_unfold_paper_basic",
+      "license": "CC-BY-NC-ND-4.0",
+      "task_source": "meta/episodes tasks"
+    }
+  },
+  "episodes": [
+    {
+      "pool": "human",
+      "dataset": "egodex_add_remove_lid",
+      "slug": "episode_000014",
+      "episode": 14,
+      "profile": "human",
+      "cameras": {
+        "main": "observation.images.camera"
+      },
+      "expected_s": 14.63,
+      "hard_case": [
+        "repetition"
+      ],
+      "why": "the same sub-action four times (lids onto four cups)"
+    },
+    {
+      "pool": "human",
+      "dataset": "egodex_braid_unbraid",
+      "slug": "episode_000001",
+      "episode": 1,
+      "profile": "human",
+      "cameras": {
+        "main": "observation.images.camera"
+      },
+      "expected_s": 16.07,
+      "hard_case": [
+        "repetition"
+      ],
+      "why": "fine dexterity with repeated near-identical motions (braiding)"
+    },
+    {
+      "pool": "human",
+      "dataset": "egodex_make_sandwich",
+      "slug": "episode_000002",
+      "episode": 2,
+      "profile": "human",
+      "cameras": {
+        "main": "observation.images.camera"
+      },
+      "expected_s": 15.97,
+      "hard_case": [
+        "multi_step"
+      ],
+      "why": "egocentric 1080p AV1 (v3 concatenated file), multi-ingredient sandwich assembly"
+    },
+    {
+      "pool": "human",
+      "dataset": "wgo",
+      "slug": "homer_52",
+      "episode": "homer_52",
+      "row_group": 20,
+      "profile": "human",
+      "cameras": {
+        "main": "video"
+      },
+      "expected_s": 31.9,
+      "why": "shortest HomER row (31.9 s), 6 gold segments; no instruction text (exercises the empty-instruction path)"
+    },
+    {
+      "pool": "human",
+      "dataset": "wgo",
+      "slug": "homer_53",
+      "episode": "homer_53",
+      "row_group": 21,
+      "profile": "human",
+      "cameras": {
+        "main": "video"
+      },
+      "expected_s": 44.7,
+      "why": "medium HomER row (44.7 s, 12 gold segments)"
+    },
+    {
+      "pool": "human",
+      "dataset": "wgo",
+      "slug": "homer_50",
+      "episode": "homer_50",
+      "row_group": 19,
+      "profile": "human",
+      "cameras": {
+        "main": "video"
+      },
+      "expected_s": 46.5,
+      "hard_case": [
+        "many_short_actions"
+      ],
+      "why": "27 gold segments in 46 s: dense short actions"
+    },
+    {
+      "pool": "human",
+      "dataset": "egodex_pour",
+      "slug": "episode_000026",
+      "episode": 26,
+      "profile": "human",
+      "cameras": {
+        "main": "observation.images.camera"
+      },
+      "expected_s": 7.13,
+      "why": "shortest new clip: one pour into a cup, a single short action"
+    },
+    {
+      "pool": "human",
+      "dataset": "egodex_zip_unzip_bag",
+      "slug": "episode_000012",
+      "episode": 12,
+      "profile": "human",
+      "cameras": {
+        "main": "observation.images.camera"
+      },
+      "expected_s": 8.5,
+      "hard_case": [
+        "repetition"
+      ],
+      "why": "zip then unzip a bag: two mirrored sub-actions on a deformable object"
+    },
+    {
+      "pool": "human",
+      "dataset": "egodex_screw_unscrew_bottle_cap",
+      "slug": "episode_000019",
+      "episode": 19,
+      "profile": "human",
+      "cameras": {
+        "main": "observation.images.camera"
+      },
+      "expected_s": 8.6,
+      "hard_case": [
+        "repetition"
+      ],
+      "why": "screw then unscrew a cap: repeated small wrist rotations"
+    },
+    {
+      "pool": "human",
+      "dataset": "egodex_stack_unstack_cups",
+      "slug": "episode_000007",
+      "episode": 7,
+      "profile": "human",
+      "cameras": {
+        "main": "observation.images.camera"
+      },
+      "expected_s": 9.0,
+      "hard_case": [
+        "repetition"
+      ],
+      "why": "unstack six cups: the same sub-action six times in 9 s"
+    },
+    {
+      "pool": "human",
+      "dataset": "egodex_insert_remove_usb",
+      "slug": "episode_000015",
+      "episode": 15,
+      "profile": "human",
+      "cameras": {
+        "main": "observation.images.camera"
+      },
+      "expected_s": 11.57,
+      "why": "precise insertion and removal of a USB plug, small objects"
+    },
+    {
+      "pool": "human",
+      "dataset": "egodex_fold_unfold_paper_basic",
+      "slug": "episode_000011",
+      "episode": 11,
+      "profile": "human",
+      "cameras": {
+        "main": "observation.images.camera"
+      },
+      "expected_s": 12.87,
+      "hard_case": [
+        "multi_step"
+      ],
+      "why": "fold and unfold paper: a deformable multi-step sequence"
+    }
+  ]
+}

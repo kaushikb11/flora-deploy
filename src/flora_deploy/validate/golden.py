@@ -1,6 +1,9 @@
 """Golden-set staging (PLAN-v3.md §9, W3-C): selection data -> per-episode oracle inputs + manifest.
 
-The selection is data (``golden_selection_v1.json``, next to this module): every episode names
+The selection is data (``golden_selection_v1.json``, and the human-only certification set
+``golden_selection_v2.json``, next to this module; :data:`SELECTIONS`). A selection's
+``version`` decides its prefix: ``golden/v2`` stages under ``<root>/golden/v2/`` and never
+touches v1 (``golden/v1`` below stands for the selection's own prefix). Every episode names
 its dataset (repo + pinned revision + format + license), the episode, the camera key -> role
 map (or, for reward episodes, the ordered views), the pool and why it was chosen.
 :func:`validate_selection` checks it without any network access.
@@ -24,7 +27,8 @@ against the ``flora-golden`` Volume. Per episode it:
 the selection entry changed (``selection_digest``) or ``force``. Finally
 ``<root>/golden/v1/manifest.json`` is rebuilt from every record (:func:`build_manifest`).
 Videos and NC-licensed derivatives stay on the private Volume; only the numbers-only summary
-(:func:`summary_markdown`) is committed (``docs/golden-manifest-v1.md``).
+(:func:`summary_markdown`) is committed (``docs/golden-manifest-v1.md``,
+``docs/golden-manifest-v2.md``; v2 is staged and verified by ``scripts/golden_stage.py``).
 """
 
 from __future__ import annotations
@@ -46,6 +50,11 @@ from typing import Any, Protocol
 SELECTION_PATH = Path(__file__).with_name("golden_selection_v1.json")
 GOLDEN_VERSION = "golden/v1"
 GOLDEN_PREFIX = PurePosixPath("golden") / "v1"
+# Every version a selection may name. Each stages under its own ``golden/<v>/`` prefix
+# (:func:`prefix_for`), so v2 never rewrites v1's files or manifest.
+SELECTIONS = {"golden/v1": SELECTION_PATH,
+              "golden/v2": Path(__file__).with_name("golden_selection_v2.json")}
+GOLDEN_VERSIONS = tuple(SELECTIONS)
 MANIFEST_NAME = "manifest.json"
 RECORD_NAME = "record.json"
 
@@ -82,13 +91,22 @@ def load_selection(path: str | Path = SELECTION_PATH) -> dict:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+def prefix_for(version: str) -> PurePosixPath:
+    """``golden/v2`` -> ``PurePosixPath("golden/v2")`` (a known version only)."""
+    if version not in GOLDEN_VERSIONS:
+        raise SelectionError(f"unknown golden version {version!r}; one of {GOLDEN_VERSIONS}")
+    return PurePosixPath(version)
+
+
 def entry_id(entry: Mapping[str, Any]) -> str:
     return f"{entry['pool']}/{entry['dataset']}/{entry['slug']}"
 
 
-def episode_relpath(entry: Mapping[str, Any]) -> PurePosixPath:
-    """Volume-relative directory of one episode: ``golden/v1/<pool>/<dataset>/<slug>``."""
-    return GOLDEN_PREFIX / entry["pool"] / entry["dataset"] / entry["slug"]
+def episode_relpath(entry: Mapping[str, Any], prefix: PurePosixPath = GOLDEN_PREFIX
+                    ) -> PurePosixPath:
+    """Volume-relative directory of one episode: ``golden/v1/<pool>/<dataset>/<slug>``
+    (``prefix``: the selection's version, :func:`prefix_for`)."""
+    return prefix / entry["pool"] / entry["dataset"] / entry["slug"]
 
 
 def _canonical(obj: Any) -> bytes:
@@ -202,8 +220,8 @@ def _entry_problems(e: Mapping[str, Any], datasets: Mapping[str, Any]) -> list[s
 def validate_selection(selection: Mapping[str, Any]) -> Mapping[str, Any]:
     """Raise ``SelectionError`` listing every problem; return the selection when it is valid."""
     problems: list[str] = []
-    if selection.get("version") != GOLDEN_VERSION:
-        problems.append(f"version must be {GOLDEN_VERSION!r}")
+    if selection.get("version") not in GOLDEN_VERSIONS:
+        problems.append(f"version must be one of {GOLDEN_VERSIONS}")
     datasets = selection.get("datasets") or {}
     episodes = selection.get("episodes") or []
     if not datasets or not episodes:
@@ -222,6 +240,14 @@ def validate_selection(selection: Mapping[str, Any]) -> Mapping[str, Any]:
     )
     problems += [f"source episode {k[0]}:{k[1]} selected more than once"
                  for k, n in src.items() if n > 1]
+    ids = {entry_id(e) for e in episodes if {"pool", "dataset", "slug"} <= set(e)}
+    noise = selection.get("noise_subset")
+    if noise is not None:  # the episodes a certified run's noise job repeats (golden/v2)
+        if not isinstance(noise, list) or len(set(noise)) != len(noise):
+            problems.append("noise_subset must be a list of distinct episode ids")
+        else:
+            problems += [f"noise_subset: {i} is not a selected episode" for i in noise
+                         if i not in ids]
     used = {e.get("dataset") for e in episodes}
     problems += [f"dataset {k!r} is not used by any episode" for k in datasets if k not in used]
     if problems:
@@ -578,7 +604,7 @@ def _reward_index(resolved: Resolved, scans) -> tuple[dict, list[str], bool]:
 
 
 def stage_episode(entry: Mapping[str, Any], mirror: DatasetMirror, root: Path, scans,
-                  *, digest: str) -> dict:
+                  *, digest: str, prefix: PurePosixPath = GOLDEN_PREFIX) -> dict:
     """Stage one episode into ``root/<episode_relpath>``; return its record (also written)."""
     from flora_deploy.media.cuts import stream_copy_cut
     from flora_deploy.media.index import MediaError, get_scan, index_episode, index_stream
@@ -586,11 +612,12 @@ def stage_episode(entry: Mapping[str, Any], mirror: DatasetMirror, root: Path, s
     from flora_deploy.media.types import SourceRef
 
     ds = mirror.ds
-    dest = Path(root) / episode_relpath(entry)
+    dest = Path(root) / episode_relpath(entry, prefix)
     reward = entry["pool"] == "reward"
     record: dict[str, Any] = {
         "id": entry_id(entry), "pool": entry["pool"], "dataset": entry["dataset"],
-        "slug": entry["slug"], "episode": entry["episode"], "path": str(episode_relpath(entry)),
+        "slug": entry["slug"], "episode": entry["episode"],
+        "path": str(episode_relpath(entry, prefix)),
         "profile": entry.get("profile"), "yam32": bool(entry.get("yam32")),
         "modes": entry.get("modes"), "also_reward": entry.get("also_reward", []),
         "hard_case": entry.get("hard_case", []), "why": entry.get("why"),
@@ -659,8 +686,9 @@ def stage_episode(entry: Mapping[str, Any], mirror: DatasetMirror, root: Path, s
     return record
 
 
-def load_record(root: Path, entry: Mapping[str, Any]) -> dict | None:
-    path = Path(root) / episode_relpath(entry) / RECORD_NAME
+def load_record(root: Path, entry: Mapping[str, Any], prefix: PurePosixPath = GOLDEN_PREFIX
+                ) -> dict | None:
+    path = Path(root) / episode_relpath(entry, prefix) / RECORD_NAME
     if not path.is_file():
         return None
     try:
@@ -685,7 +713,8 @@ def stage_all(
     deadline: float | None = None,
     log: Callable[[str], None] = print,
 ) -> dict:
-    """Stage every selected episode (resumable) and rebuild ``golden/v1/manifest.json``.
+    """Stage every selected episode (resumable) and rebuild ``golden/<v>/manifest.json``
+    (``<v>``: the selection's ``version``; v1 and v2 never share a file).
 
     Episodes are grouped by dataset so each dataset's files are fetched once and the work mirror
     is deleted afterwards. ``only``: episode ids or dataset keys. ``deadline``: a
@@ -696,6 +725,7 @@ def stage_all(
     from flora_deploy.media.index import ScanCache
 
     validate_selection(selection)
+    prefix = prefix_for(selection["version"])
     only = set(only)
     root, work = Path(root), Path(work)
     datasets = selection["datasets"]
@@ -708,7 +738,7 @@ def stage_all(
         todo = []
         for e in entries:
             digest = entry_digest(e, datasets[key])
-            rec = load_record(root, e)
+            rec = load_record(root, e, prefix)
             selected = not only or key in only or entry_id(e) in only
             if rec is not None and rec.get("selection_digest") == digest and not (
                 force and selected
@@ -727,26 +757,27 @@ def stage_all(
             for e, digest in todo:
                 t0 = time.monotonic()
                 try:
-                    rec = stage_episode(e, mirror, root, scans, digest=digest)
+                    rec = stage_episode(e, mirror, root, scans, digest=digest, prefix=prefix)
                     records[entry_id(e)] = rec
                     log(f"{entry_id(e)}: {rec['status']} eligible={rec['oracle_eligible']} "
                         f"({time.monotonic() - t0:.1f}s)")
                 except Exception as ex:  # noqa: BLE001 - network etc.: retried by a rerun
                     failed.append({"id": entry_id(e), "error": f"{type(ex).__name__}: {ex}"})
                     log(f"{entry_id(e)}: FAILED {type(ex).__name__}: {ex}")
-            _stage_extra_files(key, datasets[key], mirror, root, log)
+            _stage_extra_files(key, datasets[key], mirror, root, log, prefix)
         finally:
             mirror.cleanup()
             commit()
     manifest = build_manifest(selection, records.values(), failed)
-    write_json_atomic(manifest, root / GOLDEN_PREFIX / MANIFEST_NAME)
+    write_json_atomic(manifest, root / prefix / MANIFEST_NAME)
     commit()
     return manifest
 
 
-def _stage_extra_files(key, ds, mirror: DatasetMirror, root: Path, log) -> None:
+def _stage_extra_files(key, ds, mirror: DatasetMirror, root: Path, log,
+                       prefix: PurePosixPath = GOLDEN_PREFIX) -> None:
     for rel in ds.get("extra_files", []):
-        dest = Path(root) / GOLDEN_PREFIX / "_datasets" / key / rel
+        dest = Path(root) / prefix / "_datasets" / key / rel
         if dest.is_file():
             continue
         try:
@@ -794,7 +825,7 @@ def build_manifest(selection: Mapping[str, Any], records: Iterable[Mapping[str, 
                                           "extra_files") if v.get(f) is not None}
                 for k, v in selection["datasets"].items()}
     return {
-        "version": GOLDEN_VERSION,
+        "version": selection.get("version", GOLDEN_VERSION),
         "selection_sha256": selection_sha256(selection),
         "built_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "counts": counts,

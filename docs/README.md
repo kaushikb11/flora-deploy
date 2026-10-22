@@ -43,6 +43,7 @@ Start with the repository [`README.md`](../README.md) (users) or [`PLAN.md`](PLA
 | [`rewarder-smoke.md`](rewarder-smoke.md) | WS-H: batched Rewarder vs NVIDIA's scripts, engine settings and rates | maintainer |
 | [`golden-candidates.md`](golden-candidates.md) | WS-F: public datasets that stand in for each embodiment pool | maintainer |
 | [`golden-manifest-v1.md`](golden-manifest-v1.md) | W3-C: what is staged in the golden set v1 (counts, media, licenses, coverage) | maintainer |
+| [`golden-manifest-v2.md`](golden-manifest-v2.md) | The 12-episode `human` certification set for the certified run (staged, verified) | maintainer |
 
 ## Upstream
 
