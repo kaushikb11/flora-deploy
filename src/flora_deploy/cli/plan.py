@@ -9,7 +9,7 @@ from typing import Annotated
 
 import typer
 
-from flora_deploy.cli._app import app, console
+from flora_deploy.cli._app import app, console, term_width
 
 _DUR = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd]?)\s*$", re.IGNORECASE)
 _UNIT = {"s": 1, "m": 60, "h": 3600, "d": 86400, "": 3600}
@@ -35,7 +35,7 @@ def _fail(msg: str, code: int = 2) -> typer.Exit:
 
 
 def certificate_status(cfg, option, derived_content=None) -> dict[str, dict]:
-    """Per shard kind of ``option``: the Gate certificate status of its (kind, GPU) pool
+    """Per shard kind of ``option``: the certificate status of its (kind, GPU) pool
     (``cli._certs``: reference / certified / provisional / fail / none /
     unverified_weights, and why), for the config's embodiment, modes and derived content
     digests."""
@@ -51,6 +51,122 @@ def certified_options(cfg, options, derived_content=None) -> set[str]:
     return {o.name for o in options
             if all(c["status"] in ("reference", "certified")
                    for c in certificate_status(cfg, o, derived_content).values())}
+
+
+# Below this terminal width the options are stacked (one block each) instead of a table.
+WIDE_COLUMNS = 120
+
+
+def fidelity_label(o) -> str:
+    """``reference`` / ``certified`` / ``uncertified``: what the option's records will say."""
+    return {"needs certificates": "uncertified"}.get(o.certification, o.certification)
+
+
+def status_label(o) -> str:
+    """``unavailable`` when something blocks the option, ``projection`` when it needs a feature
+    that is not deployed, else ``ok`` / ``at risk`` / ``infeasible`` (budget, deadline or GPU
+    cap)."""
+    if o.unavailable and o.status != "infeasible":
+        return "unavailable"
+    return "projection" if o.requires else o.status
+
+
+def certificate_note(cfg, o, content) -> str | None:
+    """One line on the option's certificates (``None`` for the reference preset): the pools that
+    have one, or that none do yet."""
+    if o.preset == "exact":
+        return None
+    certs = certificate_status(cfg, o, content)
+    ok = [k for k, c in certs.items() if c["status"] in ("certified", "reference")]
+    if not ok:
+        return (f"no accuracy certificates for {o.preset} yet (its records say certified: "
+                "false; `exact` is the reference)")
+    if len(ok) == len(certs):
+        return "certified on every pool"
+    return "certified: " + ", ".join(ok) + "; not yet: " + ", ".join(
+        k for k in certs if k not in ok)
+
+
+def _gpus_label(o) -> str:
+    from flora_deploy.planner.options import episodes_label
+
+    return ", ".join(f"{k.kind} {k.containers}x{k.gpu}" + (f":{k.gpu_count}" if k.gpu_count > 1
+                                                          else "") + episodes_label(k)
+                     for k in o.kinds)
+
+
+def _print_plan(cfg, workload, req, deadline_s, options, best, rates, table, content) -> None:
+    from rich.markup import escape
+    from rich.table import Table
+
+    from flora_deploy.planner.options import rates_label
+
+    dl = f", deadline {deadline_s / 3600:.0f} h" if deadline_s else ""
+    console.print(f"[bold]{escape(cfg.project)}[/bold]: {workload.video_s / 3600:,.1f} "
+                  f"video-hours, {workload.episodes:,} episodes; budget "
+                  f"{_money(req.budget_usd or 0)}{dl}, max {req.max_gpus} GPUs", soft_wrap=True)
+    colour = {"ok": "green", "at risk": "yellow", "infeasible": "red", "unavailable": "red",
+              "projection": "yellow"}
+
+    def cost(o) -> str:
+        return f"{_money(o.cost_usd)} ({_money(o.cost_low_usd)}-{_money(o.cost_high_usd)})"
+
+    def wall(o) -> str:
+        return f"{o.wall_s / 3600:.1f} h (<= {o.wall_high_s / 3600:.1f} h)"
+
+    def status(o) -> str:
+        s = status_label(o)
+        return f"[{colour[s]}]{s}[/{colour[s]}]"
+
+    wide = term_width() >= WIDE_COLUMNS
+    if wide:
+        t = Table(show_lines=False)
+        for col in ("#", "option", "cost (range)", "wall-clock", "GPUs", "fidelity", "rates",
+                    "status"):
+            t.add_column(col)
+        for i, o in enumerate(options, 1):
+            t.add_row(str(i) + (" *" if o is best else ""), escape(o.name), cost(o), wall(o),
+                      str(o.peak_gpus), fidelity_label(o), escape(rates_label(o)), status(o))
+        console.print(t)
+    for i, o in enumerate(options, 1):
+        if not wide:
+            mark = " [bold](recommended)[/bold]" if o is best else ""
+            console.print(f"[bold]{i}. {escape(o.name)}[/bold]{mark}: {status(o)}, "
+                          f"{fidelity_label(o)}", soft_wrap=True)
+            console.print(f"   cost {cost(o)}", soft_wrap=True)
+            console.print(f"   wall-clock {wall(o)}, {o.peak_gpus} GPUs at peak", soft_wrap=True)
+            console.print(f"   rates {escape(rates_label(o))}", soft_wrap=True)
+        console.print(f"  {i}. pools: {escape(_gpus_label(o))}", soft_wrap=True)
+        for f in o.flags:
+            console.print(f"  {i}. {escape(f)}", soft_wrap=True)
+        note = certificate_note(cfg, o, content)
+        if note:
+            console.print(f"  {i}. certificates: {escape(note)}", soft_wrap=True)
+    if any("!" in k.gpu for o in options for k in o.kinds):
+        console.print("H100! means exactly an H100 (Modal never upgrades it to a pricier GPU).",
+                      soft_wrap=True)
+    console.print("Cost: the all-in estimate for this workload at Modal list prices: GPU work, "
+                  "plus each container's startup and the orchestrator (idle time after the "
+                  "work is not included). `flora report` shows what a job actually spent.",
+                  soft_wrap=True)
+    console.print(f"Prices: {escape(rates.source)}" +
+                  (f" (x{rates.region_multiplier} region)" if rates.region_multiplier != 1
+                   else "") + f". Rates: {escape(table.source)} ({table.updated}).",
+                  soft_wrap=True)
+    if best is not None:
+        n = options.index(best) + 1
+        console.print(f"Recommended: {n} ({escape(best.name)}), the cheapest option your "
+                      f"config can run. Write it with `flora plan ... --write {n}`.",
+                      soft_wrap=True)
+        return
+    fits = [o for o in options if o.status != "infeasible" and not o.requires]
+    if fits:  # something fits the budget and deadline but cannot run: say why, not "raise it"
+        why = "; ".join(f"{options.index(o) + 1} ({o.name}): {', '.join(o.unavailable)}"
+                        for o in fits)
+        console.print(f"[red]No runnable option: {escape(why)}.[/red]", soft_wrap=True)
+    else:
+        console.print("[red]No option fits the budget, deadline and GPU cap: raise --budget / "
+                      "--deadline / max_gpus, or label fewer episodes.[/red]", soft_wrap=True)
 
 
 def _cameras_from_config(cfg) -> int:
@@ -88,7 +204,6 @@ def plan(
     """Show 2-4 run options (cost, wall-clock, GPUs, certification) and optionally pick one."""
     import yaml
     from rich.markup import escape
-    from rich.table import Table
 
     from flora_deploy.config.presets import PresetUnavailableError
     from flora_deploy.config.receipts import load_certified
@@ -99,7 +214,6 @@ def plan(
         WorkloadSummary,
         apply_option,
         default_presets,
-        episodes_label,
         plan_options,
         rates_label,
         recommended,
@@ -146,7 +260,8 @@ def plan(
     req = PlanRequest(workload=workload, stages=cfg.pipeline.stages, presets=presets,
                       deadline_s=deadline_s,
                       budget_usd=budget if budget is not None else cfg.modal.budget_usd,
-                      max_gpus=max_gpus or cfg.modal.max_gpus)
+                      max_gpus=max_gpus or cfg.modal.max_gpus,
+                      allow_uncertified=cfg.allow_uncertified)
     req = with_pool_overrides(req, cfg.preset, cfg.pools())
     try:
         options = plan_options(req, table=table, rates=rates)
@@ -167,49 +282,7 @@ def plan(
                          "certificates": certificate_status(cfg, o, content)}
                         for o in options]}, indent=2))
     else:
-        dl = f", deadline {deadline_s / 3600:.0f} h" if deadline_s else ""
-        console.print(f"[bold]{escape(cfg.project)}[/bold]: {workload.video_s / 3600:,.1f} "
-                      f"video-hours, {workload.episodes:,} episodes; budget "
-                      f"{_money(req.budget_usd or 0)}{dl}, max {req.max_gpus} GPUs")
-        t = Table(show_lines=False)
-        # "x4 ep": episodes in flight inside one input (segcap); "x4": Modal inputs
-        for col in ("#", "option", "GPUs (containers x inputs | ep)", "cost (range)",
-                    "wall-clock",
-                    "peak GPUs", "fidelity", "rates", "status"):
-            t.add_column(col)
-        for i, o in enumerate(options, 1):
-            gpus = ", ".join(
-                f"{k.kind} {k.containers}x{k.gpu}" + (f":{k.gpu_count}" if k.gpu_count > 1
-                                                       else "") + episodes_label(k)
-                for k in o.kinds)
-            mark = " *" if o is best else ""
-            colour = {"ok": "green", "at risk": "yellow", "infeasible": "red"}[o.status]
-            status = f"[{colour}]{o.status}[/{colour}]"
-            if o.unavailable:
-                status += " [red](unavailable)[/red]"
-            t.add_row(str(i) + mark, o.name, gpus,
-                      f"{_money(o.cost_usd)} ({_money(o.cost_low_usd)}-{_money(o.cost_high_usd)})",
-                      f"{o.wall_s / 3600:.1f} h (<= {o.wall_high_s / 3600:.1f} h)",
-                      str(o.peak_gpus), o.certification, rates_label(o), status)
-        console.print(t)
-        for i, o in enumerate(options, 1):
-            for f in o.flags:
-                console.print(f"  {i}. {escape(f)}")
-            if o.preset != "exact":
-                certs = certificate_status(cfg, o, content)
-                console.print(f"  {i}. certificates: " + ", ".join(
-                    f"{k} on {c['gpu']}: {c['status']}" + (f" ({escape(c['why'])})"
-                                                         if c["why"] else "")
-                    for k, c in certs.items()))
-        console.print(f"Prices: {escape(rates.source)}" +
-                      (f" (x{rates.region_multiplier} region)" if rates.region_multiplier != 1
-                       else "") + f". Rates: {escape(table.source)} ({table.updated}).")
-        if best is None:
-            console.print("[red]No option fits (of those available): raise --budget / --deadline / "
-                          "max_gpus, or label fewer episodes.[/red]")
-        else:
-            console.print(f"Recommended: {options.index(best) + 1} ({escape(best.name)}). "
-                          f"Write it with `flora plan ... --write {options.index(best) + 1}`.")
+        _print_plan(cfg, workload, req, deadline_s, options, best, rates, table, content)
 
     if write is not None:
         if not 1 <= write <= len(options):

@@ -54,7 +54,7 @@ from flora_deploy.planner.rates import RateTable
 #: Modal list prices in $/hour. Source: modal.com/pricing, as recorded in
 #: ``research_notes/Plan review v2/modal_verification.md`` §15 (verified 2026-10-21) and
 #: ``docs/exact-concurrency.md`` (H200 $0.001261/s, core $0.0000131/s, GiB $0.00000222/s).
-PINNED_PRICES_SOURCE = "modal.com/pricing (pinned 2026-10-21, modal_verification.md §15)"
+PINNED_PRICES_SOURCE = "Modal list prices (modal.com/pricing, pinned 2026-10-21)"
 PINNED_PRICES: dict[str, float] = {
     "B300": 7.10,
     "B200": 6.25,
