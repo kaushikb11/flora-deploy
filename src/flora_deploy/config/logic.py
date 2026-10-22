@@ -219,6 +219,7 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     "jobs/deps.py",
     "jobs/driver.py",  # per-tick driver (refresh, transient retry), shared Modal/local
     "jobs/orchestrator.py",
+    "jobs/pools.py",  # worker-pool drain / pre-warm timing and orchestrator sizing; no outputs
     "jobs/progress.py",
     "jobs/reconciler.py",
     "jobs/spawner.py",

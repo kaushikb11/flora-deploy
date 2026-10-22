@@ -27,15 +27,19 @@ from flora_deploy.jobs import attempts as A
 from flora_deploy.jobs import progress as P
 from flora_deploy.jobs.manifest import load_manifest
 from flora_deploy.jobs.orchestrator import BudgetGate, OrchestratorDeps, utc
+
+# The orchestrator's own container (``jobs.pools``: 0.125 cores, 256 MiB request,
+# preemptible): charged by the default budget gate.
+from flora_deploy.jobs.pools import (
+    ORCHESTRATOR_CORES,
+    ORCHESTRATOR_MEMORY_GIB,
+    ORCHESTRATOR_PREEMPTIBLE,
+)
 from flora_deploy.jobs.settings import RunSettings
 from flora_deploy.jobs.store import Store
 from flora_deploy.jobs.types import ControlRecord, Manifest, Shard
 
 Clock = Callable[[], float]
-# The orchestrator's own container (``modal_app.orchestrator_app``: 0.25 cores, 1 GiB,
-# non-preemptible): charged by the default budget gate.
-ORCHESTRATOR_CORES = 0.25
-ORCHESTRATOR_MEMORY_GIB = 1.0
 
 
 class StoreManifestSource:
@@ -205,6 +209,7 @@ def default_budget_gate(store: Store, settings: RunSettings, manifests: StoreMan
         rates=pinned_rates(region_multiplier=region_multiplier_for(settings.region)),
         scaledown_s=float(settings.scaledown_s), clock=clock,
         orchestrator_cores=ORCHESTRATOR_CORES, orchestrator_memory_gib=ORCHESTRATOR_MEMORY_GIB,
+        orchestrator_preemptible=ORCHESTRATOR_PREEMPTIBLE,
         quarantined=lambda: attempts.quarantined().keys(),
         estimator=RateTableEstimator.default(settings.preset, durations=durations,
                                              packing_rates=packing_rates),

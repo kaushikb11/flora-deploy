@@ -530,7 +530,8 @@ class Orchestrator:
                  budget: BudgetGate | None = None, events: EventSink | None = None,
                  clock: Callable[[], float] = time.time, deadline_s: float = DEADLINE_S,
                  lease_ttl_s: float = LEASE_TTL_S, max_respawns: int = MAX_RESPAWNS,
-                 spawn_grace_s: float = SPAWN_GRACE_S, holder: str | None = None):
+                 spawn_grace_s: float = SPAWN_GRACE_S, holder: str | None = None,
+                 pools: Any = None):
         self.settings = settings
         self.job_id = settings.job_id
         self.cfg = settings.config_hash
@@ -555,6 +556,8 @@ class Orchestrator:
         self._spawn_takes_token = _accepts_kw(spawner.spawn, "token")
         self._budget_cancelled: set[str] = set()  # call ids cancelled by the budget hard cap
         self._stopped = False  # a budget_stop is in force this tick
+        # ``jobs.pools.PoolScaler`` (or None): drains worker classes with no remaining work
+        self.pools = pools
 
     # events / files -------------------------------------------------------------------------
     def _emit(self, event: str, **kw: Any) -> None:
@@ -666,6 +669,7 @@ class Orchestrator:
                         self.spawner.cancel(led.call_id)
                     self._save(led, status="cancelled", reason="job cancelled")
             self._emit("cancelled", reason=controls.cancelled.reason)
+            self._pools_final()
             return "cancelled"
 
         for s in shards:
@@ -716,6 +720,7 @@ class Orchestrator:
             return "continue"
 
         stopped = controls.budget_stopped is not None
+        self._pools_update(shards, satisfied, dead)  # restore before spawning, drain when done
         if not stopped:
             stopped = not self._spawn_eligible(shards, satisfied, dead, status)
             if not self._held:
@@ -730,11 +735,45 @@ class Orchestrator:
                 problems = self._error_rate_problems(shards)
                 result = "completed_with_errors" if problems else "done"
             self._emit(result, shards=len(by_id), dead=sorted(dead), problems=problems)
+            self._pools_final()
             return result
         if stopped and active == 0:
             self._emit("budget_stopped")
+            self._pools_final()
             return "budget_stopped"
         return "running"
+
+    # worker pools (jobs.pools) --------------------------------------------------------------
+    def _pools_update(self, shards: Sequence[Shard], satisfied: set[str], dead: set[str]) -> None:
+        if self.pools is None:
+            return
+        from flora_deploy.jobs.pools import kind_demand
+
+        demand = kind_demand(shards, satisfied, dead)
+        live_spawned: dict[str, float] = {}
+        called: set[str] = set()
+        for led in self._ledgers.values():
+            if led.calls:
+                called.add(led.kind)
+            if led.status in _LIVE:  # a live call is demand whatever resolve says
+                demand[led.kind] = True
+                spawned = [e for e in led.calls
+                           if e.get("call_id") == led.call_id and e.get("utc")]
+                if spawned:
+                    live_spawned[led.shard_id] = _parse_utc(spawned[0]["utc"])
+        self.pools.update(demand)
+        tick_prewarm = getattr(self.pools, "tick_prewarm", None)
+        if callable(tick_prewarm):
+            tick_prewarm(shards, satisfied=satisfied, live_spawned=live_spawned,
+                         called_kinds=called, min_containers=self.settings.min_containers)
+
+    def _pools_final(self) -> None:
+        if self.pools is not None:
+            self.pools.final()
+
+    def _drains(self) -> Mapping[str, Any]:
+        fn = getattr(self.pools, "drains", None)
+        return fn() if callable(fn) else {}
 
     def _active_count(self) -> int:
         return sum(1 for led in self._ledgers.values() if led.status in _LIVE)
@@ -818,7 +857,9 @@ class Orchestrator:
                 else:
                     t1 = _parse_utc(led.updated_utc) if led.updated_utc else now
                     calls.append(CallRecord(cid, led.shard_id, led.kind, t0, t1, led.status))
-        return BudgetState(now, tuple(calls))
+        prewarms = getattr(self.pools, "prewarms", None)
+        return BudgetState(now, tuple(calls), drains=self._drains(),
+                           prewarms=prewarms() if callable(prewarms) else {})
 
     def enforce_budget(self) -> list[str]:
         """Budget hard cap, every tick: ``budget.overspend(budget_state())`` names live calls to
