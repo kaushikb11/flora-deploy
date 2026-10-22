@@ -1113,7 +1113,7 @@ def main(argv: list[str] | None = None) -> int:
     app_names: list[str] = []
     watch: list[str] = []
     notes: list[str] = []
-    watch: ContainerWatch | None = None
+    cwatch: ContainerWatch | None = None
     try:
         # media to its own Volume (input.stage_to), as Wave H stages it
         for data in sorted({r.spec.data for r in runs}):
@@ -1172,7 +1172,7 @@ def main(argv: list[str] | None = None) -> int:
                 fut.result()  # re-raise the first setup failure
 
         # every container of this run's apps, as Modal sees it (the drain / pre-warm checks)
-        watch = ContainerWatch(lambda app: app in app_names).start()
+        cwatch = ContainerWatch(lambda app: app in app_names).start()
         procs = {}
         for r in runs:
             args_ = [fl, "run", "--config", str(r.cfg_path), "--fake-models", "--determinism",
@@ -1198,9 +1198,9 @@ def main(argv: list[str] | None = None) -> int:
                   "\n  ".join(out.strip().splitlines()[-8:]), flush=True)
         # the job-end drains happen as the jobs end: give them the bound (and one poll) to act
         # before anything is stopped (`modal app stop` would end the containers itself)
-        watch.wait_drained(time.time() + WATCH_TAIL_S)
-        watch.stop()
-        print(f"container watch: {len(watch.seen)} containers, still alive {watch.alive()}",
+        cwatch.wait_drained(time.time() + WATCH_TAIL_S)
+        cwatch.stop()
+        print(f"container watch: {len(cwatch.seen)} containers, still alive {cwatch.alive()}",
               flush=True)
         for r in runs:
             st = sh([fl, "status", r.job_id, "--config", str(r.cfg_path), "--json"], cwd=work,
@@ -1214,7 +1214,7 @@ def main(argv: list[str] | None = None) -> int:
                     gap=True)
             assert_job(r, run_id, getattr(r, "poison", None))
             try:
-                assert_new(r, watch)
+                assert_new(r, cwatch)
             except Exception as e:  # noqa: BLE001 - reported as a failed check
                 r.check("new-behaviour checks ran", False, repr(e))
     except Exception as e:  # noqa: BLE001 - always clean up, then report
@@ -1223,8 +1223,8 @@ def main(argv: list[str] | None = None) -> int:
         traceback.print_exc()
         notes.append(f"aborted: {e!r}")
     finally:
-        if watch is not None:
-            watch.stop()
+        if cwatch is not None:
+            cwatch.stop()
         notes += cleanup(app_names, run_id, [r.job_id for r in runs], watch, keep=args.keep)
         if not args.work:
             for data in EPISODES:
