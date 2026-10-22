@@ -12,18 +12,24 @@ All examples on this page are synthetic.
 
 Every path is relative to `output.sink`:
 
-* `s3://bucket/prefix`, `r2://...` and `gs://...`: object keys under `prefix/`;
+* `s3://bucket/prefix`: object keys under `prefix/` (Cloudflare R2 and Google Cloud Storage
+  work as `s3://` with their S3 endpoint in `AWS_ENDPOINT_URL`; `gs://` and `r2://` sinks are
+  refused);
 * `volume://name/dir`: files under `/dir` in the Modal Volume `name`;
-* `file:///abs/dir`: files under `/abs/dir`.
+* `file:///abs/dir`: files under `/abs/dir` (local runs only).
 
 ```
 flora/<job_id>/
   manifest.json                 # the job's latest planned manifest (a pointer)
   run.json                      # the latest run spec (`flora status` reads it)
   runs/<config_hash>.json       # one run spec per config
+  job.json                      # a status cache; status is derived from receipts
+  control/  containers/         # cancel/resume requests and container heartbeats
   index/                        # `flora index`: one receipt per episode, plus summary.json
   <config_hash>/
     manifest.json               # this config's manifest (episodes, shards, stage hashes)
+    calls/                      # the orchestrator's per-shard call ledgers
+    pools/drains.json           # Modal runs: when idle worker pools were scaled down
     output/
       summary.json              # the pointer: written last, names the current generation
       gen/<generation>/         # one complete compose; a re-compose writes a new one
@@ -33,12 +39,15 @@ flora/<job_id>/
         reward.dense.jsonl      reward.dense.parquet
         reward.rubric.jsonl     reward.rubric.parquet
   <stage_hash>/                 # what shards produce, keyed by the hash of their shard kind
-    parts/  receipts/  attempts/  calls/  errors/  audit/  replans/
+    parts/  receipts/  attempts/  errors/  audit/  replans/
 flora/deployments/<app>.json    # what `flora deploy` deployed
 ```
 
-Only the stages the config lists get files, in the formats `output.formats` lists (default
-both JSONL and Parquet). Read the stage files through `summary.json`: its `files` maps
+A local run (`flora run --local`) also keeps its own state under `<store>/.flora-local/`.
+
+Only the stages the config lists get files, in the formats `output.formats` lists (default:
+Parquet only; add `jsonl` to get the JSONL files too; `lerobot` is not an output format, use
+`flora export`, see [`export.md`](export.md)). Read the stage files through `summary.json`: its `files` maps
 `<stage>.<format>` to the path under `output/gen/<generation>/` (`flora results` and the SDK do
 this). `<generation>` is a digest of the composed contents, so composing the same parts again
 reuses the same directory, and a reader never sees a half-written set. Inside `<stage_hash>/`,
@@ -69,7 +78,7 @@ same `<stage_hash>` directory.
 | `terminal` | object or null | terminal reward (`reward.terminal`) |
 | `dense` | object or null | dense reward (`reward.dense`) |
 | `rubric` | object or null | rubric reward (`reward.rubric`) |
-| `audit_ref` | string or null | store path of the full audit file for this record, when one was written |
+| `audit_ref` | string or null | where the episode's full NVIDIA audit is: `<stage_hash>/audit/<kind>/#uid=<uid>` (the audit line for this uid is in one of the JSONL files under that directory). Set by `exact` segment/caption; null for reward stages and `balanced` |
 
 `uncertified_reason` is one of:
 
@@ -79,7 +88,8 @@ same `<stage_hash>` directory.
 * `uncertified_stack`: no accuracy certificate covers this stage on this GPU for the job's
   embodiment, and `allow_uncertified: true` let it run anyway (`flora doctor` and `flora plan`
   show each stage's status);
-* `uncovered_pool`: no certificate covers the episode's embodiment pool;
+* `uncovered_pool`: no certificate covers the episode's embodiment pool (reserved: not written
+  today);
 * `oracle_ineligible_source`: the source video cannot be cut so that it decodes to exactly the
   source frames, so the record cannot be compared with the reference;
 * `fake_models`: the record was made by fake engines in a local run (`flora run --local
@@ -98,7 +108,7 @@ same `<stage_hash>` directory.
 | `logic_version` | string | framework logic version |
 | `framework` | string | `flora-deploy <version>` |
 | `gpu` | string or null | GPU the worker ran on (from `nvidia-smi`); not part of the config hash |
-| `certificate` | string or null | id of the Gate certificate that covers this record; null for `exact` (the reference) and for uncertified stacks; `fake-models` / `local-fake-models` for fake engines |
+| `certificate` | string or null | id of the accuracy certificate that covers this record ([`certification.md`](certification.md)); null for `exact` (the reference), for stages that are the reference by identity (today `balanced`'s reward stages, which are certified without a certificate) and for uncertified stacks; `fake-models` / `local-fake-models` for fake engines |
 | `source` | object | camera role to `{uri, range_s}`: the video file and time range the episode came from |
 | `engine_hash` | string or null | the producing stage's own hash (for `balanced`, the engine spec, sampling and pins), kept when the worker stamps `config_hash` with the job's stage hash; null when the stage set none |
 | `embodiment` | string or null | the job's `pipeline.embodiment` (the embodiment pool a certificate must cover) |
@@ -246,7 +256,7 @@ Reward stages have one row per record:
 | `duplicates_resolved` | int | duplicate records dropped (a retried shard wrote the same record twice) |
 | `conflicts` | list of strings | `uid/stage` keys whose duplicates differed (the latest one is kept) |
 | `foreign_records_dropped` | int | records from another config hash, ignored |
-| `poison_pills` | list of strings | `uid/kind` episodes isolated because they kept crashing workers |
+| `poison_pills` | list of strings | `uid/kind` episodes set aside because they crashed their worker every time they ran |
 | `unplanned_episodes` | object | episode to reason, for indexed episodes the planner excluded (for example, no task text); they count as excluded in every stage |
 | `generation` | string | digest of this compose's stage files: they live under `output/gen/<generation>/` |
 | `formats` | list of strings | the output formats written (`output.formats`) |
@@ -275,22 +285,31 @@ Reward stages have one row per record:
 
 ## Exclusions
 
-An excluded episode has **no record** in its stage's JSONL or Parquet. It is counted in
-`summary.json`, under `stages.<stage>.excused`, `poison_pills` and `errors.by_kind`, and it has a
+An excluded episode has **no record** in its stage's JSONL or Parquet. A worker exclusion is
+counted in `summary.json`, under `stages.<stage>.excused`, `poison_pills` and `errors.by_kind`
+(an episode the planner left out is under `stages.<stage>.unplanned` instead), and it has a
 line in an error file under `flora/<job>/<stage_hash>/errors/`. Episodes are excluded for three
 reasons:
 
 * `nv_failure`: NVIDIA's own code rejected the episode (for example, an unparseable model answer
   where NVIDIA has no fallback);
-* `poison_pill`: the episode crashed workers repeatedly, so it was isolated after bisection;
+* `poison_pill`: the episode crashed its worker every time it ran, so it was set aside (the shard
+  was split until only that episode was left);
 * `missing_task`: a reward stage needs the episode's task text, and it has none (empty in the
-  dataset, with `episode_instruction.source: dataset_task`). The planner usually leaves such an
-  episode out (`unplanned_episodes`, reason `missing_task`); a reward worker that still meets one
-  excludes that episode only, never its shard. With `source: fixed` the fixed text is used.
+  dataset, with `episode_instruction.source: dataset_task`). The planner leaves such an episode
+  out of the whole job, segment and caption included (`unplanned_episodes`, reason
+  `missing_task: ...`), and it counts as excluded in every stage, so a few of them can push the
+  job past `max_episode_error_rate`. Set `episode_instruction.source: fixed` with a `text`, or
+  drop the reward stages, to label it. A reward worker that still meets one excludes that
+  episode only, never its shard.
+
+The planner's reasons in `unplanned_episodes` are written as `<reason>: <detail>`: `index_failed`
+(the index pass raised), `source_error` (the source is unusable: missing file, bad range),
+`out_of_envelope` (only with `pipeline.envelope: enforce`) and `missing_task`.
 
 `infra` errors (missing media, I/O, CUDA) are diagnostics: the shard is retried and they never
 exclude an episode by themselves. If a stage excludes more than `retries.max_episode_error_rate`
-of its episodes, the job ends `completed_with_errors` (exit code 3) and `problems` says which
+of its episodes (default 0.1), the job ends `completed_with_errors` (exit code 3) and `problems` says which
 stage.
 
 Error files are JSONL, one object per line:
@@ -311,12 +330,16 @@ on `certified` if you want only certified labels.
 
 ## Loading the output
 
-Copy a stage locally with `flora results` (or read from the bucket with `s3fs` / `gcsfs`):
+Copy a stage locally with `flora results` (or read from the bucket with `s3fs`):
 
 ```bash
-flora results --job my-labels --stage caption --format parquet --out caption.parquet
-flora results --job my-labels --stage reward.terminal --format parquet --out terminal.parquet
+flora results caption --job my-labels --format parquet --out caption.parquet
+flora results reward.terminal --job my-labels --format parquet --out terminal.parquet
 ```
+
+`--job` defaults to the `flora.yaml` project, and falls back to `<project>.fake` (a fake-model
+local run) with a notice when no real run exists; an explicit `--job` never falls back.
+`--store` defaults to `output.sink`, then `<config dir>/flora-local-store`.
 
 pandas:
 
@@ -346,7 +369,7 @@ From Python with the store directly:
 ```python
 from flora_deploy.export.results import iter_records, load_parquet, store_from_uri
 
-store = store_from_uri("s3://my-bucket/flora/my-labels")
+store = store_from_uri("s3://my-bucket/prefix")   # the job's output.sink, not the job directory
 records = list(iter_records(store, "my-labels", "caption"))   # StageRecord objects
 table = load_parquet(store, "my-labels", "reward.dense")       # pyarrow.Table
 ```

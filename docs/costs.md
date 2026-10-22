@@ -61,8 +61,11 @@ memory. A job pays for four things:
   container then labels.
 - **GPU work.** The seconds spent labelling. This grows with the video, at the same rate for a
   small job as for a big one.
-- **Idle at the end.** After a stage's last episode its containers stay up for a few seconds
-  until they are shut down.
+- **Idle at the end.** Once a stage has no work left, the orchestrator notices within one 15 s
+  poll and drops that pool's idle window to 2 s, so its containers stay up about 17 s more and
+  then scale to zero. This happens per stage, mid-job too: the segment pool drains while
+  captioning still runs. Containers you keep warm with `flora deploy --min-containers` are left
+  alone.
 - **The orchestrator.** A small CPU container that runs the job. It costs under a cent an hour.
 
 Segment + caption, one container per stage, per video-hour:
@@ -121,8 +124,10 @@ over as many GPUs as `modal.max_gpus` allows, so it picks more containers when y
 Each cell: cost per video-hour, wall-clock and the containers `flora plan` picks (segment + caption).
 <!-- /cost-table:gpus -->
 
-- If time doesn't matter, keep `max_containers: 1` per stage (the templates' default). That is
-  the cheapest way to run.
+- If time doesn't matter, run one container per stage (`max_containers: 1`, as in
+  `balanced_lerobot.yaml`; `balanced_mp4_dir.yaml` ships 2 per stage). That is the cheapest way
+  to run. `flora plan` recommends a layout that fills `modal.max_gpus`, so set
+  `modal.max_gpus: 2` if you want it to pick one container per stage.
 - If you have a deadline, pass `flora plan --deadline 12h`. The planner adds containers only
   until the job meets it.
 - `flora plan --write N` writes option N's `max_containers` into `flora.yaml`.
@@ -131,11 +136,20 @@ Each cell: cost per video-hour, wall-clock and the containers `flora plan` picks
 
 ### Warm starts
 
-The first container of a stage builds its GPU kernels and then saves them (a compile cache).
-Later containers of the same stage load the cache, which should take minutes off each startup.
+The first container of a stage builds its GPU kernels and then saves them (a compile cache),
+once, after its first shard. Later containers of the same stage load the cache, which should take
+minutes off each startup. The cache lives on the `flora-cache` Volume, so it is shared across
+jobs and redeploys. It is keyed by the image, the vLLM / torch / Triton / CUDA versions, the
+engine settings (model, lengths and scheduler limits such as `max_num_seqs`) and the GPU: the
+first job after an image or engine change starts cold again and publishes a new cache, and
+later jobs start warm.
+
 Separately, the caption pool starts booting while segmentation is still running, so its startup
-overlaps the segment work instead of following it. That costs a few cents and saves several
-minutes of wall-clock on a small job.
+overlaps the segment work instead of following it. The orchestrator starts it about one caption
+startup before the first caption shard can run, and the budget charges it from its start. If the
+estimate is early the H100 waits, at about $0.09 per minute; on a small job it saves several
+minutes of wall-clock. It is skipped when `flora deploy --min-containers` already keeps the
+pool warm.
 
 Batch fill is the other new change: it feeds the GPU bigger batches, so it does the same work in
 fewer seconds. It matters on big jobs, where GPU work is the whole bill. Neither warm starts nor
@@ -168,9 +182,9 @@ batch fill has been measured yet, so the columns below are estimates:
 | cost (range) | The all-in estimate, and its range from the rates' error bands |
 | wall-clock | How long the job should take; `<=` is the slow end of the range |
 | GPUs | How many GPUs the option uses at once |
-| fidelity | `certified`, `uncertified` or `reference`: what the records will say about accuracy |
+| fidelity | `certified`, `partly certified` (some stages have a certificate, or are NVIDIA's own engine, and others do not), `uncertified` or `reference`: what the records will say about accuracy |
 | rates | `measured (n=1, ±50%)` means measured, on one job, ±50%; `estimate (...)` means part of the price is not measured |
-| status | `ok`, `at risk` (the high end of the range passes your budget or deadline), `infeasible` or `unavailable` |
+| status | `ok`, `at risk` (the high end of the range passes your budget or deadline), `infeasible`, `unavailable` or `projection` (needs a feature that is not deployed; shown for comparison and never recommended) |
 
 Lines under the table give each option's pools (for example `segment 1xL40S x1, caption 3xH100! x1`)
 and any warnings. The last line names the recommended option. Big episodes, GPU queueing and
@@ -192,20 +206,21 @@ also prints how to set a Modal Environment budget as a backstop, a little above 
 
 `flora report` shows what a job actually spent: the total, a breakdown by stage and by container,
 and the cost per video-hour. `flora status` shows the spend so far while the job runs. Both work
-from Modal's list prices; Modal's own billing (`modal billing report`) is the final word.
+from Modal's list prices; Modal's own billing is the final word (`modal billing report`, on
+Team and Enterprise plans; otherwise the usage page of the Modal dashboard).
 
 ## What isn't included
 
 - **Modal plans and credits.** Every number here is at Modal's list price, before any free
   credits (the Starter plan comes with $30 of credits) and before any plan fee or discount.
 - **Storage and transfer.** Modal Volumes cost $0.09 per GiB a month above 1 TiB free, and
-  downloads out of Modal cost $0.04 per GiB. Videos, model weights and outputs live on Volumes.
+  downloads out of Modal cost $0.04 per GiB beyond the transfer your plan includes. Videos, model weights and outputs live on Volumes.
 - **Preparing the data.** `flora index` runs on CPU containers and costs a few cents for most
   datasets (or nothing with `--local`); downloading a Hugging Face dataset is not priced.
 - **Region pinning.** Setting `modal.region` multiplies every price by 1.15 to 1.75.
   `flora plan` includes this; the tables here don't.
-- **Retries and preemptions.** A preempted or crashed container redoes at most a few minutes of
-  work, which these tables don't count.
+- **Retries and preemptions.** A preempted or crashed container redoes at most one shard of
+  work (about 10 GPU-minutes by default), which these tables don't count.
 - **`reward.rubric`.** Its rate is not measured yet, so `flora plan` marks an option that
   uses it as unavailable.
 - **Certification runs.** Running the `exact` reference to certify a stack is a separate job on

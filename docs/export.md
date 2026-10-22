@@ -7,16 +7,27 @@ the episode metadata, and per-frame columns in the data parquet. The code is
 upload). `tests/unit/test_export_doc.py` checks the field tables below against the code.
 
 ```bash
-flora export --job my-labels --store s3://bucket/flora --to lerobot --out ./demo-flora
-flora export --job my-labels --to lerobot --out ./demo-flora \
+flora export --job my-labels --store s3://bucket/prefix --to lerobot --out ./demo-flora \
+    --allow-uncertified                                           # see Safety
+flora export --job my-labels --to lerobot --out ./demo-flora --allow-uncertified \
     --stages caption,reward.dense --push-to-hub me/demo-flora      # private repo
 ```
+
+**`flora export` refuses uncertified records unless you pass `--allow-uncertified`.** Today that
+covers every `balanced` job: its `segment` and `caption` records are uncertified until a
+certificate exists (its rewards are NVIDIA's own engine and certified). Fake-model records need
+`--allow-fake` instead. A refusal exits 2 and writes nothing.
+
+`--store` is the job's `output.sink` (the store root, not the `flora/<job>/` directory). Run in
+the directory of `flora.yaml`, `--job` defaults to the config's project (falling back to
+`<project>.fake` with a notice when no real run exists) and `--store` to `output.sink`, then
+`<config dir>/flora-local-store`.
 
 ```python
 from flora_deploy import sdk
 
-job = sdk.open_job("my-labels", store="s3://bucket/flora")
-report = job.export("./demo-flora", push_to_hub="me/demo-flora")
+job = sdk.open_job("my-labels", store="s3://bucket/prefix")
+report = job.export("./demo-flora", allow_uncertified=True, push_to_hub="me/demo-flora")
 report.unlabeled            # episodes that got no label, with the reason
 ```
 
@@ -26,8 +37,10 @@ report.unlabeled            # episodes that got no label, with the reason
 **never modified**. The export is built in a temporary sibling directory and renamed into place
 when it is complete, so a failed export leaves nothing behind.
 
-* **Copied unchanged:** everything in the source except `videos/`: `meta/tasks.*`,
-  `meta/stats.json` / `meta/episodes_stats.jsonl`, and the rest.
+* **Copied unchanged:** everything else in the source except `videos/` and tool directories
+  (`.git`, `.cache`, `.scratch`, `__pycache__`): `meta/tasks.*`, `meta/stats.json` /
+  `meta/episodes_stats.jsonl`, and the rest. A symlink that points outside the source dataset
+  stops the export (see Safety).
 * **Rewritten with labels added:** `meta/info.json`, the episode metadata
   (`meta/episodes.jsonl` in v2.1, `meta/episodes/chunk-*/file-*.parquet` in v3.0) and every data
   parquet file. Source columns, rows, row order and row groups are kept as they are.
@@ -54,7 +67,8 @@ captions) only when `caption` is not exported.
 
 They are added to each episode row: as JSON keys in v2.1 `meta/episodes.jsonl`, and as Parquet
 columns in v3.0 `meta/episodes/*`. A field is written only when its stage is exported.
-`flora_certified` and `flora_provenance` are always written.
+`flora_certified` and `flora_provenance` are always present (null for an episode without a
+label).
 
 <!-- fields: episode -->
 | Field | Type | Meaning |
@@ -62,8 +76,8 @@ columns in v3.0 `meta/episodes/*`. A field is written only when its stage is exp
 | `flora_subtasks` | list<struct<start_s: double, end_s: double, caption: string>> | the episode's segments ordered by `start_s`, in seconds from the episode start (`segment` / `caption`) |
 | `flora_terminal_score` | int64 | `terminal.score`, 1 (failure) to 5 (success) (`reward.terminal`) |
 | `flora_terminal_expected` | double | `terminal.expected_score` (`reward.terminal`) |
-| `flora_certified` | bool | true when every exported record of the episode is certified |
-| `flora_provenance` | list<struct<...>> | one entry per exported record (below) |
+| `flora_certified` | bool | true when every record behind the episode's fields is certified (the `segment` record is skipped when `caption` supplies the subtasks) |
+| `flora_provenance` | list<struct<...>> | one entry per record behind the episode's fields: `caption` (or `segment` when `caption` is not exported), `reward.terminal`, `reward.dense` (below) |
 
 <!-- fields: episode.provenance -->
 | Field | Type | Meaning |
@@ -80,8 +94,9 @@ columns in v3.0 `meta/episodes/*`. A field is written only when its stage is exp
 ## Per-frame columns
 
 The export adds these columns to every data parquet file. It declares them in
-`meta/info.json` `features` the way LeRobot declares scalar features (`shape: [1]`), and in each
-file's `huggingface` schema metadata as `Value` features. LeRobot and `datasets` load them like
+`meta/info.json` `features` the way LeRobot declares scalar features (`shape: [1]`), and, when
+the source file has a `huggingface` schema metadata entry (LeRobot writes one), in that entry as
+`Value` features. LeRobot and `datasets` load them like
 any other feature.
 
 <!-- fields: frame -->
@@ -152,29 +167,45 @@ normalize.
 ## Safety
 
 * **Uncertified records are refused** unless you pass `--allow-uncertified`: `balanced` segment
-  and caption records, out-of-envelope episodes, uncovered pools.
+  and caption records, out-of-envelope episodes, uncovered pools. The flag is not read from
+  `flora.yaml`'s `allow_uncertified`.
 * **Fake-model records are refused** unless you pass `--allow-fake`. These are
-  `--fake-models` runs and `*.fake` job ids. `--allow-uncertified` does not cover them.
+  `--fake-models` runs and `*.fake` job ids; they are counted as `fake`, not `uncertified`, and
+  `--allow-fake` alone is enough for them. `--allow-uncertified` does not cover them.
+* **Paths stay inside the dataset and `--out`.** A source whose `meta/info.json` `data_path`
+  template (or episode values) would name a file outside the dataset is refused, and the export
+  never writes outside `--out`. An overlapping or non-empty `--out` is refused too.
 * A refusal fails the whole export (exit 2) and writes nothing. Records are never silently
   dropped. The flags used are recorded in `flora.policy`, in each episode's
   `flora_certified` / `flora_provenance`, and in a warning on the dataset card.
 * An export of an export is refused: the source already has `flora_*` columns.
+* The job does not have to be `complete`: a `completed_with_errors` (or `--partial`-composed)
+  job exports, and its status is recorded in `flora.job.status` and on the card.
 
 **Episodes without a label** keep their rows, with null episode fields and NaN / -1 frame
 values. `flora_export_report.json` lists each one as `{episode_index, episode_id, uid,
-missing_stages, reason}`. `reason` is one of:
+missing_stages, reason}` under `unlabeled`; `dense_uncovered` lists `{episode_index,
+nan_frames}`. The report also has `schema` (`flora_lerobot_export_report_v1`), `episodes`,
+`labeled`, `records`, the `allow_*` flags, `videos_included`, `job`, `source`, `pushed` and
+`stages`. `reason` is one of:
 
-* `excluded`: planned, but the stage excluded it (`nv_failure`; see `summary.json`);
-* `poison_pill`;
-* `unplanned: <why>`: the planner left it out;
+* `excluded`: planned, but the stage excluded it (`nv_failure` or a worker's `missing_task`;
+  see `summary.json`), or planned with no record when the job has no manifest;
+* `poison_pill`: the episode crashed its worker every time it ran, so it was set aside;
+* `unplanned: <why>`: the planner left it out, for example `unplanned: missing_task: ...` for an
+  episode with no task text in a job with reward stages (all stages are then missing);
 * `not_in_job`: the job never included it (for example, `--limit`).
 
 ## `--push-to-hub`
 
 `--push-to-hub user/repo` uploads the export with `huggingface_hub`:
 
-* The repo is **private** by default. Pass `--public` for a public one.
+* The local export is written first. If the push is then refused, the local directory stays
+  and the command exits 2.
+* A new repo is **private** by default. Pass `--public` for a public one. `--public` does not
+  make an existing private repo public.
 * A private push into an existing **public** repo is refused.
+* `.cache/**` and `.git/**` are not uploaded.
 * After the upload, the commit is tagged with the `codebase_version` (`v3.0` / `v2.1`). LeRobot
   resolves a Hub dataset by that tag.
 
