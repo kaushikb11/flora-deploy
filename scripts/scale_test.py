@@ -12,7 +12,7 @@ Usage::
 Modes (one state file each, ``reports/scale-test/<mode>/state.json``):
 
 * ``real``: the pinned EgoDex subset (:data:`DATASET`, 128 episodes, 0.980 video-h), ``preset:
-  balanced``, ``segment`` on 3 x L40S and ``caption`` on 2 x H100!;
+  balanced``, ``segment`` on 2 x L40S and ``caption`` on 3 x H100!;
 * ``fake-modal``: the same job shape on Modal with ``flora deploy/run --fake-models`` (CPU fake
   workers, the real factory app, orchestrator, Volumes and reconciler) over :data:`FAKE_EPISODES`
   small synthetic episodes with the same total video length, so the manifest has the same number
@@ -115,12 +115,16 @@ FAKE_EPISODES = round(VIDEO_S / ((FAKE_MIN_S + FAKE_MAX_S) / 2))  # 784
 # ---------------------------------------------------------------------------------------------
 # Job shape
 
-POOLS = {"segment": {"gpu": "L40S", "max_containers": 3},
-         "caption": {"gpu": "H100!", "max_containers": 2}}
+# 2 + 3: the cheapest size with >= 2 containers per pool whose upper wall is within the hour
+# at the measured rates (docs/scale-test.md "Pool sizing"; :func:`pool_sizing`,
+# :func:`recommend`). caption (0.906 container-s per video-s, 2.5x segment) is the bottleneck:
+# a third segment container only adds a cold start and a scale-down tail.
+POOLS = {"segment": {"gpu": "L40S", "max_containers": 2},
+         "caption": {"gpu": "H100!", "max_containers": 3}}
 MAX_GPUS = 5
 # 4 GPU-minutes per shard at the manifest's packing rates (segment 0.5, caption 1.0 GPU-s per
 # video-s): ~480 video-s per segment shard (~8 shards), ~240 per caption shard (~15), so each
-# segment container runs ~3 shards and captions can start after the first segment shard.
+# segment container runs ~4 shards and captions can start after the first segment shard.
 SHARD_TARGET_GPU_MIN = 4.0
 STORE_VOLUME = {"real": "flora-scale", "fake-modal": "flora-scale-fake"}
 MEDIA_VOLUME = {"real": "flora-scale-media", "fake-modal": "flora-scale-fake-media"}
@@ -154,7 +158,7 @@ def caps(mode: str) -> dict[str, float]:
     if mode == "local":
         return dict.fromkeys(STEPS, 0.0)
     return {s: round(math.ceil(p.usd_upper / CAP_STEP_USD - 1e-9) * CAP_STEP_USD, 2)
-            for s, p in projections(mode).items()}
+            for s, p in projections(mode, warm=False).items()}
 
 
 def global_cap(mode: str) -> float:
@@ -261,21 +265,54 @@ class KindRate:
     startup_s: float
     startup_unc: float
     status: str
+    startup_status: str = "placeholder"
+    startup_cache: str | None = None  # "cold" | "warm" (compile cache) | None
 
 
-def kind_rates(mode: str, table: Any = None) -> dict[str, KindRate]:
+# Warm start (a compile cache seeded on ``flora-cache`` before the run). Until rates.json has a
+# ``compile_cache: warm`` startup row for a balanced kind, the warm variant assumes the cold row
+# times the Rewarder's measured warm/cold ratio on the same vLLM image and H100! (fresh
+# container, warm compile cache + prefetch 229 s vs cold cache 318 s: rates.json `reward.*`
+# startup, docs/cold-start.md), at +/-50%. An assumption, not a measurement.
+WARM_STARTUP_FACTOR = 229.0 / 318.0  # 0.72
+WARM_STARTUP_UNC = 0.5
+ASSUME_WARM = False  # --assume-warm: price (and print) the warm-start variant
+
+
+def startup_row(table: Any, kind: str, cache: str) -> Any | None:
+    """The balanced ``kind`` startup row timed with this compile cache (``cold`` also takes a
+    row that does not say), else None; a non-placeholder beats a placeholder."""
+    rows = [e for e in table.startup if e.preset == "balanced" and e.kind == kind
+            and (e.compile_cache == cache or (cache == "cold" and e.compile_cache is None))]
+    rows.sort(key=lambda e: e.status == "placeholder")
+    return rows[0] if rows else None
+
+
+def kind_rates(mode: str, table: Any = None, *, warm: bool | None = None
+               ) -> dict[str, KindRate]:
+    """Per pool kind: the work rate and the startup the projection uses. ``warm``: the
+    warm-start variant (default :data:`ASSUME_WARM`)."""
     from flora_deploy.planner.rates import RateTable
 
+    warm = ASSUME_WARM if warm is None else warm
     if mode != "real":
         return {k: KindRate(FAKE_RATE[0], FAKE_RATE[1], FAKE_STARTUP[0], FAKE_STARTUP[1],
-                            "placeholder") for k in POOLS}
+                            "placeholder", "placeholder") for k in POOLS}
     t = table or RateTable.load()
     out = {}
     for kind in POOLS:
         e = t.rate("balanced", kind, 1, 1)
-        st = t.startup_for("balanced", kind)
-        out[kind] = KindRate(e.container_s_per_video_s, e.uncertainty, st.startup_s,
-                             st.uncertainty, e.status)
+        cold = startup_row(t, kind, "cold") or t.startup_for("balanced", kind)
+        s, su, sst, cache = cold.startup_s, cold.uncertainty, cold.status, cold.compile_cache
+        if warm:
+            w = startup_row(t, kind, "warm")
+            if w is not None:
+                s, su, sst, cache = w.startup_s, w.uncertainty, w.status, "warm"
+            else:
+                s, su = cold.startup_s * WARM_STARTUP_FACTOR, WARM_STARTUP_UNC
+                sst, cache = "assumed", "warm"
+        out[kind] = KindRate(e.container_s_per_video_s, e.uncertainty, s, su, e.status, sst,
+                             cache)
     return out
 
 
@@ -290,31 +327,138 @@ def shard_counts(video_s: float = VIDEO_S) -> dict[str, int]:
     return {k: max(1, math.ceil(video_s / shard_video_s(k))) for k in POOLS}
 
 
+def pool_sizes(sizes: Mapping[str, int] | None = None) -> dict[str, int]:
+    return {k: int((sizes or {}).get(k, POOLS[k]["max_containers"])) for k in POOLS}
+
+
+@dataclass
+class PoolSim:
+    """One pool in :func:`simulate`: its containers' lives and work."""
+
+    starts: int = 0  # containers started (cold or warm)
+    startup_s: float = 0.0
+    busy_s: float = 0.0
+    wait_s: float = 0.0  # ready but idle between shards (waiting for upstream shards)
+    tail_s: float = 0.0  # after its last shard: scale-down window, cut at the app stop
+    container_s: float = 0.0
+    peak: int = 0
+    t_peak: float | None = None  # first time the pool had its size of containers started
+    first_start: float = 0.0  # first shard start
+    first_end: float = 0.0  # first shard end
+    last_end: float = 0.0
+
+    @property
+    def utilization(self) -> float | None:
+        return round(self.busy_s / self.container_s, 3) if self.container_s else None
+
+    @property
+    def utilization_working(self) -> float | None:
+        """busy / (busy + waits between shards): utilization while the pool holds work."""
+        w = self.busy_s + self.wait_s
+        return round(self.busy_s / w, 3) if w else None
+
+
+def _schedule(inputs: Sequence[tuple[float, float]], n: int, startup: float,
+              scaledown: float) -> tuple[list[list[Any]], list[tuple[float, float]]]:
+    """FIFO inputs ``(ready, seconds)`` on a pool of at most ``n`` containers that each start
+    in ``startup`` s and scale down ``scaledown`` s after their last input; a queued input
+    starts a new container while the pool is below ``n`` and none is free. Returns the
+    containers ``[spawn, ready, free, end]`` (end None while alive) and the input spans, in
+    input order."""
+    conts: list[list[Any]] = []
+    spans: list[tuple[float, float]] = []
+    for r, d in inputs:  # ready times are non-decreasing (FIFO)
+        for c in conts:  # containers idle past the window by now are gone
+            if c[3] is None and c[2] > 0 and r > c[2] + scaledown:
+                c[3] = c[2] + scaledown
+        alive = [c for c in conts if c[3] is None]
+        free = min((max(c[1], c[2]) for c in alive), default=math.inf)
+        if len(alive) < n and free > r:
+            conts.append([r, r + startup, 0.0, None])
+            alive.append(conts[-1])
+        c = min(alive, key=lambda c: max(c[1], c[2], r))
+        t0 = max(c[1], c[2], r)
+        c[2] = t0 + d
+        spans.append((t0, t0 + d))
+    return conts, spans
+
+
+def simulate(sizes: Mapping[str, int], rates: Mapping[str, KindRate],
+             video_s: float = VIDEO_S, *, upper: bool = False) -> dict[str, Any]:
+    """Shard-level schedule of the run without chaos: every ``segment`` shard is queued at
+    t=0, a ``caption`` shard is queued once the segment shards covering its episodes have
+    receipts (per-shard ``depends_on``), each pool autoscales up to its size, containers
+    scale down ``WORKER_SCALEDOWN_S`` after their last shard, and the app stops
+    :data:`IDLE_AFTER_JOB_S` after the last receipt. ``upper``: rates and startups at
+    ``1 + uncertainty``. Returns ``{"wall_s", "pools": {kind: PoolSim}, "pipelining"}``."""
+    from flora_deploy.jobs.settings import WORKER_SCALEDOWN_S
+
+    def rate(k: str) -> float:
+        return rates[k].cs_per_video_s * ((1 + rates[k].uncertainty) if upper else 1.0)
+
+    def start(k: str) -> float:
+        return rates[k].startup_s * ((1 + rates[k].startup_unc) if upper else 1.0)
+
+    n_shards = shard_counts(video_s)
+    seg_v = video_s / n_shards["segment"]
+    cap_v = video_s / n_shards["caption"]
+    seg_c, seg_sp = _schedule([(0.0, seg_v * rate("segment"))] * n_shards["segment"],
+                              sizes["segment"], start("segment"), WORKER_SCALEDOWN_S)
+    seg_end = [e for _, e in seg_sp]
+    cap_in = []
+    for j in range(n_shards["caption"]):
+        lo = int(j * cap_v // seg_v)
+        hi = min(n_shards["segment"] - 1, int(((j + 1) * cap_v - 1e-6) // seg_v))
+        cap_in.append((max(seg_end[lo:hi + 1]), cap_v * rate("caption")))
+    cap_in.sort(key=lambda x: x[0])
+    cap_c, cap_sp = _schedule(cap_in, sizes["caption"], start("caption"), WORKER_SCALEDOWN_S)
+    wall = max(e for _, e in seg_sp + cap_sp)
+    stop = wall + IDLE_AFTER_JOB_S
+    out: dict[str, Any] = {"wall_s": wall, "pools": {}}
+    for kind, conts, spans in (("segment", seg_c, seg_sp), ("caption", cap_c, cap_sp)):
+        p = PoolSim()
+        ends = [min(c[3] if c[3] is not None else c[2] + WORKER_SCALEDOWN_S, stop)
+                for c in conts]
+        for c, end in zip(conts, ends, strict=True):
+            p.starts += 1
+            p.startup_s += c[1] - c[0]
+            p.container_s += end - c[0]
+            p.tail_s += end - c[2]
+        p.busy_s = sum(e - s for s, e in spans)
+        p.wait_s = max(0.0, p.container_s - p.startup_s - p.busy_s - p.tail_s)
+        cur = 0
+        for t, d in sorted([(c[0], 1) for c in conts] + [(e, -1) for e in ends]):
+            cur += d
+            p.peak = max(p.peak, cur)
+            if p.t_peak is None and cur >= sizes[kind]:
+                p.t_peak = t
+        p.first_start = min(s for s, _ in spans)
+        p.first_end = min(e for _, e in spans)
+        p.last_end = max(e for _, e in spans)
+        out["pools"][kind] = p
+    seg, cap = out["pools"]["segment"], out["pools"]["caption"]
+    out["pipelining"] = {
+        "first_caption_after_first_segment_s": cap.first_start - seg.first_end,
+        "overlap_s": max(0.0, min(seg.last_end, cap.last_end)
+                         - max(seg.first_start, cap.first_start))}
+    return out
+
+
 def run_wall_s(mode: str, video_s: float = VIDEO_S, *, upper: bool = False,
-               table: Any = None) -> float:
-    """Wall seconds of the run: captions start after the first segment shard; the job ends when
-    both pools drained; the orchestrator kill adds the reconciler gap."""
-    r = kind_rates(mode, table)
-    n = {k: v[1] for k, v in pools_for(mode).items()}
-
-    def f(k: str) -> tuple[float, float]:
-        m = (1 + r[k].uncertainty) if upper else 1.0
-        s = r[k].startup_s * ((1 + r[k].startup_unc) if upper else 1.0)
-        return s, r[k].cs_per_video_s * m
-
-    s_seg, rate_seg = f("segment")
-    s_cap, rate_cap = f("caption")
-    seg_end = s_seg + video_s * rate_seg / n["segment"]
-    first_seg = s_seg + shard_video_s("segment") * rate_seg
-    cap_end = max(first_seg + s_cap + video_s * rate_cap / n["caption"],
-                  seg_end + shard_video_s("caption") * rate_cap)
+               table: Any = None, warm: bool | None = None,
+               sizes: Mapping[str, int] | None = None) -> float:
+    """Wall seconds of the run: the shard schedule (:func:`simulate`) plus the reconciler gap
+    of the orchestrator kill (half the cron period nominal, the whole wait upper)."""
+    sim = simulate(pool_sizes(sizes), kind_rates(mode, table, warm=warm), video_s, upper=upper)
     gap = RECONCILE_WAIT_S if upper else RECONCILE_WAIT_S / 2
-    return max(seg_end, cap_end) + gap
+    return sim["wall_s"] + gap
 
 
-def project(step: str, mode: str, video_s: float = VIDEO_S, table: Any = None
+def project(step: str, mode: str, video_s: float = VIDEO_S, table: Any = None, *,
+            warm: bool | None = None, sizes: Mapping[str, int] | None = None
             ) -> wh.Projection:
-    """What ``step`` costs in ``mode`` (nominal and upper; see ``docs/scale-test.md``)."""
+    """What ``step`` costs in ``mode`` (nominal and upper; see ``docs/scale-test.md``).
+    ``warm``: the warm-start variant; ``sizes``: pool sizes other than :data:`POOLS`."""
     p = wh.Projection(step)
     if step in ("verify", "plan", "report") or mode == "local":
         return p
@@ -334,36 +478,86 @@ def project(step: str, mode: str, video_s: float = VIDEO_S, table: Any = None
         raise KeyError(step)
     from flora_deploy.jobs.settings import WORKER_SCALEDOWN_S
 
-    r = kind_rates(mode, table)
-    pools = pools_for(mode)
-    for kind, (c, n) in pools.items():
-        k = r[kind]
-        work = video_s * k.cs_per_video_s
+    r = kind_rates(mode, table, warm=warm)
+    n = pool_sizes(sizes)
+    shapes = pools_for(mode)
+    nom = simulate(n, r, video_s)["pools"]
+    up = simulate(n, r, video_s, upper=True)["pools"]
+    for kind, (c, _) in shapes.items():
+        k, a, b = r[kind], nom[kind], up[kind]
         s_up = k.startup_s * (1 + k.startup_unc)
-        idle = WORKER_SCALEDOWN_S if kind == "segment" else IDLE_AFTER_JOB_S
-        p.add(f"{kind}: {n} cold starts ({k.status} {k.startup_s:.0f} s)", c, n * k.startup_s,
-              upper_s=n * s_up)
+        how = k.startup_cache or "cold"
+        p.add(f"{kind}: {a.starts} {how} starts ({k.startup_status} {k.startup_s:.0f} s)", c,
+              a.startup_s, upper_s=b.startup_s)
         p.add(f"{kind}: work {video_s:.0f} video-s x {k.cs_per_video_s:g} ({k.status} "
-              f"+/-{k.uncertainty:.0%})", c, work, upper_s=work * (1 + k.uncertainty))
-        p.add(f"{kind}: idle tail x{n} (scale-down / stop)", c, n * idle,
-              upper_s=n * (WORKER_SCALEDOWN_S + CLIENT_SLACK_S))
+              f"+/-{k.uncertainty:.0%})", c, a.busy_s, upper_s=b.busy_s)
+        p.add(f"{kind}: idle between shards (pipelining waits)", c, a.wait_s,
+              upper_s=max(a.wait_s, b.wait_s))
+        p.add(f"{kind}: idle tail x{a.starts} (scale-down / stop)", c, a.tail_s,
+              upper_s=b.starts * (WORKER_SCALEDOWN_S + CLIENT_SLACK_S))
         shard = shard_video_s(kind) * k.cs_per_video_s
         p.add(f"{kind}: 1 preemption (replacement start + lost shard)", c,
               k.startup_s + shard / 2, upper_s=s_up + shard * (1 + k.uncertainty))
         if kind == "caption":  # the orchestrator kill: captions idle, scale down, restart
-            p.add(f"caption: reconciler gap x{n} (idle {WORKER_SCALEDOWN_S} s + restart)", c,
-                  n * (WORKER_SCALEDOWN_S + k.startup_s),
-                  upper_s=n * (WORKER_SCALEDOWN_S + s_up))
+            p.add(f"caption: reconciler gap x{n[kind]} (idle {WORKER_SCALEDOWN_S} s + "
+                  "restart)", c, n[kind] * (WORKER_SCALEDOWN_S + k.startup_s),
+                  upper_s=n[kind] * (WORKER_SCALEDOWN_S + s_up))
     orch = wh.Container(None, 0.25 * 3, 1.0 * 3)  # nonpreemptible: 3x CPU/memory
     p.add("orchestrator (non-preemptible CPU) over the wall", orch,
-          run_wall_s(mode, video_s, table=table),
-          upper_s=run_wall_s(mode, video_s, upper=True, table=table) + CLIENT_SLACK_S)
-    p.peak_usd_per_s = sum(c.usd_per_s() * n for c, n in pools.values()) + orch.usd_per_s()
+          run_wall_s(mode, video_s, table=table, warm=warm, sizes=n),
+          upper_s=run_wall_s(mode, video_s, upper=True, table=table, warm=warm, sizes=n)
+          + CLIENT_SLACK_S)
+    p.peak_usd_per_s = sum(c.usd_per_s() * n[k] for k, (c, _) in shapes.items()) \
+        + orch.usd_per_s()
     return p
 
 
-def projections(mode: str, table: Any = None) -> dict[str, wh.Projection]:
-    return {s: project(s, mode, table=table) for s in STEPS}
+def projections(mode: str, table: Any = None, *, warm: bool | None = None
+                ) -> dict[str, wh.Projection]:
+    return {s: project(s, mode, table=table, warm=warm) for s in STEPS}
+
+
+SIZING_TARGET_WALL_S = 3600.0  # the recommendation finishes within an hour, even upper
+
+
+def pool_sizing(ns: Sequence[int] = (1, 2, 3, 4), *, warm: bool | None = None,
+                table: Any = None, video_s: float = VIDEO_S) -> list[dict[str, Any]]:
+    """The wall-clock / cost trade-off of every ``segment`` x ``caption`` pool size in ``ns``
+    (real mode; the run step with its chaos, and the bare schedule without it)."""
+    rows = []
+    r = kind_rates("real", table, warm=warm)
+    usd_s = container_rates("real")
+    for a in ns:
+        for b in ns:
+            sz = {"segment": a, "caption": b}
+            p = project("run", "real", video_s, table, warm=warm, sizes=sz)
+            sim = simulate(sz, r, video_s)
+            pools = sim["pools"]
+            usd = sum(pools[k].container_s * usd_s[k] for k in POOLS)
+            rows.append({
+                "segment": a, "caption": b, "usd": round(p.usd, 2),
+                "usd_upper": round(p.usd_upper, 2),
+                "wall_s": round(run_wall_s("real", video_s, table=table, warm=warm, sizes=sz)),
+                "wall_upper_s": round(run_wall_s("real", video_s, upper=True, table=table,
+                                                 warm=warm, sizes=sz)),
+                "no_chaos_usd": round(usd, 2), "no_chaos_wall_s": round(sim["wall_s"]),
+                "peak": {k: pools[k].peak for k in POOLS},
+                "utilization_working": {k: pools[k].utilization_working for k in POOLS},
+                "utilization": {k: pools[k].utilization for k in POOLS},
+                "idle_share": round(sum(pools[k].tail_s * usd_s[k] for k in POOLS) / usd, 3),
+                "first_caption_after_first_segment_s":
+                    round(sim["pipelining"]["first_caption_after_first_segment_s"])})
+    return rows
+
+
+def recommend(rows: Sequence[Mapping[str, Any]], max_wall_s: float = SIZING_TARGET_WALL_S,
+              min_per_pool: int = 2) -> Mapping[str, Any] | None:
+    """The cheapest size whose **upper** wall (chaos included; both rates are n=1 at +/-50%)
+    is within ``max_wall_s``, with at least ``min_per_pool`` containers per pool (the test is
+    about autoscaling several containers) that both pools reach (so criterion 3 can pass)."""
+    ok = [x for x in rows if x["wall_upper_s"] <= max_wall_s
+          and all(x[k] >= min_per_pool and x["peak"][k] >= x[k] for k in POOLS)]
+    return min(ok, key=lambda x: (x["usd"], x["wall_s"])) if ok else None
 
 
 def planner_options(mode: str = "real") -> list[Any]:
@@ -531,7 +725,8 @@ def read_shard_files(store: Any, job_id: str, config_hash: str, manifest: Any
 def measure(files: Mapping[str, Sequence[Mapping[str, Any]]], durations: Mapping[str, float],
             containers: Mapping[str, Mapping[str, float]] | None = None, *,
             usd_per_s: Mapping[str, float] | None = None,
-            run_start: float | None = None) -> dict[str, Any]:
+            run_start: float | None = None,
+            outage: tuple[float, float] | None = None) -> dict[str, Any]:
     """Per pool: containers, container-seconds, busy seconds, utilization, cold starts, idle
     tails and their cost, video-s per container-s, peak concurrency; plus pipelining.
 
@@ -539,7 +734,11 @@ def measure(files: Mapping[str, Sequence[Mapping[str, Any]]], durations: Mapping
     samples; without it (local) a container's life is its first start to its last end.
     ``run_start``: when ``run`` launched the job. ``time_to_peak_s`` is from it to the moment
     the pool first ran ``max_containers`` containers (None: no run start, or never reached).
-    ``preempted_recovered``: preempted starts whose shard a later attempt finished."""
+    ``preempted_recovered``: preempted starts whose shard a later attempt finished.
+    ``utilization_working``: busy / the containers' seconds from their first shard start to
+    their last shard end (no cold start, no tail). ``outage``: ``(killed, revived)`` times of
+    the orchestrator kill; ``idle_share_excl_outage`` leaves out the tails that began inside
+    it (containers idled by the induced outage, not by the scale-down policy)."""
     kind_of: dict[str, str] = {}
     spans: dict[str, list[tuple[float, float, str]]] = {}
     receipts = {(r["shard_id"], r["container_id"]): r for r in files.get("receipts", [])}
@@ -587,6 +786,9 @@ def measure(files: Mapping[str, Sequence[Mapping[str, Any]]], durations: Mapping
         cold = [min(s[0] for s in spans[c]) - life[c][0] for c in cids
                 if containers and c in containers]
         idle = [life[c][1] - max(s[1] for s in spans[c]) for c in cids]
+        working = sum(max(s[1] for s in spans[c]) - min(s[0] for s in spans[c]) for c in cids)
+        idle_x = [life[c][1] - max(s[1] for s in spans[c]) for c in cids
+                  if not (outage and outage[0] <= max(s[1] for s in spans[c]) <= outage[1])]
         events = sorted([(life[c][0], 1) for c in cids] + [(life[c][1], -1) for c in cids])
         peak = cur = 0
         t_full = None  # first moment the pool ran max_containers
@@ -604,6 +806,7 @@ def measure(files: Mapping[str, Sequence[Mapping[str, Any]]], durations: Mapping
                                if t_full is not None and run_start is not None else None),
             "container_s": round(cs, 1), "busy_s": round(busy, 1),
             "utilization": round(busy / cs, 3) if cs else None,
+            "utilization_working": round(busy / working, 3) if working else None,
             "video_s": round(video, 1),
             "video_s_per_container_s": round(video / cs, 4) if cs else None,
             "window_s": round(max(ends) - min(starts), 1) if starts else None,
@@ -612,6 +815,7 @@ def measure(files: Mapping[str, Sequence[Mapping[str, Any]]], durations: Mapping
             "cold_start_s": _quant(cold), "spawn_to_start_s": _quant(latency.get(kind, [])),
             "idle_tail_s": _quant(idle), "idle_s": round(sum(idle), 1),
             "idle_usd": round(sum(idle) * rate, 4), "usd": round(cs * rate, 4),
+            "idle_usd_excl_outage": round(sum(idle_x) * rate, 4),
             "preempted_starts": preempted.get(kind, 0),
             "preempted_recovered": recovered.get(kind, 0), "shards_done": len(rs)}
     seg = out["pools"].get("segment", {})
@@ -630,6 +834,9 @@ def measure(files: Mapping[str, Sequence[Mapping[str, Any]]], durations: Mapping
     total_usd = sum(p["usd"] for p in out["pools"].values())
     out["idle_share"] = (round(sum(p["idle_usd"] for p in out["pools"].values()) / total_usd, 3)
                          if total_usd else None)
+    out["idle_share_excl_outage"] = (
+        round(sum(p["idle_usd_excl_outage"] for p in out["pools"].values()) / total_usd, 3)
+        if total_usd else None)
     out["observed_usd"] = round(total_usd, 4)
     return out
 
@@ -649,9 +856,7 @@ def first_spawn_after(ledgers: Sequence[Mapping[str, Any]], t: float) -> float |
 CRITERIA: dict[str, Any] = {
     "end_state": "done",
     "lost_or_duplicate_records": 0,
-    "utilization_min": 0.60,  # busy / container-s per pool, while it holds work
-    "time_to_peak_max_s": 2 * 195 + 60,  # two upper cold starts + a poll
-    "pipelining_first_caption_max_s": 195 + 120,  # caption cold start (upper) + scheduling
+    "utilization_min": 0.60,  # busy / container-s per pool while it holds work
     "projection_within_upper": True,
     "projection_nominal_error_max": 0.50,  # |actual / nominal - 1|
     "idle_share_max": 0.15,
@@ -660,80 +865,179 @@ CRITERIA: dict[str, Any] = {
     "report_max_s": 30.0,
     "compose_max_s": 60.0,
 }
+LAUNCH_MARGIN_S = 120.0  # `flora run --detach` -> orchestrator up -> first spawn, + scheduling
+
+# The 14 criteria: (number, name). Every one is automatic: computed by :func:`evaluate` from
+# what ``run`` and ``report`` record. MANUAL lists the ones that are not (none today); each
+# would carry the reason it cannot be read from the recorded data.
+CRITERION_NAMES: tuple[tuple[int, str], ...] = (
+    (1, "end state"),
+    (2, "lost or duplicate records"),
+    (3, "each pool reaches max_containers"),
+    (4, "time to peak concurrency"),
+    (5, "utilization while holding work"),
+    (6, "segment -> caption pipelining"),
+    (7, "spend within the upper projection"),
+    (8, "spend vs the nominal projection"),
+    (9, "idle / scale-down share of pool cost"),
+    (10, "preemption recovered"),
+    (11, "orchestrator revived"),
+    (12, "flora status p95"),
+    (13, "flora report"),
+    (14, "flora compose"),
+)
+MANUAL: dict[int, str] = {}
+LOCAL_NA = "local: calls run on threads, with no containers, cold starts or money"
 
 
-def evaluate(r: Mapping[str, Any], mode: str) -> list[dict[str, Any]]:
-    """PASS / FAIL / n.a. per criterion from the ``run`` + ``report`` results."""
-    out = []
+def criteria_targets(mode: str, sizes: Mapping[str, int] | None = None,
+                     table: Any = None) -> dict[str, Any]:
+    """The rate-derived targets: from the **upper**, cold-start schedule (:func:`simulate`) of
+    the pools as configured, so they move with ``rates.json``. Time to peak: when the upper
+    schedule has each pool at its size, plus a poll and :data:`LAUNCH_MARGIN_S`. First
+    caption: the upper caption cold start plus the margin."""
+    n = pool_sizes(sizes)
+    r = kind_rates(mode, table, warm=False)
+    up = simulate(n, r, upper=True)
+    poll = POLL_S.get(mode, 30.0)
+    return {**CRITERIA, "sizes": n,
+            "time_to_peak_max_s": {k: round((up["pools"][k].t_peak or 0.0) + poll
+                                            + LAUNCH_MARGIN_S) for k in POOLS},
+            "pipelining_first_caption_max_s": round(
+                r["caption"].startup_s * (1 + r["caption"].startup_unc) + LAUNCH_MARGIN_S)}
 
-    def add(name: str, value: Any, target: str, ok: bool | None) -> None:
-        out.append({"criterion": name, "value": value, "target": target,
-                    "verdict": "n.a." if ok is None else ("PASS" if ok else "FAIL")})
+
+def _all(oks: Sequence[bool | None]) -> bool | None:
+    if any(o is False for o in oks):
+        return False
+    return None if not oks or any(o is None for o in oks) else True
+
+
+def evaluate(r: Mapping[str, Any], mode: str, targets: Mapping[str, Any] | None = None
+             ) -> list[dict[str, Any]]:
+    """PASS / FAIL / n.a. for each of the 14 criteria (:data:`CRITERION_NAMES`) from the
+    ``run`` + ``report`` results. A value the run did not record is a FAIL ("not
+    recorded"): every criterion is meant to be measured. ``n.a.`` is only for criteria that
+    cannot apply in ``local`` (``reason`` says why)."""
+    T = dict(targets or criteria_targets(mode, r.get("sizes")))
+    sizes = T["sizes"]
+    local = mode == "local"
+    rows: dict[int, dict[str, Any]] = {}
+
+    def add(i: int, value: Any, target: str, ok: bool | None, reason: str = "") -> None:
+        if ok is None and not reason:
+            ok, reason = False, "not recorded"
+        rows[i] = {"id": i, "criterion": dict(CRITERION_NAMES)[i], "value": value,
+                   "target": target, "auto": i not in MANUAL,
+                   "verdict": "n.a." if ok is None else ("PASS" if ok else "FAIL"),
+                   "reason": reason}
 
     m = r.get("measure") or {}
     pools = m.get("pools") or {}
-    add("end state", r.get("state"), CRITERIA["end_state"], r.get("state") == "done"
-        if r.get("state") else None)
+    st = r.get("state")
+    add(1, st, T["end_state"], None if st is None else st == T["end_state"])
     rec = r.get("records") or {}
-    bad = rec.get("missing", 0) + rec.get("duplicates", 0) if rec else None
-    add("lost/duplicate records", bad, "0", None if bad is None else bad == 0)
-    for kind, p in pools.items():
-        want = POOLS[kind]["max_containers"]
-        add(f"{kind}: autoscaled to max_containers", p.get("peak_concurrent"), f">= {want}",
-            p.get("peak_concurrent", 0) >= want if mode != "local" else None)
-        t = p.get("time_to_peak_s")
-        reached = p.get("peak_concurrent", 0) >= want
-        # from the run start to max_containers; a pool that never got there fails, it is not
-        # measured to a lower peak
-        add(f"{kind}: time to peak", t, f"<= {CRITERIA['time_to_peak_max_s']} s from the run "
-            "start", None if mode == "local" else
-            (False if not reached else None if t is None
-             else t <= CRITERIA["time_to_peak_max_s"]))
-        u = p.get("utilization")
-        add(f"{kind}: utilization (busy / container-s)", u, f">= {CRITERIA['utilization_min']}",
-            None if u is None or mode == "local" else u >= CRITERIA["utilization_min"])
-        n_pre, n_rec = p.get("preempted_starts", 0), p.get("preempted_recovered", 0)
-        add(f"{kind}: preemption recovered", f"{n_rec}/{n_pre}", ">= 1 preempted start, each "
-            "shard finished by a later attempt",
-            (n_pre >= 1 and n_rec == n_pre) if f"preempt_{kind}" in (r.get("chaos") or {})
-            else None)
+    bad = (int(rec.get("missing", 0)) + int(rec.get("duplicates", 0))) if rec else None
+    add(2, bad, "0 (compose missing + conflicts)", None if bad is None else bad == 0)
+
+    def per_pool(get: Callable[[str, Mapping[str, Any]], tuple[Any, bool | None]]
+                 ) -> tuple[dict[str, Any], bool | None]:
+        vals, oks = {}, []
+        for kind in POOLS:
+            p = pools.get(kind)
+            v, ok = get(kind, p) if p else (None, None)
+            vals[kind] = v
+            oks.append(ok)
+        return vals, _all(oks)
+
+    if local:
+        for i, tgt in ((3, f"peak >= {sizes}"), (4, "<= upper schedule"),
+                       (5, f">= {T['utilization_min']}")):
+            add(i, None, tgt, None, LOCAL_NA)
+    else:
+        v, ok = per_pool(lambda k, p: (p.get("peak_concurrent"),
+                                       None if p.get("peak_concurrent") is None
+                                       else p["peak_concurrent"] >= sizes[k]))
+        add(3, v, f"peak >= {sizes}", ok)
+
+        def ttp(k: str, p: Mapping[str, Any]) -> tuple[Any, bool | None]:
+            t = p.get("time_to_peak_s")
+            if (p.get("peak_concurrent") or 0) < sizes[k]:
+                return t, False  # never reached its size: no peak to time
+            return t, None if t is None else t <= T["time_to_peak_max_s"][k]
+        v, ok = per_pool(ttp)
+        add(4, v, "<= " + ", ".join(f"{k} {s} s" for k, s in T["time_to_peak_max_s"].items())
+            + " from the run start", ok)
+
+        def util(k: str, p: Mapping[str, Any]) -> tuple[Any, bool | None]:
+            u = p.get("utilization_working")
+            return u, None if u is None else u >= T["utilization_min"]
+        v, ok = per_pool(util)
+        add(5, v, f">= {T['utilization_min']} per pool (busy / container-s from each "
+            "container's first shard start to its last shard end)", ok)
     pl = m.get("pipelining") or {}
-    v = pl.get("first_caption_after_first_segment_s")
-    add("pipelining: first caption after first segment shard", v,
-        f"<= {CRITERIA['pipelining_first_caption_max_s']} s and overlap > 0",
-        None if v is None else (v <= CRITERIA["pipelining_first_caption_max_s"]
-                                and pl.get("overlap_s", 0) > 0))
+    fc = pl.get("first_caption_after_first_segment_s")
+    add(6, {"first_caption_s": fc, "overlap_s": pl.get("overlap_s")},
+        f"<= {T['pipelining_first_caption_max_s']} s and overlap > 0",
+        None if fc is None else (fc <= T["pipelining_first_caption_max_s"]
+                                 and (pl.get("overlap_s") or 0) > 0))
     pe = r.get("projection_error") or {}
-    if mode != "local" and pe:
-        add("spend within the upper projection", pe.get("actual_usd"),
-            f"<= ${pe.get('upper_usd')}", pe.get("actual_usd", 0) <= pe.get("upper_usd", 0))
+    if local:
+        add(7, None, "actual <= upper", None, "local: fake call seconds are not money")
+        add(8, None, f"|err| <= {T['projection_nominal_error_max']}", None,
+            "local: fake call seconds are not money")
+    else:
+        a, u = pe.get("actual_usd"), pe.get("upper_usd")
+        add(7, a, f"<= ${u}", None if a is None or u is None else a <= u + 1e-9,
+            "" if pe.get("billed") else
+            ("provisional: tracked spend; --report re-checks once Modal billing lands"
+             if a is not None else ""))
         e = pe.get("vs_nominal")
-        lim = CRITERIA["projection_nominal_error_max"]
-        add("spend vs nominal projection", e, f"|err| <= {lim}",
-            None if e is None else abs(e) <= CRITERIA["projection_nominal_error_max"])
-    s = m.get("idle_share")
-    add("idle / scale-down share of pool cost", s, f"<= {CRITERIA['idle_share_max']}",
-        None if s is None or mode == "local" else s <= CRITERIA["idle_share_max"])
+        add(8, e, f"|err| <= {T['projection_nominal_error_max']}",
+            None if e is None else abs(e) <= T["projection_nominal_error_max"])
+    s = m.get("idle_share_excl_outage", m.get("idle_share"))
+    add(9, s, f"<= {T['idle_share_max']} (tails that began while the killed orchestrator was "
+        "down are excluded)", None if local else (None if s is None
+                                                  else s <= T["idle_share_max"]),
+        LOCAL_NA if local else "")
+    chaos = r.get("chaos") or {}
+
+    def pre(k: str, p: Mapping[str, Any]) -> tuple[Any, bool | None]:
+        n_pre, n_rec = p.get("preempted_starts", 0), p.get("preempted_recovered", 0)
+        if f"preempt_{k}" not in chaos:
+            return "not fired", False
+        return f"{n_rec}/{n_pre}", n_pre >= 1 and n_rec == n_pre
+    v, ok = per_pool(pre)
+    add(10, v, ">= 1 preempted start per pool, each shard finished by a later attempt", ok)
     orch = r.get("orchestrator") or {}
-    if orch:
-        rv = orch.get("revive_s")
-        add("orchestrator killed -> revived" + (" by the reconciler" if mode != "local" else
-                                                " by flora resume"),
-            rv, f"<= {CRITERIA['reconciler_revive_max_s']} s",
-            None if rv is None and not orch.get("killed") else
-            (rv is not None and rv <= CRITERIA["reconciler_revive_max_s"]
-             and (mode == "local" or orch.get("revived_by") == "reconciler")))
+    rv = orch.get("revive_s")
+    by = "flora resume" if local else "the reconciler"
+    if not orch.get("killed"):
+        add(11, None, f"killed, revived by {by} <= {T['reconciler_revive_max_s']} s",
+            False, "the orchestrator kill did not fire")
+    else:
+        add(11, {"revive_s": rv, "revived_by": orch.get("revived_by")},
+            f"revived by {by} <= {T['reconciler_revive_max_s']} s, then work continues "
+            f"(end state {T['end_state']})",
+            rv is not None and rv <= T["reconciler_revive_max_s"]
+            and (local or orch.get("revived_by") == "reconciler") and st == T["end_state"])
     tm = r.get("timings") or {}
-    st = (tm.get("status") or {}).get("p95")
-    add("flora status p95", st, f"<= {CRITERIA['status_p95_max_s']} s",
-        None if st is None else st <= CRITERIA["status_p95_max_s"])
+    sp = (tm.get("status") or {}).get("p95")
+    add(12, sp, f"<= {T['status_p95_max_s']} s", None if sp is None
+        else sp <= T["status_p95_max_s"])
     rp = tm.get("report_s")
-    add("flora report", rp, f"<= {CRITERIA['report_max_s']} s",
-        None if rp is None else rp <= CRITERIA["report_max_s"])
-    cp = tm.get("compose_s")
-    add("flora compose", cp, f"<= {CRITERIA['compose_max_s']} s",
-        None if cp is None else cp <= CRITERIA["compose_max_s"])
-    return out
+    add(13, rp, f"<= {T['report_max_s']} s", None if rp is None else rp <= T["report_max_s"])
+    cp, crc = tm.get("compose_s"), tm.get("compose_rc", 0)
+    add(14, cp, f"<= {T['compose_max_s']} s and exit 0",
+        None if cp is None else cp <= T["compose_max_s"] and crc == 0)
+    return [rows[i] for i, _ in CRITERION_NAMES]
+
+
+def criteria_summary(rows: Sequence[Mapping[str, Any]]) -> str:
+    c = {v: sum(1 for x in rows if x["verdict"] == v) for v in ("PASS", "FAIL", "n.a.")}
+    auto = sum(1 for x in rows if x["auto"])
+    return (f"{c['PASS']} PASS, {c['FAIL']} FAIL, {c['n.a.']} n.a. "
+            f"({auto} of {len(rows)} automatic)")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1049,8 +1353,8 @@ def run_run(ctx: Ctx) -> dict[str, Any]:
         return {"ok": False, "error": f"budget left ${budget:.2f}", "tracked_usd": 0.0,
                 "apps": []}
     video = float(ctx.st.step("index").result.get("video_s") or VIDEO_S)
-    wall_limit = run_wall_s(mode, video, upper=True) + CLIENT_SLACK_S if mode != "local" \
-        else 3600.0
+    wall_limit = (run_wall_s(mode, video, upper=True, warm=False) + CLIENT_SLACK_S
+                  if mode != "local" else 3600.0)
     slack_usd = CLIENT_SLACK_S * sum(rates[k] * n for k, (_, n) in pools.items())
     chaos = Chaos(fired=dict(ctx.st.step("run").result.get("chaos") or {}))
     app = None if mode == "local" else _app_name(ctx)
@@ -1098,6 +1402,7 @@ def run_run(ctx: Ctx) -> dict[str, Any]:
                 t_new = _spawn_after(ctx, killed_at)
                 if t_new is not None:
                     orch["revive_s"] = round(t_new - killed_at, 1)
+                    orch["revived_utc"] = t_new
                     orch.setdefault("revived_by", "reconciler" if mode != "local" else
                                     "flora resume")
                 elif mode != "local" and time.time() - killed_at > RECONCILE_WAIT_S:
@@ -1111,7 +1416,7 @@ def run_run(ctx: Ctx) -> dict[str, Any]:
                     proc.wait()
                 killed_at = time.time()
                 orch.update(killed=True, at_s=s.get("t"), how="SIGKILL flora run --local",
-                            resumes=0)
+                            resumes=0, killed_utc=killed_at)
                 chaos.fired[due] = {"at_s": s.get("t")}
             # local: `flora resume` is a no-op while the dead orchestrator's lease is unexpired
             # (it reads "alive" for LOCAL_LEASE_TTL_S), so resume once it reads dead
@@ -1127,7 +1432,8 @@ def run_run(ctx: Ctx) -> dict[str, Any]:
                 chaos.fired[due] = {"at_s": s.get("t"), **res}
                 if due == "kill_orchestrator" and res.get("killed"):
                     killed_at = time.time()
-                    orch.update(killed=True, at_s=s.get("t"), call_id=res.get("call_id"))
+                    orch.update(killed=True, at_s=s.get("t"), call_id=res.get("call_id"),
+                                killed_utc=killed_at)
             if s.get("state") in wh_terminal() or s.get("state") == "composing":
                 if mode != "local" or all(p is None or p.poll() is not None
                                           for p in (proc, resume_proc)):
@@ -1252,6 +1558,7 @@ def run_report(ctx: Ctx) -> dict[str, Any]:
     run = ctx.st.step("run").result
     timings["status"] = _quant(run.get("status_s") or [])
     timings["compose_s"] = run.get("compose_s")
+    timings["compose_rc"] = run.get("compose_rc")
     rep: dict[str, Any] = {}
     with contextlib.suppress(ValueError):
         rep = json.loads(rp.stdout)
@@ -1259,8 +1566,12 @@ def run_report(ctx: Ctx) -> dict[str, Any]:
     manifest = job._deps().manifests.load()
     files = read_shard_files(job.store, ctx.job_id, job.config_hash, manifest)
     dur = {e.uid: e.duration_s for e in manifest.episodes}
+    o = run.get("orchestrator") or {}
+    outage = ((o["killed_utc"], o.get("revived_utc") or o["killed_utc"] + RECONCILE_WAIT_S)
+              if o.get("killed_utc") else None)
     meas = measure(files, dur, run.get("containers") or None,
-                   usd_per_s=container_rates(ctx.mode), run_start=run.get("started_at"))
+                   usd_per_s=container_rates(ctx.mode), run_start=run.get("started_at"),
+                   outage=outage)
     summary = job.summary() or {}
     stages = summary.get("stages", {})
     records = {"missing": sum(int(c.get("missing", 0)) for c in stages.values()),
@@ -1270,10 +1581,12 @@ def run_report(ctx: Ctx) -> dict[str, Any]:
                                                          "excused")}
                             for k, c in stages.items()}}
     proj = ctx.st.step("run")
-    actual = float(run.get("tracked_usd") or 0.0)
+    actual = proj.spent_at(ctx.st.billed_at)  # tracked, or the billed delta once it lands
     pe: dict[str, Any] = {}
     if proj.projected_usd:
-        pe = {"actual_usd": round(actual, 4), "nominal_usd": proj.projected_usd,
+        pe = {"actual_usd": round(actual, 4), "billed": proj.billed_usd is not None,
+              "tracked_usd": float(run.get("tracked_usd") or 0.0),
+              "nominal_usd": proj.projected_usd,
               "upper_usd": proj.projected_upper_usd,
               "vs_nominal": round(actual / proj.projected_usd - 1, 3),
               "vs_upper": round(actual / (proj.projected_upper_usd or 1) - 1, 3),
@@ -1286,7 +1599,8 @@ def run_report(ctx: Ctx) -> dict[str, Any]:
            "usd_per_video_hour": rep.get("usd_per_video_hour"), "measure": meas,
            "records": records, "projection_error": pe, "timings": timings,
            "orchestrator": run.get("orchestrator"), "chaos": run.get("chaos"),
-           "launches": len(job.spec.get("launches") or [])}
+           "launches": len(job.spec.get("launches") or []), "sizes": pool_sizes(),
+           "startup_variant": "warm" if ASSUME_WARM else "cold"}
     res["criteria"] = evaluate(res, ctx.mode)
     res.update(ok=rp.returncode in (0, 3) and bool(meas["pools"]), tracked_usd=0.0, apps=[])
     return res
@@ -1299,6 +1613,25 @@ RUNNERS: dict[str, Callable[[Ctx], dict[str, Any]]] = {
 
 # ---------------------------------------------------------------------------------------------
 # Report / plan printing
+
+
+def recheck(st: wh.State, mode: str) -> list[dict[str, Any]]:
+    """The criteria from the recorded ``report`` result, with the ``run`` step's spend as it
+    stands now (the billed delta once Modal billing has landed), so ``--report`` re-checks
+    criteria 7 and 8 without re-running anything."""
+    rep = st.steps.get("report")
+    if not rep or not rep.result.get("criteria"):
+        return []
+    res = dict(rep.result)
+    pe = dict(res.get("projection_error") or {})
+    run = st.steps.get("run")
+    if pe and run is not None and mode != "local":
+        actual = run.spent_at(st.billed_at)
+        pe.update(actual_usd=round(actual, 4), billed=run.billed_usd is not None)
+        if pe.get("nominal_usd"):
+            pe["vs_nominal"] = round(actual / pe["nominal_usd"] - 1, 3)
+        res["projection_error"] = pe
+    return evaluate(res, mode)
 
 
 def render_report(st: wh.State, mode: str, projs: Mapping[str, wh.Projection]) -> str:
@@ -1315,11 +1648,15 @@ def render_report(st: wh.State, mode: str, projs: Mapping[str, wh.Projection]) -
         lines.append(f"| {TITLES[name]} | {s.status} | ${c[name]:.2f} | ${p.usd:.2f} "
                      f"(${p.usd_upper:.2f}) | {len(s.attempts)} | ${s.tracked_usd:.2f} |")
     rep = st.steps.get("report")
-    if rep and rep.result.get("criteria"):
-        lines += ["", "## Success criteria", "", "| criterion | value | target | verdict |",
-                  "|---|---|---|---|"]
-        for x in rep.result["criteria"]:
-            lines.append(f"| {x['criterion']} | {x['value']} | {x['target']} | {x['verdict']} |")
+    crit = recheck(st, mode)
+    if rep and crit:
+        lines += ["", "## Success criteria", "", f"**{criteria_summary(crit)}**", "",
+                  "| # | criterion | value | target | verdict | note |",
+                  "|---|---|---|---|---|---|"]
+        for x in crit:
+            how = x["reason"] or ("" if x["auto"] else "manual")
+            lines.append(f"| {x['id']} | {x['criterion']} | {x['value']} | {x['target']} | "
+                         f"{x['verdict']} | {how} |")
         for key in ("measure", "projection_error", "timings", "orchestrator", "chaos",
                     "records"):
             lines += ["", f"## {key}", "", "```json",
@@ -1374,6 +1711,43 @@ def print_plan(st: wh.State, mode: str, projs: Mapping[str, wh.Projection], out=
             f"{run_wall_s(mode, upper=True) / 60:.0f} min")
     if upper > g + 1e-9:
         out(f"  NOT HONEST AT ${g:.2f}: the upper total needs ${honest['global']:.2f}")
+    if mode == "real":
+        print_variants(mode, out)
+
+
+def print_variants(mode: str, out=print) -> None:
+    """Cold vs warm start, side by side (caps always come from the cold projection)."""
+    for warm in (False, True):
+        ps = projections(mode, warm=warm)
+        r = kind_rates(mode, warm=warm)
+        st = ", ".join(f"{k} {v.startup_s:.0f} s {v.startup_status}" for k, v in r.items())
+        out(f"  {'warm' if warm else 'cold'} start ({st}): run nominal ${ps['run'].usd:.2f} "
+            f"upper ${ps['run'].usd_upper:.2f}; total nominal "
+            f"${sum(p.usd for p in ps.values()):.2f} upper "
+            f"${sum(p.usd_upper for p in ps.values()):.2f}; wall "
+            f"{run_wall_s(mode, warm=warm) / 60:.0f} / "
+            f"{run_wall_s(mode, upper=True, warm=warm) / 60:.0f} min")
+
+
+def print_sizing(out=print) -> None:
+    """The pool-size trade-off (``--sizing``)."""
+    for warm in (False, True):
+        rows = pool_sizing(warm=warm)
+        rec = recommend(rows)
+        out(f"  pool sizing ({'warm' if warm else 'cold'} start; run step with chaos, and the "
+            "bare schedule):")
+        out("    seg cap  nominal   upper  wall  upper  | no-chaos $  wall | util seg/cap "
+            "(life)  idle  first-cap")
+        for x in sorted(rows, key=lambda x: (x["segment"], x["caption"])):
+            mark = " <- recommended" if rec and (x["segment"], x["caption"]) == (
+                rec["segment"], rec["caption"]) else ""
+            u = x["utilization"]
+            out(f"    {x['segment']:3d} {x['caption']:3d}  ${x['usd']:6.2f} "
+                f"${x['usd_upper']:6.2f} {x['wall_s'] / 60:4.0f}m "
+                f"{x['wall_upper_s'] / 60:5.0f}m  | ${x['no_chaos_usd']:6.2f} "
+                f"{x['no_chaos_wall_s'] / 60:4.0f}m | {u['segment']:.2f}/{u['caption']:.2f}"
+                f"          {x['idle_share']:.3f}  "
+                f"{x['first_caption_after_first_segment_s']:4d} s{mark}")
 
 
 def print_options(out=print) -> None:
@@ -1382,7 +1756,7 @@ def print_options(out=print) -> None:
     except Exception as e:  # noqa: BLE001 - informational only
         out(f"  flora plan options unavailable offline: {e!r}")
         return
-    out("  flora plan options (offline, same rates; balanced rows are placeholders):")
+    out("  flora plan options (offline, same rates.json; cold startup):")
     for o in opts:
         kinds = ", ".join(f"{k.kind} {k.containers}x{k.gpu}" for k in o.kinds)
         out(f"    {o.name:28s} ${o.cost_usd:7.2f} (${o.cost_low_usd:.2f}-${o.cost_high_usd:.2f})"
@@ -1415,7 +1789,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--state", type=Path, default=None)
     ap.add_argument("--work", type=Path, default=None)
     ap.add_argument("--keep", action="store_true", help="fake-modal: keep the run's Volumes")
+    ap.add_argument("--assume-warm", action="store_true",
+                    help="price the warm-start variant (seeded compile cache); caps stay cold")
+    ap.add_argument("--sizing", action="store_true",
+                    help="dry run: also print the pool-size trade-off (1-4 per pool)")
     args = ap.parse_args(argv)
+    global ASSUME_WARM
+    prev, ASSUME_WARM = ASSUME_WARM, bool(args.assume_warm)
+    try:
+        return _main(args)
+    finally:
+        ASSUME_WARM = prev
+
+
+def _main(args: argparse.Namespace) -> int:
     mode = args.mode
     spath = (args.state or state_path(mode)).resolve()
     work = (args.work or spath.parent / "work").resolve()
@@ -1429,6 +1816,8 @@ def main(argv: list[str] | None = None) -> int:
     print_plan(st, mode, projs)
     if mode == "real" and not go:
         print_options()
+        if args.sizing:
+            print_sizing()
     report_path = spath.parent / "report.md"
     if args.report:
         report_path.write_text(render_report(st, mode, projs))
@@ -1540,10 +1929,12 @@ def main(argv: list[str] | None = None) -> int:
         st.step("report").notes += cleanup_fake_modal(ctx)
     wh.save_state(st, spath)
     report_path.write_text(render_report(st, mode, projs))
-    rep = st.steps.get("report")
-    if rep and rep.result.get("criteria"):
-        for x in rep.result["criteria"]:
-            print(f"  {x['verdict']:5s} {x['criterion']}: {x['value']} (target {x['target']})")
+    crit = recheck(st, mode)
+    for x in crit:
+        print(f"  {x['verdict']:5s} {x['id']:2d}. {x['criterion']}: {x['value']} "
+              f"(target {x['target']}){' - ' + x['reason'] if x['reason'] else ''}")
+    if crit:
+        print(f"  criteria: {criteria_summary(crit)}")
     print(f"wrote {report_path}; state {spath}")
     return rc
 
