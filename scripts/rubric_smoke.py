@@ -773,7 +773,8 @@ def run_job(ctx: Ctx, job: Job) -> dict[str, Any]:
             out["rc"] = ctx.sh(args, timeout=deadline, check=False).returncode
         except subprocess.TimeoutExpired:
             out["rc"] = "deadline"
-            ctx.sh([fl, "cancel", jid, "--config", str(cfg_path)], check=False, timeout=120)
+            ctx.sh([fl, "cancel", jid, "--yes", "--config", str(cfg_path)], check=False,
+                   timeout=120)
     finally:
         p = ctx.sh(["modal", "app", "stop", "--yes", plan.app_name], check=False, timeout=120)
         out["stopped_at"] = time.time()

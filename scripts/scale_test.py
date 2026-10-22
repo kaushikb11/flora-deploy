@@ -265,6 +265,9 @@ MEDIA_VOLUME = {"real": "flora-scale-media", "fake-modal": "flora-scale-fake-med
 
 IDLE_AFTER_JOB_S = 30  # last receipt -> compose -> `modal app stop`
 CLIENT_SLACK_S = wh.CLIENT_SLACK_S  # 240: deadline -> cancel -> app stopped, per container
+# `flora run --detach` (client side: plan on the Volume, write the run spec, spawn): the fake-modal
+# rehearsal's took 5.5 min before its reads went parallel. Generous, and outside the wall limit
+SUBMIT_TIMEOUT_S = 1800.0
 RECONCILE_WAIT_S = 660  # the reconciler cron runs every 10 min; then `flora resume` fallback
 LOCAL_LEASE_TTL_S = 35.0  # local.runner lease TTL (30 s) + margin
 POLL_S = {"real": 30.0, "fake-modal": 10.0, "local": 1.0}
@@ -987,20 +990,21 @@ def _quant(xs: Sequence[float]) -> dict[str, float] | None:
 def read_shard_files(store: Any, job_id: str, config_hash: str, manifest: Any
                      ) -> dict[str, list[dict[str, Any]]]:
     """``{"attempts": [...], "receipts": [...], "ledgers": [...]}`` for the pools' kinds."""
-    from flora_deploy.jobs.store import JobPaths
+    from flora_deploy.jobs.store import JobPaths, prefetch
 
     paths = JobPaths(job_id, config_hash=config_hash, stage_hashes=dict(manifest.stage_hashes))
     out: dict[str, list[dict[str, Any]]] = {"attempts": [], "receipts": [], "ledgers": []}
-    for kind in POOLS:
-        for area, key in (("attempts", "attempts"), ("receipts", "receipts"),
-                          ("calls", "ledgers")):
-            for f in store.list(paths.area_prefix(config_hash, area, kind)):
-                if not f.endswith(".json"):
-                    continue
-                with contextlib.suppress(Exception):
-                    d = json.loads(store.get_bytes(f))
-                    d.setdefault("kind", kind)
-                    out[key].append(d)
+    todo = [(kind, key, f) for kind in POOLS
+            for area, key in (("attempts", "attempts"), ("receipts", "receipts"),
+                              ("calls", "ledgers"))
+            for f in store.list(paths.area_prefix(config_hash, area, kind))
+            if f.endswith(".json")]
+    prefetch(store, [f for _k, _key, f in todo])  # in parallel: one round trip each otherwise
+    for kind, key, f in todo:
+        with contextlib.suppress(Exception):
+            d = json.loads(store.get_bytes(f))
+            d.setdefault("kind", kind)
+            out[key].append(d)
     return out
 
 
@@ -1869,13 +1873,17 @@ def _container_kinds(ctx: Ctx) -> dict[str, str]:
     m = job._deps().manifests.load()
     paths = JobPaths(ctx.job_id, config_hash=job.config_hash,
                      stage_hashes=dict(m.stage_hashes))
+    from flora_deploy.jobs.store import prefetch
+
     out: dict[str, str] = {}
-    for kind in POOLS:
-        for f in job.store.list(paths.area_prefix(job.config_hash, "attempts", kind)):
-            with contextlib.suppress(Exception):
-                cid = json.loads(job.store.get_bytes(f)).get("container_id")
-                if cid:
-                    out[str(cid)] = kind
+    files = [(kind, f) for kind in POOLS
+             for f in job.store.list(paths.area_prefix(job.config_hash, "attempts", kind))]
+    prefetch(job.store, [f for _k, f in files])
+    for kind, f in files:
+        with contextlib.suppress(Exception):
+            cid = json.loads(job.store.get_bytes(f)).get("container_id")
+            if cid:
+                out[str(cid)] = kind
     return out
 
 
@@ -1914,7 +1922,7 @@ def _chaos_modal(ctx: Ctx, action: str) -> dict[str, Any]:
         cid = _running_container(ctx, kind)
         if cid is None:
             return {"skipped": f"no running {kind} container found"}
-        p = ctx.sh(["modal", "container", "stop", cid], check=False, timeout=120)
+        p = ctx.sh(["modal", "container", "stop", "--yes", cid], check=False, timeout=120)
         return {"container": cid, "rc": p.returncode}
     import modal
 
@@ -1947,6 +1955,7 @@ def run_run(ctx: Ctx) -> dict[str, Any]:
     orch: dict[str, Any] = {}
     logs = {"run": ctx.work / "flora-run.log", "resume": ctx.work / "flora-resume.log"}
     t0 = out["started_at"] = time.time()  # the run's start: time to peak counts from here
+    t_wall = t0  # the wall limit counts from the orchestrator's spawn (submit's return)
     killed_at: float | None = None
     resume_proc: subprocess.Popen | None = None
     end_state = None
@@ -1970,7 +1979,12 @@ def run_run(ctx: Ctx) -> dict[str, Any]:
                 chaos.fired.update({f"preempt_{k}": {"fake_faults": f"{k}@2"} for k in pre})
             ctx.sh([fl, "run", "--config", str(ctx.cfg), "--detach", "--job", ctx.job_id,
                     "--budget", f"{budget:.2f}", "--poll", str(ctx.poll_s), *_modal_flags(ctx)],
-                   timeout=900)
+                   timeout=SUBMIT_TIMEOUT_S)
+            # `flora run --detach` plans the job on the Volume, then spawns the orchestrator
+            # and returns: nothing bills on the pools before that, so the wall limit (the
+            # projection's upper wall time) starts here, not before a slow submit
+            t_wall = time.time()
+            out["submit_s"] = round(t_wall - t0, 1)
         while True:
             mon.poll_containers()
             if app is not None and mon.unmatched():
@@ -2027,12 +2041,12 @@ def run_run(ctx: Ctx) -> dict[str, Any]:
                 break
             if mode != "local" and spent + slack_usd >= budget:
                 out["stopped"] = f"observed spend ${spent:.2f} + slack reached ${budget:.2f}"
-                ctx.sh([fl, "cancel", ctx.job_id, "--config", str(ctx.cfg)], check=False)
+                _cancel(ctx, fl)
                 break
-            if time.time() - t0 > wall_limit:
+            if time.time() - t_wall > wall_limit:
                 out["stopped"] = f"wall limit {wall_limit:.0f} s"
                 if mode != "local":
-                    ctx.sh([fl, "cancel", ctx.job_id, "--config", str(ctx.cfg)], check=False)
+                    _cancel(ctx, fl)
                 break
             time.sleep(ctx.poll_s)
         if app is not None and end_state is not None:
@@ -2080,6 +2094,13 @@ def run_run(ctx: Ctx) -> dict[str, Any]:
     return out
 
 
+def _cancel(ctx: Ctx, fl: str) -> None:
+    """``flora cancel --yes``: a stop rule never waits at the [y/N] confirmation (without a
+    terminal, ``flora cancel`` takes no answer as a no and exits 2, cancelling nothing)."""
+    ctx.sh([fl, "cancel", ctx.job_id, "--yes", "--reason", "scale test stop rule",
+            *ctx.store_args()], check=False, timeout=300)
+
+
 def wh_terminal() -> tuple[str, ...]:
     return ("done", "completed_with_errors", "failed", "cancelled", "budget_stopped")
 
@@ -2090,7 +2111,8 @@ def _popen(args: list[str], cwd: Path, log: Path) -> subprocess.Popen:
     print(f"$ {' '.join(args)} > {log}", flush=True)
     f = log.open("a", encoding="utf-8")
     try:
-        return subprocess.Popen(args, cwd=cwd, stdout=f, stderr=subprocess.STDOUT, text=True)
+        return subprocess.Popen(args, cwd=cwd, stdin=subprocess.DEVNULL, stdout=f,
+                                stderr=subprocess.STDOUT, text=True)
     finally:
         f.close()  # the child holds its own descriptor
 
@@ -2107,15 +2129,42 @@ def _spawn_after(ctx: Ctx, t: float) -> float | None:
     return first_spawn_after(files["ledgers"], t)
 
 
+CLEANUP_NOTE = "modal volume delete "  # a report note: this fake-modal run's Volumes are gone
+
+
+def fake_volumes(run_id: str) -> list[str]:
+    """The fake-modal run's own two Volumes (named per run: never another run's)."""
+    return [f"{STORE_VOLUME['fake-modal']}-{run_id}", f"{MEDIA_VOLUME['fake-modal']}-{run_id}"]
+
+
 def cleanup_fake_modal(ctx: Ctx) -> list[str]:
-    """Delete the fake-modal run's two Volumes (named per run; never another run's)."""
+    """Delete the fake-modal run's two Volumes (:func:`fake_volumes`)."""
     notes = []
-    for vol in (f"{STORE_VOLUME['fake-modal']}-{ctx.run}",
-                f"{MEDIA_VOLUME['fake-modal']}-{ctx.run}"):
+    for vol in fake_volumes(ctx.run):
         p = subprocess.run(["modal", "volume", "delete", vol, "--yes"], capture_output=True,
-                           text=True)
-        notes.append(f"modal volume delete {vol}: rc={p.returncode}")
+                           text=True, stdin=subprocess.DEVNULL, timeout=300)
+        notes.append(f"{CLEANUP_NOTE}{vol}: rc={p.returncode}")
     return notes
+
+
+def fake_run_over(st: wh.State) -> str | None:
+    """Why a fake-modal run is over (its Volumes can go), or None while it can still go on:
+    the report step ran (done or not), or a step failed, or was stopped by the stop rule after
+    it ran. A step left ``running`` (the script was killed) or refused before it started (a stop
+    rule's ``wait`` clears once billing catches up) is resumable: its Volumes stay."""
+    rep = st.steps.get("report")
+    if rep is not None and rep.attempts and rep.status in ("done", "failed", "stopped"):
+        return f"report {rep.status}"
+    for name in STEPS:
+        s = st.steps.get(name)
+        if s is not None and s.attempts and s.status in ("failed", "stopped"):
+            return f"{name} {s.status}"
+    return None
+
+
+def fake_volumes_deleted(st: wh.State) -> bool:
+    rep = st.steps.get("report")
+    return rep is not None and any(n.startswith(CLEANUP_NOTE) for n in rep.notes)
 
 
 def _fake_store(ctx: Ctx) -> Any:
@@ -2658,6 +2707,11 @@ def _main(args: argparse.Namespace) -> int:
     if args.execute and mode != "local":
         print("--execute runs --mode local only; Modal modes need --yes-spend")
         return 2
+    if go and mode == "fake-modal" and fake_volumes_deleted(st):
+        print(f"fake-modal run {st.run_id} is over and its Volumes were deleted "
+              f"({', '.join(fake_volumes(st.run_id))}); start a new rehearsal with another "
+              f"--state (or move {spath} away)")
+        return 2
     killed = st.mark_killed() if go else []
     projs = projections(mode)
     print_plan(st, mode, projs)
@@ -2742,14 +2796,20 @@ def _main(args: argparse.Namespace) -> int:
         if name in ("deploy", "run") and mode != "local":
             mark_app(st, APP_STOPPED)  # not known to be live: the next pass deploys
 
-    rc = rb.run_steps(
-        st, [n for n in STEPS if n in selected], state_path=spath, ctx=ctx, run=run,
-        projection=lambda name: projections_now()[name], decide=decide,
-        check_after=lambda name: wh.check_after(st, name, caps=c, global_cap=gcap),
-        refresh=refresh, skip=skip, refuse=refuse, status_of=status_of, on_error=on_error,
-        attempt_kw=lambda name: {"slack_s": CLIENT_SLACK_S})
-    if mode == "fake-modal" and st.step("report").status == "done" and not args.keep:
-        st.step("report").notes += cleanup_fake_modal(ctx)
+    try:
+        rc = rb.run_steps(
+            st, [n for n in STEPS if n in selected], state_path=spath, ctx=ctx, run=run,
+            projection=lambda name: projections_now()[name], decide=decide,
+            check_after=lambda name: wh.check_after(st, name, caps=c, global_cap=gcap),
+            refresh=refresh, skip=skip, refuse=refuse, status_of=status_of, on_error=on_error,
+            attempt_kw=lambda name: {"slack_s": CLIENT_SLACK_S})
+    finally:  # whatever ended the run (a failed report too): its own Volumes go
+        why = fake_run_over(st) if mode == "fake-modal" and not args.keep else None
+        if why and st.step("index").attempts:  # index is what creates them
+            print(f"fake-modal run over ({why}): deleting its Volumes "
+                  f"{', '.join(fake_volumes(st.run_id))} (--keep keeps them)")
+            st.step("report").notes += cleanup_fake_modal(ctx)
+            wh.save_state(st, spath)
     wh.save_state(st, spath)
     report_path.write_text(render_report(st, mode, projs))
     crit = recheck(st, mode)

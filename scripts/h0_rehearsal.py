@@ -394,7 +394,7 @@ def sh(args: list[str], *, cwd: Path, timeout: float = 900, check: bool = True,
     """Run ``args`` (``env``: added to this process's environment for this command only)."""
     print(f"$ {' '.join(args)}", flush=True)
     p = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout,
-                       env={**os.environ, **env} if env else None)
+                       stdin=subprocess.DEVNULL, env={**os.environ, **env} if env else None)
     out = (p.stdout or "") + (p.stderr or "")
     tail = "\n".join(out.strip().splitlines()[-12:])
     with _LOCK:
@@ -1191,8 +1191,8 @@ def main(argv: list[str] | None = None) -> int:
             except subprocess.TimeoutExpired:
                 pr.kill()
                 out, _ = pr.communicate()
-                sh([fl, "cancel", r.job_id, "--config", str(r.cfg_path)], cwd=work, log=log,
-                   check=False)
+                sh([fl, "cancel", r.job_id, "--yes", "--config", str(r.cfg_path)], cwd=work,
+                   log=log, check=False)
                 out += "\n[h0: wall-clock limit reached; job cancelled]"
             r.run_rc, r.run_out = pr.returncode, out
             with log.open("a", encoding="utf-8") as f:

@@ -636,7 +636,8 @@ def utc(t: float | None) -> str:
 
 def _run(args: list[str], run: Callable[..., Any] | None) -> Any:
     try:
-        return (run or subprocess.run)(args, capture_output=True, text=True, timeout=120)
+        return (run or subprocess.run)(args, capture_output=True, text=True, timeout=120,
+                                       stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return None
 
