@@ -362,6 +362,14 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _same_file(a: Path, b: Path) -> bool:
+    """``a`` and ``b`` both exist and are one file (symlinked paths, a resolved mount)."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
 def copy_atomic(src: Path, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_name(f".{dest.name}.partial")
@@ -418,7 +426,11 @@ class DatasetMirror:
         if not dest.is_file():
             got = self.hub.download(self.ds["repo"], self.ds["revision"], self.repo_path(rel),
                                     self.local)
-            if Path(got) != dest:  # a hub that ignores local_dir layout
+            # hf_hub_download resolves local_dir, so behind a symlinked mount (Modal's
+            # /vol/<name> -> /__modal/volumes/vo-...) it returns ``dest`` by its real path:
+            # the same file, not a copy to make.
+            if Path(got) != dest and not _same_file(Path(got), dest):
+                # a hub that ignores local_dir layout
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(got, dest)
         self.fetched.append(self.repo_path(rel))
