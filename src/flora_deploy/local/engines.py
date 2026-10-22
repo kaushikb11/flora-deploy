@@ -86,6 +86,9 @@ class Decoded:
 _CACHE: OrderedDict[tuple[str, int, int], Decoded] = OrderedDict()
 _CACHE_LOCK = threading.Lock()
 _CACHE_MAX = 64
+# Decoded RGB is large (an 8 s 640x480 view is 220 MB), so the cache is bounded by bytes too:
+# by count alone, a real dataset's episodes filled many GB and the OS killed the run.
+_CACHE_MAX_BYTES = 512 << 20
 
 
 def decode(path: str) -> Decoded:
@@ -113,7 +116,8 @@ def decode(path: str) -> Decoded:
     out = Decoded(arr, float(rate), h.hexdigest())
     with _CACHE_LOCK:
         _CACHE[key] = out
-        while len(_CACHE) > _CACHE_MAX:
+        while len(_CACHE) > 1 and (len(_CACHE) > _CACHE_MAX or sum(
+                d.frames.nbytes for d in _CACHE.values()) > _CACHE_MAX_BYTES):
             _CACHE.popitem(last=False)
     return out
 
@@ -155,6 +159,7 @@ class FakeSegcapEngine:
 
     concurrency: int = 1
     calls: int = field(default=0, init=False)
+    on_episode: Any = None  # called with each episode's uid before it runs (progress)
 
     def label(self) -> str:
         return FAKE_ENGINE
@@ -183,6 +188,8 @@ class FakeSegcapEngine:
         note_episodes(len(items))
         for item in items:
             uid = item["episode"]
+            if self.on_episode is not None:
+                self.on_episode(uid)
             checkpoint(uid)
             try:
                 if nv_rejects(uid):
