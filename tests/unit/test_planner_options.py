@@ -207,8 +207,13 @@ def test_mixed_cameras_and_rewards():
                       max_gpus=6)
     o = build_option(req, RateTable.load(), pinned_rates(), "exact", 4)
     seg = next(k for k in o.kinds if k.kind == "segcap")
-    # the cu130 3-view rows are stale: both groups use the 1-/3-view-mix cu128 rate
-    assert seg.work_s == pytest.approx(3600 * 6.4 + 3600 * 6.4)
+    # the cu130 3-view rows are stale: both groups use the 1-/3-view-mix cu128 rate, the
+    # 3-view one scaled by rates.json camera_scaling; rewards have no multiplier
+    f = RateTable.load().camera_scaling.factor("segcap", 3)
+    assert f > 1
+    assert seg.work_s == pytest.approx(3600 * 6.4 + 3600 * 6.4 * f)
+    dense = next(k for k in o.kinds if k.kind == "reward.dense")
+    assert not dense.camera_scale
     assert {k.kind for k in o.kinds} == {"segcap", "reward.dense"}
     assert o.peak_gpus <= 6
 

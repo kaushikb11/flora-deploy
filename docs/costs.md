@@ -34,6 +34,20 @@ sample videos, so treat these numbers as a guide and not a quote: the real cost 
 in the bracket. Wall-clock assumes the stages overlap; on a small job expect a few minutes more. `flora plan` gives the same kind of
 estimate for your own dataset, and `flora report` shows what a finished job actually spent.
 
+### Episodes with several cameras
+
+Each camera view is another video in the prompt, so a three-camera (yam-style) episode costs
+more per video-hour than a single-camera one:
+
+<!-- cost-table:cameras -->
+| Cameras per episode | 1 video-hour, per video-hour | 100 video-hours, per video-hour |
+|---|---|---|
+| 1 | **$6.34** ($4.24-$9.50) | **$5.63** ($3.75-$8.44) |
+| 3 | **$9.84** ($6.57-$14.75) | **$9.13** ($6.08-$13.69) |
+
+Segment + caption, one container per stage, cold starts. 3-view GPU work is the 1-view rate times `segment` x2.56, `caption` x1.42: an estimate, not measured on 3-view episodes (yam certification prep: docs/golden-manifest-v3-yam.md, scripts/wave_h.py three_view_scale, 2026-10-22). Only the share of the work spent generating text grows with the longer three-view prompt; decoding and frame preparation are kept at 1x. `flora plan` applies the same multipliers and says so.
+<!-- /cost-table:cameras -->
+
 ### Why you may have seen other numbers
 
 The README quotes the cost of GPU work alone, with no startup or idle time. A very large job
@@ -183,7 +197,7 @@ batch fill has been measured yet, so the columns below are estimates:
 | wall-clock | How long the job should take; `<=` is the slow end of the range |
 | GPUs | How many GPUs the option uses at once |
 | fidelity | `certified`, `partly certified` (some stages have a certificate, or are NVIDIA's own engine, and others do not), `uncertified` or `reference`: what the records will say about accuracy |
-| rates | `measured (n=1, ±50%)` means measured, on one job, ±50%; `estimate (...)` means part of the price is not measured |
+| rates | `measured (n=1, ±50%)` means measured, on one job, ±50%; `estimate (...)` means part of the price is not measured; `+ camera scaling (estimate)` means multi-camera episodes were priced with the camera multipliers above |
 | status | `ok`, `at risk` (the high end of the range passes your budget or deadline), `infeasible`, `unavailable` or `projection` (needs a feature that is not deployed; shown for comparison and never recommended) |
 
 Lines under the table give each option's pools (for example `segment 1xL40S x1, caption 3xH100! x1`)

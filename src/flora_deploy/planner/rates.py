@@ -17,6 +17,13 @@ configuration's features, :data:`DEPLOYED_FEATURES`; pass ``()`` for none. At eq
 a measured entry beats a projected one, and only then does the entry that uses more enabled
 features win (review 5 M-C: a projection must never displace a measurement of the configuration
 that actually runs).
+
+Camera scaling (``camera_scaling`` in ``rates.json``, :class:`CameraScaling`): per camera layout
+(views per episode) and shard kind, a multiplier on a rate that was not measured on that layout
+(its ``cameras`` is ``"*"`` or another count). It prices the longer prompts of multi-view
+episodes until per-layout rates are measured. The table carries its own ``status``
+(``estimate`` | ``measured``), ``source`` and ``date``; a layout or kind it does not list is
+priced at 1x.
 """
 
 from __future__ import annotations
@@ -99,6 +106,49 @@ def _check(cond: bool, msg: str) -> None:
         raise RatesFileError(msg)
 
 
+CAMERA_SCALING_STATUSES: tuple[str, ...] = ("estimate", "measured")
+
+
+@dataclass(frozen=True)
+class CameraScaling:
+    """``rates.json`` ``camera_scaling``: container-s per video-s multipliers per camera layout
+    and shard kind, for rates not measured on that layout. ``layouts``: ``((cameras,
+    ((kind, multiplier), ...)), ...)``, sorted."""
+
+    status: str  # estimate | measured
+    source: str
+    date: str
+    layouts: tuple[tuple[int, tuple[tuple[str, float], ...]], ...]
+    derivation: str = ""
+
+    def factors(self, cameras: int) -> dict[str, float]:
+        """Kind -> multiplier for ``cameras``-view episodes (empty: the layout is not listed)."""
+        return dict(dict(self.layouts).get(cameras, ()))
+
+    def factor(self, kind: str, cameras: int) -> float:
+        return self.factors(cameras).get(kind, 1.0)
+
+    @classmethod
+    def from_dict(cls, d: Any, *, source: str) -> CameraScaling:
+        where = f"{source}: camera_scaling"
+        _check(isinstance(d, dict), f"{where} must be an object")
+        _check(d.get("status") in CAMERA_SCALING_STATUSES,
+               f"{where}.status {d.get('status')!r}; use {' | '.join(CAMERA_SCALING_STATUSES)}")
+        _check(bool(d.get("source") and d.get("date")), f"{where} needs `source` and `date`")
+        raw = d.get("layouts")
+        _check(isinstance(raw, dict) and bool(raw), f"{where}.layouts must be a non-empty object")
+        layouts = []
+        for cams, kinds in raw.items():
+            _check(str(cams).isdigit() and int(cams) >= 2,
+                   f"{where}.layouts: {cams!r} is not a camera count >= 2")
+            _check(isinstance(kinds, dict) and all(
+                isinstance(v, int | float) and v > 0 for v in kinds.values()),
+                f"{where}.layouts.{cams}: multipliers must be positive numbers")
+            layouts.append((int(cams), tuple(sorted((k, float(v)) for k, v in kinds.items()))))
+        return cls(str(d["status"]), str(d["source"]), str(d["date"]), tuple(sorted(layouts)),
+                   derivation=str(d.get("derivation", "")))
+
+
 def _check_slots(rates: list[RateEntry], source: str) -> None:
     for preset, kind in MEASURED_SLOTS:
         for e in (r for r in rates if r.preset == preset and r.kind == kind):
@@ -116,6 +166,7 @@ class RateTable:
     startup: tuple[StartupEntry, ...]
     source: str = "planner/rates.json"
     updated: str = ""
+    camera_scaling: CameraScaling | None = None
 
     # loading -----------------------------------------------------------------------------
     @classmethod
@@ -145,7 +196,10 @@ class RateTable:
                    "warm or leave it out")
             startup.append(e2)
         _check_slots(rates, source)
-        return cls(tuple(rates), tuple(startup), source=source, updated=data.get("updated", ""))
+        cs = data.get("camera_scaling")
+        return cls(tuple(rates), tuple(startup), source=source, updated=data.get("updated", ""),
+                   camera_scaling=None if cs is None else CameraScaling.from_dict(cs,
+                                                                                source=source))
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> RateTable:
@@ -202,6 +256,14 @@ class RateTable:
                                              len(e.requires)))
         return min(cands, key=lambda e: (e.concurrency, STATUS_RANK[e.status],
                                          -len(e.requires)))
+
+    def camera_factor(self, kind: str, cameras: int, entry: RateEntry) -> float:
+        """The :class:`CameraScaling` multiplier for ``entry`` priced on ``cameras``-view
+        episodes: 1.0 when the entry was measured on exactly that layout, or the table has no
+        multiplier for the layout and kind."""
+        if self.camera_scaling is None or entry.cameras == cameras:
+            return 1.0
+        return self.camera_scaling.factor(kind, cameras)
 
     def startup_for(self, preset: str, kind: str, *, warm: bool = False) -> StartupEntry:
         """The startup row of ``(preset, kind)``: exact kind before ``reward.*`` style prefixes
