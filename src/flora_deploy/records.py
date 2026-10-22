@@ -54,6 +54,11 @@ class Provenance:
     # recomputed; ``None``: unknown). ``flora certify`` reads both.
     compile_cache: str | None = None
     engine_preemptions: int | None = None
+    # Stage-isolated caption certification only (docs/certification.md): the caption stage
+    # captioned the pinned oracle segment records ``{"sha256": <file sha256>,
+    # "oracle_stage_hash": <exact segcap stage hash>}`` instead of its own job's segments.
+    # Omitted from the JSON when None, so every other record's bytes are unchanged.
+    segments_from: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -113,8 +118,13 @@ class StageRecord:
             raise ValueError("certified records have no reason; uncertified records need one")
 
     def to_json(self) -> str:
-        """Canonical JSON. NaN/inf are rejected (ValueError): stages must not emit them."""
-        return json.dumps(asdict(self), sort_keys=True, separators=(",", ":"), allow_nan=False)
+        """Canonical JSON. NaN/inf are rejected (ValueError): stages must not emit them.
+        ``provenance.segments_from`` is left out when None (records predating it, and every
+        record but a stage-isolated caption record, keep their bytes)."""
+        d = asdict(self)
+        if d["provenance"].get("segments_from") is None:
+            d["provenance"].pop("segments_from", None)
+        return json.dumps(d, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> StageRecord:

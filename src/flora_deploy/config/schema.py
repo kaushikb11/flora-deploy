@@ -309,6 +309,34 @@ class RubricSection(_Model):
         return tuple(c.role for c in self.cameras)
 
 
+_HEX64 = re.compile(r"^[0-9a-f]{64}\Z")
+
+
+class CaptionSegments(_Model):
+    """Stage-isolated caption certification only (``docs/certification.md``): a ``balanced``
+    caption-only job captions the **exact oracle's** segments, pinned by content, instead of
+    its own job's. ``records``: the staged JSONL of the oracle's ``segment`` records, under
+    ``output.sink``; ``sha256``: its bytes' sha256; ``oracle_stage_hash``: the oracle's exact
+    ``segcap`` stage hash (every record's ``provenance.config_hash``). Hashed into the caption
+    shard entry (``config.hashing``), so these shards never mix with production ones; not a
+    mode, so the certificate key is the production caption key."""
+
+    records: str = Field(min_length=1)
+    sha256: str
+    oracle_stage_hash: str
+
+    @field_validator("sha256", "oracle_stage_hash")
+    @classmethod
+    def _hex(cls, v: str) -> str:
+        if not _HEX64.match(v):
+            raise ValueError("must be 64 lowercase hex characters")
+        return v
+
+    def as_hashed(self) -> dict[str, str]:
+        """What the caption stage hash binds: the content, not the location."""
+        return {"sha256": self.sha256, "oracle_stage_hash": self.oracle_stage_hash}
+
+
 class PipelineSection(_Model):
     stages: tuple[Stage, ...] = Field(min_length=1)
     embodiment: Embodiment
@@ -327,6 +355,9 @@ class PipelineSection(_Model):
     exact_scheduling: ExactScheduling = Field(default_factory=ExactScheduling)
     # NVIDIA's rubric job fields for `reward.rubric` (hashed into its stage hash).
     rubric: RubricSection | None = None
+    # Stage-isolated caption certification only: caption the exact oracle's pinned segments
+    # (balanced, ``stages: [caption]``; hashed into the caption stage hash).
+    caption_segments: CaptionSegments | None = None
 
     @model_validator(mode="after")
     def _rubric(self) -> PipelineSection:
@@ -342,10 +373,20 @@ class PipelineSection(_Model):
     def _stages(cls, v: tuple[Stage, ...]) -> tuple[Stage, ...]:
         if len(set(v)) != len(v):
             raise ValueError("stages are listed more than once")
-        if "caption" in v and "segment" not in v:
-            raise ValueError("`caption` needs `segment` (captions are per segment)")
         order = get_args(Stage)
         return tuple(sorted(v, key=order.index))
+
+    @model_validator(mode="after")
+    def _caption_segments(self) -> PipelineSection:
+        if self.caption_segments is None:
+            if "caption" in self.stages and "segment" not in self.stages:
+                raise ValueError("`caption` needs `segment` (captions are per segment), unless "
+                                 "`pipeline.caption_segments` pins the oracle's segments")
+            return self
+        if self.stages != ("caption",):
+            raise ValueError("pipeline.caption_segments needs `stages: [caption]` (a "
+                             "caption-only job on the oracle's segments)")
+        return self
 
     @model_validator(mode="after")
     def _instruction_for_rewards(self) -> PipelineSection:
@@ -521,6 +562,16 @@ class FloraConfig(_Model):
                     if self.preset == "exact" and {"segment", "caption"} & set(extra) else "")
             raise ValueError(f"resources {extra} are not used by preset {self.preset!r} with "
                              f"stages {list(self.pipeline.stages)}; used: {kinds}{hint}")
+        cs = self.pipeline.caption_segments
+        if cs is not None:
+            if self.preset != "balanced":
+                raise ValueError("pipeline.caption_segments is for the balanced caption stage "
+                                 f"only (stage-isolated certification), not preset "
+                                 f"{self.preset!r}")
+            if not cs.records.startswith(self.output.sink.rstrip("/") + "/"):
+                raise ValueError(f"pipeline.caption_segments.records {cs.records!r} must be "
+                                 f"under output.sink {self.output.sink!r} (the workers read it "
+                                 "from their job store)")
         if self.preset == "exact" and ("segment" in self.pipeline.stages) != (
                 "caption" in self.pipeline.stages):
             raise ValueError("the exact preset runs NVIDIA's pipeline, which does segment and "
@@ -824,5 +875,7 @@ def to_run_settings(
         min_containers=min_containers,
         max_episode_error_rate=cfg.retries.max_episode_error_rate,
         output_formats=tuple(cfg.output.formats),
+        caption_segments=(cfg.pipeline.caption_segments.as_hashed()
+                          if cfg.pipeline.caption_segments is not None else None),
         **output_settings(cfg),
     )

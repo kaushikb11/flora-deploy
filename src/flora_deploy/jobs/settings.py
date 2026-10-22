@@ -101,6 +101,10 @@ class RunSettings:
     # A ``--fake-models`` job (H0): every kind runs on a CPU container of FAKE_WORKER_CPU cores
     # and FAKE_WORKER_MEMORY_GIB, so spend is priced at that (``billed_pool``), not the pool GPU.
     fake_models: bool = False
+    # Stage-isolated caption certification (``pipeline.caption_segments``): ``{"sha256",
+    # "oracle_stage_hash"}`` of the pinned oracle segments a caption-only job captions. Its
+    # caption shards have no upstream segment shards (``jobs.manifest``).
+    caption_segments: dict[str, str] | None = None
 
     def __post_init__(self) -> None:
         if self.budget_usd <= 0:

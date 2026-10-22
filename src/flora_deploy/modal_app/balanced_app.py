@@ -417,9 +417,11 @@ def build_stage(kind: str, env: Mapping[str, str] = os.environ) -> BalancedStage
         job: Any = SegmentEpisodeJob(SegmentStage(nv, processor), info, inputs)
     else:
         from flora_deploy.stages.caption import CaptionStage
-        from flora_deploy.workers_impl.caption import CaptionEpisodeJob
+        from flora_deploy.workers_impl.caption import CaptionEpisodeJob, segments_for
 
-        job = CaptionEpisodeJob(CaptionStage(nv, processor), info, inputs)
+        # pinned oracle segments (stage-isolated certification) or this job's own
+        job = CaptionEpisodeJob(CaptionStage(nv, processor), info, inputs,
+                                segments=segments_for(env))
     active = apply_accel(nv)
     stats = prefetch.wait(timeout=0) if prefetch is not None else None
     startup = {"kind": kind, "preflight": facts, "marks": marks, "spec": spec.as_json(),
