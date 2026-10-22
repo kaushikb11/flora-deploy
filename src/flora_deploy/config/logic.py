@@ -275,6 +275,7 @@ NON_OUTPUT_MODULES: tuple[str, ...] = (
     "prep/verify.py",  # verification only
     "validate/__init__.py",
     "validate/certify.py",  # certificate generator: metrics over finished records
+    "validate/certfreeze.py",  # drift check / freeze listing of committed certificates
     "validate/gatec.py",
     "validate/gatec_driver.py",
     "validate/golden.py",  # golden build; stream_receipt digests are integrity data

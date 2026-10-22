@@ -97,6 +97,7 @@ def certify(
     from flora_deploy.config.presets import get_preset
     from flora_deploy.config.schema import ConfigError, load_config
     from flora_deploy.validate import certify as C
+    from flora_deploy.validate.certfreeze import write_freeze
     from flora_deploy.validate.certkey import CertKeyError, key_document
 
     try:
@@ -152,6 +153,9 @@ def certify(
         path = None
         if cert["verdict"] != "fail" or out_dir is not None:
             path = C.write_certificate(cert, out_dir)
+            # the freeze lock: the full key document and per-module hashes, so a later drift
+            # report names what changed (validate/certfreeze.py; diagnostic only)
+            write_freeze(cert, doc, path.parent)
         worst = max(worst, ("certified", "provisional", "fail").index(cert["verdict"]))
         certs.append((cert, path))
     if as_json:
