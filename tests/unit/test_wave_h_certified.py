@@ -325,3 +325,30 @@ def test_main_runs_the_certified_certify_step_and_finalize_reads_its_plan(
     # a v1 plan never runs on the certified state
     assert wh.main(["--plan", "full", "--dry-run", "--offline", "--state",
                     str(ctx.state_path)]) == 2
+
+
+def test_certified_balanced_step_prices_cold_from_the_merged_rate_table(capsys):
+    """(d) is priced on the measured balanced rows and the measured cold startups, never the
+    warm compile-cache placeholders, and runs the batch-fill engine limits."""
+    from flora_deploy.engines.batch_policy import policy_for
+    from flora_deploy.engines.offline_llm import GPU_LIMITS
+    from flora_deploy.planner.rates import RateTable
+
+    t = RateTable.load()
+    for kind in ("segment", "caption"):
+        assert t.rate("balanced", kind, 1, 1).status == "measured"
+        assert t.startup_for("balanced", kind).compile_cache == "cold"
+        assert t.startup_for("balanced", kind, warm=True).compile_cache == "warm"
+    secs = wh.balanced_job_seconds(100.0, t)
+    assert secs["segment"][0] > wh.balanced_job_seconds(100.0, t, warm_kinds=("segment",))[
+        "segment"][0]
+    lim = wh.balanced_engine_limits()
+    assert lim["segment"]["max_num_seqs"] == GPU_LIMITS[("tempseg", "L40S")].max_num_seqs
+    assert lim["caption"]["max_num_seqs"] == GPU_LIMITS[("captioner", "H100")].max_num_seqs
+    assert lim["segment"]["infer_episodes"] == policy_for("segment").infer_episodes
+    man = wh.offline_manifest(wh.DURATION_HEADROOM, wh.SPECS[wh.CERTIFIED].golden)
+    st = wh.State("r", 0.0, "x")
+    wh.print_plan(st, wh.plan_projections(wh.CERTIFIED, man), manifest=man, plan=wh.CERTIFIED)
+    out = capsys.readouterr().out
+    assert "batch-fill engine limits" in out and "max_num_seqs 64" in out
+    assert "never write it back" not in out

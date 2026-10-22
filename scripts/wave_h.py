@@ -431,6 +431,24 @@ def startup_basis(table: Any = None) -> dict[str, str]:
     return out
 
 
+def balanced_engine_limits() -> dict[str, dict[str, Any]]:
+    """Per balanced pool: the engine limits (``engines.offline_llm.GPU_LIMITS``) and batch
+    policy (``engines.batch_policy``) its deployed worker builds on the preset's GPU, from the
+    code (what (d)'s ``flora deploy`` runs and its certificate key hashes)."""
+    from flora_deploy.config.presets import get_preset
+    from flora_deploy.engines.batch_policy import policy_for
+    from flora_deploy.engines.offline_llm import spec_for
+
+    out: dict[str, dict[str, Any]] = {}
+    for kind in ("segment", "caption"):
+        gpu = get_preset("balanced").pools[kind].gpu
+        lim = spec_for(kind, "<pinned>", gpu).limits
+        out[kind] = {"gpu": gpu, "max_num_seqs": lim.max_num_seqs,
+                     "max_num_batched_tokens": lim.max_num_batched_tokens,
+                     "infer_episodes": policy_for(kind).infer_episodes}
+    return out
+
+
 def warm_startup_s(st: Any) -> tuple[float, str] | None:
     """A startup row timed (or placeheld) with a loaded compile cache, as is; ``None`` when
     ``st`` is not a ``compile_cache: warm`` row (price it cold instead)."""
@@ -2159,8 +2177,16 @@ def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
         out("  assumption: (d) is priced with a cold compile: startup segment "
             f"{basis['segment']}, caption {basis['caption']} (a startup measured cold is taken "
             f"as is; any other is scaled by {COLD_COMPILE_FACTOR:.2f}, the Rewarder's cold/warm "
-            "@enter 318 s / 229 s, docs/cold-start.md). The deployed workers copy "
-            "flora-cache:/balanced/<engine> to local disk and never write it back")
+            "@enter 318 s / 229 s, docs/cold-start.md). The warm compile-cache rows "
+            "(rates.json `compile_cache: warm`, placeholders) are never used here: a cache is "
+            "keyed by the engine spec, so none is published for this code's yet; a worker that "
+            "compiled publishes one after its first shard (engines/compile_cache.py)")
+        lim = balanced_engine_limits()
+        out("  assumption: (d) runs the batch-fill engine limits and batch policy: "
+            + ", ".join(f"{k} on {v['gpu']} max_num_seqs {v['max_num_seqs']}, "
+                        f"max_num_batched_tokens {v['max_num_batched_tokens']}, "
+                        f"{v['infer_episodes']} episodes per batcher" for k, v in lim.items())
+            + "; its rates were measured before batch fill, so they can only overstate it")
     if "lab" in steps:
         out("  assumption: each lab call compiles two engines cold (baseline + dt_bias "
             "plugin): deadline " + ", ".join(f"{k} {LAB_DEADLINE_S[k]:.0f} s"
