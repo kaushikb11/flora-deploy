@@ -72,7 +72,7 @@ Terms used below:
 | `--exact` | `exact` records of the oracle run (JSONL, `flora_labels_v1`) | yes |
 | `--balanced` | the candidate stack's records on the same episodes | yes |
 | `--noise` | the oracle run **repeated** on some of its episodes: same stage hash, key, GPU and determinism mode. `exact` vs `noise` is the noise floor. Noise episodes the oracle did not label are dropped (`metrics.noise.unpaired`), so a spare fills in | no (without it: `provisional`) |
-| `--witness` | the **cold witness**: candidate records from one container forced cold (`FLORA_COMPILE_CACHE=off`), the same stack, on some of the oracle's episodes. Its means are held to the same thresholds as the candidate's on their own; its subtask-count flips are counted together with the candidate's ("Pass rule", "Warm and cold compiles") | no |
+| `--witness` | the **cold witness**: candidate records from one container forced cold (`FLORA_COMPILE_CACHE=off`), the same stack, on some of the oracle's episodes. Its means are held to the same thresholds as the candidate's on their own; its subtask-count flips are counted together with the candidate's ("Pass rule", "Warm and cold compiles") | no (without it, or with no record forced cold, `segment`/`caption` are `provisional`: `no_witness`) |
 | `--l0` | `modal_app/balanced_lab.py` result JSON (L0 rows, Gate A and `engine_hashes`, the `certkey.engine_settings_hash` of each engine it built), one per model kind. A lab whose baseline engine hash is not the candidate's engine settings is stale (`stale_l0`) | no (without it, or stale, video stages are `provisional`) |
 | `--config` / `-c` | the candidate run's `flora.yaml`: preset, pool GPUs, output-affecting modes, embodiment | default `flora.yaml` |
 | `--derived-content NAME=SHA256` | content digest of each derived weight the kind needs (`tempseg_merged`, `captioner_bf16`): `flora prepare`'s `content_digest(receipt)`, the value `DerivedPin.content_sha256` pins | yes for `segment`/`caption` |
@@ -290,15 +290,20 @@ In this order:
      the lab predates the hash);
    - a candidate or witness record whose engine preempted while it ran (`engine_preempted`) or
      that does not say (`preemptions_unknown`);
+   - for `segment`/`caption`, no cold witness (`no_witness`): no witness record paired with the
+     oracle, or none of them with `compile_cache: cold:forced`. The evidence must cover a
+     forced-cold container, so a certificate without one is never `certified` (the independent
+     check gives the same verdict);
    - a witness with fewer than `min_noise_samples` episodes (`too_few_witness_samples`) or with
-     a record that was not forced cold (`witness_not_forced_cold`);
+     some, not all, records not forced cold (`witness_not_forced_cold`);
    - a metric could not be evaluated (`metric_not_evaluable`).
 3. **`certified`** otherwise.
 
 **What `certified` needs**, per stage and GPU: binding provenance on every record; at least
 10 candidate episodes of the pool, at most 2 oracle episodes unlabelled; a noise run pairing at
 least 5 of the oracle's episodes; L0 passing for `segment`/`caption` under the candidate's engine
-settings; no preempted or unknown-preemption engine record; every check within threshold. **The
+settings; for `segment`/`caption`, a cold witness of at least 5 episodes, every record forced
+cold; no preempted or unknown-preemption engine record; every check within threshold. **The
 six-episode `--plan full` session (6 candidate episodes, a 6-episode noise run) is `provisional`
 by construction**: 6 is below `min_samples` (10). The certified run (`scripts/wave_h.py --plan
 certified`: 12 episodes, a noise run on 6 of them, the selection's 5 plus one spare) is sized

@@ -864,12 +864,16 @@ def check_pass_rule(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
             prov.add("engine_preempted")
         if pre["unknown"]:
             prov.add("preemptions_unknown")
-        if rc.witness is not None:
+        paired = [r for r in run.side("witness", stage).values()
+                  if r.get("uid") in run.side("exact", stage)]
+        cold = [r for r in paired
+                if (r.get("provenance") or {}).get("compile_cache") == FORCED_COLD]
+        if stage in LAB_KIND and not cold:  # no forced-cold evidence at all
+            prov.add("no_witness")
+        if rc.witness:
             if len(rc.witness) < min_n:
                 prov.add("too_few_witness_samples")
-            if any((r.get("provenance") or {}).get("compile_cache") != FORCED_COLD
-                   for r in run.side("witness", stage).values() if
-                   r.get("uid") in run.side("exact", stage)):
+            if cold and len(cold) < len(paired):
                 prov.add("witness_not_forced_cold")
     verdict = "fail" if failures else ("provisional" if prov else "certified")
     reasons = failures | prov
@@ -1265,7 +1269,7 @@ def our_strings(run: Run, stage: str, cert: Mapping[str, Any]) -> set[str]:
     allowed |= {"divergence_above_noise_floor", "l0_failed", "no_noise_run",
                 "too_few_noise_samples", "too_few_samples", "incomplete_coverage", "no_l0",
                 "stale_l0", "metric_not_evaluable", "engine_preempted", "preemptions_unknown",
-                "too_few_witness_samples", "witness_not_forced_cold"}
+                "too_few_witness_samples", "witness_not_forced_cold", "no_witness"}
 
     def walk(o: Any) -> None:
         if isinstance(o, str):

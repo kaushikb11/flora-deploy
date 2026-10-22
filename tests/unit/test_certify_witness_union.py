@@ -39,12 +39,15 @@ def certify_case(case: Case, stage: str):
     wit_split = set(wit_ids[:case.witness_flips])
     shift = 0.2 if case.drift == "boundary" else 0.0
     wcaps = ["x " + c for c in CAPS] if case.drift == "caption" else None
+    cache = "warm:k:" + "f" * 16 if case.drift == "warm" else "cold:forced"
+    witness = None if case.drift == "absent" else stage_recs(
+        stage, "balanced", wit_ids, split=wit_split, shift=shift, captions=wcaps,
+        compile_cache=cache)
     return C.certify_stage(
         stage, exact=stage_recs(stage, "exact", main),
         balanced=stage_recs(stage, "balanced", main, split=main_split),
         noise=stage_recs(stage, "exact", wit_ids),
-        witness=stage_recs(stage, "balanced", wit_ids, split=wit_split, shift=shift,
-                           captions=wcaps, compile_cache="cold:forced"),
+        witness=witness,
         engine_spec=key("balanced", stage, gpu), gpu=gpu,
         l0=L0_PASS if stage == "segment" else lab_for(stage), generated_at=STAMP)
 
@@ -59,13 +62,17 @@ def test_witness_union_cases(case):
     cf = c["metrics"]["count_flips"]
     assert (cf["union"]["flips"], cf["union"]["n"], cf["union"]["allowed"]) == (flips, n, allowed)
     assert cf["union"]["rate"] == pytest.approx(flips / n, abs=1e-6)
-    assert cf["groups"] == {"yam": {"n": case.main, "flips": case.main_flips},
-                            "cold-witness": {"n": WITNESS_N, "flips": case.witness_flips}}
+    groups = {"yam": {"n": case.main, "flips": case.main_flips}}
+    if case.drift != "absent":
+        groups["cold-witness"] = {"n": WITNESS_N, "flips": case.witness_flips}
+    assert cf["groups"] == groups
     union = [ch for ch in c["checks"] if ch["metric"] == "count_mismatch"]
     assert [(ch["class"], ch["flips"], ch["n"], ch["allowed"]) for ch in union] == \
         [("union", flips, n, allowed)]
     if case.verdict == "certified":
         assert c["reasons"] == [] and certkey.policy_problems(c) == []
+    elif case.verdict == "provisional":
+        assert c["reasons"] == list(case.reasons) and not c["unlocks"]
     else:
         assert "divergence_above_noise_floor" in c["reasons"]
 
@@ -85,7 +92,7 @@ def test_without_a_witness_the_union_is_the_candidate():
                         noise=stage_recs("segment", "exact", main[:6]),
                         engine_spec=key("balanced", "segment", "L40S"), gpu="L40S",
                         l0=L0_PASS, generated_at=STAMP)
-    assert c["verdict"] == "certified", c["reasons"]
+    assert c["verdict"] == "provisional" and c["reasons"] == ["no_witness"]
     assert c["metrics"]["count_flips"] == {
         "groups": {"yam": {"n": 12, "flips": 1}},
         "union": {"n": 12, "flips": 1, "rate": round(1 / 12, 6), "threshold": 0.1,

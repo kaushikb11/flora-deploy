@@ -48,7 +48,8 @@ Verdict: ``fail`` if any check fails or a present L0 fails; else ``provisional``
 noise run, too few samples (per pool, in the noise run or in the witness), too many missing
 episodes, (video stages) no L0 or an L0 measured under other engine settings (``stale_l0``), a
 candidate or witness record whose engine preempted while it ran (``engine_preempted``) or that
-does not say (``preemptions_unknown``), or a witness not forced cold; else ``certified``. The
+does not say (``preemptions_unknown``), (video stages) no witness record forced cold
+(``no_witness``), or a witness with some record not forced cold; else ``certified``. The
 certificate states the compile caches its evidence ran (``compile_cache``).
 
 The certificate holds metrics only: no record string ever goes in (no captions, prompts,
@@ -731,10 +732,15 @@ def certify_stage(
         provisional.append("engine_preempted")
     if preempt["unknown"]:
         provisional.append("preemptions_unknown")
-    if witness_block is not None:
+    # Video stages: the evidence must cover a forced-cold container (no_witness: no witness
+    # record paired, or none of them forced cold).
+    forced = sum(1 for r in (wit or {}).values() if r.provenance.compile_cache == FORCED_COLD)
+    if stage in L0_STAGES and not forced:
+        provisional.append("no_witness")
+    if witness_block is not None and wit:
         if witness_block["n"] < th.min_noise_samples:
             provisional.append("too_few_witness_samples")
-        if any(r.provenance.compile_cache != FORCED_COLD for r in wit.values()):
+        if forced and forced < len(wit):
             provisional.append("witness_not_forced_cold")
     verdict = "fail" if failures else ("provisional" if provisional else "certified")
 

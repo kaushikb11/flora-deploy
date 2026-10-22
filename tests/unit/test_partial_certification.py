@@ -25,7 +25,7 @@ from flora_deploy.config.hashing import kind_modes
 from flora_deploy.config.schema import ConfigError, parse_config
 from flora_deploy.validate import certify as C
 from flora_deploy.validate import certkey
-from tests.fakes.certrecords import STAGE_SETS, key, lab_for, rec, segs
+from tests.fakes.certrecords import STAGE_SETS, cold_witness, key, lab_for, rec, segs
 from tests.unit.test_wave_h_finalize import REPO, fin
 
 runner = CliRunner()
@@ -64,9 +64,10 @@ def write_cert(cert_dir: Path, stage: str, embodiment: str = "human", *, noise: 
     modes = kind_modes(cfg, stage)
     doc = key("balanced", stage, gpu, fp=None, modes=modes, content=content())
     lab = lab_for(stage)
+    bal = mk("balanced", 10, fp=None, cert_key=doc, embodiment=embodiment)
     cert = C.certify_stage(
-        stage, exact=mk("exact", 10, fp=None, embodiment=embodiment),
-        balanced=mk("balanced", 10, fp=None, cert_key=doc, embodiment=embodiment),
+        stage, exact=mk("exact", 10, fp=None, embodiment=embodiment), balanced=bal,
+        witness=cold_witness(bal) if stage in C.L0_STAGES else None,
         noise=mk("exact", 5, fp=None, embodiment=embodiment) if noise else None,
         engine_spec=doc, gpu=gpu, l0=lab if stage in C.L0_STAGES else None,
         generated_at=stamp)

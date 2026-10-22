@@ -367,7 +367,7 @@ def test_flora_certify_writes_the_freeze_lock(tmp_path):
     from typer.testing import CliRunner
 
     from flora_deploy.cli import app
-    from tests.fakes.certrecords import L0_PASS, key, segment_set
+    from tests.fakes.certrecords import L0_PASS, cold_witness, key, segment_set
     from tests.unit.test_certify import _balanced_yaml, _jsonl
 
     content = pinned_content("balanced", "segment")
@@ -375,11 +375,14 @@ def test_flora_certify_writes_the_freeze_lock(tmp_path):
     ex = _jsonl(tmp_path / "exact.jsonl", segment_set("exact", 12, fp=None))
     bal = _jsonl(tmp_path / "bal.jsonl", segment_set("balanced", 12, fp=None, cert_key=doc))
     nz = _jsonl(tmp_path / "noise.jsonl", segment_set("exact", 5, fp=None))
+    wit = _jsonl(tmp_path / "witness.jsonl",
+                 cold_witness(segment_set("balanced", 12, fp=None, cert_key=doc)))
     lab = tmp_path / "lab.json"
     lab.write_text(json.dumps(L0_PASS))
     out = tmp_path / "certs"
     r = CliRunner().invoke(app, [
-        "certify", "--exact", str(ex), "--balanced", str(bal), "--noise", str(nz), "--l0",
+        "certify", "--exact", str(ex), "--balanced", str(bal), "--noise", str(nz),
+        "--witness", str(wit), "--l0",
         str(lab), "-c", str(_balanced_yaml(tmp_path)), "--out-dir", str(out),
         "--derived-content", f"tempseg_merged={content['tempseg_merged']}", "--json"])
     assert r.exit_code == 0, r.output

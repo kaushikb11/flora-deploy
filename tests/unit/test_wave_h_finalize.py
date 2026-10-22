@@ -227,7 +227,7 @@ def test_happy_path_updates_everything_consistently_and_is_idempotent(tmp_path, 
     assert {c["verdict"] for c in cs} == {"provisional"}
     by = {(c["stage"], c["covered_pools"][0]): c for c in cs}
     assert set(by[("segment", "human")]["reasons"]) == {"too_few_noise_samples",
-                                                        "too_few_samples"}
+                                                        "too_few_samples", "no_witness"}
     assert "no_noise_run" in by[("segment", "yam")]["reasons"]
     assert by[("segment", "yam")]["l0"]["status"] == "pass"
     assert by[("caption", "yam")]["gpu"] == "H100!"

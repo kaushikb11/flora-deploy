@@ -354,7 +354,11 @@ def test_witness_union_cases(tmp_path, case):
     """The table the generator is tested on (tests/unit/test_certify_witness_union.py): count
     flips over the union of the candidate's and the witness's episodes, witness means alone."""
     opts = {"episodes": R.EPISODES[:case.main], "flips": case.main_flips,
-            "witness_flips": case.witness_flips, "witness_drift": case.drift}
+            "witness_flips": case.witness_flips,
+            "witness_drift": case.drift if case.drift in ("boundary", "caption") else None,
+            "witness": case.drift != "absent"}
+    if case.drift == "warm":
+        opts["witness_cache"] = R.WARM
     f = build(tmp_path, **opts)
     rows = R.by_item(f.run())
     s = case.stage
@@ -362,9 +366,12 @@ def test_witness_union_cases(tmp_path, case):
     for item in ("checks", "verdict", "count-flip tolerance"):
         row = rows[f"2 pass rule | {s} {item}"]
         assert row.status == cc.PASS, row
-    assert rows[f"1 metrics | {s} oracle vs cold witness"].status == cc.PASS
+    if case.drift != "absent":
+        assert rows[f"1 metrics | {s} oracle vs cold witness"].status == cc.PASS
     verdict = rows[f"2 pass rule | {s} verdict"].detail
     assert verdict.split(" ")[0] == case.verdict, verdict
+    for reason in case.reasons:
+        assert reason in verdict, verdict
     flips, n, allowed = WC.UNION[case.id]
     assert rows[f"2 pass rule | {s} count-flip tolerance"].detail.startswith(
         f"{flips} of {n} episodes differ in count")
