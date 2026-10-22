@@ -9,8 +9,11 @@
 | `full` | all 128 | 3,529 s = 0.98 h | 2 × L40S + 3 × H100! | 2 preemptions, 1 orchestrator kill | $11.49 / $19.30 | 36 / 57 min |
 
 Both are prepared but **have not been run on Modal**. Only the local fake-models variant has
-run. `lite` is the default because only about $10–15 of the project's $50 budget is left after
-the certified run, and the full test's upper projection ($19.30) no longer fits.
+run. `lite` is the default because only about $10–15 of the project budget (default $50) is
+left after the certified run, and the full test's upper projection ($19.30) no longer fits.
+The project budget is one setting, `FLORA_PROJECT_BUDGET_USD` (default `50`), read by
+`scripts/spend.py` (where `--budget` overrides it), the `cert_preflight.py` budget check and
+the `wave_h.py --global-cap` ceiling.
 
 ```
 uv run python scripts/scale_test.py                                # dry run (default): lite plan + costs

@@ -140,6 +140,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import _runbook as rb  # noqa: E402 - state, billing, heartbeat, stop rules (shared)
+import spend as _spend  # noqa: E402 - the project budget (FLORA_PROJECT_BUDGET_USD)
 import h0_rehearsal as h0  # noqa: E402 - the same staging and configs as H0
 
 STATE = ROOT / "reports" / "wave-h" / "state.json"
@@ -373,8 +374,9 @@ CAPS_USD = {"tempseg": 0.75, "preflight": 0.05, "exact_e2e": 3.30, "balanced": 2
             "lab": 2.35, "certify": 0.0, "noise": 3.30}
 GLOBAL_CAP_USD = 6.50  # --plan full; balanced-only derives its own (plan_global_cap)
 # The most --global-cap may approve: the project's whole GPU budget (review 12 F7: ``inf`` once
-# turned every global check into a no-op).
-MAX_GLOBAL_CAP_USD = 50.0
+# turned every global check into a no-op): ``$FLORA_PROJECT_BUDGET_USD``, default $50, the one
+# setting ``spend.py`` and ``cert_preflight.py`` read too.
+MAX_GLOBAL_CAP_USD = _spend.project_budget_usd()
 # Cold compile (image smoke, 2026-10-22): ``flora-cache`` holds no compile cache for
 # balanced/tempseg or balanced/captioner at the current image key, so (d)'s first L40S and H100
 # engine starts compile from scratch (torch.compile, Triton, CUDA graphs). The balanced startup
