@@ -13,7 +13,7 @@ modal:
   region: null
   tags: {}
 
-# balanced: TempSeg on an L40S, the Captioner on an H100!, the Rewarder on an H100!. No Gate
+# balanced: TempSeg on an L40S, the Captioner on an H100!, the Rewarder on an H100!. No accuracy
 # certificates yet, so it needs `allow_uncertified: true` (records are marked certified: false).
 preset: balanced
 allow_uncertified: true

@@ -37,7 +37,7 @@ def test_plan_table(cfg):
     r = runner.invoke(app, ["plan", "-c", str(cfg), *ARGS], env={"COLUMNS": "200"})
     assert r.exit_code == 0, r.output
     assert "exact x4" in r.output and "balanced x1" in r.output
-    assert "reference" in r.output and "needs certificates" in r.output
+    assert "reference" in r.output and "uncertified" in r.output
     assert r.output.index("balanced x1") < r.output.index("exact x4")  # balanced first
     assert "Recommended: 2 (exact x4)" in r.output
     assert "exact x8 +long_lived_container" in r.output and "projection only" in r.output

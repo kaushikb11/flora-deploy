@@ -71,7 +71,8 @@ def _print_summary(s: dict) -> None:
 def index(
     config: Annotated[Path, typer.Option("--config", "-c", help="flora.yaml")] = Path("flora.yaml"),
     local: Annotated[bool, typer.Option(
-        "--local", help="Run in this process instead of on Modal.")] = False,
+        "--local", help="Run in this process instead of on Modal (free; downloads the "
+                         "dataset here).")] = False,
     job: Annotated[str | None, typer.Option("--job", help="Job id (default: project).")] = None,
     store: Annotated[str | None, typer.Option(
         "--store", envvar="FLORA_STORE",
@@ -93,7 +94,12 @@ def index(
         help="Also write the summary here (default: summary.json next to the config, where "
              "`flora plan` reads it).", show_default=False)] = None,
 ) -> None:
-    """Index a dataset: per-episode receipts (probe-equivalent, envelope, eligibility)."""
+    """Index a dataset: per-episode receipts (probe-equivalent, envelope, eligibility).
+
+    Runs on Modal CPU containers (no GPU; 1 core and 2 GiB each, about $0.06 per
+    container-hour at list prices), so it costs a few cents for most datasets. --local runs
+    it in this process for free.
+    """
     from flora_deploy.config.schema import ConfigError, load_config
     from flora_deploy.jobs.indexing import IndexJob, open_dataset, run_index
 

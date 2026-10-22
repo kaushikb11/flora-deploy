@@ -80,7 +80,7 @@ def test_completed_with_errors_exit_code(deployed):
     assert out.exit_code == 3, out.output
     assert job_cmd(deployed, "status").exit_code == 3
     rep = job_cmd(deployed, "report")
-    assert rep.exit_code == 3 and "poison pills 1" in rep.output
+    assert rep.exit_code == 3 and "episodes set aside 1" in rep.output
 
 
 def test_budget_stop_then_resume(deployed):

@@ -55,6 +55,24 @@ def report(job: JobArg = None, store: StoreOpt = None,
     sp = r["spend"]
     _p(f"[bold]{escape(job)}[/bold] {r['state']}  config {r['config_hash'][:12]}  app "
        f"{escape(r['app_name'])}")
+    vh, per = r["video_hours"], r["usd_per_video_hour"]
+    if sp.get("simulated"):
+        from flora_deploy.cli.run import SIMULATED_SPEND
+
+        _p(SIMULATED_SPEND)
+        if sp["containers"]:
+            done = all(c["stopped"] for c in sp["containers"])
+            _p(f"  containers: {len(sp['containers'])} local stand-ins, "
+               + ("all finished" if done else "some still running"))
+        _p(f"video-hours: {vh['done']:.3f} done of {vh['planned']:.3f} planned")
+    else:
+        _spend(sp, vh, per)
+    _rest(r, job)
+
+
+def _spend(sp: dict, vh: dict, per: float | None) -> None:
+    from rich.markup import escape
+
     _p(f"spend ${sp['total_usd']:,.2f} (source {sp['source']}) of budget "
        f"${sp['budget_usd']:,.2f}; projected ${sp['projected_usd']:,.2f}; prices "
        f"{escape(sp['prices'])}")
@@ -66,18 +84,28 @@ def report(job: JobArg = None, store: StoreOpt = None,
         for c in sp["containers"][:20]:
             _p(f"    {escape(c['container_id'])} {c['gpu'] or 'cpu'}x{c['gpu_count']} "
                f"${c['usd']:,.2f}{'' if c['stopped'] else ' (running)'}")
-    vh, per = r["video_hours"], r["usd_per_video_hour"]
     _p(f"video-hours: {vh['done']:.3f} done of {vh['planned']:.3f} planned; "
-       + (f"${per:,.2f} per video-hour" if per is not None else "$/video-hour: n/a yet"))
+       + (f"${per:,.2f} per video-hour all-in" if per is not None else "$/video-hour: n/a yet"))
+    if per is not None:
+        _p("  all-in: GPU work plus each container's startup and idle time (`flora plan` "
+           "estimates work and startup, not idle); on a small job startup and idle dominate")
+
+
+def _rest(r: dict, job: str) -> None:
+    from rich.markup import escape
+
+    from flora_deploy import sdk
+
     e = r["errors"]
     _p(f"errors: {e['files']} error file(s)" + (
-        f", by kind {e['by_kind']}, poison pills {len(e['poison_pills'])}, excused "
+        f", by kind {e['by_kind']}, episodes set aside {len(e['poison_pills'])}, excused "
         f"{e['excused']}, missing {e['missing']}" if "by_kind" in e else ""))
     for prob in [*e.get("problems", []), *e["notes"]][:10]:
         _p(f"  [yellow]{escape(prob)}[/yellow]")
     c = r["certification"]
     _p(f"certification: preset {c['preset']} " + (
-        "(needs Gate certificates)" if c["needs_certificate"] else "(reference by construction)"))
+        "(uncertified until its accuracy certificates exist)" if c["needs_certificate"]
+        else "(reference by construction)"))
     for stage, s in c["stages"].items():
         share = "-" if s["certified_share"] is None else f"{s['certified_share']:.1%}"
         reasons = ", ".join(f"{k}={v}" for k, v in s["uncertified_reasons"].items())

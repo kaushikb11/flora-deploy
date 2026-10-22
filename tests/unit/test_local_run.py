@@ -302,7 +302,7 @@ def test_cli_run_local_with_faults_and_sample_data(clean, tmp_path):
                            f"preempt:{shard(clean, 'segcap')},oom:ep001@segcap",
                            "--inject", f"fail:{shard(clean, 'reward.dense')}"])
     assert out.exit_code == 3, out.output  # completed_with_errors
-    assert "COMPLETED_WITH_ERRORS" in out.output and "poison pills 1" in out.output
+    assert "COMPLETED_WITH_ERRORS" in out.output and "episodes set aside 1" in out.output
     assert (tmp_path / "videos" / "ep000.mp4").is_file()
     store = tmp_path / "flora-local-store"
     m = load_manifest(LocalStore(store), JOB)

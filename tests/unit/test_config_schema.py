@@ -170,7 +170,7 @@ def test_balanced_needs_certificates_or_explicit_opt_in(monkeypatch):
 
     d = with_(base(), "preset", "balanced")
     msg = err(d)
-    assert "no Gate certificate for segment on L40S, caption on H100!" in msg
+    assert "no accuracy certificate for segment on L40S, caption on H100!" in msg
     assert "--allow-uncertified" in msg
     assert parse_config(with_(d, "allow_uncertified", True)).preset == "balanced"
     assert parse_config(d, allow_uncertified=True).allow_uncertified is False  # CLI flag

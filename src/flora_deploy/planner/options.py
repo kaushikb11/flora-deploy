@@ -51,7 +51,11 @@ Certification = Literal["reference", "certified", "needs certificates"]
 # The ``unavailable`` reason (and flag) of a preset without certificates; :func:`with_certificates`
 # removes both from an option whose every pool is certified.
 UNCERTIFIED = "uncertified ({preset} has no certificates)"
-_UNCERTIFIED_FLAG = "{preset}: uncertified until its certificates exist"
+# Every "uncertified" flag starts with this (``with_certificates`` drops it).
+_UNCERTIFIED_FLAG = "{preset}: uncertified"
+_UNCERTIFIED_BLOCKED = ("{preset}: uncertified until its certificates exist; set "
+                        "`allow_uncertified: true` in flora.yaml to run it anyway")
+_UNCERTIFIED_ALLOWED = "{preset}: uncertified, allowed by `allow_uncertified: true`"
 Status = Literal["ok", "at risk", "infeasible"]
 
 # The user-facing preset: its options are listed first. `exact` stays selectable as the
@@ -188,6 +192,9 @@ class PlanOption:
     # Why this option cannot be run (and is never recommended) today: uncertified, priced
     # from placeholder rates, or a shard kind the deploy factory refuses (review 6 M2).
     unavailable: tuple[str, ...] = ()
+    # Uncertified, but the config opted in (``allow_uncertified: true``): runnable, and
+    # ``recommended`` ranks it on cost like a certified option.
+    uncertified_allowed: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         """``asdict``, with each kind's concurrency labelled as it is deployed (review 8a R7,
@@ -222,6 +229,9 @@ class PlanRequest:
     # Worker features of the configuration that will run (rates.json ``requires`` /
     # ``excludes``): by default the deployed ones, as ``jobs.budget`` assumes.
     features: tuple[str, ...] = DEPLOYED_FEATURES
+    # The config's ``allow_uncertified``: an uncertified preset is runnable (not
+    # ``unavailable``) and may be recommended, still labelled uncertified.
+    allow_uncertified: bool = False
 
 
 def _pool(req: PlanRequest, preset: str, kind: str) -> PoolSettings:
@@ -370,11 +380,12 @@ def build_option(req: PlanRequest, table: RateTable, rates: Rates, preset: str, 
                 else "includes projected (unconfirmed) rates")
         flags.append(f"warning: {what}: {', '.join(unmeasured)}")
     cert: Certification = "reference" if preset == "exact" else "needs certificates"
+    allowed = cert == "needs certificates" and req.allow_uncertified
     if cert == "needs certificates":
-        flags.append(_UNCERTIFIED_FLAG.format(preset=preset)
-                     + " (`flora run` needs --allow-uncertified)")
+        flags.append((_UNCERTIFIED_ALLOWED if allowed else _UNCERTIFIED_BLOCKED)
+                     .format(preset=preset))
     unavailable: list[str] = []
-    if cert != "reference":
+    if cert != "reference" and not allowed:
         unavailable.append(UNCERTIFIED.format(preset=preset))
     if worst == "placeholder":
         unavailable.append("priced from placeholder rates: "
@@ -398,7 +409,8 @@ def build_option(req: PlanRequest, table: RateTable, rates: Rates, preset: str, 
         kinds=plans, cost_usd=round(c_mid, 2), cost_low_usd=round(c_lo, 2),
         cost_high_usd=round(c_hi, 2), wall_s=round(wall, 1), wall_high_s=round(wall_hi, 1),
         peak_gpus=peak, certification=cert, status=status, flags=tuple(flags),
-        rate_status=worst, requires=missing, unavailable=tuple(unavailable))
+        rate_status=worst, requires=missing, unavailable=tuple(unavailable),
+        uncertified_allowed=allowed)
 
 
 def _gpus_for_deadline(kinds: list[_Kind], deadline_s: float) -> int | None:
@@ -461,7 +473,7 @@ def plan_options(req: PlanRequest, *, table: RateTable | None = None,
     out = runnable[:keep]
     out += projections[: max(0, req.max_options - len(out))]
     if len(out) < req.max_options and req.deadline_s is not None:
-        base = recommended(out)
+        base = recommended(out)  # (an allowed uncertified option is not ``unavailable``)
         if base is not None:
             fast = build_option(req, table, rates, base.preset, base.concurrency, fill=True,
                                 name=f"{base.name} fastest")
@@ -494,7 +506,7 @@ def with_certificates(options: Sequence[PlanOption],
         if unavailable:
             flags.append("unavailable: " + "; ".join(unavailable))
         out.append(replace(o, certification="certified", unavailable=unavailable,
-                           flags=tuple(flags)))
+                           flags=tuple(flags), uncertified_allowed=False))
     return out
 
 
@@ -503,15 +515,18 @@ def recommended(options: Sequence[PlanOption],
     """The option to suggest: never a projection that needs an unwired feature, never an
     ``unavailable`` one (uncertified, placeholder-priced or refused by the factory); ``ok`` before
     ``at risk``; then the reference preset, or an option named in ``certified`` (every pool has
-    a ``certified`` Gate certificate), before uncertified ones; then measured rates before
-    projected before placeholders (review 4 M5); then the cheapest. So a certified ``balanced``
-    that is cheaper wins over ``exact``. ``None`` when no option is feasible and runnable."""
+    a ``certified`` Gate certificate), before uncertified ones, unless the config allows
+    uncertified ones (``uncertified_allowed``: they rank on cost like certified ones); then
+    measured rates before projected before placeholders (review 4 M5); then the cheapest. So a
+    certified, or allowed, ``balanced`` that is cheaper wins over ``exact``. ``None`` when no
+    option is feasible and runnable."""
     live = [o for o in options
             if o.status != "infeasible" and not o.requires and not _blocking(o, certified)]
     if not live:
         return None
     return min(live, key=lambda o: (o.status != "ok",
-                                    o.certification != "reference" and o.name not in certified,
+                                    o.certification != "reference" and o.name not in certified
+                                    and not o.uncertified_allowed,
                                     STATUS_RANK[o.rate_status], o.cost_usd, o.wall_s, o.name))
 
 

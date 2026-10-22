@@ -348,6 +348,9 @@ class JobView:
     summary_status: str | None = None
     episodes: int = 0
     video_s: float = 0.0
+    # A `flora run --local` job: stand-in models in this process, nothing charged. Its spend
+    # figures are the budget gate's simulation, never money.
+    simulated: bool = False
 
     @property
     def exit_code(self) -> int:
@@ -501,7 +504,8 @@ class Job:
             composed=summary is not None,
             summary_status=summary.get("status") if summary else None,
             episodes=len(manifest.episodes),
-            video_s=round(sum(e.duration_s for e in manifest.episodes), 3))
+            video_s=round(sum(e.duration_s for e in manifest.episodes), 3),
+            simulated=self.is_local)
 
     # -- lifecycle -------------------------------------------------------------------------
     def launch(self, reason: str = "submit") -> str:
@@ -683,6 +687,8 @@ class Job:
             containers = job_container_rows(
                 self.store, self.job_id, self.config_hash, manifest, pools=settings.pools,
                 scaledown_s=float(settings.scaledown_s), now=now, rates=rates)
+        if self.is_local and not v.orchestrator_alive:  # its containers died with the process
+            containers = [{**c, "stopped": True} for c in containers]
         done_ids = _done_shards(self, manifest)
         done_eps = {u for s in manifest.shards if s.shard_id in done_ids for u in s.episodes}
         dur = {e.uid: e.duration_s for e in manifest.episodes}
@@ -716,12 +722,13 @@ class Job:
             "job_id": self.job_id, "config_hash": self.config_hash, "app_name": self.app_name,
             "state": v.state, "store": self.store_uri,
             "spend": {"total_usd": v.spend_usd, "source": v.spend_source,
+                      "simulated": v.simulated,
                       "budget_usd": v.budget_usd, "projected_usd": v.projected_usd,
                       "by_kind": by_kind, "containers": containers, "prices": rates.source},
             "video_hours": {"planned": round(v.video_s / 3600, 4),
                             "done": round(done_video_h, 4)},
-            "usd_per_video_hour": (round(v.spend_usd / done_video_h, 2) if done_video_h > 0
-                                   else None),
+            "usd_per_video_hour": (round(v.spend_usd / done_video_h, 2)
+                                   if done_video_h > 0 and not v.simulated else None),
             "errors": errors, "certification": certification,
             "outputs": outputs,
             "summary": (f"{self.store_uri.rstrip('/')}/{self._summary_path()}"

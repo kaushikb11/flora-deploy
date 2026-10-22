@@ -1,5 +1,5 @@
 # flora.yaml: score policy rollouts with the Flora Rewarder only (terminal + dense rewards).
-# Every key is documented in exact_lerobot.yaml. Unknown keys are an error.
+# Every key is documented in `flora init --template exact_lerobot`. Unknown keys are an error.
 
 project: my-rollout-rewards
 
@@ -35,5 +35,5 @@ resources:
   reward.dense: {gpu: H100!, max_containers: 1}
 
 output:
-  sink: s3://my-bucket/flora/rollout-rewards
+  sink: volume://flora-results/rollout-rewards
   formats: [parquet]

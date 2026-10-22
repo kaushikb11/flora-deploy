@@ -80,7 +80,7 @@ def compose(
         console.print(f"{stage}: {c['records']} records ({c['rows']} rows), certified {share}, "
                       f"missing {c['missing']}, excused {c['excused']}")
     console.print(f"duplicates resolved {s['duplicates_resolved']}, conflicts "
-                  f"{len(s['conflicts'])}, poison pills {len(s['poison_pills'])}, "
+                  f"{len(s['conflicts'])}, episodes set aside {len(s['poison_pills'])}, "
                   f"errors {s['errors']['by_kind']}")
     _print_status(s)
     console.print(f"summary: {res.paths['summary']}")
@@ -190,14 +190,95 @@ def results(
         out.write_text("".join(json.dumps(x, sort_keys=True) + "\n" for x in rows))
         console.print(f"Wrote {out}")
         return
+    from rich.markup import escape
     from rich.table import Table
 
-    t = Table(title=f"{job} {stage}: {len(recs)} records")
-    for col in ("uid", "certified", "reason", "segments", "score"):
-        t.add_column(col)
-    for x in rows[:limit]:
-        t.add_row(*("" if x[c] is None else str(x[c])
-                    for c in ("uid", "certified", "reason", "segments", "score")))
-    console.print(t)
-    if len(rows) > limit:
-        console.print(f"... {len(rows) - limit} more (raise --limit or use --format jsonl)")
+    from flora_deploy.cli._app import term_width
+
+    cols, label_rows = label_table(stage, recs)
+    t = Table(title=f"{escape(job)} {stage}: {len(recs)} records", title_justify="left")
+    shown = label_rows[:limit]
+    same = {r[-1] for r in label_rows}
+    if len(same) == 1:  # every record has the same certification: say it once, below
+        cols, shown = cols[:-1], [r[:-1] for r in shown]
+    width = term_width()
+    fits = [min(max([len(col), *(len(r[j]) for r in shown)]), 40) for j, col in enumerate(cols)]
+    # the text column (caption / summary) gets what the others leave, and is truncated to it
+    room = width - (3 * len(cols) + 1) - sum(f for f, c in zip(fits, cols, strict=True)
+                                             if c not in WIDE_COLUMNS)
+    for col, fit in zip(cols, fits, strict=True):
+        if col in WIDE_COLUMNS:
+            w = max(12, room)
+            t.add_column(col, no_wrap=True, overflow="ellipsis", max_width=w)
+        else:
+            t.add_column(col, no_wrap=True, overflow="ellipsis", min_width=fit)
+    for row in shown:
+        t.add_row(*(escape(c) for c in row))
+    console.print(t, width=width)
+    if len(same) == 1:
+        console.print(f"certified: {escape(same.pop())} for every record", soft_wrap=True)
+    if len(label_rows) > limit:
+        console.print(f"... {len(label_rows) - limit} more rows (raise --limit or use "
+                      "--format jsonl)", soft_wrap=True)
+
+
+# Columns of `flora results` tables that take the remaining width and are truncated to it.
+WIDE_COLUMNS = ("caption", "summary", "scores")
+
+
+def _span(s) -> str:
+    return f"{s.start_s:.1f}–{s.end_s:.1f} s"
+
+
+def _certified(r) -> str:
+    return "yes" if r.certified else f"no ({r.uncertified_reason or '-'})"
+
+
+def dense_summary(per_step, width: int = 24) -> str:
+    """``3×4 1×2: 3 3 3 3 1 1``: counts per step label (1 failure, 2 suboptimal, 3 normal),
+    then the first values, as many as fit in ``width`` characters."""
+    from collections import Counter
+
+    counts = Counter(per_step)
+    head = " ".join(f"{k}×{counts[k]}" for k in sorted(counts, reverse=True))
+    vals, shown = [str(v) for v in per_step], ""
+    for i in range(len(vals), 0, -1):
+        shown = " ".join(vals[:i]) + (" …" if i < len(vals) else "")
+        if len(shown) <= width:
+            break
+    return f"{head}: {shown}" if vals else "-"
+
+
+def label_table(stage: str, recs) -> tuple[tuple[str, ...], list[tuple[str, ...]]]:
+    """The labels themselves, per stage: one row per segment (span, and caption for
+    ``caption``); the score and expected score for ``reward.terminal``; a per-step summary for
+    ``reward.dense``; the total and per-step scores for ``reward.rubric``. Each row also says
+    whether the record is certified (and why not)."""
+    rows: list[tuple[str, ...]] = []
+    if stage in ("segment", "caption"):
+        cols = ("uid", "#", "span", *(("caption",) if stage == "caption" else ()), "certified")
+        for r in recs:
+            if not r.segments:
+                rows.append((r.uid, "-", "-", *(("-",) if stage == "caption" else ()),
+                             _certified(r)))
+            for i, s in enumerate(r.segments):
+                text = ((s.caption or "-").replace("\n", " "),) if stage == "caption" else ()
+                rows.append((r.uid, str(i), _span(s), *text, _certified(r)))
+        return cols, rows
+    if stage == "reward.terminal":
+        for r in recs:
+            t = r.terminal
+            rows.append((r.uid, str(t.score) if t else "-",
+                         f"{t.expected_score:.2f}" if t else "-", _certified(r)))
+        return ("uid", "score (1-5)", "expected", "certified"), rows
+    if stage == "reward.dense":
+        for r in recs:
+            d = r.dense
+            rows.append((r.uid, str(len(d.per_step)) if d else "-",
+                         dense_summary(d.per_step) if d else "-", _certified(r)))
+        return ("uid", "steps", "summary", "certified"), rows
+    for r in recs:  # reward.rubric
+        u = r.rubric
+        rows.append((r.uid, f"{u.total:g}" if u else "-",
+                     " ".join(f"{x:g}" for x in u.scores) if u else "-", _certified(r)))
+    return ("uid", "total", "scores", "certified"), rows

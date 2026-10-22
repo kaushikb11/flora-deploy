@@ -33,9 +33,16 @@ flora results caption
 
 **You need:**
 - A [Modal](https://modal.com) account. Run `modal setup` once.
-- An output location Modal can write to: a Modal Volume (`volume://name/dir`, nothing to set up)
-  or a bucket (`s3://`, `gs://`, `r2://`) with its credentials in a Modal Secret named
-  `flora-bucket`.
+- Nothing to request on [Hugging Face](https://huggingface.co): the `nvidia/Flora-*` model
+  repos are public and not gated, so there are no terms to accept and no token is required
+  (`flora prepare` downloads them anonymously). A token (`hf auth login`) is optional and raises
+  rate limits. `flora doctor` checks that every model repo and your dataset can be read.
+- An output location Modal can write to: a Modal Volume (`volume://name/dir`, the `flora init`
+  default; `flora deploy` creates the Volume if it does not exist) or a bucket (`s3://`,
+  `gs://`, `r2://`) with its credentials in a Modal Secret named `flora-bucket`.
+
+To start from a working config instead, see [`examples/`](examples/): `lerobot_small` labels a
+50-episode public dataset for a few dollars.
 
 ```bash
 flora init                 # writes flora.yaml; set your dataset and output location
@@ -104,10 +111,23 @@ GPU produced it. Field reference: [`docs/output-format.md`](docs/output-format.m
 a finished job actually spent. Segmentation runs on an L40S, captioning and rewards on H100s.
 
 <!-- wave-h:cost -->
-Measured in Wave H-lite (2026-10-22): `balanced` costs about **$5.62 per video-hour** (±50%)
-at Modal list prices for segmentation + captioning. Rewards and the cold
-start of each container are extra; details in `docs/wave-h-report.md`.
+`balanced` costs about **$5.61 per video-hour** of GPU work (±50%) for segmentation + captioning,
+measured 2026-10-22 at Modal list prices. Startup (a few minutes per container), idle time and
+rewards are extra and dominate small jobs: `flora plan` shows the all-in estimate for your dataset.
 <!-- /wave-h:cost -->
+
+Three numbers, three definitions:
+- **GPU work** (above): only the seconds the GPUs spend labelling. A large job's segmentation +
+  captioning approaches it.
+- **`flora plan`**: the all-in estimate for your dataset: GPU work for every stage you chose,
+  plus each container's startup and the orchestrator. Idle time after the work is not included.
+- **`flora report`**: what the job actually spent: everything above plus idle time. On a job of
+  a few minutes of video, startup and idle can make this several times the GPU-work rate.
+
+`flora index` runs on Modal CPU containers (no GPU, about $0.06 per container-hour), so it costs a
+few cents for most datasets; `flora index --local` runs it on your machine for free. `flora
+doctor` and `flora plan` cost nothing. The measurement behind these rates:
+[`docs/wave-h-report.md`](docs/wave-h-report.md).
 
 ## While a job runs
 
