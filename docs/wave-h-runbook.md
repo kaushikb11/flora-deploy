@@ -643,10 +643,9 @@ re-runs only, and the outcome committed in advance.
 
 ```
 uv run python scripts/wave_h.py --plan recertify --dry-run                 # steps, prices, caps
-#   phase 1 (today's main checkout, before this change lands): the exact noise job on all 12
-#   episodes. Then land the v4 code (tests green), adopt that job and run phase 2:
-uv run python scripts/wave_h.py --plan recertify --adopt-noise <noise job id> --adopt-noise-usd <billed>
-uv run python scripts/wave_h.py --plan recertify --yes-spend --global-cap 11.70
+#   phase 1, from main before the v4 code lands: f2 noise_all (main's recertify plan writes
+#   reports/wave-h/recertified/state.json with f2 done). Then land the v4 code (tests green):
+uv run python scripts/wave_h.py --plan recertify --yes-spend      # phase 2: lab, balanced, caption_iso, certify
 uv run python scripts/wave_h.py --plan recertify --status
 ```
 
@@ -669,9 +668,10 @@ change the `exact` segcap stage hash. So:
   no diff in the segcap modules, so it reproduces (b)'s stage hash; P0 checks it before any
   spend. The noise job runs from today's `main` checkout (phase 1), and this whole change (the
   v4 package code, the `recertify` plan and these docs) lands only **after** it has finished.
-  `recertify` then adopts that finished job as its `noise_all` step (`--adopt-noise`); its own
-  `noise_all` runner exists for a pre-landing run only, and its guard refuses once anything
-  hashed has moved. `flora certify` still checks that the noise records repeat the oracle's
+  It is `recertify`'s own first step: main's plan records f2 in the recertify state, and after
+  the merge phase 2 reads it from there (`noise_all.result.jobs.human`, in (b)'s store; phase-2
+  job ids are prefixed `rc-` so they never collide with (b)'s). f2's guard (config and stage
+  hashes equal to (b)'s) refuses on the merged checkout, as it should: f2 is done by then. `flora certify` still checks that the noise records repeat the oracle's
   stage hash, key, GPU and determinism mode.
 - **B (not chosen):** land the code first, then re-run the oracle **and** the noise, for
   +$2.74 / +$4.17 (total $9.86 / $15.85).
@@ -701,7 +701,7 @@ change the `exact` segcap stage hash. So:
 - **Cap.** The user approved a global cap of **$11.70** for the plan, noise run included
   (`RECERT_GLOBAL_CAP_USD`; never derived higher). On the current rates the all-upper total
   ($11.90) is above it, so the plan only fits once `noise_all` is recorded at its billed cost:
-  adopted at $2.74, phase 2's upper $7.73 brings the total to $10.47, under $11.70. Step caps:
+  done at $2.74, phase 2's upper $7.73 brings the total to $10.47, under $11.70. Step caps:
   each upper rounded up to $0.05 (lab $1.70, balanced $3.10, caption_iso $3.00).
 - **What each job is for.** J1 gives the `segment` candidate and the reported-only end-to-end
   caption block; J2 is the `caption` candidate; J1w and J2w are the forced-cold witnesses of their
