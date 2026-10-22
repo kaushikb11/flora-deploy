@@ -411,7 +411,7 @@ class LocalRunner:
 
     # -- steps -----------------------------------------------------------------------------
     def index(self) -> dict[str, Any]:
-        from flora_deploy.jobs.indexing import IndexJob, open_dataset, run_index
+        from flora_deploy.jobs.indexing import IndexJob, open_dataset
 
         ijob = IndexJob.from_config(self.cfg, self.job_id)
         if self.dataset_root is not None:
@@ -426,13 +426,35 @@ class LocalRunner:
             files = open_dataset(ijob.dataset, work=work, staged=True)
         self.media_root = Path(files.root).resolve()  # NVIDIA wants absolute video paths
         quiet = (lambda m: None) if not self.verbose else self.log
-        summary = run_index(ijob, self.store, files, log=quiet, progress=self.log)
+        summary = self._run_index(ijob, files, log=quiet)
         c = summary["counts"]
         self.log(f"index: {c['episodes']} episodes, {c['indexed']} indexed, "
                  f"{c['source_error']} source errors, {c['failed']} failed "
                  f"({c['resumed']} resumed)")
         self.index_summary = summary
         return summary
+
+    def _run_index(self, job: Any, files: Any, *, log: Callable[[str], None]) -> dict:
+        """``jobs.indexing.run_index``, plus a few progress lines on ``self.log`` (how many
+        episodes and source files, then one per unit) while ``log`` keeps the per-episode lines
+        quiet. This lives here, not in ``jobs/indexing.py``: that module is in the logic digest,
+        so even a print-only change there changes every stage hash (review 15 M1)."""
+        from flora_deploy.jobs.indexing import finish_index, index_unit, plan_index
+
+        t0 = time.monotonic()
+        job, units = plan_index(job, files)
+        total = sum(len(u.episodes) for u in units)
+        nfiles = len({f for u in units for f in u.files})
+        where = f"; Hub files are downloaded to {files.root} once" if job.dataset.repo else ""
+        plural = "" if nfiles == 1 else "s"
+        self.log(f"index: {total} episodes in {nfiles} source file{plural}{where}")
+        rows: list[dict] = []
+        for i, unit in enumerate(units, 1):
+            rows += index_unit(job, unit, files, self.store, log=log)
+            if len(units) > 1:
+                self.log(f"index: {len(rows)}/{total} episodes (unit {i}/{len(units)})")
+        return finish_index(job, rows, self.store, units=len(units),
+                            run={"mode": "local", "wall_s": round(time.monotonic() - t0, 3)})
 
     # Price spend as the ``--fake-models`` Modal app's CPU containers (``RunSettings.
     # fake_models``) rather than the pool GPUs, which local budget tests exercise.

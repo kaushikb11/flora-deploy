@@ -775,24 +775,13 @@ def finish_index(job: IndexJob, rows: Iterable[Mapping[str, Any]], store: Store,
 
 def run_index(job: IndexJob, store: Store, files: DatasetFiles, *, limit: int | None = None,
               max_episodes: int = MAX_EPISODES_PER_UNIT, force: bool = False,
-              log: Log = print, progress: Log | None = None) -> dict:
-    """In-process index job (``flora index --local``): plan, index every unit, summarize.
-    ``progress``: a few lines (how many episodes and source files, then one per unit), for
-    callers that keep ``log``'s per-episode lines quiet."""
+              log: Log = print) -> dict:
+    """In-process index job (``flora index --local``): plan, index every unit, summarize."""
     t0 = time.monotonic()
     job, units = plan_index(job, files, limit=limit, max_episodes=max_episodes)
-    total = sum(len(u.episodes) for u in units)
-    if progress is not None:
-        nfiles = len({f for u in units for f in u.files})
-        where = (f"; Hub files are downloaded to {files.root} once" if job.dataset.repo
-                 else "")
-        plural = "" if nfiles == 1 else "s"
-        progress(f"index: {total} episodes in {nfiles} source file{plural}{where}")
     rows: list[dict] = []
-    for i, unit in enumerate(units, 1):
+    for unit in units:
         rows += index_unit(job, unit, files, store, force=force, log=log)
-        if progress is not None and len(units) > 1:
-            progress(f"index: {len(rows)}/{total} episodes (unit {i}/{len(units)})")
     return finish_index(job, rows, store, units=len(units),
                         run={"mode": "local", "wall_s": round(time.monotonic() - t0, 3)})
 
