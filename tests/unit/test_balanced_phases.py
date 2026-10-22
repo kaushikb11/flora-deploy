@@ -213,13 +213,39 @@ def test_shard_audit_rows_carry_the_policy_digest(monkeypatch):
 TEMPLATE = Path(__file__).resolve().parents[2] / "src/flora_deploy/config/templates/local_demo.yaml"
 
 
-def test_local_fake_balanced_job_with_64_episodes(tmp_path):
+def _prepare_first_episodes_together(monkeypatch, n: int = 2) -> None:
+    """Each shard's first ``n`` episodes finish preparing together, so they enter inference in
+    one loop step and share the first round. Without it, whether two episodes ever share a
+    round is timing: a segment episode makes one call, a round starts as soon as every
+    inferring episode is blocked, and on a slow runner each episode's CPU preparation outlasts
+    the previous one's inference (CI ``order (3.11)``: every segment round had one request)."""
+    from flora_deploy.local import balanced as LB
+
+    orig = LB._FakeJob._prepare
+
+    async def _prepare(self, ref, ctx):
+        out = await orig(self, ref, ctx)
+        b = ctx.cache.setdefault("test_first_prepared", {"n": 0, "ev": asyncio.Event()})
+        b["n"] += 1
+        if b["n"] >= n:
+            b["ev"].set()
+        try:  # a shard of fewer episodes (none here) must not hang
+            await asyncio.wait_for(b["ev"].wait(), 30)
+        except TimeoutError:
+            pass
+        return out
+
+    monkeypatch.setattr(LB._FakeJob, "_prepare", _prepare)
+
+
+def test_local_fake_balanced_job_with_64_episodes(tmp_path, monkeypatch):
     from flora_deploy.export.results import iter_records
     from flora_deploy.jobs.stores import LocalStore
     from flora_deploy.local import run_local
     from flora_deploy.local import sample_dataset as make_sample
     from tests.unit.test_balanced_deps import balanced_yaml
 
+    _prepare_first_episodes_together(monkeypatch)
     d = tmp_path / "demo"
     d.mkdir()
     shutil.copy(TEMPLATE, d / "flora.yaml")
