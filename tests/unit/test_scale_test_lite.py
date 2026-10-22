@@ -8,6 +8,7 @@ import argparse
 import copy
 import importlib.util
 import json
+import re
 import statistics
 import sys
 from pathlib import Path
@@ -307,17 +308,20 @@ def test_finalize_folds_samples_and_keeps_the_certified_record(tmp_path):
     for kind, lo, hi in (("segment", 0.30, 0.40), ("caption", 0.80, 0.90)):
         old, new = _row(before, "rates", kind), _row(data, "rates", kind)
         base, *folds = new["samples"]
+        # the committed record's video seconds, as its provenance states them
+        video = float(re.search(r"\(([\d.]+) video s\)", old["provenance"]).group(1))
         # the certified run's record is kept verbatim as the base sample
         assert base["origin"] == "base" and base["value"] == old["container_s_per_video_s"]
         assert base["source"] == old["source"] and base["n"] == old["n"]
-        assert base["provenance"] == old["provenance"] and base["video_s"] == 178.2
+        assert base["provenance"] == old["provenance"] and base["video_s"] == video
         assert new["source"] == old["source"]
         assert [f["value"] for f in folds] == [lo, hi] and new["n"] == old["n"] + 2
         vals = [old["container_s_per_video_s"], lo, hi]
         assert new["uncertainty"] == round(max(wf.UNCERTAINTY_FLOOR,
                                                (max(vals) - min(vals)) / statistics.mean(vals)),
                                            2)
-        pooled = (old["container_s_per_video_s"] * 178.2 + lo * 300 + hi * 400) / 878.2
+        pooled = ((old["container_s_per_video_s"] * video + lo * 300 + hi * 400)
+                  / (video + 700))
         assert new["container_s_per_video_s"] == round(pooled, 3)
     # startups: cold row; the pre-warmed caption container gives no startup sample
     seg, cap = _row(data, "startup", "segment"), _row(data, "startup", "caption")

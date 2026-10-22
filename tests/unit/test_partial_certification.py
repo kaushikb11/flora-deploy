@@ -274,17 +274,24 @@ def blocks(text: str) -> dict[str, str]:
             for n in ("certified", "allow-uncertified")}
 
 
-def test_readme_blocks_as_committed_match_no_certificates(tmp_path):
+def no_certificates_readme(tmp_path: Path) -> str:
+    """The committed README with its certification blocks as for an empty registry."""
     readme = (REPO / "README.md").read_text(encoding="utf-8")
-    assert fin.certification_blocks(readme, [tmp_path / "none"]) == readme  # idempotent
-    b = blocks(readme)
-    assert "none yet" in b["certified"] and "required" in b["allow-uncertified"]
+    return fin.certification_blocks(readme, [tmp_path / "none"])
+
+
+def test_readme_blocks_as_committed_match_the_committed_certificates(tmp_path):
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    # what scripts/wave_h_finalize.py writes for the committed registry (idempotent)
+    assert fin.certification_blocks(readme, [certkey.CERT_DIR]) == readme
     assert "allow_uncertified: true           # for stages without an accuracy certificate" \
         in readme
+    b = blocks(no_certificates_readme(tmp_path))
+    assert "none yet" in b["certified"] and "required" in b["allow-uncertified"]
 
 
 def test_readme_blocks_follow_the_certificates(human_certs, registry, tmp_path):
-    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    readme = no_certificates_readme(tmp_path)
     new = fin.certification_blocks(readme, [registry])
     b = blocks(new)
     assert b["certified"] == ("Accuracy certificates: segmentation and captioning for `human` "

@@ -165,9 +165,12 @@ def test_duplicate_yaml_keys_are_an_error():
     assert loads_config(yaml.safe_dump(base())).preset == "exact"
 
 
-def test_balanced_needs_certificates_or_explicit_opt_in(monkeypatch):
+def test_balanced_needs_certificates_or_explicit_opt_in(monkeypatch, tmp_path):
     from flora_deploy.config import presets, schema
+    from flora_deploy.validate import certkey
 
+    # an empty registry, so this does not depend on the certificates committed so far
+    monkeypatch.setattr(certkey, "CERT_DIR", tmp_path)
     d = with_(base(), "preset", "balanced")
     msg = err(d)
     assert "no accuracy certificate for segment on L40S, caption on H100!" in msg
@@ -185,6 +188,40 @@ def test_balanced_needs_certificates_or_explicit_opt_in(monkeypatch):
     assert "not certified for every stage of this config (certified: segment" in msg
     assert "caption on H100!: no certificate" in msg
     assert "allow_uncertified: true" in msg and "segment on L40S" not in msg
+
+
+def _committed_certified(gpu_of: dict[str, str]) -> dict[str, dict]:
+    """The committed ``certified`` balanced certificates covering ``human`` on the base
+    config's GPUs, by kind."""
+    from flora_deploy.validate import certkey
+
+    return {c["kind"]: c for c in certkey.load_certificates()
+            if c["preset"] == "balanced" and c["verdict"] == "certified"
+            and "human" in c["covered_pools"] and gpu_of.get(c["kind"]) == c["gpu"]}
+
+
+def test_balanced_refusal_names_the_committed_certificates():
+    """Against the committed registry (with the certified derived weights' digests, as after
+    ``flora prepare``): the refusal credits each certified stage and names only the others."""
+    d = with_(base(), "preset", "balanced")
+    gpus = {k: p.gpu for k, p in parse_config(d, allow_uncertified=True).pools().items()}
+    certs = _committed_certified(gpus)
+    dc = {n: h for c in certs.values() for n, h in (c.get("derived_weights") or {}).items()}
+    needs = [k for k in gpus if k != "reward.terminal"]  # rewards are the reference
+    if all(k in certs for k in needs):
+        assert parse_config(d, derived_content=dc).preset == "balanced"
+        return
+    with pytest.raises(ConfigError) as e:
+        parse_config(d, derived_content=dc)
+    msg = str(e.value)
+    ok = [k for k in gpus if k in certs]
+    if ok:
+        assert f"(certified: {', '.join(ok)}; reference: reward.terminal)" in msg
+    else:
+        assert "(reference: reward.terminal)" in msg
+    for k in needs:
+        assert (f"{k} on {gpus[k]}: no certificate" in msg) is (k not in certs), (k, msg)
+    assert "allow_uncertified: true" in msg and "--allow-uncertified" in msg
 
 
 def test_exact_needs_no_certificate():

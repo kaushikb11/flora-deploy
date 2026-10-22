@@ -526,7 +526,11 @@ def test_shipped_balanced_startups_are_recorded_cold_and_priced_as_measured():
     from flora_deploy.planner.rates import RatesFileError, RateTable
 
     t = RateTable.load()
-    for kind, sec in (("segment", 300.5), ("caption", 325.0)):
+    # the committed cold rows, read straight from rates.json (they follow each measured run)
+    raw = json.loads((SCRIPTS.parent / "src/flora_deploy/planner/rates.json").read_text())
+    for kind in ("segment", "caption"):
+        sec = next(r["startup_s"] for r in raw["startup"] if r["preset"] == "balanced"
+                   and r["kind"] == kind and r.get("compile_cache") == "cold")
         st = t.startup_for("balanced", kind)
         assert (st.status, st.compile_cache, st.startup_s) == ("measured", "cold", sec)
     secs = wh.balanced_job_seconds(100.0, t)

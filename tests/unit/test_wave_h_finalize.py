@@ -109,6 +109,12 @@ def build(tmp: Path, *, jobs=("human", "yam"), labs=("tempseg", "captioner"),
     for rel in ("src/flora_deploy/planner/rates.json", "docs/balanced-engines.md", "README.md"):
         (tmp / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(REPO / rel, tmp / rel)
+    # the README's certification blocks as for this root's own (empty) registry, so the
+    # fixture does not depend on the certificates committed to the repo
+    readme = tmp / "README.md"
+    readme.write_text(fin.certification_blocks(
+        readme.read_text(encoding="utf-8"),
+        [tmp / "src" / "flora_deploy" / "config" / "certificates"]), encoding="utf-8")
     w = tmp / "reports" / "wave-h"
     (w / "work").mkdir(parents=True)
     cfgs = {}
@@ -263,7 +269,7 @@ def test_happy_path_updates_everything_consistently_and_is_idempotent(tmp_path, 
     cost = readme.split("<!-- wave-h:cost -->")[1].split("<!-- /wave-h:cost -->")[0]
     assert f"${bal_cost:.2f} per video-hour" in cost and "#" not in cost
     assert 2 <= len(cost.strip().splitlines()) <= 3
-    readme0 = (REPO / "README.md").read_text()
+    readme0 = before["README.md"].decode()  # as built: no certificates in this root
     outside = readme0.split("<!-- wave-h:cost -->")
     assert readme.startswith(outside[0]) and readme.endswith(outside[1].split(
         "<!-- /wave-h:cost -->")[1])  # only the block changed

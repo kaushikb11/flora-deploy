@@ -26,6 +26,19 @@ def _load(name: str):
 sc = _load("scale_test")
 wh = sys.modules["wave_h"]
 
+RATES_JSON = Path(__file__).resolve().parents[2] / "src/flora_deploy/planner/rates.json"
+
+
+def _committed_balanced(kind: str) -> tuple[float, float]:
+    """The committed balanced ``kind`` work rate (concurrency 1) and cold startup, read
+    straight from ``rates.json`` so these tests follow each refresh of the measured rows."""
+    d = json.loads(RATES_JSON.read_text())
+    rate = next(r for r in d["rates"] if r["preset"] == "balanced" and r["kind"] == kind
+                and r["concurrency"] == 1)
+    cold = next(r for r in d["startup"] if r["preset"] == "balanced" and r["kind"] == kind
+                and r.get("compile_cache") in ("cold", None))
+    return rate["container_s_per_video_s"], cold["startup_s"]
+
 
 @pytest.fixture(autouse=True)
 def full_profile(monkeypatch):
@@ -508,10 +521,10 @@ def test_projection_uses_the_measured_balanced_rows_and_per_class_prices():
     r = sc.kind_rates("real", warm=False)
     assert r["segment"].status == r["caption"].status == "measured"
     assert r["segment"].startup_status == r["caption"].startup_status == "measured"
-    assert r["segment"].cs_per_video_s == pytest.approx(0.367)
-    assert r["caption"].cs_per_video_s == pytest.approx(0.906)
-    assert r["segment"].startup_s == pytest.approx(300.5)
-    assert r["caption"].startup_s == pytest.approx(325.0)
+    for kind in ("segment", "caption"):
+        rate, startup = _committed_balanced(kind)
+        assert r[kind].cs_per_video_s == pytest.approx(rate)
+        assert r[kind].startup_s == pytest.approx(startup)
     rates = sc.container_rates("real")
     run = sc.project("run", "real", warm=False)
     for i in run.items:
@@ -557,8 +570,10 @@ def test_simulated_schedule_pipelines_and_respects_pool_sizes():
     sim = sc.simulate({"segment": 2, "caption": 3}, r)
     seg, cap = sim["pools"]["segment"], sim["pools"]["caption"]
     assert seg.peak == 2 and cap.peak == 3
-    assert seg.busy_s == pytest.approx(sc.VIDEO_S * 0.367, rel=1e-6)
-    assert cap.busy_s == pytest.approx(sc.VIDEO_S * 0.906, rel=1e-6)
+    seg_rate, _ = _committed_balanced("segment")
+    cap_rate, cap_startup = _committed_balanced("caption")
+    assert seg.busy_s == pytest.approx(sc.VIDEO_S * seg_rate, rel=1e-6)
+    assert cap.busy_s == pytest.approx(sc.VIDEO_S * cap_rate, rel=1e-6)
     # the pre-warmed caption container is ready at the first segment receipt, and they overlap
     assert sim["pipelining"]["first_caption_after_first_segment_s"] == pytest.approx(0.0)
     assert sim["pipelining"]["overlap_s"] > 0
@@ -567,7 +582,7 @@ def test_simulated_schedule_pipelines_and_respects_pool_sizes():
     assert one["wall_s"] > sim["wall_s"]
     # without the pre-warm, captions start one caption cold start after that receipt
     cold = sc.simulate({"segment": 2, "caption": 3}, r, prewarm=False)
-    assert cold["pipelining"]["first_caption_after_first_segment_s"] == pytest.approx(325.0)
+    assert cold["pipelining"]["first_caption_after_first_segment_s"] == pytest.approx(cap_startup)
     assert cold["wall_s"] >= sim["wall_s"]
 
 
