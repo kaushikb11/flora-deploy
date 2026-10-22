@@ -199,6 +199,30 @@ def gpu_name() -> str | None:
     return out.strip().splitlines()[0] if out.strip() else None
 
 
+def gpu_count() -> int | None:
+    """GPUs this container sees (``nvidia-smi``): 2 for the TP=2 rubric pool."""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=10, check=True).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return len([line for line in out.splitlines() if line.strip()])
+
+
+# The one line ``RubricWorker`` prints when its engine is up; ``scripts/rubric_smoke.py`` reads
+# the engine build time and the GPU count from it (``modal app logs``).
+RUBRIC_READY = "rubric worker ready:"
+
+
+def rubric_ready_facts(startup: Mapping[str, Any], gpu: str | None, gpus: int | None
+                       ) -> dict[str, Any]:
+    """The numbers of :data:`RUBRIC_READY`'s line (no paths, no text)."""
+    keys = ("engine_build_s", "enter_total_s", "link_and_processor_s", "cache_mode")
+    out: dict[str, Any] = {k: startup.get(k) for k in keys}
+    out.update(gpu=gpu, gpu_count=gpus)
+    return out
+
+
 def reward_settings_from_env(env: Mapping[str, str] = os.environ, *,
                              gpu: str | None = None) -> RewardWorkerSettings:
     from flora_deploy.config.pins import PINS_BY_KEY
@@ -296,6 +320,10 @@ class RubricWorker:
         self.startup["preflight"] = facts
         self.runner = RewardShardRunner(store, engine, nv, settings,
                                         call_id=modal.current_function_call_id, fatal=_die)
+        import json
+
+        print(f"{RUBRIC_READY} {json.dumps(rubric_ready_facts(self.startup, gpu, gpu_count()))}",
+              flush=True)
 
     @modal.method()
     def run_shard(self, job_id: str, shard_id: str, config_hash: str, token: str = ""):

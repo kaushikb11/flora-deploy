@@ -117,6 +117,10 @@ def certify(
         raise _fail(f"bad input: {e}") from None
     lab_by_kind = {lab.get("kind"): lab for lab in labs}
     stages = stage or [s for s in C.STAGE_METRICS if any(r.stage == s for r in bal)]
+    if not stages:  # e.g. reward.rubric records only: never a silent success with nothing
+        present = sorted({r.stage for r in bal})
+        raise _fail(f"no certifiable stage in {balanced} (it holds {', '.join(present) or 'no'} "
+                    f"records; certifiable: {', '.join(C.STAGE_METRICS)}); nothing certified")
     sim = _similarity(similarity)
     try:
         th = C.Thresholds(tolerance=tolerance, min_samples=min_samples,
