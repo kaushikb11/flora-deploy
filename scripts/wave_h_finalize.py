@@ -37,7 +37,8 @@ and balanced jobs (``reports/wave-h/records/{exact,noise,balanced}/<job>/<stage>
    ``README.md`` (2-3 plain lines), each between ``<!-- wave-h:<name> -->`` /
    ``<!-- /wave-h:<name> -->`` markers. The script fills exactly those blocks and refuses when
    the markers are missing; it never inserts a section. Until the balanced rates are measured
-   the README block is left as it is.
+   the README block is left as it is. When the rates change, the generated tables of
+   ``docs/costs.md`` are regenerated from them (``scripts/cost_table.py``).
 
 Idempotent: a second run with the same inputs changes nothing. Nothing here starts a container.
 """
@@ -54,7 +55,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -105,6 +106,7 @@ class Paths:
     engines_doc: Path | None = None
     readme: Path | None = None
     manifest: Path | None = None
+    costs_doc: Path | None = None
 
     def __post_init__(self) -> None:
         r = self.root
@@ -118,6 +120,7 @@ class Paths:
         self.engines_doc = self.engines_doc or r / "docs" / "balanced-engines.md"
         self.readme = self.readme or r / "README.md"
         self.manifest = self.manifest or w / "finalize.json"
+        self.costs_doc = self.costs_doc or r / "docs" / "costs.md"
 
     def rel(self, p: str | Path) -> str:
         """``p`` as the committed files may name it: relative to the root, never a local
@@ -1094,8 +1097,14 @@ def analyze(paths: Paths, *, derived: Mapping[str, str] | None = None, cert_tmp:
     if not refusals:
         data = json.loads(paths.rates.read_text(encoding="utf-8"))
         new = updated_rates(data, ms, run_id=st.run_id, date=date, source=source)
-        RateTable.from_dict(new, source=str(paths.rates))  # the loader must accept it
+        table = RateTable.from_dict(new, source=str(paths.rates))  # the loader must accept it
         outputs[paths.rates] = dump_json(new)
+        if paths.costs_doc.exists():  # its generated tables follow the new rates
+            import cost_table  # scripts/, on sys.path above
+
+            outputs[paths.costs_doc] = cost_table.render(
+                paths.costs_doc.read_text(encoding="utf-8"),
+                table=replace(table, source="planner/rates.json"))
     outcomes = certify_all(paths, st, cert_tmp,
                            derived=derived_content_used(st) if derived is None else derived,
                            cli=cli)

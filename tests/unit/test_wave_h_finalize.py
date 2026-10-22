@@ -742,3 +742,24 @@ def test_write_refuses_a_certificate_this_tree_cannot_lock(tmp_path, capsys, mon
     rc, out = run(root, "--write", capsys=capsys)
     assert rc == 1 and "REFUSED freeze lock" in out and "nothing written" in out
     assert owned(root) == before
+
+
+def test_new_rates_regenerate_the_cost_guide(tmp_path, capsys):
+    """When the rates change, docs/costs.md's generated tables follow them, prose untouched."""
+    from dataclasses import replace
+
+    from flora_deploy.planner.rates import RateTable
+    from scripts import cost_table
+
+    root = build(tmp_path)
+    shutil.copyfile(REPO / "docs/costs.md", root / "docs/costs.md")
+    rc, out = run(root, "--write", capsys=capsys)
+    assert rc == 0, out
+    assert "docs/costs.md" in out
+    table = replace(RateTable.load(root / "src/flora_deploy/planner/rates.json"),
+                    source="planner/rates.json")
+    doc0 = (REPO / "docs/costs.md").read_text(encoding="utf-8")
+    doc = (root / "docs/costs.md").read_text(encoding="utf-8")
+    assert doc != doc0 and doc == cost_table.render(doc0, table=table)
+    rc, out = run(root, "--write", capsys=capsys)
+    assert rc == 0 and "costs.md" not in out  # idempotent

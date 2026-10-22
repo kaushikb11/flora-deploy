@@ -13,6 +13,7 @@ Start with the repository [`README.md`](../README.md) (users) or [`PLAN.md`](PLA
 | Doc | What it is for | Reader |
 |---|---|---|
 | [`PLAN.md`](PLAN.md) | Build plan v4: architecture, decisions D1-D18, cost model, determinism, licensing, roadmap | contributor, maintainer |
+| [`costs.md`](costs.md) | What a `balanced` job costs by size, where the money goes and how to spend less; its tables are generated from the rates | user |
 | [`output-format.md`](output-format.md) | Every field a finished job writes (JSONL, Parquet, `summary.json`, exclusions); checked against the code by a test | user, contributor |
 | [`certification.md`](certification.md) | How a `balanced` certificate is computed, what it binds to, and when it unlocks a preset | user, maintainer |
 | [`certificate-freeze.md`](certificate-freeze.md) | What a committed certificate freezes, how to tell whether a change affects it (the drift gate), and the re-certification workflow; with the current freeze listing | contributor, maintainer |

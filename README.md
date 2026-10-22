@@ -139,6 +139,8 @@ few cents for most datasets; `flora index --local` runs it on your machine for f
 doctor` and `flora plan` cost nothing. The measurement behind these rates:
 [`docs/wave-h-report.md`](docs/wave-h-report.md).
 
+Cost by job size, where the money goes and how to spend less: [`docs/costs.md`](docs/costs.md).
+
 ## While a job runs
 
 ```bash
