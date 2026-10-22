@@ -144,3 +144,184 @@ class Sampler:
         if mx("load1") is not None:
             out["load1_max"] = round(mx("load1"), 2)
         return out
+
+
+# ---------------------------------------------------------------------------------------------
+# Container resources of the balanced workers: what the pools' CPU / memory requests can be cut
+# to. Read-only and output-neutral (/proc, cgroup files, ``nvidia-smi``); sampled at most every
+# ``CONTAINER_MIN_INTERVAL_S``.
+# ---------------------------------------------------------------------------------------------
+
+CONTAINER_MIN_INTERVAL_S = 10.0
+CGROUP_CPU_FILES = (
+    (Path("/sys/fs/cgroup/cpu.stat"), "usage_usec", 1e-6),  # cgroup v2
+    (Path("/sys/fs/cgroup/cpuacct/cpuacct.usage"), None, 1e-9),  # cgroup v1 (ns)
+)
+
+
+def available_cores() -> int:
+    """Cores this process may run on (affinity, then the cgroup quota; ``os.cpu_count``
+    fallback)."""
+    try:
+        n = len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        n = os.cpu_count() or 1
+    try:
+        quota, period = Path("/sys/fs/cgroup/cpu.max").read_text().split()[:2]
+        if quota != "max":
+            n = min(n, max(1, -(-int(quota) // int(period))))
+    except (OSError, ValueError):
+        pass
+    return max(1, int(n))
+
+
+def _children(pid: int) -> list[int]:
+    out: list[int] = []
+    try:
+        for task in Path(f"/proc/{pid}/task").iterdir():
+            out.extend(int(c) for c in (task / "children").read_text().split())
+    except (OSError, ValueError):
+        pass
+    return out
+
+
+def tree_rss_bytes(root: int | None = None) -> dict[str, int] | None:
+    """RSS of this process and all its descendants (vLLM's engine-core process included):
+    ``tree_rss`` (sum of VmRSS) and ``tree_rss_hwm`` (sum of each process's VmHWM, an upper
+    bound of the tree's peak). ``None`` without ``/proc``."""
+    root = os.getpid() if root is None else root
+    if not Path(f"/proc/{root}/status").is_file():
+        return None
+    rss = hwm = procs = 0
+    todo, seen = [root], set()
+    while todo:
+        pid = todo.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        st = _proc_status(Path(f"/proc/{pid}/status"))
+        if "VmRSS" in st:
+            rss += st["VmRSS"]
+            hwm += st.get("VmHWM", st["VmRSS"])
+            procs += 1
+        todo.extend(_children(pid))
+    return {"tree_rss": rss, "tree_rss_hwm": hwm, "tree_procs": procs}
+
+
+def cgroup_cpu_s(files=CGROUP_CPU_FILES) -> float | None:
+    """CPU seconds used by the whole container (every process), from the cgroup."""
+    for path, key, scale in files:
+        try:
+            text = Path(path).read_text()
+        except OSError:
+            continue
+        try:
+            if key is None:
+                return int(text.strip()) * scale
+            for line in text.splitlines():
+                k, _, v = line.partition(" ")
+                if k == key:
+                    return int(v) * scale
+        except ValueError:
+            continue
+    return None
+
+
+def gpu_memory(timeout_s: float = 5.0, run=None) -> list[dict] | None:
+    """Per GPU: ``memory.used`` / ``memory.total`` (MiB) and ``utilization.gpu`` (%), from
+    ``nvidia-smi``. It counts every process on the GPU (vLLM's engine core included), which
+    ``torch.cuda.max_memory_allocated`` in this process would not. ``None`` without it."""
+    import subprocess
+
+    if run is None:
+        if shutil.which("nvidia-smi") is None:
+            return None
+        run = subprocess.run
+    try:
+        out = run(["nvidia-smi", "--query-gpu=memory.used,memory.total,utilization.gpu",
+                   "--format=csv,noheader,nounits"], capture_output=True, text=True,
+                  timeout=timeout_s, check=True).stdout
+    except Exception:  # noqa: BLE001 - diagnostics only
+        return None
+    gpus = []
+    for line in out.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        try:
+            used, total, util = (float(p) for p in parts[:3])
+        except ValueError:
+            continue
+        gpus.append({"mem_used_mib": used, "mem_total_mib": total, "util_pct": util})
+    return gpus
+
+
+class ContainerSampler(Sampler):
+    """:class:`Sampler` plus the container view: process-tree RSS, container CPU from the
+    cgroup, GPU memory and utilization from ``nvidia-smi``; never more often than every
+    ``CONTAINER_MIN_INTERVAL_S`` seconds in its thread. ``summary()`` adds ``cores``,
+    ``tree_rss_max_gib``, ``tree_rss_hwm_gib``, ``container_cores_busy``,
+    ``container_core_util``, ``gpu_mem_used_max_mib``, ``gpu_mem_total_mib`` and
+    ``gpu_util_mean_pct`` / ``gpu_util_max_pct``. Samples are capped (``max_samples``): the
+    oldest are thinned, the first is kept."""
+
+    def __init__(self, interval_s: float = CONTAINER_MIN_INTERVAL_S, *, gpu=gpu_memory,
+                 tree=tree_rss_bytes, cgroup_cpu=cgroup_cpu_s, max_samples: int = 4096,
+                 **kw):
+        super().__init__(max(float(interval_s), CONTAINER_MIN_INTERVAL_S), **kw)
+        self._gpu, self._tree, self._cgroup_cpu = gpu, tree, cgroup_cpu
+        self.max_samples = max(4, int(max_samples))
+        self.cores = available_cores()
+
+    def sample(self) -> dict:
+        s = super().sample()
+        tree = self._tree()
+        if tree:
+            s.update(tree)
+        cpu = self._cgroup_cpu()
+        if cpu is not None:
+            s["cgroup_cpu_s"] = cpu
+        gpus = self._gpu() if self._gpu is not None else None
+        if gpus:
+            s["gpus"] = gpus
+        if len(self.samples) > self.max_samples:  # keep the first, thin the rest
+            self.samples[1:] = self.samples[1::2]
+        return s
+
+    def summary(self) -> dict:
+        out = super().summary()
+        if not self.samples:
+            return out
+        gib = 2**30
+        out["cores"] = self.cores
+        out["interval_s"] = self.interval_s
+        trees = [s for s in self.samples if "tree_rss" in s]
+        if trees:
+            out["tree_rss_max_gib"] = round(max(s["tree_rss"] for s in trees) / gib, 3)
+            out["tree_rss_hwm_gib"] = round(max(s["tree_rss_hwm"] for s in trees) / gib, 3)
+            out["tree_procs_max"] = max(s["tree_procs"] for s in trees)
+        cpus = [s for s in self.samples if "cgroup_cpu_s" in s]
+        if len(cpus) >= 2 and cpus[-1]["t"] > cpus[0]["t"]:
+            busy = (cpus[-1]["cgroup_cpu_s"] - cpus[0]["cgroup_cpu_s"]) / (
+                cpus[-1]["t"] - cpus[0]["t"])
+            out["container_cores_busy"] = round(busy, 3)
+            out["container_core_util"] = round(busy / self.cores, 4)
+        gpus = [g for s in self.samples for g in s.get("gpus", ())]
+        if gpus:
+            out["gpu_mem_used_max_mib"] = max(g["mem_used_mib"] for g in gpus)
+            out["gpu_mem_total_mib"] = max(g["mem_total_mib"] for g in gpus)
+            out["gpu_util_max_pct"] = max(g["util_pct"] for g in gpus)
+            out["gpu_util_mean_pct"] = round(sum(g["util_pct"] for g in gpus) / len(gpus), 1)
+            out["gpu_samples"] = len(gpus)
+        return out
+
+    def summary_since(self, t: float) -> dict:
+        """``summary()`` over the samples taken at or after clock time ``t`` (one shard)."""
+        view = object.__new__(type(self))
+        view.__dict__.update(self.__dict__)
+        view.samples = [s for s in list(self.samples) if s["t"] >= t]
+        return view.summary()
+
+    def snapshot(self) -> dict:
+        """Take one sample now and summarize. ``rss_peak_gib`` / ``tree_rss_hwm_gib`` cover
+        the time since each process started (the engine build included)."""
+        self.sample()
+        return self.summary()

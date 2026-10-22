@@ -365,8 +365,9 @@ def build_runner(kind: str, env: Mapping[str, str] = os.environ, *,
 
     st = build_stage(kind, env)
     runner = BalancedShardRunner(st.store, st.engine, wrap_job(st.job, stamp=st.stamp_fn()),
-                                 BalancedWorkerSettings(gpu=st.info.gpu), call_id=call_id,
-                                 fatal=fatal)
+                                 BalancedWorkerSettings(gpu=st.info.gpu, sample_resources=True),
+                                 call_id=call_id, fatal=fatal)
+    st.startup.update(runner.startup_facts())  # batch policy, executor, peak RSS / GPU memory
     return runner, st.startup
 
 

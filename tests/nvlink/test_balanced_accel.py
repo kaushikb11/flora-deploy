@@ -25,7 +25,7 @@ import pytest
 
 from flora_deploy.engines.base import Completion
 from flora_deploy.engines.microbatch import MicroBatcher
-from flora_deploy.jobs.types import EpisodeRef
+from flora_deploy.jobs.types import EpisodeRef, Shard
 from flora_deploy.media import synth
 from flora_deploy.media.synth import Spec
 from flora_deploy.nv import Family
@@ -34,7 +34,14 @@ from flora_deploy.stages import caption as C
 from flora_deploy.stages import segment as S
 from flora_deploy.workers_impl.balanced import AccelJob, apply_accel, wrap_job
 from flora_deploy.workers_impl.caption import CaptionEpisodeJob
-from flora_deploy.workers_impl.segment import EpisodeInputs, SegmentEpisodeJob, StageInfo
+from flora_deploy.workers_impl.segment import (
+    BalancedShardRunner,
+    BalancedWorkerSettings,
+    EpisodeInputs,
+    SegmentEpisodeJob,
+    ShardContext,
+    StageInfo,
+)
 from tests.fakes.request_digest import prompt_dict_digest
 
 pytestmark = pytest.mark.nvlink
@@ -129,7 +136,20 @@ def _segments_record(ref, _ctx):
                             provenance=prov)
 
 
-def _run(nv, procs, episodes, kind, accel: bool):
+class _ListSink:
+    def __init__(self):
+        self.records, self.audits, self.errors = [], [], []
+
+    def add(self, records=(), audits=(), errors=()):
+        self.records += list(records)
+        self.audits += list(audits)
+        self.errors += list(errors)
+
+    def flush(self):
+        return []
+
+
+def _run(nv, procs, episodes, kind, accel: bool, two_phase: bool = False):
     proc = procs[kind]
     engine = DigestEngine(proc.tokenizer, kind)
     info = StageInfo(engine_label="vllm-test")
@@ -161,8 +181,27 @@ def _run(nv, procs, episodes, kind, accel: bool):
             return await asyncio.gather(*(one(mb, uid, pool)
                                           for uid, _p, pool, _i in episodes))
 
+    def phased():
+        # WP1a: the runner's two-phase path (probe under EpisodeGates.prep, outside the
+        # batcher's episode; inference under infer), one episode preparing at a time
+        settings = BalancedWorkerSettings(max_inflight_episodes=2, prefetch_episodes=1,
+                                          max_wait_s=30, flush_every=10**6)
+        runner = BalancedShardRunner(None, engine, job, settings)
+        refs = {uid: _ref(uid, pool) for uid, _p, pool, _i in episodes}
+        sink = _ListSink()
+        ctx = ShardContext(None, Shard("s", "segment", tuple(refs), 1.0), None, "c")
+        asyncio.run(runner._episodes(list(refs), refs, sink, ctx))
+        assert not sink.errors, sink.errors
+        assert runner.last_gates["peak_preparing"] == 1
+        by = {r.uid: r for r in sink.records}
+        aud = {a["uid"]: a for a in sink.audits}
+        return [("ok", [by[uid].to_json()],
+                 json.dumps([{k: v for k, v in aud[uid].items()
+                              if k not in ("timings_s", "accel", "batch_policy")}],
+                            sort_keys=True, default=str)) for uid, *_ in episodes]
+
     try:
-        outs = asyncio.run(main())
+        outs = phased() if two_phase else asyncio.run(main())
         stats = active.stats() if active is not None else {}
     finally:
         stage.close()
@@ -182,3 +221,17 @@ def test_balanced_inputs_identical_with_and_without_accel(nv, procs, episodes, k
     assert all(o[0] == "ok" for o in ref_out), ref_out
     assert stats.get("frames_for_calls", 0) >= 1  # the patches were on the decode path
     assert stats.get("active_episodes", 0) == 0  # every episode scope was released
+
+
+@pytest.mark.parametrize("kind", ["tempseg", "captioner"])
+def test_two_phase_episodes_send_identical_model_inputs(nv, procs, episodes, kind):
+    """WP1a: NVIDIA's probe outside the batcher's episode (the runner's EpisodeGates), with
+    accel's episode scope around both phases: every model input, record and audit equals the
+    one-phase run without accel."""
+    ref_out, ref_digests, _ = _run(nv, procs, episodes, kind, accel=False)
+    got_out, got_digests, stats = _run(nv, procs, episodes, kind, accel=True, two_phase=True)
+    assert ref_digests[0], "no model request was made"
+    assert got_digests == ref_digests  # semantic and literal request digests
+    assert got_out == ref_out
+    assert stats.get("frames_for_calls", 0) >= 1
+    assert stats.get("active_episodes", 0) == 0  # each scope spanned both phases, then closed

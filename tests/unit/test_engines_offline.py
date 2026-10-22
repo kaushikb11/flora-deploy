@@ -27,10 +27,10 @@ def test_engine_kwargs_are_explicit_and_valid():
     assert kw["max_model_len"] == 32768
     assert kw["limit_mm_per_prompt"] == {"image": 0, "video": 3}
     assert kw["mm_processor_kwargs"] == {"fps": 4, "max_frames": 128}
-    assert (kw["max_num_seqs"], kw["max_num_batched_tokens"]) == (32, 16384)
+    assert (kw["max_num_seqs"], kw["max_num_batched_tokens"]) == (64, 16384)
     cap = spec("captioner", "H100!").engine_kwargs()
     assert cap["mm_processor_kwargs"] == {"fps": 8, "max_frames": 40}
-    assert (cap["max_num_seqs"], cap["max_num_batched_tokens"]) == (16, 16384)
+    assert (cap["max_num_seqs"], cap["max_num_batched_tokens"]) == (24, 16384)
 
 
 @pytest.mark.parametrize(("key", "value"), [
@@ -95,7 +95,7 @@ def test_label_and_hash_view():
     assert spec(dtbias_fp32=True).label == "vllm-0.24.0-offline+dtbias"
     h = s.hashed()
     assert "gpu" not in h and "model" not in h["engine_kwargs"]
-    assert h["engine_kwargs"]["max_num_seqs"] == 32  # batching changes numerics: hashed
+    assert h["engine_kwargs"]["max_num_seqs"] == 64  # batching changes numerics: hashed
 
 
 def test_nvidia_sampling_is_greedy_eos_only():
@@ -339,3 +339,29 @@ def test_extra_state_under_vision_tower_fails_preflight():
     bad = {**lm, "model.visual.blocks.0.mlp.fc1._extra_state": "b.safetensors"}
     with pytest.raises(O.EngineVerifyError, match="model.visual"):
         O.check_extra_state(bad)
+
+
+def _blocks_llm(n):
+    from types import SimpleNamespace
+
+    cache = SimpleNamespace(num_gpu_blocks=n)
+    return SimpleNamespace(llm_engine=SimpleNamespace(
+        vllm_config=SimpleNamespace(cache_config=cache)))
+
+
+def test_batch_fill_engine_limits():
+    """WP1c: TempSeg/L40S 64, Captioner/H100 24; one prefill chunk size everywhere."""
+    assert O.GPU_LIMITS[("tempseg", "L40S")].max_num_seqs == 64
+    assert O.GPU_LIMITS[("captioner", "H100")].max_num_seqs == 24
+    assert {lim.max_num_batched_tokens for lim in O.GPU_LIMITS.values()} == {16384}
+
+
+def test_max_num_seqs_over_mamba_blocks_fails_fast():
+    s = spec()  # tempseg L40S: 64 sequences
+    assert O.check_mamba_blocks(s, _blocks_llm(400)) == {
+        "num_gpu_blocks": 400, "max_num_seqs": 64, "checked": True}
+    assert O.check_mamba_blocks(s, _blocks_llm(64))["checked"]
+    with pytest.raises(O.EngineVerifyError, match="49064"):
+        O.check_mamba_blocks(s, _blocks_llm(63))
+    assert O.check_mamba_blocks(s, object()) == {
+        "num_gpu_blocks": None, "max_num_seqs": 64, "checked": False}

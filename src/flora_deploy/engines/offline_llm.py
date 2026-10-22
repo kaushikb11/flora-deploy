@@ -90,14 +90,20 @@ class GpuLimits:
 
 # Per (kind, GPU) scheduler limits. TempSeg is 9B (19.3 GB merged), the Captioner 27B (54.7 GB
 # BF16). ``max_num_batched_tokens`` 16384 equals the offline LLM's H100 default and holds the
-# longest golden prompt (14.7k tokens) in one prefill chunk; ``max_num_seqs`` stays well under
-# the Mamba-block bound of #49064 at these memory fractions.
+# longest golden prompt (14.7k tokens) in one prefill chunk; it stays 16384 everywhere, because
+# chunk boundaries change the GDN prefill numerics. ``max_num_seqs`` must stay within the Mamba
+# cache blocks vLLM allocates (#49064): :func:`check_mamba_blocks` fails the build otherwise.
+# Batch fill (WP1c): TempSeg on the L40S 32 -> 64 (about 17 GiB KV left after the weights; a
+# 1.85k-token request needs about 0.11 GiB, so the sequence count binds, not memory), the
+# Captioner on the H100 16 -> 24 (about 15 GiB KV; 0.4 GiB at 4-6k tokens, 0.77 GiB at 10k).
 GPU_LIMITS: Mapping[tuple[str, str], GpuLimits] = {
-    ("tempseg", "L40S"): GpuLimits(32, 16384, 0.90),
+    ("tempseg", "L40S"): GpuLimits(64, 16384, 0.90),
     ("tempseg", "A100-80GB"): GpuLimits(48, 16384, 0.90),
     ("tempseg", "H100"): GpuLimits(48, 16384, 0.90),
     ("tempseg", "H200"): GpuLimits(64, 16384, 0.90),
-    ("captioner", "H100"): GpuLimits(16, 16384, 0.90),
+    # 32 would fit about 32 typical requests but only about 19 at the 10k-token worst case:
+    # raise it only after a measured H100 run (peak KV use, preemptions) shows it holds.
+    ("captioner", "H100"): GpuLimits(24, 16384, 0.90),
     ("captioner", "H200"): GpuLimits(32, 16384, 0.90),
 }
 
@@ -340,7 +346,9 @@ class OfflineEngine:
             verify = True if verify is None else verify
         self.llm = llm
         self.gdn_dtypes: dict[str, Any] | None = None
+        self.cache_blocks: dict[str, Any] | None = None
         if verify:
+            self.cache_blocks = check_mamba_blocks(spec, llm)
             self.gdn_dtypes = verify_gdn_dtypes(spec, gdn_param_dtypes(llm))
 
     def _params(self, sp: Sampling):
@@ -412,7 +420,35 @@ class OfflineEngine:
         out: dict[str, Any] = {"label": self.name, "spec": self.spec.as_json(),
                                "stats": dict(self.stats)}
         out["resolved"] = resolved_facts(self.llm)
+        out["cache_blocks"] = self.cache_blocks
         return out
+
+
+def cache_blocks(llm) -> int | None:
+    """The KV / Mamba cache blocks vLLM allocated (``cache_config.num_gpu_blocks``; best
+    effort: the attribute path is internal). For a hybrid model each running sequence holds
+    Mamba state blocks out of this pool."""
+    try:
+        n = llm.llm_engine.vllm_config.cache_config.num_gpu_blocks
+    except Exception:  # noqa: BLE001 - internal attribute path
+        return None
+    return int(n) if isinstance(n, int) and not isinstance(n, bool) else None
+
+
+def check_mamba_blocks(spec: EngineSpec, llm, *, blocks: int | None = None) -> dict[str, Any]:
+    """Fail fast (:class:`EngineVerifyError`) when ``max_num_seqs`` exceeds the cache blocks
+    the built engine has (vLLM #49064: a hybrid model needs Mamba state blocks per running
+    sequence; with fewer blocks the scheduler stalls or errors mid-run instead of at start).
+    Returns ``{"num_gpu_blocks", "max_num_seqs", "checked"}``; ``checked`` is false when vLLM
+    does not expose the count."""
+    n = cache_blocks(llm) if blocks is None else blocks
+    seqs = spec.limits.max_num_seqs
+    if n is not None and n < seqs:
+        raise EngineVerifyError(
+            f"{spec.kind} on {spec.gpu}: max_num_seqs={seqs} exceeds the {n} cache blocks vLLM "
+            f"allocated at gpu_memory_utilization={spec.limits.gpu_memory_utilization} "
+            "(#49064); lower max_num_seqs in GPU_LIMITS")
+    return {"num_gpu_blocks": n, "max_num_seqs": seqs, "checked": n is not None}
 
 
 def resolved_facts(llm) -> dict[str, Any]:

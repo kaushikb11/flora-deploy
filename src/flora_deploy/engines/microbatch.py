@@ -16,7 +16,10 @@ for the next round, so preparation of round k+1 overlaps generation of round k.
 
 Liveness: ``async with batcher.episode():`` around an episode's work. An episode that leaves
 (finished or failed) no longer holds rounds back. Calls made outside an episode never hold a
-round back either.
+round back either. The balanced workers enter the episode only for the inference phase: CPU
+preparation (input resolve, NVIDIA's probe) runs before it, under its own bound
+(``workers_impl.segment.EpisodeGates``, ``engines.batch_policy``), so a preparing episode never
+makes a round wait for ``max_wait_s``.
 
 Bounded memory: admission waits while the pending frames exceed ``max_pending_bytes`` (a single
 call larger than that is still admitted when nothing is pending).
@@ -116,6 +119,7 @@ class BatcherStats:
     peak_pending_bytes: int = 0
     peak_live: int = 0
     episodes: int = 0
+    wall_s: float = 0.0  # from start() to the last round's end (busy_fraction's denominator)
 
     def as_json(self) -> dict:
         sizes = self.batch_sizes
@@ -125,7 +129,9 @@ class BatcherStats:
                 "max_batch": max(sizes) if sizes else 0, "batch_sizes": sizes[:200],
                 "generate_s": round(self.generate_s, 3), "wait_s": round(self.wait_s, 3),
                 "peak_pending_bytes": self.peak_pending_bytes, "peak_live": self.peak_live,
-                "episodes": self.episodes}
+                "episodes": self.episodes, "wall_s": round(self.wall_s, 3),
+                "busy_fraction": round(self.generate_s / self.wall_s, 4) if self.wall_s > 0
+                else None}
 
 
 Observer = Callable[[Sequence[VllmRequest], Sequence[Completion], dict], None]
@@ -162,6 +168,7 @@ class MicroBatcher:
         self._fatal: BaseException | None = None
         self._inflight: list[_Item] = []
         self._lock = engine_lock(engine)
+        self._started: float | None = None
 
     # -- lifecycle ---------------------------------------------------------------------------
     async def start(self) -> MicroBatcher:
@@ -169,6 +176,7 @@ class MicroBatcher:
             self._wake = asyncio.Event()
             self._space = asyncio.Condition()
             self._executor = ThreadPoolExecutor(1, thread_name_prefix="flora-generate")
+            self._started = self.clock()
             self._pump = asyncio.get_running_loop().create_task(self._run(), name="microbatch")
         return self
 
@@ -350,16 +358,16 @@ class MicroBatcher:
                 self.stats.batch_sizes.append(len(batch))
             reqs = [i.request for i in batch]
             sps = [i.sampling for i in batch]
-            t0 = time.perf_counter()
+            t0 = self.clock()
             self._inflight = batch
             try:
-                outs = await loop.run_in_executor(self._executor, self._generate, reqs, sps)
+                outs = await self._dispatch(loop, reqs, sps)
                 if len(outs) != len(batch):
                     raise EngineBatchError(f"engine returned {len(outs)} completions for "
                                            f"{len(batch)} requests")
             except Exception as exc:  # noqa: BLE001 - fail this batch, keep serving
                 self.stats.failed_batches += 1
-                self.stats.generate_s += time.perf_counter() - t0
+                self._account(t0)
                 err = exc if isinstance(exc, EngineBatchError) else EngineBatchError(
                     f"{type(exc).__name__}: {exc}")
                 for item in batch:
@@ -374,7 +382,7 @@ class MicroBatcher:
                 raise
             finally:
                 self._inflight = []
-            self.stats.generate_s += time.perf_counter() - t0
+            self._account(t0)
             if self.observer is not None:
                 try:
                     self.observer(reqs, outs, {"round": self.stats.rounds, "trigger": trigger})
@@ -383,6 +391,18 @@ class MicroBatcher:
             for item, out in zip(batch, outs, strict=True):
                 if not item.future.done():
                     item.future.set_result(out)
+
+    def _account(self, t0: float) -> None:
+        now = self.clock()
+        self.stats.generate_s += now - t0
+        if self._started is not None:
+            self.stats.wall_s = now - self._started
+
+    async def _dispatch(self, loop: asyncio.AbstractEventLoop, reqs: list[VllmRequest],
+                        sps: list[Sampling]) -> list[Completion]:
+        """One ``generate_batch`` in the worker thread (a seam for the virtual-clock
+        simulation, ``tests/fakes/batch_sim.py``)."""
+        return await loop.run_in_executor(self._executor, self._generate, reqs, sps)
 
     def _generate(self, reqs: list[VllmRequest], sps: list[Sampling]) -> list[Completion]:
         with self._lock:  # an abandoned generate of an earlier batcher may still be running

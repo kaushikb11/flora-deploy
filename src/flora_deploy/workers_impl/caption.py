@@ -29,7 +29,9 @@ from flora_deploy.workers_impl.segment import (
     EpisodeOutcome,
     ShardContext,
     StageInfo,
+    gates_of,
     phase,
+    timings,
 )
 
 
@@ -71,6 +73,7 @@ class CaptionEpisodeJob:
     """One episode: upstream segments, NVIDIA's probe, ``CaptionStage.caption``."""
 
     stage = "caption"
+    phased = True  # CPU preparation outside the batcher's episode (segment.EpisodeGates)
 
     def __init__(self, stage, info: StageInfo, inputs: Callable[[EpisodeRef], EpisodeInputs],
                  *, segments: Callable[[EpisodeRef, ShardContext], StageRecord] | None = None,
@@ -89,21 +92,26 @@ class CaptionEpisodeJob:
     async def run(self, ref: EpisodeRef, batcher, ctx: ShardContext) -> EpisodeOutcome:
         from flora_deploy.stages import segment as S
 
-        with phase("inputs"):
-            seg_record = await asyncio.to_thread(self.segments, ref, ctx)
-            rows = S.rows_from_record(seg_record)
-            inp = await asyncio.to_thread(self.inputs, ref)
-        t0 = time.perf_counter()
-        with phase("nvidia"):
-            ep = await asyncio.to_thread(S.prepare_videos, self.nv, inp.paths, inp.profile,
-                                         yam32=inp.yam32, instruction=inp.instruction)
+        gates = gates_of(ctx)
+        async with gates.prep():  # phase 1: CPU, outside the batcher's episode
+            with phase("inputs"):
+                seg_record = await asyncio.to_thread(self.segments, ref, ctx)
+                rows = S.rows_from_record(seg_record)
+                inp = await asyncio.to_thread(self.inputs, ref)
+            t0 = time.perf_counter()
+            with phase("nvidia"):
+                ep = await asyncio.to_thread(S.prepare_videos, self.nv, inp.paths, inp.profile,
+                                             yam32=inp.yam32, instruction=inp.instruction)
             t1 = time.perf_counter()
-            res = await self.cap.caption(batcher, ep, rows)
+        async with gates.infer(batcher):  # phase 2: inference, inside it
+            tq = time.perf_counter()
+            with phase("nvidia"):
+                res = await self.cap.caption(batcher, ep, rows)
         t2 = time.perf_counter()
         with phase("records"):
-            return self._outcome(ref, inp, ep, res, t0, t1, t2)
+            return self._outcome(ref, inp, ep, res, t0, t1, t2, tq)
 
-    def _outcome(self, ref, inp, ep, res, t0, t1, t2) -> EpisodeOutcome:
+    def _outcome(self, ref, inp, ep, res, t0, t1, t2, tq=None) -> EpisodeOutcome:
         from flora_deploy.stages import caption as C
         from flora_deploy.stages import segment as S
 
@@ -118,5 +126,5 @@ class CaptionEpisodeJob:
                  "profile": ep.profile, "duration_s": ep.duration_s,
                  "envelope_ok": inp.envelope_ok, "caption_inputs": S.json_safe(res.audit),
                  "calls": res.stats.as_json(),
-                 "timings_s": {"probe": round(t1 - t0, 3), "caption": round(t2 - t1, 3)}}
+                 "timings_s": timings(t0, t1, t2, tq, "caption")}
         return EpisodeOutcome([rec], [audit])

@@ -15,10 +15,13 @@ TempSeg / Captioner engines sit on a GPU:
   call per segment and writes ``"<verb> <object> (task: <instruction>)"`` captions over those
   exact spans, so a caption record proves which segment record it came from.
 
-Both are pure functions of the decoded frames and the instruction, so a preempted shard, a
-bisection child or a re-run produce byte-identical records. Faults are hooks: ``before(uid)``
-runs before each episode (``local.faults.checkpoint`` locally, ``workers_app.FakeFaultHook`` on
-Modal) and ``rejects(uid)`` turns an episode into NVIDIA's input rejection (``nv_failure``).
+Both run in two phases as the real jobs do (``workers_impl.segment.EpisodeGates``): decoding
+and hashing under ``gates.prep()``, outside the batcher's episode, the model calls under
+``gates.infer(batcher)``. Both are pure functions of the decoded frames and the instruction,
+so a preempted shard, a bisection child or a re-run produce byte-identical records. Faults are
+hooks: ``before(uid)`` runs before each episode (``local.faults.checkpoint`` locally,
+``workers_app.FakeFaultHook`` on Modal) and ``rejects(uid)`` turns an episode into NVIDIA's input
+rejection (``nv_failure``).
 """
 
 from __future__ import annotations
@@ -39,6 +42,7 @@ from flora_deploy.workers_impl.segment import (
     EpisodeInputs,
     EpisodeOutcome,
     ShardContext,
+    gates_of,
     phase,
 )
 
@@ -70,7 +74,8 @@ class FakeBalancedEngine:
 
 class _FakeJob:
     stage = ""
-    nv = None  # the runner's classifier: fake rejections are NVIDIA's by origin (fake_nvidia)
+    nv = None
+    phased = True  # the runner's classifier: fake rejections are NVIDIA's by origin (fake_nvidia)
 
     def __init__(self, inputs: Callable[[EpisodeRef], EpisodeInputs], *, gpu: str | None,
                  certificate: str, before: Callable[[str], Any] = _nothing,
@@ -122,13 +127,16 @@ class FakeSegmentJob(_FakeJob):
     async def run(self, ref: EpisodeRef, batcher, ctx: ShardContext) -> EpisodeOutcome:
         from flora_deploy.stages import segment as S
 
-        inp, digest, duration, frames = await self._prepare(ref, ctx)
-        with phase("nvidia"):
-            out = await batcher.generate(
-                VllmRequest(prompt=f"<tempseg {digest}>", videos=(), key=ref.uid),
-                Sampling(max_tokens=1024))
-            if not out.ok:
-                raise RuntimeError(f"fake engine failed: {out.error}")
+        gates = gates_of(ctx)
+        async with gates.prep():
+            inp, digest, duration, frames = await self._prepare(ref, ctx)
+        async with gates.infer(batcher):
+            with phase("nvidia"):
+                out = await batcher.generate(
+                    VllmRequest(prompt=f"<tempseg {digest}>", videos=(), key=ref.uid),
+                    Sampling(max_tokens=1024))
+                if not out.ok:
+                    raise RuntimeError(f"fake engine failed: {out.error}")
         rows = [{"start_s": s["start_s"], "end_s": s["end_s"],
                  "metadata": {"segmentation_provenance": "fake", "fake_digest": digest}}
                 for s in fake_segments(digest, duration, "")]
@@ -155,16 +163,20 @@ class FakeCaptionJob(_FakeJob):
         from flora_deploy.stages import caption as C
         from flora_deploy.stages import segment as S
 
-        with phase("inputs"):
-            seg = await asyncio.to_thread(self.segments, ref, ctx)
-            spans = S.rows_from_record(seg)
-        inp, digest, _duration, _frames = await self._prepare(ref, ctx)
-        with phase("nvidia"):
-            outs = await batcher.generate_many(
-                [VllmRequest(prompt=f"<captioner {digest} {i}>", videos=(), key=f"{ref.uid}#{i}")
-                 for i in range(len(spans))], [Sampling(max_tokens=512)] * len(spans))
-            if not all(o.ok for o in outs):
-                raise RuntimeError("fake engine failed")
+        gates = gates_of(ctx)
+        async with gates.prep():
+            with phase("inputs"):
+                seg = await asyncio.to_thread(self.segments, ref, ctx)
+                spans = S.rows_from_record(seg)
+            inp, digest, _duration, _frames = await self._prepare(ref, ctx)
+        async with gates.infer(batcher):
+            with phase("nvidia"):
+                outs = await batcher.generate_many(
+                    [VllmRequest(prompt=f"<captioner {digest} {i}>", videos=(),
+                                 key=f"{ref.uid}#{i}") for i in range(len(spans))],
+                    [Sampling(max_tokens=512)] * len(spans))
+                if not all(o.ok for o in outs):
+                    raise RuntimeError("fake engine failed")
         rows = []
         for i, sp in enumerate(spans):
             caption = (f"{_VERBS[_h(digest, 'verb', i) % len(_VERBS)]} "
@@ -193,6 +205,7 @@ def fake_balanced_runner(kind: str, store, *, media_root: str | None, gpu: str |
                          call_id: Callable[[], str | None] = lambda: "",
                          fatal: Callable[[BaseException], None] | None = None,
                          stamp: Any = None, max_inflight_episodes: int = 4,
+                         prefetch_episodes: int | None = None,
                          flush_every: int = 1) -> BalancedShardRunner:
     """The real ``BalancedShardRunner`` for ``kind`` (``segment`` | ``caption``) with the fake
     job and engine (module docstring). ``stamp``: a ``workers_impl.certstamp.CertStamp``."""
@@ -210,6 +223,8 @@ def fake_balanced_runner(kind: str, store, *, media_root: str | None, gpu: str |
         job = StampedJob(job, stamp)
     kw: dict[str, Any] = {} if container_id is None else {"container_id": container_id}
     settings = BalancedWorkerSettings(max_inflight_episodes=max_inflight_episodes,
+                                      prefetch_episodes=prefetch_episodes or
+                                      max_inflight_episodes,
                                       flush_every=flush_every, max_wait_s=0.05,
                                       local_dir=local_dir, gpu=gpu, **kw)
     return BalancedShardRunner(store, FakeBalancedEngine(), job, settings, call_id=call_id,
