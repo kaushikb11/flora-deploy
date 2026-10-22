@@ -8,6 +8,7 @@ Nothing here contacts Modal."""
 from __future__ import annotations
 
 import os
+import sys
 
 import pytest
 
@@ -150,3 +151,28 @@ def test_lab_refuses_while_the_witness_is_pending(tmp_path, monkeypatch):
     ctx = wh.Ctx(_state(), _manifest(), tmp_path, spec=SPEC, caps=dict(wh.CAPS_USD))
     with pytest.raises(RuntimeError, match="cold witness"):
         wh.run_lab(ctx, lab_module=object())
+
+
+# ---------------------------------------------------------------------------------------------
+# W4: rates.json without camera_scaling
+
+
+def test_import_without_camera_scaling_prices_at_one_and_warns(monkeypatch, capsys):
+    import dataclasses
+    import importlib.util
+
+    import flora_deploy.planner.rates as R
+
+    real = R.RateTable.load
+    monkeypatch.setattr(R.RateTable, "load", classmethod(
+        lambda cls, *a, **k: dataclasses.replace(real(*a, **k), camera_scaling=None)))
+    spec = importlib.util.spec_from_file_location("wave_h_noscale", wh.__file__)
+    mod = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "wave_h_noscale", mod)  # dataclasses look it up
+    spec.loader.exec_module(mod)  # no AttributeError at import
+    assert mod.CERT_SPECS["yam"].rate_scale == () and mod.NO_CAMERA_SCALING
+    assert mod.main(["--plan", "certified", "--embodiment", "yam", "--dry-run",
+                     "--offline"]) == 0
+    out = capsys.readouterr().out
+    assert "no camera_scaling" in out and "factor 1.0" in out
+    assert not wh.NO_CAMERA_SCALING  # the shipped table has it

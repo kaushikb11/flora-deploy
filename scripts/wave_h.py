@@ -329,6 +329,12 @@ SPECS: dict[str, PlanSpec] = {
 CERT_YAM_ROOT = ROOT / "reports" / "wave-h" / "certified-yam"
 from flora_deploy.planner.rates import RateTable  # noqa: E402 - camera_scaling, as flora plan
 
+# 3-view work multipliers; a rates.json without camera_scaling prices them at 1.0 (and the
+# plan output warns: NO_CAMERA_SCALING).
+_CAMERA_SCALING = RateTable.load().camera_scaling
+NO_CAMERA_SCALING = _CAMERA_SCALING is None
+_YAM_SCALE = () if NO_CAMERA_SCALING else tuple(sorted(_CAMERA_SCALING.factors(3).items()))
+
 # The certified plan per embodiment (``--embodiment``): each its own golden set, data dir,
 # state, work dir and records, so certified runs never collide and resume independently.
 CERT_SPECS: dict[str, PlanSpec] = {
@@ -337,7 +343,7 @@ CERT_SPECS: dict[str, PlanSpec] = {
                     CERT_YAM_ROOT / "state.json", CERT_YAM_ROOT / "work",
                     CERT_YAM_ROOT / "records", CERT_YAM_ROOT / "runbook.md", shared_data=True,
                     embodiment="yam", data="cert-yam",
-                    rate_scale=tuple(sorted(RateTable.load().camera_scaling.factors(3).items())),
+                    rate_scale=_YAM_SCALE,
                     lab_eps=CERT_YAM_EPISODES[:6]),
 }
 # config.schema.Embodiment; the ones without a golden certification set are refused.
@@ -2304,6 +2310,9 @@ def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
         f"({' -> '.join(title[s].split('.')[0] for s in steps)}): spent ${st.spent:.2f} of "
         f"${gcap:.2f} (billing read "
         f"{'never' if st.billed_at is None else time.ctime(st.billed_at)})")
+    if NO_CAMERA_SCALING:
+        out("  warning: planner/rates.json has no camera_scaling: 3-view episodes are priced "
+            "at factor 1.0 (the 1-view rates)")
     for line in held_lines(st):
         out(line)
     if manifest is not None:
