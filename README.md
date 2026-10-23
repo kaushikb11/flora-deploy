@@ -164,8 +164,7 @@ Startup, idle time and rewards are extra and dominate small jobs: `flora plan` s
 
 Three numbers, three definitions:
 - **GPU work** (above): only the seconds the GPUs spend labelling. A large job's segmentation +
-  captioning should approach it; no job at scale has measured that yet
-  ([`docs/scale-test.md`](docs/scale-test.md)).
+  captioning should approach it; no job at scale has measured that yet.
 - **`flora plan`**: the all-in estimate for your dataset: GPU work for every stage you chose,
   plus each container's startup, a short idle tail after its stage's last episode (about 17 s),
   and the orchestrator. It also says whether `balanced` is certified for your embodiment (rewards
@@ -180,8 +179,7 @@ few cents for most datasets; `flora index --local` runs it on your machine for f
 doctor` and `flora plan` cost nothing. A `balanced` stage's first container publishes its compiled
 engine, so later containers and jobs start warm (the time saved is not measured yet); after an
 image or engine change the first starts
-cold (`flora plan --check-cache`). The measurement behind these rates:
-[measurement report](docs/wave-h-report.md).
+cold (`flora plan --check-cache`).
 
 Cost by job size, where the money goes and how to spend less: [`docs/costs.md`](docs/costs.md).
 
@@ -228,4 +226,4 @@ uv run pytest -n auto --dist loadfile -q   # ~3,000 CPU tests; about 2.5 min on 
 `-n auto` runs one worker per core (pytest-xdist); without it the suite takes several times
 longer. GPU and Modal tests are skipped unless asked for ([`docs/ci.md`](docs/ci.md)).
 
-How it works: [`docs/PLAN.md`](docs/PLAN.md). All docs: [`docs/`](docs/).
+How it works: [`docs/architecture.md`](docs/architecture.md). All docs: [`docs/README.md`](docs/README.md).

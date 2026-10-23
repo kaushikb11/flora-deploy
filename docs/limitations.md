@@ -22,8 +22,7 @@ Nothing is certified yet, so `balanced` segmentation and captioning need `allow_
 and their records say `certified: false`.
 <!-- /limitations:certification -->
 
-Certification sets exist for `human` ([v2](golden-manifest-v2.md)) and `yam`
-([v3-yam](golden-manifest-v3-yam.md)); the other embodiments have none yet (below).
+Certification sets exist for `human` and `yam`; the other embodiments have none yet (below).
 
 ## What "certified" promises, and what it doesn't
 
@@ -33,12 +32,9 @@ from `exact` no more than 1.5 times as much as `exact` differs from itself betwe
 For example, `balanced` may split up to 10.0% of episodes into a different number of subtasks
 when NVIDIA's own two runs rarely disagree, counted over every episode measured, warm and
 cold containers together, to the nearest episode: 2 of 18 pass. That 10% is a floor. When
-NVIDIA's two runs disagree more often, the limit is 1.5 times their rate: on the `human`
-segmentation certificate they split 1 of 6 episodes differently, so the limit is 25% (5 of 18),
-and `balanced` split 1 of 18. The 18 are the certificate's 12 episodes plus its 6-episode cold
-witness (6 of those episodes run again in a container forced to compile cold), counted together;
-"1 of 6" comes from running NVIDIA's pipeline twice on those same 6 episodes (the noise run).
-[`wave-h-report.md`](wave-h-report.md) lists these as 12 episodes and 6 noise episodes.
+NVIDIA's two runs disagree more often, the limit is 1.5 times their rate. The 18 are a
+certificate's 12 episodes plus its 6-episode cold witness (6 of those episodes run again in a
+container forced to compile cold), counted together.
 Boundaries and captions must still agree closely on average, in the cold container on its own
 too. Each certificate records its exact thresholds.
 It covers only the embodiment, GPU and software it was measured on. Details:
@@ -61,7 +57,7 @@ It covers only the embodiment, GPU and software it was measured on. Details:
 | Startup, `caption`, warm | estimate (not measured), ±60% |
 <!-- /limitations:costs -->
 
-A figure from one job carries a ±50% band until the [scale test](scale-test.md) measures more; a
+A figure from one job carries a ±50% band until a scale test measures more; a
 ±100% band means a rough estimate. `flora plan` labels each option with what its price rests on.
 Where the money goes: [`costs.md`](costs.md).
 
@@ -78,8 +74,7 @@ Where the money goes: [`costs.md`](costs.md).
 - **`dex`, `tianji` and `yam32`** have no certification path yet: there are too few suitable public
   episodes to build a certification set. `balanced` segmentation and captioning run on them only
   with `allow_uncertified: true`; `exact` and rewards are unaffected.
-- **No interactive or online API** yet: jobs run in batches. There is a design
-  [proposal](interactive-design.md).
+- **No interactive or online API** yet: jobs run in batches.
 - **No FP8 or quantized models**, by design: the engines refuse quantization and other settings
   that change the numbers, because no certificate could cover them.
 

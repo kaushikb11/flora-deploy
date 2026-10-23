@@ -6,7 +6,7 @@ Status: first patch set, 2026-10-21. Package: `src/flora_deploy/accel/`. Tests:
 
 `docs/reference-smoke.md` measured that model generation is only 9–31% of each reference stage.
 The rest is CPU work inside NVIDIA's code. These patches take that CPU work out of the critical
-path **without changing a single output**. This is form (1) of PLAN.md D17: runtime wraps in our
+path **without changing a single output**. This is form (1) of decision D17 ([`architecture.md`](architecture.md)): runtime wraps in our
 process, each proven output-identical to NVIDIA's unmodified code, which stays the oracle.
 
 ## How patches work

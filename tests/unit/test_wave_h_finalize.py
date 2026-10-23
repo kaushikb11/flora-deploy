@@ -279,7 +279,7 @@ def test_happy_path_updates_everything_consistently_and_is_idempotent(tmp_path, 
     assert (cap.status, cap.container_s_per_video_s) == ("measured", want_cap)
     assert seg.uncertainty == 0.25  # range/mean 0.18 is below the floor
     assert cap.uncertainty == round((1.4 - 1.0) / 1.2, 2)  # the range: above the floor
-    assert seg.source.startswith("docs/wave-h-report.md") and seg.date == "2026-10-14"
+    assert seg.source.startswith("reports/wave-h/report.md") and seg.date == "2026-10-14"
     assert "n=2 job(s) (76.5 video s) on L40S" in seg.provenance and "0.500-0.600" in seg.provenance
     assert t.startup_for("balanced", "segment").startup_s == 120.0
     assert t.startup_for("balanced", "caption").startup_s == 145.0
@@ -305,7 +305,7 @@ def test_happy_path_updates_everything_consistently_and_is_idempotent(tmp_path, 
     assert "at least 5 noise-run episodes (has 2)" in out
 
     # 3. report
-    rep = (root / "docs/wave-h-report.md").read_text()
+    rep = (root / "reports/wave-h/report.md").read_text()
     for head in ("## Spend per step", "## Measured rates", "## $/video-hour at list prices",
                  "## L0", "## Gate A", "## Certificate"):
         assert head in rep
@@ -377,7 +377,7 @@ def test_too_little_video_refuses_the_rates_and_keeps_the_placeholders(tmp_path,
     assert "balanced segment on L40S: 20.0 video s behind the rate; at least 30 s" in out
     assert (root / "src/flora_deploy/planner/rates.json").read_bytes() == rates0
     assert (root / "README.md").read_bytes() == readme0  # the placeholder stays
-    rep = (root / "docs/wave-h-report.md").read_text()
+    rep = (root / "reports/wave-h/report.md").read_text()
     assert "`planner/rates.json` **not updated**" in rep
     assert "| balanced | not measured |" in rep
     doc = (root / "docs/balanced-engines.md").read_text()
@@ -408,7 +408,7 @@ def test_a_single_balanced_job_is_measured_with_n_1_and_a_50_percent_band(tmp_pa
                     and r["kind"] == kind)
         assert (srow["status"], srow["n"], srow["uncertainty"]) == ("measured", 1, 0.5)
         assert "one container" in srow["provenance"]
-    rep = (root / "docs/wave-h-report.md").read_text()
+    rep = (root / "reports/wave-h/report.md").read_text()
     assert "a single sample (n=1) has no range, so its band is ±50%" in rep
     assert "| balanced | segment | L40S | 1 | 30.7 |" in rep and "±50%" in rep
     t = RateTable.load(path)
@@ -432,7 +432,7 @@ def test_without_oracle_or_noise_records_certificates_are_deferred(tmp_path, cap
     assert rc == 0, out
     assert "deferred to the certified run" in out and "remove" not in out
     assert sorted(p.name for p in _cert_dir(root).glob("cert_*.json")) == before
-    rep = (root / "docs/wave-h-report.md").read_text()
+    rep = (root / "reports/wave-h/report.md").read_text()
     assert "deferred to the certified run (no oracle records" in rep
     assert "refused" not in rep.split("## Certificate")[1]
 
@@ -445,7 +445,7 @@ def test_missing_l0_is_reported_and_downgrades_the_segment_certificate(tmp_path,
     assert "no_l0" in by[("segment", "yam")]["reasons"]
     assert by[("segment", "yam")]["l0"]["status"] == "missing"
     assert by[("caption", "yam")]["l0"]["status"] == "pass"
-    rep = (root / "docs/wave-h-report.md").read_text()
+    rep = (root / "reports/wave-h/report.md").read_text()
     assert "| tempseg | missing | - |" in rep
     assert "the L0 JSON of tempseg" in rep
     assert "| tempseg | not measured |" in rep and "(tempseg not measured)" in rep
@@ -467,7 +467,7 @@ def test_billing_lag_and_mismatch_are_flagged(tmp_path, capsys, lag, billed, wan
     root = build(tmp_path, billed_lag_s=lag, billed=billed)
     rc, out = run(root, "--write", capsys=capsys)
     assert rc == 0
-    rep = (root / "docs/wave-h-report.md").read_text()
+    rep = (root / "reports/wave-h/report.md").read_text()
     row = next(ln for ln in rep.splitlines() if ln.startswith("| b. exact oracle"))
     assert want in row
     assert "Warnings:" in rep and "WARNING exact_e2e" in out
@@ -556,7 +556,7 @@ def test_write_with_missing_records_never_deletes_certificates(tmp_path, capsys)
     man = json.loads((root / "reports/wave-h/finalize.json").read_text())
     assert man["certificates"] == [Path(b).stem for b in before]  # still owned
     # L6: the refusals name inputs relative to the root, never the local path
-    rep = (root / "docs/wave-h-report.md").read_text()
+    rep = (root / "reports/wave-h/report.md").read_text()
     assert ("deferred to the certified run (no oracle records: "
             "reports/wave-h/records/exact/human/segment.jsonl" in rep)
     assert str(root) not in rep and str(tmp_path) not in rep
@@ -613,7 +613,7 @@ def test_report_carries_structured_certify_fields_only(tmp_path, capsys):
         return 2, f"error: {SECRET} {root}/reports/wave-h/records/x.jsonl"
 
     run_with(root, leaky, "--write", capsys=capsys)
-    rep = (root / "docs/wave-h-report.md").read_text()
+    rep = (root / "reports/wave-h/report.md").read_text()
     assert SECRET not in rep and str(root) not in rep
     assert "refused: flora certify exited 2" in rep
     for name, data in owned(root).items():
@@ -626,7 +626,7 @@ def test_report_carries_structured_certify_fields_only(tmp_path, capsys):
 
     run_with(root, lies, "--write", capsys=capsys)
     assert certs(root) == []
-    rep = (root / "docs/wave-h-report.md").read_text()
+    rep = (root / "reports/wave-h/report.md").read_text()
     assert "flora certify exited 1 with verdict provisional" in rep
     assert SECRET not in rep
 
@@ -695,7 +695,7 @@ def test_global_cap_is_the_state_plans_cap_not_the_full_plans(tmp_path, capsys):
     rc, out = run(root, "--write", capsys=capsys)
     assert rc == 0, out
     assert "(plan balanced-only)" in out and "of $4.40" in out and "$6.50" not in out
-    rep = (root / "docs/wave-h-report.md").read_text()
+    rep = (root / "reports/wave-h/report.md").read_text()
     assert "of the $4.40 global cap" in rep and "$6.50" not in rep
 
 
@@ -751,7 +751,7 @@ def test_report_spend_shows_tracked_charged_and_billed(tmp_path, capsys):
     st_path.write_text(json.dumps(st.to_json()))
     rc, out = run(root, "--write", capsys=capsys)
     assert rc == 0, out
-    rep = (root / "docs/wave-h-report.md").read_text()
+    rep = (root / "reports/wave-h/report.md").read_text()
     tracked = sum(s.tracked_usd for s in st.steps.values())
     charged = sum(s.charged(st.watermark) for s in st.steps.values())
     assert f"Total: **${st.spent:,.2f}**" in rep

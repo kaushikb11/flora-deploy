@@ -21,7 +21,7 @@ of startup however much video it labels. These are the planner's estimates (the 
 | 10 | 600 | **$5.37** ($3.58-$8.04) | $53.65 | 8.6 h | **$6.53** ($4.17-$10.33) | $65.25 |
 | 100 | 6,000 | **$5.29** ($3.53-$7.94) | $529 | 85.5 h | **$6.39** ($4.08-$10.14) | $639 |
 
-One container per stage, cold starts, Modal list prices. Bold: the estimate; in brackets: its range from the error bands below. Rewards are terminal + dense (`reward.rubric` is not measured yet). The 10 and 100 video-hour rows are projected from rates measured on one small job; not yet confirmed at scale ([scale test](scale-test.md)). What each rate rests on:
+One container per stage, cold starts, Modal list prices. Bold: the estimate; in brackets: its range from the error bands below. Rewards are terminal + dense (`reward.rubric` is not measured yet). The 10 and 100 video-hour rows are projected from rates measured on one small job; not yet confirmed at scale. What each rate rests on:
 
 - `segment`: GPU work 0.342 container-s per video-s, measured (n=1, ±50%); startup 295 s, measured (n=1, ±50%)
 - `caption`: GPU work 0.854 container-s per video-s, measured (n=1, ±50%); startup 373 s, measured (n=1, ±50%)
@@ -45,7 +45,7 @@ more per video-hour than a single-camera one:
 | 1 | **$6.07** ($4.06-$9.09) | **$5.29** ($3.53-$7.94) |
 | 3 | **$9.36** ($6.25-$14.01) | **$8.58** ($5.72-$12.86) |
 
-Segment + caption, one container per stage, cold starts. 3-view GPU work is the 1-view rate times `segment` x2.56, `caption` x1.42: an estimate, not measured on 3-view episodes (yam certification prep: docs/golden-manifest-v3-yam.md, scripts/wave_h.py three_view_scale, 2026-10-22). Only the share of the work spent generating text grows with the longer three-view prompt; decoding and frame preparation are kept at 1x. `flora plan` applies the same multipliers and says so.
+Segment + caption, one container per stage, cold starts. 3-view GPU work is the 1-view rate times `segment` x2.56, `caption` x1.42: an estimate, not measured on 3-view episodes (yam certification prep: scripts/wave_h.py three_view_scale, 2026-10-22). Only the share of the work spent generating text grows with the longer three-view prompt; decoding and frame preparation are kept at 1x. `flora plan` applies the same multipliers and says so.
 <!-- /cost-table:cameras -->
 
 ### Why you may have seen other numbers
@@ -54,7 +54,7 @@ The README quotes the cost of GPU work alone, with no startup or idle time. A ve
 should tend towards it:
 
 <!-- cost-table:busy -->
-**$5.28 per video-hour** (segment + caption; $6.37 with rewards), projected from rates measured on one small job; not yet confirmed at scale ([scale test](scale-test.md))
+**$5.28 per video-hour** (segment + caption; $6.37 with rewards), projected from rates measured on one small job; not yet confirmed at scale
 <!-- /cost-table:busy -->
 
 `flora plan` gives the all-in estimate for your dataset: the rows above, worked out for your
@@ -63,8 +63,8 @@ episodes, stages and pool sizes.
 The first test job (run `102207184317`, three minutes of video) cost $33.36 per video-hour all
 in. Back then each container also sat idle for five minutes after its work. Pools are now told
 to shut down as soon as their work is done, so the same job is priced at the 0.05 row above, and
-most of what is left is startup. The certified run's job (3.9 minutes) cost $27.10 per
-video-hour all in, $9.90 without its cold starts ([measurement report](wave-h-report.md)).
+most of what is left is startup. A later 3.9-minute job cost $27.10 per
+video-hour all in, $9.90 without its cold starts.
 
 ## Where the money goes
 

@@ -1,13 +1,11 @@
 """Independent check of a written certificate before it is published.
 
-The reviewer brief is ``docs/certificate-check.md``.
-
 Usage::
 
     uv run python scripts/cert_check.py            # the certified run's defaults
     uv run python scripts/cert_check.py --json     # the same rows as JSON
     uv run python scripts/cert_check.py --run-root reports/wave-h/certified \\
-        --cert-dir src/flora_deploy/config/certificates --report docs/wave-h-report.md
+        --cert-dir src/flora_deploy/config/certificates --report reports/wave-h/report.md
 
 Run it after ``scripts/wave_h.py --plan certified`` and ``scripts/wave_h_finalize.py --write``,
 before the README flip and the push. It reads the records (``<run-root>/records/<side>/<job>/
@@ -155,7 +153,7 @@ CAND_SIDES = {"caption": ("isolated", "isolated_witness")}
 CAND_STEP = {"caption": "caption_iso"}
 DEFAULT_RUN_ROOT = ROOT / "reports" / "wave-h" / "certified"
 DEFAULT_LAB_DIR = ROOT / "reports" / "wave-h"
-DEFAULT_REPORT = ROOT / "docs" / "wave-h-report.md"
+DEFAULT_REPORT = ROOT / "reports" / "wave-h" / "report.md"
 DRIFT_TEST = "tests/unit/test_certificate_drift.py"
 NV_PINS = ("tempseg_code", "captioner_code", "rewarder")
 NV_SKIP = {"tokenizer.json", "LICENSE.pdf"}

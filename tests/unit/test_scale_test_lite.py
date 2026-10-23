@@ -344,7 +344,7 @@ def test_a_warm_run_fills_the_warm_startup_row(tmp_path):
     w = _row(data, "startup", "segment", "warm")
     assert w["status"] == "measured" and w["n"] == 2 and w["startup_s"] == 210.0
     assert all(x["origin"] == "fold" for x in w["samples"])  # a placeholder is no record
-    assert w["source"].startswith("docs/scale-test.md (scale test lite run lite01)")
+    assert w["source"].startswith("reports/scale-test (scale test lite run lite01)")
 
 
 def test_finalize_refuses_what_it_cannot_measure(tmp_path):

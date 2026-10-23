@@ -11,7 +11,7 @@
   "startup_note": "`compile_cache` on a startup row: `cold` (timed compiling from scratch), `warm` (timed loading a published compile cache, engines/compile_cache.py) or absent (projections). Lookups skip `warm` rows unless the caller prices warm: `RateTable.startup_for(..., warm=True)`, which `flora plan` does for a pool only when a cache is published for its key (`--check-cache`) or with `--assume-warm` (a projection). `jobs.budget` always charges the cold row. The balanced `warm` rows are placeholders until a warm start is measured.",
   "camera_scaling": {
     "status": "estimate",
-    "source": "yam certification prep: docs/golden-manifest-v3-yam.md, scripts/wave_h.py three_view_scale",
+    "source": "yam certification prep: scripts/wave_h.py three_view_scale",
     "date": "2026-10-22",
     "derivation": "Not measured: derived from the 1-view measured rates. Balanced segment / caption: (1 - g) + g x r, where g is generation's share of the deployed job's busy time (lab generate_s 50.4 s / 70.5 s over (d)'s busy 65.4 s / 161.5 s, run 102207184317's six 1-view episodes) and r the per-request prompt-token ratio, 3-view / 1-view (TempSeg 5,493 / 1,818; Captioner 11,145 / 5,663; docs/exact-concurrency.md vs reports/wave-h/balanced-<kind>.json). Decode and frame preparation stay at 1x. Exact segcap: the same rule on NVIDIA's call mix (0.137 TempSeg, 0.286 Captioner calls per video-s), generation share 5.04 / 6.4, applied to the 3-view half of its 1-/3-view-mix measured rate (docs/perf-1.md). Requests per video-s are assumed equal across layouts.",
     "applies_to": "A rate whose `cameras` is not the episode's layout (\"*\" or another count) is multiplied by the layout's factor for its kind; a rate measured on exactly that layout is not. Layouts or kinds not listed (1-view, rewards): 1x. scripts/wave_h.py prices its yam certified plan from layout 3.",
@@ -198,8 +198,8 @@
       "image": "img_vllm (vllm 0.24.0)",
       "requires": [],
       "excludes": [],
-      "provenance": "Wave H-lite run 10221548f1b8, `preset: balanced` deployed with flora deploy/run: n=1 job(s) (235.8 video s) on L40S, busy container-s per video-s 0.342 from one job: no range, so the error band is ±50%; excludes @enter (startup row) and idle (docs/wave-h-report.md (Wave H-lite run 10221548f1b8))",
-      "source": "docs/wave-h-report.md (Wave H-lite run 10221548f1b8)",
+      "provenance": "Wave H-lite run 10221548f1b8, `preset: balanced` deployed with flora deploy/run: n=1 job(s) (235.8 video s) on L40S, busy container-s per video-s 0.342 from one job: no range, so the error band is ±50%; excludes @enter (startup row) and idle (reports/wave-h/report.md (Wave H-lite run 10221548f1b8))",
+      "source": "reports/wave-h/report.md (Wave H-lite run 10221548f1b8)",
       "date": "2026-10-22",
       "n": 1
     },
@@ -214,8 +214,8 @@
       "image": "img_vllm (vllm 0.24.0)",
       "requires": [],
       "excludes": [],
-      "provenance": "Wave H-lite run 10221548f1b8, `preset: balanced` deployed with flora deploy/run: n=1 job(s) (235.8 video s) on H100, busy container-s per video-s 0.854 from one job: no range, so the error band is ±50%; excludes @enter (startup row) and idle (docs/wave-h-report.md (Wave H-lite run 10221548f1b8))",
-      "source": "docs/wave-h-report.md (Wave H-lite run 10221548f1b8)",
+      "provenance": "Wave H-lite run 10221548f1b8, `preset: balanced` deployed with flora deploy/run: n=1 job(s) (235.8 video s) on H100, busy container-s per video-s 0.854 from one job: no range, so the error band is ±50%; excludes @enter (startup row) and idle (reports/wave-h/report.md (Wave H-lite run 10221548f1b8))",
+      "source": "reports/wave-h/report.md (Wave H-lite run 10221548f1b8)",
       "date": "2026-10-22",
       "n": 1
     }
@@ -247,9 +247,9 @@
       "status": "measured",
       "compile_cache": "cold",
       "n": 1,
-      "provenance": "Wave H-lite run 10221548f1b8: spawn to first attempt of n=1 fresh L40S container(s), 295 s, one container: no range, so the error band is ±50% (docs/wave-h-report.md (Wave H-lite run 10221548f1b8))",
+      "provenance": "Wave H-lite run 10221548f1b8: spawn to first attempt of n=1 fresh L40S container(s), 295 s, one container: no range, so the error band is ±50% (reports/wave-h/report.md (Wave H-lite run 10221548f1b8))",
       "date": "2026-10-22",
-      "source": "docs/wave-h-report.md (Wave H-lite run 10221548f1b8)"
+      "source": "reports/wave-h/report.md (Wave H-lite run 10221548f1b8)"
     },
     {
       "preset": "balanced",
@@ -259,9 +259,9 @@
       "status": "measured",
       "compile_cache": "cold",
       "n": 1,
-      "provenance": "Wave H-lite run 10221548f1b8: spawn to first attempt of n=1 fresh H100 container(s), 373 s, one container: no range, so the error band is ±50% (docs/wave-h-report.md (Wave H-lite run 10221548f1b8))",
+      "provenance": "Wave H-lite run 10221548f1b8: spawn to first attempt of n=1 fresh H100 container(s), 373 s, one container: no range, so the error band is ±50% (reports/wave-h/report.md (Wave H-lite run 10221548f1b8))",
       "date": "2026-10-22",
-      "source": "docs/wave-h-report.md (Wave H-lite run 10221548f1b8)"
+      "source": "reports/wave-h/report.md (Wave H-lite run 10221548f1b8)"
     },
     {
       "preset": "balanced",

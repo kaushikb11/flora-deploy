@@ -2975,7 +2975,7 @@ def finalize_samples(st: wh.State) -> tuple[dict[tuple[str, str], list[dict[str,
         return {}, [], refusals
     t_done = rep.attempts[-1].finished if rep.attempts else res.get("finished_at")
     date = time.strftime("%Y-%m-%d", time.gmtime(t_done or time.time()))
-    source = f"docs/scale-test.md (scale test {res.get('profile', PROFILE.name)} run {st.run_id})"
+    source = f"reports/scale-test (scale test {res.get('profile', PROFILE.name)} run {st.run_id})"
     rows = {str(c["container_id"]): c for c in res.get("report_containers") or ()}
     out: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for kind in POOLS:

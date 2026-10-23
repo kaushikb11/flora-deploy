@@ -195,8 +195,7 @@ def single_job(table, kinds: tuple[str, ...] = SEGCAP) -> bool:
                and table.rate(PRESET, k, 1, 1).n == 1 for k in kinds)
 
 
-SCALE_CAVEAT = ("projected from rates measured on one small job; not yet confirmed at scale "
-                "([scale test](scale-test.md))")
+SCALE_CAVEAT = "projected from rates measured on one small job; not yet confirmed at scale"
 
 
 def table_md(head: list[str], rows: list[list[str]]) -> str:

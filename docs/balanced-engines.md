@@ -16,7 +16,7 @@ Terms used below (maintainer doc):
 - **Gate A**: the `dt_bias` FP32 drift check: logit differences between the stock bf16 engine and
   the FP32 `dt_bias` plugin engine (recorded only; it does not affect certification).
 - **the 2026-10-22 GPU run** ("Wave H-lite" in `scripts/wave_h.py` and the Results block): the
-  first measured `balanced` session ([`wave-h-runbook.md`](wave-h-runbook.md)).
+  first measured `balanced` session.
 
 `balanced` deploys and runs through `flora deploy` / `flora run` (see "Deployment" below).
 Without a certificate it needs `allow_uncertified: true`. Every `segment` / `caption` record is
@@ -167,8 +167,9 @@ episode coroutines (one event loop; ≤ 8 preparing, ≤ 64 segment / 32 caption
   model pins, the GPU and the per-camera source. The job's segment / caption **stage hashes**
   (`config/hashing.py`, which key the shard files) cover the worker's full `EngineSpec.hashed()`
   on the configured GPU (`engine.spec`: every engine kwarg incl. the per-GPU scheduler limits and
-  `dtbias_fp32`; the GPU name stays out, as `docs/PLAN.md`'s hashing rule says), so a GPU override with other limits gets a new
-  key instead of resuming into old shards. The stage's own hash (engine spec, NVIDIA's sampling,
+  `dtbias_fp32`; the GPU name stays out, as the hashing rule says: D11 in
+  [`architecture.md`](architecture.md)), so a GPU override with other limits gets a new key
+  instead of resuming into old shards. The stage's own hash (engine spec, NVIDIA's sampling,
   model pins, the logic version and the `vllm-video` logic digest) is kept in
   `provenance.engine_hash`; the sink stamps the stage key as `provenance.config_hash`, as for
   rewards. A `dtbias_fp32` deploy knob does not exist yet; when one lands it must reach
@@ -368,16 +369,15 @@ The certifying plans split the Captioner into two calls (`arm`: `baseline`, then
 the Gate A inputs the baseline staged under `flora-golden:balanced-lab/<run>/captioner-gate/`),
 each in its own container under the 20-minute timeout. On the v4 engine, one call with both
 cold builds passed its 1131 s deadline (2026-10-23). Baseline ≈ 960 s (deadline 1200 s),
-≈ $1.36 (upper $1.78); plugin ≈ 530 s (deadline 662 s), ≈ $0.75 (upper $1.02)
-(`docs/wave-h-runbook.md`, "The lab step (d2)").
+≈ $1.36 (upper $1.78); plugin ≈ 530 s (deadline 662 s), ≈ $0.75 (upper $1.02).
 
 ## Results
 
 <!-- wave-h:results (owned by scripts/wave_h_finalize.py) -->
-| Item | Result (Wave H-lite, 2026-10-22; `docs/wave-h-report.md`) |
+| Item | Result (Wave H-lite, 2026-10-22) |
 |---|---|
 | L0 in-engine (ids, grid vs HF) | tempseg: pass (6/6 ids, 6/6 grid); captioner: pass (6/6 ids, 6/6 grid) |
-| Segments / captions end to end on golden episodes | 1 `balanced` job(s) through `flora deploy` / `flora run` (run `10221548f1b8`); certificate per stage: segment (human) certified, caption (human) fail |
+| Segments / captions end to end on golden episodes | 1 `balanced` job(s) through `flora deploy` / `flora run` (run `10221548f1b8`); certificate per stage: segment (human) refused, caption (human) refused |
 | Throughput, $/video-h vs `exact` | **$5.28/video-h** ±50% vs `exact` $36.39 as `flora plan` prices it (6.9x cheaper), list prices, busy seconds; measured on one 3.9-min job (2026-10-22, n=1), not yet confirmed at scale |
 | Gate A (dt_bias FP32 vs bf16) | tempseg: max 0.25, mean 0.034514, greedy 4/6; captioner: max 0.25, mean 0.019797, greedy 6/6; recommendation: plugin **off** |
 <!-- /wave-h:results -->

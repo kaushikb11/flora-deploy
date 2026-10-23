@@ -29,10 +29,11 @@ and balanced jobs (``reports/wave-h/records/{exact,noise,balanced}/<job>/<stage>
    only; a ``fail`` is never written here. A certificate written earlier is replaced only by
    a new one with the same key; one whose inputs are missing now, or that certify refused,
    is kept.
-3. **Report** (``docs/wave-h-report.md``): spend per step (tracked vs billed, with the billing
-   lag), measured $/video-h for ``exact`` and ``balanced`` at list prices (formula shown), L0,
-   Gate A with the ``dt_bias`` plugin recommendation (the rule in ``docs/balanced-engines.md``)
-   and the certificate summary. Numbers only: no NVIDIA text, captions, prompts or episode ids.
+3. **Report** (``reports/wave-h/report.md``, git-ignored): spend per step (tracked vs
+   billed, with the billing lag), measured $/video-h for ``exact`` and ``balanced`` at list
+   prices (formula shown), L0, Gate A with the ``dt_bias`` plugin recommendation (the rule
+   in ``docs/balanced-engines.md``) and the certificate summary. Numbers only: no NVIDIA
+   text, captions, prompts or episode ids.
 4. **Docs**: the ``Results`` table of ``docs/balanced-engines.md`` and the ``Cost`` block of
    ``README.md`` (2-3 plain lines), each between ``<!-- wave-h:<name> -->`` /
    ``<!-- /wave-h:<name> -->`` markers. The script fills exactly those blocks and refuses when
@@ -151,7 +152,7 @@ class Paths:
         self.lab = self.lab or w
         self.rates = self.rates or r / "src" / "flora_deploy" / "planner" / "rates.json"
         self.certs = self.certs or r / "src" / "flora_deploy" / "config" / "certificates"
-        self.report = self.report or r / "docs" / "wave-h-report.md"
+        self.report = self.report or w / "report.md"  # git-ignored, never docs/
         self.engines_doc = self.engines_doc or r / "docs" / "balanced-engines.md"
         self.readme = self.readme or r / "README.md"
         self.manifest = self.manifest or w / "finalize.json"
@@ -1225,7 +1226,7 @@ def render_report(f: Findings) -> str:
     warm = run_usd_per_video_h_after_startup(st, "balanced")
     L += ["", "$/video-h (busy) counts busy container-seconds only, without cold starts or idle "
           "time until scale-down: what a large job approaches if the per-video-second rate "
-          "holds at scale, a projection until a scale run measures it (`docs/scale-test.md`). "
+          "holds at scale, a projection until a scale run measures it. "
           "This run's figure is everything "
           "its jobs spent"
           + (f"; without the cold starts, `balanced` was {usd(warm)}/video-h (idle kept)"
@@ -1345,7 +1346,7 @@ def results_block(f: Findings) -> str:
             ["Segments / captions end to end on golden episodes", e2e],
             ["Throughput, $/video-h vs `exact`", cost],
             ["Gate A (dt_bias FP32 vs bf16)", ga]]
-    return "\n".join([*table(["Item", f"Result (Wave H-lite, {f.date}; `docs/wave-h-report.md`)"],
+    return "\n".join([*table(["Item", f"Result (Wave H-lite, {f.date})"],
                              rows)])
 
 
@@ -1710,7 +1711,7 @@ def analyze(paths: Paths, *, derived: Mapping[str, str] | None = None, cert_tmp:
     refusals = [r for k in (("balanced", "segment"), ("balanced", "caption"))
                 for r in ms[k].refusals]
     outputs: dict[Path, str] = {}
-    source = f"docs/wave-h-report.md (Wave H-lite run {st.run_id})"
+    source = f"reports/wave-h/report.md (Wave H-lite run {st.run_id})"
     if not refusals:
         data = json.loads(paths.rates.read_text(encoding="utf-8"))
         new = updated_rates(data, ms, run_id=st.run_id, date=date, source=source)

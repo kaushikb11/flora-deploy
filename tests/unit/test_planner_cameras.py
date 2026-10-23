@@ -62,7 +62,7 @@ def _work(o) -> dict[str, float]:
 def test_table_is_an_estimate_with_provenance():
     cs = RateTable.load().camera_scaling
     assert cs is not None and cs.status == "estimate"
-    assert "golden-manifest-v3-yam" in cs.source and cs.date and cs.derivation
+    assert "three_view_scale" in cs.source and cs.date and cs.derivation
     assert cs.factors(1) == {}
     f = cs.factors(3)
     assert set(f) == {"segment", "caption", "segcap"}

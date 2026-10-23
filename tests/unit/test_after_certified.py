@@ -75,9 +75,10 @@ def test_dry_run_writes_nothing_and_summarizes(fake, capsys):
     assert "- preemptions: 0 preempted, 0 unknown" in out
     assert "Spend: tracked $4.57, billed $3.10" in out
     assert "cert_check: PASS" in out
-    for name in ("README.md", "docs/costs.md", "docs/limitations.md", "docs/wave-h-report.md",
+    for name in ("README.md", "docs/costs.md", "docs/limitations.md",
                  "src/flora_deploy/planner/rates.json"):
         assert f"- `{name}`: +" in out
+    assert "- `reports/wave-h/report.md`: new, " in out  # outside docs/, never committed
     assert out.count("src/flora_deploy/config/certificates/cert_") == 2
     assert out.count("src/flora_deploy/config/certificates/freeze/cert_") == 2
     for block in ac.README_BLOCKS:
@@ -97,7 +98,7 @@ def test_write_applies_what_cert_check_passes_and_is_idempotent(fake, capsys):
     # the applied tree passes the independent check as it stands
     rows = cc.check_all(cc.Inputs(run_root=fake.run_root, cert_dir=fake.cert_dir,
                                   lab_dir=fake.root / "reports" / "wave-h",
-                                  report=fake.root / "docs" / "wave-h-report.md",
+                                  report=fake.root / "reports" / "wave-h" / "report.md",
                                   nv_root=fake.nv_root, drift_runner=drift_ok))
     assert [r for r in rows if r.status != cc.PASS] == []
     readme = (fake.root / "README.md").read_text()

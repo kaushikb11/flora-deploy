@@ -394,12 +394,6 @@ def test_criteria_are_the_19_of_the_doc_and_all_automatic():
     assert all(x["auto"] for x in rows) and not sc.MANUAL
     assert {x["verdict"] for x in rows} == {"PASS"}, [x for x in rows if x["verdict"] != "PASS"]
     assert sc.criteria_summary(rows) == "19 PASS, 0 FAIL, 0 n.a. (19 of 19 automatic)"
-    # the doc's table lists the same 19, in order
-    doc = (Path(__file__).resolve().parents[2] / "docs" / "scale-test.md").read_text()
-    table = doc.split("## Success criteria", 1)[1].split("\n## ", 1)[0]
-    ids = [int(line.split("|")[1]) for line in table.splitlines()
-           if line.startswith("| ") and line.split("|")[1].strip().isdigit()]
-    assert ids == list(range(1, 20))
 
 
 def test_criteria_targets_derive_from_the_rates():

@@ -37,7 +37,7 @@ from tests.fakes import certcheck_run as R
 REPO = Path(__file__).resolve().parents[2]
 CERT_REL = Path("src/flora_deploy/config/certificates")
 COPIED = ("src/flora_deploy/planner/rates.json", "README.md", "docs/balanced-engines.md",
-          "docs/costs.md", "docs/limitations.md", "docs/cli.md", "docs/wave-h-report.md")
+          "docs/costs.md", "docs/limitations.md", "docs/cli.md")
 VIDEO_S = {"exact_e2e": 250.0, "noise": 102.0, "balanced": 250.0, "witness": 102.0,
            "isolated": 250.0, "isolated_witness": 102.0}
 

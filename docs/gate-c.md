@@ -59,7 +59,7 @@ The driver checks that both runs made the same calls with the same prompt, frame
 |---|---|---|
 | `synthetic`: 640x480 gradient plus seeded noise, 40 s | fake `decode_selected` | 2 per case |
 | `bbb_360_10s`: Big Buck Bunny 10 s, 640x360 H.264 30 fps CFR, CC BY 3.0 Blender Foundation | fake `decode_selected` | 2 per case |
-| **golden v1**: Volume `flora-golden`, `golden/v1/` (`docs/golden-manifest-v1.md`) | NVIDIA's **real** `media.probe` and `decode_selected` | up to 6 per pool and kind |
+| **golden v1**: Volume `flora-golden`, `golden/v1/` | NVIDIA's **real** `media.probe` and `decode_selected` | up to 6 per pool and kind |
 
 Notes on the sources:
 - The BBB sample is staged at `flora-golden:samples/wse/bbb_360_10s.mp4` (sha256 `77145c94…2016`).
@@ -90,7 +90,7 @@ only.
 
 The episodes used are the first ones in manifest order, `golden/v1/manifest.json`.
 
-Deviation from archive/PLAN-v3.md §9's "20 golden requests per pool": the gate uses up to 6 per pool and kind,
+Deviation from the build plan's "20 golden requests per pool": the gate uses up to 6 per pool and kind,
 11-12 per pool in total. The plan's 20 would mean 120 requests per kind on real media; the
 coverage above spans every pool, codec, rate class (VFR, 10/15/30/50 fps) and window length at
 about a third of the build cost. Raise `--quota` to 20 to run the plan's number.

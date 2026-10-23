@@ -220,8 +220,7 @@ uv run modal run src/flora_deploy/modal_app/convert_app.py::tempseg --step equiv
 
 ## Not done here
 
-- Wiring the merged directory into a vLLM engine or the `balanced` preset. That is Gate B
-  (archive/PLAN-v3.md §9).
+- Wiring the merged directory into a vLLM engine or the `balanced` preset. That is Gate B.
 - Building merger v2, re-running the equivalence check on it, and pinning its content digest
   (`DERIVED_PINS["tempseg-merged"].content_sha256`).
 

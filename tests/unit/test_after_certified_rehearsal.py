@@ -124,7 +124,7 @@ def test_the_human_flip_reads_cleanly(human, capsys):
         assert max(map(len, new.splitlines())) <= 130, name
     assert {k for k in changed if not k.startswith(str(A.CERT_REL))} == {
         "README.md", "docs/balanced-engines.md", "docs/costs.md", "docs/limitations.md",
-        "docs/wave-h-report.md", "reports/wave-h/finalize.json",
+        "reports/wave-h/report.md", "reports/wave-h/finalize.json",
         "src/flora_deploy/planner/rates.json"}
     # the regenerated docs are their generators' fixed points
     assert limitations_status.render(lim, cert_dirs=[human.cert_dir]) == lim

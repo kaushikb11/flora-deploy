@@ -959,7 +959,7 @@ def test_committed_docs_still_scan_clean():
             eid = spec.local_id(gid)
             plan_ids |= {eid, f"{spec.data_dir('balanced')}--{eid}"}
     scanned = [ROOT / "README.md", *(ROOT / "docs" / n for n in (
-        "wave-h-report.md", "costs.md", "limitations.md", "cli.md")),
+        "costs.md", "limitations.md", "cli.md")),
         *sorted((ROOT / "src/flora_deploy/config/certificates").rglob("*.json"))]
     for p in scanned:
         if p.exists():
