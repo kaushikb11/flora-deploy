@@ -6,6 +6,15 @@ readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE.md"]
 requires-python = ">=3.11"
+keywords = ["robotics", "video labeling", "lerobot", "modal", "vllm", "nvidia flora"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "av==16.0.1",
     "huggingface_hub>=1.29,<2.0",
@@ -22,6 +31,11 @@ dependencies = [
     "rich>=13",
     "typer>=0.12",
 ]
+
+[project.urls]
+Homepage = "https://github.com/kaushikb11/flora-deploy"
+Repository = "https://github.com/kaushikb11/flora-deploy"
+Issues = "https://github.com/kaushikb11/flora-deploy/issues"
 
 [project.scripts]
 flora = "flora_deploy.cli:main"
