@@ -65,7 +65,7 @@ def test_plan_honours_allow_uncertified_from_the_config(balanced_cfg):
     bal = d["options"][d["recommended"] - 1]
     assert bal["preset"] == "balanced" and bal["cost_usd"] < 25
     assert bal["uncertified_allowed"] and not bal["unavailable"]
-    assert bal["certification"] == "needs certificates"  # allowed is not certified
+    assert bal["certification"] == "partly certified"  # allowed is not certified
     r = _plan(balanced_cfg, "--write", "1")  # and writing the recommendation keeps balanced
     assert r.exit_code == 0, r.output
     assert load_config(balanced_cfg).preset == "balanced"
@@ -183,10 +183,16 @@ def test_dense_summary_fits_its_width():
 
 
 def test_local_demo_status_and_report_show_no_spend(demo):
+    """Nothing is charged; the one dollar amount is the as-if-on-Modal price the local budget
+    gate counts, labelled as such, against the config's budget (newcomer 2, item 7)."""
     for argv in (["status"], ["report"]):
         out = _in(demo, argv, columns="200")
         assert "n/a: local run, fake models; nothing charged" in out and "$0" in out, out
-        assert not re.search(r"\$[1-9]|\$0\.[0-9]*[1-9]", out), out  # no dollar amounts
+        m = re.search(r"priced as if on Modal: \$(\d+\.\d\d) of the \$5\.00 budget \(a "
+                      r"projected Modal-equivalent cost", out)
+        assert m and float(m.group(1)) > 0, out
+        rest = out.replace(m.group(0), "").replace("$5.00", "")
+        assert not re.search(r"\$[1-9]|\$0\.[0-9]*[1-9]", rest), out  # no other amounts
         assert "(running)" not in out and "per video-hour" not in out
         assert_no_jargon(out, f"flora {argv[0]}")
     assert "all finished" in _in(demo, ["report"], columns="200")
@@ -402,7 +408,7 @@ def test_plan_without_a_summary_offers_the_free_index(tmp_path):
     cfg = _write(tmp_path, template_text("local_demo"))
     r = runner.invoke(app, ["plan", "-c", str(cfg)], env={"COLUMNS": "200"})
     assert r.exit_code == 2
-    assert "`flora index --local`" in " ".join(r.output.split())
+    assert "`flora run --local --fake-models --sample-data --config " in " ".join(r.output.split())
 
 
 def test_results_more_rows_is_singular_for_one(demo):
@@ -602,3 +608,96 @@ def test_readme_test_command_matches_ci():
     timing that is not the old, unreachable ~30 s."""
     line = next(ln for ln in README.splitlines() if ln.startswith("uv run pytest"))
     assert "-n auto --dist loadfile" in line and "~30 s" not in line, line
+
+
+# ---------------------------------------------------------------------------------------------
+# Newcomer evaluation 2 (2026-10-23): the demo's plan, labels and notation
+
+
+def test_plan_after_the_local_demo_finds_its_index(demo):
+    """`flora plan` right after `flora run --local` reads the index the run wrote in the local
+    store (no `flora index`, which would open the sink's Modal Volume)."""
+    out = _in(demo, ["plan"], columns="200")
+    assert "flora-local-store" in out and "summary.json" in out, out
+    assert "no workload" not in out and "Recommended:" in out
+
+
+def test_plan_without_a_workload_suggests_the_free_local_command(tmp_path):
+    import os
+
+    old = Path.cwd()
+    os.chdir(tmp_path)
+    try:
+        assert runner.invoke(app, ["init", "--template", "local_demo"]).exit_code == 0
+        r = runner.invoke(app, ["plan"], env={"COLUMNS": "200"})
+    finally:
+        os.chdir(old)
+    assert r.exit_code == 2
+    msg = " ".join(r.output.split())
+    assert "flora run --local --fake-models --sample-data" in msg, msg
+    assert "flora index" not in msg  # it would create the sink's Modal Volume
+
+
+def test_plan_labels_one_option_one_way(balanced_cfg):
+    """Table, flags and JSON use the same fidelity words (item 4)."""
+    out = _plan(balanced_cfg).output
+    assert "partly certified" in out
+    assert "balanced: uncertified" not in out and "uncertified (not every" not in out
+    line = next(ln for ln in out.splitlines() if "balanced: partly certified (" in ln)
+    assert "reference" in line and "not certified" in line, line
+    d = json.loads(_plan(balanced_cfg, "--json").output)
+    bal = next(o for o in d["options"] if o["preset"] == "balanced")
+    assert bal["certification"] == "partly certified"
+    assert not any(f.startswith("balanced: uncertified") for f in bal["flags"])
+
+
+def test_plan_pools_say_containers_and_gpus(balanced_cfg):
+    """`2 containers × 1 H200, 4 episodes each`, never `2xH200 x4 ep` (item 9)."""
+    out = _plan(balanced_cfg, "--budget", "100").output
+    pools = [ln for ln in out.splitlines() if ". pools: " in ln]
+    assert pools and all("×" in ln and " each" in ln for ln in pools), pools
+    assert not re.search(r"\d+x(H200|H100|L40S)", out), out
+    assert re.search(r"segcap \d+ containers? × 1 H200, \d+ episodes? each", out), out
+
+
+def test_sdk_plan_matches_the_cli(balanced_cfg):
+    """Same options in the same order as `flora plan --json`, the same certificates applied,
+    and the CLI's recommendation (item 10)."""
+    from flora_deploy import sdk
+    from flora_deploy.planner.options import recommended
+
+    opts = sdk.plan(str(balanced_cfg), video_hours=1)
+    d = json.loads(_plan(balanced_cfg, "--json").output)
+    assert [o.name for o in opts] == [o["name"] for o in d["options"]]
+    assert [o.cost_usd for o in opts] == [o["cost_usd"] for o in d["options"]]
+    best = recommended(opts, certified={o.name for o in opts if o.certification == "certified"})
+    assert opts.index(best) + 1 == d["recommended"]
+
+
+def test_results_caption_counts_episodes_and_subtasks(demo):
+    out = _in(demo, ["results", "caption"], columns="200")
+    title = next(ln for ln in out.splitlines() if " caption: " in ln)
+    assert re.search(r"caption: 6 episodes, \d+ subtasks", title), title
+    assert "records" not in title
+
+
+def test_balanced_template_idle_tail_matches_the_planner():
+    from flora_deploy.planner.options import POOL_END_TAIL_S
+
+    text = template_text("balanced_lerobot")
+    assert f"about {POOL_END_TAIL_S:g} s after it runs out of work" in text
+    assert "about 2 s after" not in text
+
+
+def test_deploy_dry_run_explains_index_and_fits_80_columns(tmp_path):
+    cfg = tmp_path / "flora.yaml"
+    cfg.write_text(template_text("balanced_lerobot"))
+    args = ["deploy", "--dry-run", "-c", str(cfg), "--allow-uncertified",
+            "--receipt", "captioner_bf16=" + "c" * 64, "--receipt", "tempseg_merged=" + "b" * 64]
+    r = runner.invoke(app, args, env={"COLUMNS": "80"})
+    assert r.exit_code == 0, r.output
+    assert "index_run_shard" not in r.output and "defines no" not in r.output
+    assert "flora-index" in " ".join(r.output.split())
+    table = [ln for ln in r.output.splitlines() if "│" in ln]
+    assert table and "…" not in "".join(table), r.output
+    assert any("SegmentWorker" in ln and "49152/61440" in ln for ln in table), r.output

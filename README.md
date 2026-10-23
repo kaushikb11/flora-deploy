@@ -16,7 +16,7 @@ for every episode:
 Labels come back as Parquet and/or JSONL (`output.formats`), keyed by episode, ready for pandas
 or 🤗 `datasets`.
 
-## Try it in two minutes
+## Try it in a few minutes
 
 No GPU or Modal account needed. This runs the full pipeline locally with stand-in models, so you
 can see the workflow and the output format before spending anything.
@@ -144,8 +144,10 @@ a finished job actually spent. With `balanced`, segmentation runs on an L40S, ca
 rewards on H100s (`exact` runs segmentation + captioning on an H200).
 
 <!-- wave-h:cost -->
-`balanced` costs about **$5.28 per video-hour** of GPU work (±50%) for segmentation + captioning (`exact`: $36.39),
+`balanced` costs about **$5.28 per video-hour** of GPU work (±50%) for segmentation + captioning,
 at Modal list prices; a projection from rates measured on one 3.9-min job (2026-10-22, n=1), not yet confirmed at scale.
+`exact` is priced at $36.39 (±35%): the planner's rate (6.4 GPU-s per video-s, an older measurement);
+the 2026-10-22 validation run measured `exact` at $25.35 (±41%, n=2 jobs), not yet folded into the planner.
 Startup, idle time and rewards are extra and dominate small jobs: `flora plan` shows the all-in estimate for your dataset.
 <!-- /wave-h:cost -->
 

@@ -203,8 +203,8 @@ so those columns below are estimates:
 | rates | `measured (n=1, ±50%)` means measured, on one job, ±50%; `estimate (...)` means part of the price is not measured; `+ camera scaling (estimate)` means multi-camera episodes were priced with the camera multipliers above |
 | status | `ok`, `at risk` (the high end of the range passes your budget or deadline), `infeasible`, `unavailable` or `projection` (needs a feature that is not deployed; shown for comparison and never recommended) |
 
-Lines under the table give each option's pools (for example `segment 1xL40S x1, caption 3xH100! x1`)
-and any warnings. The last line names the recommended option. Big episodes, GPU queueing and
+Lines under the table give each option's pools (for example `segment 1 container × 1 L40S, 1 input
+each; caption 3 containers × 1 H100!, 1 input each`) and any warnings. The last line names the recommended option. Big episodes, GPU queueing and
 storage are not in the estimate; see [What isn't included](#what-isnt-included).
 
 ### Set a budget, then check `flora report`

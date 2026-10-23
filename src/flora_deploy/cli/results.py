@@ -196,7 +196,12 @@ def results(
     from flora_deploy.cli._app import term_width
 
     cols, label_rows = label_table(stage, recs)
-    t = Table(title=f"{escape(job)} {stage}: {len(recs)} records", title_justify="left")
+    # one record per episode; a caption / segment table has one row per subtask / segment
+    n_ep = f"{len(recs)} episode{'s' if len(recs) != 1 else ''}"
+    noun = {"caption": "subtasks", "segment": "segments"}.get(stage, "rows")
+    title = (n_ep if len(label_rows) == len(recs)
+             else f"{n_ep}, {len(label_rows)} {noun}")
+    t = Table()  # the header is its own line: a table title wraps to a narrow table's width
     shown = label_rows[:limit]
     same = {r[-1] for r in label_rows}
     if len(same) == 1:  # every record has the same certification: say it once, below
@@ -214,6 +219,7 @@ def results(
             t.add_column(col, no_wrap=True, overflow="ellipsis", min_width=fit)
     for row in shown:
         t.add_row(*(escape(c) for c in row))
+    console.print(f"{escape(job)} {stage}: {title}", soft_wrap=True, highlight=False)
     console.print(t, width=width)
     if len(same) == 1:
         console.print(f"certified: {escape(same.pop())} for every record", soft_wrap=True)

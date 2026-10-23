@@ -43,7 +43,7 @@ def test_compose_then_results_jsonl_table_parquet(tmp_path):
     r = runner.invoke(app, ["results", "--job", JOB, "--stage", "reward.terminal",
                             "--store", uri], env=ENV)
     assert r.exit_code == 0, r.output
-    assert "4 records" in r.output and "outside NVIDIA's tested conditions" in r.output
+    assert "4 episodes" in r.output and "outside NVIDIA's tested conditions" in r.output
 
     out = tmp_path / "out" / "seg.parquet"
     r = runner.invoke(app, ["results", "--job", JOB, "--stage", "segment", "--store", uri,
