@@ -497,7 +497,7 @@ def check_segments_oracle(side: str, records: Mapping[str, StageRecord],
         a, b = ref[uid].segments, r.segments
         if len(a) != len(b) or any(
                 not (abs(x.start_s - y.start_s) <= BOUNDS_EPS
-                     and abs(x.end_s - y.end_s) <= BOUNDS_EPS) for x, y in zip(a, b)):
+                     and abs(x.end_s - y.end_s) <= BOUNDS_EPS) for x, y in zip(a, b, strict=True)):
             raise CertifyRefused("segments_not_oracle", f"{side} caption rows of an episode "
                                  "are not the oracle's (count or bounds differ)")
 

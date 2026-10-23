@@ -99,9 +99,8 @@ def test_isolated_job_has_its_own_stage_hash_but_the_production_key():
 
 
 def test_planner_gives_pinned_caption_shards_no_upstream():
-    from tests.unit.test_jobs_manifest import make_index
-
     from flora_deploy.jobs.manifest import build_manifest
+    from tests.unit.test_jobs_manifest import make_index
 
     rs = to_run_settings(parse_config(iso()), "job", derived_receipts=RECEIPTS)
     assert rs.caption_segments == {"sha256": "b" * 64, "oracle_stage_hash": ORACLE}
