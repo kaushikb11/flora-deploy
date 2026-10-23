@@ -76,7 +76,7 @@ from flora_deploy.jobs.attempts import JobFiles
 from flora_deploy.jobs.manifest import load_manifest, stages_of
 from flora_deploy.jobs.progress import Progress, compose_input, derive, read_errors
 from flora_deploy.jobs.settings import MAX_EPISODE_ERROR_RATE
-from flora_deploy.jobs.store import JobPaths, Store, prefetch_areas
+from flora_deploy.jobs.store import JobPaths, Store, prefetch_areas, put_many
 from flora_deploy.jobs.types import MAX_STARTS_BEFORE_QUARANTINE, EpisodeRef
 from flora_deploy.records import SCHEMA, Stage, StageRecord
 
@@ -349,10 +349,13 @@ def compose(store: Store, job_id: str, *, config_hash: str | None = None,
 
     # every receipt and part is read below, one Volume round trip each through the client:
     # read them ahead in parallel (a no-op on a mounted or local store)
+    # (errors: the summary counts every error file)
     prefetch_areas(store, JobPaths(job_id).root, [cfg, *dict(manifest.stage_hashes).values()],
-                   ("receipts", "parts"))
+                   ("receipts", "parts", "errors"))
     dstore = _DigestingStore(store)
-    jf = JobFiles(dstore, job_id, cfg)  # type: ignore[arg-type]
+    # the stage hashes of the manifest just read (JobFiles would read the manifest again)
+    jf = JobFiles(dstore, job_id, cfg,  # type: ignore[arg-type]
+                  stage_hashes=dict(manifest.stage_hashes))
     try:
         progress = derive(jf, manifest, limit=limit)
         ci = compose_input(jf, progress)
@@ -484,8 +487,7 @@ def compose(store: Store, job_id: str, *, config_hash: str | None = None,
     summary_path = jf.paths.output(cfg, "summary", "json")
     paths["summary"] = summary_path
     if write:  # the generation's files first, the pointer last (module docstring)
-        for p, data in files.items():
-            store.put_bytes(p, data)
+        put_many(store, files)  # one upload and one commit on a Volume, not one per file
         store.put_bytes(summary_path, (json.dumps(summary, sort_keys=True, indent=2,
                                                   allow_nan=False) + "\n").encode())
     return ComposeResult(job_id, cfg, dict(by_stage), summary, paths)

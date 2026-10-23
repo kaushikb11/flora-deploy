@@ -39,7 +39,7 @@ import shutil
 import tempfile
 import threading
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -88,6 +88,26 @@ class VolumeStore:
             self._exit()
         with self._lock:
             self._pending += 1
+            due = self._pending >= self.commit_every
+        if due:
+            self.commit()
+
+    def put_many(self, files: Mapping[str, bytes]) -> None:
+        """Write every file of ``files`` (whole files, in order), then commit at most once
+        (``commit_every`` counts them all), instead of one commit per file."""
+        items = [(self._abs(p), d) for p, d in files.items()]
+        if any(not isinstance(d, bytes | bytearray) for _p, d in items):
+            raise TypeError("whole-file bytes only")
+        if not items:
+            return
+        self._enter()
+        try:
+            for dest, data in items:
+                self._put(dest, data)
+        finally:
+            self._exit()
+        with self._lock:
+            self._pending += len(items)
             due = self._pending >= self.commit_every
         if due:
             self.commit()
