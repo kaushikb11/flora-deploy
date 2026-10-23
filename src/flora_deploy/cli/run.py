@@ -94,6 +94,16 @@ def _dur(s: float | None) -> str:
 SIMULATED_SPEND = "spend $0 (n/a: local run, fake models; nothing charged)"
 
 
+def simulated_spend(spend_usd: float | None, budget_usd: float | None) -> str:
+    """:data:`SIMULATED_SPEND` plus the as-if-on-Modal price the local budget gate counts
+    (``modal.budget_usd``), labelled as a projection."""
+    if spend_usd is None:
+        return SIMULATED_SPEND
+    of = f" of the {_money(budget_usd)} budget" if budget_usd is not None else ""
+    return (f"{SIMULATED_SPEND}; priced as if on Modal: {_money(spend_usd)}{of} (a projected "
+            "Modal-equivalent cost; the local budget gate counts it)")
+
+
 def print_view(v: Any, *, brief: bool = False) -> None:
     """One job status (``sdk.JobView``) for humans."""
     from rich.markup import escape
@@ -101,7 +111,7 @@ def print_view(v: Any, *, brief: bool = False) -> None:
     colour = {"done": "green", "completed_with_errors": "yellow", "running": "cyan",
               "composing": "cyan", "planned": "cyan"}.get(v.state, "red")
     orch = "alive" if v.orchestrator_alive else "not running"
-    spend = (SIMULATED_SPEND if getattr(v, "simulated", False) else
+    spend = (simulated_spend(v.spend_usd, v.budget_usd) if getattr(v, "simulated", False) else
              f"spend {_money(v.spend_usd)} of {_money(v.budget_usd)} (projected "
              f"{_money(v.projected_usd)})")
     console.print(f"[bold]{escape(v.job_id)}[/bold] [{colour}]{v.state}[/{colour}]  "

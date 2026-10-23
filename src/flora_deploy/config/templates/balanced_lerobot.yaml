@@ -18,7 +18,7 @@ modal:
 # balanced: vLLM engines on stage-separated pools: TempSeg on an L40S, the Captioner on an
 # H100!, the Rewarder on an H100! (`H100!` means exactly an H100: Modal never upgrades it to a
 # pricier GPU). Workers scale from zero, so you pay only while a job runs; a stage's containers
-# stop about 2 s after it runs out of work.
+# stop about 17 s after it runs out of work (a 2 s idle window after a 15 s poll).
 # A stage runs as certified when an accuracy certificate covers it for your embodiment and GPU
 # (rewards are NVIDIA's own engine and need none).
 # Any stage without one needs `allow_uncertified: true` (its records say certified: false).

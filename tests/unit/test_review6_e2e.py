@@ -497,7 +497,7 @@ def test_file_uri_store(tmp_path, videos, monkeypatch):
     assert out.exit_code == 0, out.output
     assert (tmp_path / "uri-store" / "flora").is_dir() and not (tmp_path / "file:").exists()
     res = invoke("results", "--job", JOB, "--stage", "caption", "--store", uri)
-    assert res.exit_code == 0 and "6 records" in res.output
+    assert res.exit_code == 0 and "caption: 6 episodes" in res.output
 
 
 def test_output_formats_are_honoured(tmp_path, videos):

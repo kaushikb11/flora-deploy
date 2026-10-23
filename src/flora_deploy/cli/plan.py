@@ -66,6 +66,30 @@ def fidelity_label(o, certs: dict[str, dict] | None = None) -> str:
     return {"needs certificates": "uncertified"}.get(o.certification, o.certification)
 
 
+def fidelity_detail(o, certs: dict[str, dict] | None = None) -> str:
+    """:func:`fidelity_label`, with the stages behind ``partly certified`` named, e.g.
+    ``partly certified (reward.terminal, reward.dense: reference; segment, caption: not
+    certified)``."""
+    label = fidelity_label(o, certs)
+    if label != "partly certified":
+        return label
+    groups: dict[str, list[str]] = {}
+    for kind, c in (certs or {}).items():
+        st = c.get("state")
+        groups.setdefault(st if st in ("reference", "certified") else "not certified",
+                          []).append(kind)
+    return label + " (" + "; ".join(f"{', '.join(ks)}: {st}" for st, ks in groups.items()) + ")"
+
+
+def display_flags(o, certs: dict[str, dict] | None = None) -> tuple[str, ...]:
+    """``o.flags`` with the planner's ``<preset>: uncertified`` wording replaced by the same
+    fidelity words the table shows (:func:`fidelity_detail`), so one option has one label."""
+    head = f"{o.preset}: uncertified"
+    detail = fidelity_detail(o, certs)
+    return tuple(f"{o.preset}: {detail}{f[len(head):]}" if f.startswith(head) else f
+                 for f in o.flags)
+
+
 def status_label(o) -> str:
     """``unavailable`` when something blocks the option, ``projection`` when it needs a feature
     that is not deployed, else ``ok`` / ``at risk`` / ``infeasible`` (budget, deadline or GPU
@@ -90,9 +114,11 @@ def certificate_note(cfg, o, content, certs: dict[str, dict] | None = None) -> s
 def _gpus_label(o) -> str:
     from flora_deploy.planner.options import episodes_label
 
-    return ", ".join(f"{k.kind} {k.containers}x{k.gpu}" + (f":{k.gpu_count}" if k.gpu_count > 1
-                                                          else "") + episodes_label(k)
-                     for k in o.kinds)
+    def one(k) -> str:
+        boxes = f"{k.containers} container{'s' if k.containers != 1 else ''}"
+        return f"{k.kind} {boxes} × {k.gpu_count} {k.gpu}, {episodes_label(k)}"
+
+    return "; ".join(one(k) for k in o.kinds)
 
 
 def _print_plan(cfg, workload, req, deadline_s, options, best, rates, table, content) -> None:
@@ -144,7 +170,7 @@ def _print_plan(cfg, workload, req, deadline_s, options, best, rates, table, con
             console.print(f"   wall-clock {wall(o)}, {o.peak_gpus} GPUs at peak", soft_wrap=True)
             console.print(f"   rates {escape(rates_label(o))}", soft_wrap=True)
         console.print(f"  {i}. pools: {escape(_gpus_label(o))}", soft_wrap=True)
-        for f in o.flags:
+        for f in display_flags(o, cs.get(o.name)):
             console.print(f"  {i}. {escape(f)}", soft_wrap=True)
         note = certificate_note(cfg, o, content, cs.get(o.name))
         if note:
@@ -203,6 +229,41 @@ def published_cache_kinds(cfg, exists=None) -> tuple[str, ...]:
                           "startups cold[/yellow]")
             return ()
     return published_kinds(gpus, exists)
+
+
+def local_index_summary(config: Path, cfg) -> Path | None:
+    """The index summary ``flora run --local`` left in the default local store
+    (``<config dir>/flora-local-store``) for the config's job or its fake-models twin
+    (``<project>.fake``), or ``None``."""
+    from flora_deploy.cli._jobref import local_store_dir
+    from flora_deploy.jobs.indexing import summary_path
+    from flora_deploy.jobs.store import fake_job_id
+
+    root = local_store_dir(config)
+    for jid in dict.fromkeys((cfg.project, fake_job_id(cfg.project))):
+        p = root / summary_path(jid)
+        if p.is_file():
+            return p
+    return None
+
+
+def no_workload_message(config: Path, cfg, index: Path) -> str:
+    """Why ``flora plan`` has no workload, and the free command that writes one. A config whose
+    input is a local directory gets ``flora run --local --fake-models``: ``flora index --local``
+    writes its receipts to ``output.sink``, which for a ``volume://`` sink creates a Modal
+    Volume."""
+    alt = "or give --index FILE or --video-hours H [--episodes N]"
+    if cfg.input.repo is None:
+        p = Path(str(cfg.input.path)).expanduser()
+        missing = not (p if p.is_absolute() else config.parent / p).exists()
+        cmd = "flora run --local --fake-models" + (
+            " --sample-data" if missing and cfg.input.format in ("mp4_dir", "lerobot_v3")
+            else "") + ("" if config == Path("flora.yaml") else f" --config {config}")
+        return (f"no workload: {index} not found, and no `flora run --local` index in "
+                f"{config.parent / 'flora-local-store'}. Run `{cmd}` first (free: it indexes "
+                f"the dataset on this machine), {alt}")
+    return (f"no workload: {index} not found. Run `flora index` first (it writes it; "
+            f"`flora index --local` indexes on this machine instead of Modal containers), {alt}")
 
 
 def _cameras_from_config(cfg) -> int:
@@ -277,9 +338,13 @@ def plan(
 
             index = default_index_summary(config)
             if not index.is_file():
-                raise _fail(f"no workload: {index} not found. Run `flora index` first (it "
-                            "writes it; `flora index --local` runs it here, for free), or give "
-                            "--index FILE or --video-hours H [--episodes N]")
+                found = local_index_summary(config, cfg)
+                if found is None:
+                    raise _fail(no_workload_message(config, cfg, index))
+                index = found
+                if not as_json:
+                    console.print(f"workload: {escape(str(index))} (the index `flora run "
+                                  "--local` wrote)", soft_wrap=True, highlight=False)
         if index is not None:
             workload = WorkloadSummary.from_dict(json.loads(index.read_text(encoding="utf-8")))
         elif video_hours is not None:
@@ -317,15 +382,20 @@ def plan(
     best = recommended(options, certified=certified)
 
     if as_json:
+        def option_json(o) -> dict:
+            # the table's fidelity words (fidelity_label), not the planner's internal state
+            certs = certificate_status(cfg, o, content)
+            return {**o.as_dict(), "certification": fidelity_label(o, certs),
+                    "flags": list(display_flags(o, certs)), "rates": rates_label(o),
+                    "certificates": certs}
+
         typer.echo(json.dumps({
             "workload": {"video_hours": round(workload.video_s / 3600, 3),
                          "episodes": workload.episodes},
             "budget_usd": req.budget_usd, "deadline_s": deadline_s, "max_gpus": req.max_gpus,
             "prices": rates.source, "rates": table.source,
             "recommended": options.index(best) + 1 if best else None,
-            "options": [{**o.as_dict(), "rates": rates_label(o),
-                         "certificates": certificate_status(cfg, o, content)}
-                        for o in options]}, indent=2))
+            "options": [option_json(o) for o in options]}, indent=2))
     else:
         _print_plan(cfg, workload, req, deadline_s, options, best, rates, table, content)
 

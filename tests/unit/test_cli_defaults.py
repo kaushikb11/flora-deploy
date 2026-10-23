@@ -223,7 +223,9 @@ def test_plan_reads_the_index_summary_by_default(tmp_path, monkeypatch):
     shutil.copy(TEMPLATE, tmp_path / "flora.yaml")
     sample_dataset(tmp_path / "videos")
     none = cli.invoke(app, ["plan"])
-    assert none.exit_code == 2 and "flora index" in none.output
+    # a local dataset: the free local run, not `flora index` (it opens the sink's Volume)
+    assert none.exit_code == 2 and "`flora run --local --fake-models`" in " ".join(
+        none.output.split())
     idx = cli.invoke(app, ["index", "--local", "--store", str(tmp_path / "store")])
     assert idx.exit_code == 0, idx.output
     assert default_index_summary(Path("flora.yaml")) == Path("summary.json")

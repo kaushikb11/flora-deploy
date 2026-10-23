@@ -5,7 +5,7 @@ comment of a Python block) is a real command that parses with the real typer sig
 flags exist, its positional arguments fit the command's arguments (count and values), and it
 passes every required option. Every template it names ships; every repo path it mentions
 exists; the config block uses only real keys and validates; the SDK snippet's calls exist; the
-Modal flow deploys. CI runs the quickstart ("Try it in two minutes") block verbatim from the
+Modal flow deploys. CI runs the quickstart ("Try it in a few minutes") block verbatim from the
 built wheel (``scripts/readme_blocks.py``).
 """
 
@@ -38,7 +38,7 @@ GROUP = typer.main.get_command(app)  # typer vendors click: duck-type it below
 
 # The blocks the tests below read, by the heading that contains them (a LookupError names the
 # headings present when one is missing).
-QUICKSTART = TRY_IT_HEADING  # "Try it in two minutes": the block CI runs
+QUICKSTART = TRY_IT_HEADING  # "Try it in a few minutes": the block CI runs
 MODAL_FLOW = "Label your own data"
 CONFIG = "Configuration"
 

@@ -276,10 +276,11 @@ def test_happy_path_updates_everything_consistently_and_is_idempotent(tmp_path, 
     readme = (root / "README.md").read_text()
     cost = readme.split("<!-- wave-h:cost -->")[1].split("<!-- /wave-h:cost -->")[0]
     assert f"${bal_cost:.2f} per video-hour" in cost and "#" not in cost
-    assert f"(`exact`: ${want_ex:.2f})" in cost  # the planner's figure, not this run's
+    # the planner's figure, labelled as the planner's (not this run's), on its own line
+    assert f"`exact` is priced at ${want_ex:.2f} (±" in cost and "planner's rate" in cost
     assert "projection" in cost and "not yet confirmed at scale" in cost
     assert "measured 20" not in cost  # never presented as an at-scale measurement
-    assert 2 <= len(cost.strip().splitlines()) <= 3
+    assert 2 <= len(cost.strip().splitlines()) <= 5
     readme0 = before["README.md"].decode()  # as built: no certificates in this root
     outside = readme0.split("<!-- wave-h:cost -->")
     assert readme.startswith(outside[0]) and readme.endswith(outside[1].split(
