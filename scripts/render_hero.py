@@ -175,8 +175,8 @@ def render(ep: Episode, out: Path, title: str | None = None,
         "font.family": "DejaVu Sans",
     })
     n = len(ep.subtasks)
-    cols = min(n, MAX_COLS)
-    rows = -(-n // cols)
+    rows = -(-n // MAX_COLS)
+    cols = -(-n // rows)  # balance the rows: 5 subtasks are 3 + 2, 6 are 3 + 3
     inner = WIDTH_IN - 2 * MARGIN_IN
     card_w = (inner - GUTTER_IN * (cols - 1)) / cols
     line_h = CAPTION_PT * 1.45 / 72
