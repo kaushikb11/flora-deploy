@@ -2,7 +2,7 @@
 both Captioner engines in one call on the v4 engine (the lab compiles every engine cold: its
 caches are its own, never the deployed workers'), so the certifying plans run the Captioner lab
 as two calls, a baseline call and a plugin call on the Gate A inputs the baseline staged, each
-its own container and deadline. Also: recertify runs d' (J1 + J1w) before d2', J1 publishes its
+its own container and deadline. Also: recertify runs d2' first (then d'), J1 publishes its
 compile cache and J1w (forced cold) does not, and a retry reuses a saved baseline call."""
 
 from __future__ import annotations
@@ -212,7 +212,7 @@ def test_the_lab_stop_rule_uses_the_first_call_it_would_start(split_ctx):
 # --- the projection and the plan -----------------------------------------------------------------
 
 
-def test_recertify_prices_the_captioner_lab_as_two_calls_and_runs_it_after_d():
+def test_recertify_prices_the_captioner_lab_as_two_calls_and_runs_it_first():
     m = wh.offline_manifest(wh.DURATION_HEADROOM, wh.CERT_GOLDEN)
     p = wh.project("lab", m, wh.SPECS[wh.RECERTIFY], reuse=("tempseg",))
     assert [i["gpu"] for i in p.items] == ["L40S", "H100", "H100"]
@@ -230,7 +230,8 @@ def test_recertify_prices_the_captioner_lab_as_two_calls_and_runs_it_after_d():
     v1 = wh.project("lab", wh.offline_manifest(wh.DURATION_HEADROOM))
     assert [i["gpu"] for i in v1.items] == ["L40S", "H100"]
     steps = wh.PLANS[wh.RECERTIFY]
-    assert steps.index("balanced") < steps.index("lab") < steps.index("caption_iso") \
+    assert steps.index("noise_all") < steps.index("lab") < steps.index("balanced") \
+        < steps.index("caption_iso") \
         < steps.index("certify")
 
 
@@ -391,13 +392,13 @@ def test_run_kind_both_is_the_one_call_it_always_was(lab_container):
 # --- the recertify state as 2026-10-23 left it ----------------------------------------------------
 
 
-def test_the_failed_d2_prime_state_runs_d_prime_then_retries_the_lab_as_attempt_2():
+def test_the_failed_d2_prime_state_retries_the_lab_as_attempt_2_before_d_prime():
     """f2 done, d2' attempt 1 failed at its 1131 s client deadline ($1.60, no evidence), d' g e'
-    pending: d' runs next, then d2' as attempt 2 (its own app), and e' stays after g."""
+    pending: d2' runs next as attempt 2 (its own app), then d', and e' stays after g."""
     m = wh.offline_manifest(wh.DURATION_HEADROOM, wh.CERT_GOLDEN)
     projs = wh.plan_projections(wh.RECERTIFY, m)
     st = wh.State("10221548f1b8", 0.0, "x", plan=wh.RECERTIFY)
-    st.cap_override, st.cap_override_plan = 16.40, wh.RECERTIFY
+    st.cap_override, st.cap_override_plan = 16.40, wh.RECERTIFY  # offline: +10% durations
     f2 = st.step("noise_all")
     f2.status = "done"
     f2.attempts.append(wh.Attempt(1.0, "done", tracked_usd=5.87, finished=2.0))
@@ -406,15 +407,15 @@ def test_the_failed_d2_prime_state_runs_d_prime_then_retries_the_lab_as_attempt_
     lab_s.attempts.append(wh.Attempt(3.0, "failed", tracked_usd=1.6043, finished=4.0,
                                      apps=["flora-wh-10221548f1b8-rc-lab-a1"]))
     lab_s.result = {"ok": False, "error": "captioner: client deadline 1131 s"}
-    first = wh.next_decision(st, wh.RECERTIFY, projs)
-    assert first.step == "balanced" and first.action == "run", first.message
-    st.step("balanced").status = "done"
     d = wh.next_decision(st, wh.RECERTIFY, projs)
     assert d.step == "lab" and d.action == "run", d.message
     lab_s.attempts.append(wh.Attempt(5.0))
     ctx = wh.Ctx(st, m, wh.ROOT, spec=wh.SPECS[wh.RECERTIFY], step="lab")
     assert ctx.app_name() == "flora-wh-10221548f1b8-rc-lab-a2"
-    st.step("lab").status = "done"
+    lab_s.status = "done"
+    nxt = wh.next_decision(st, wh.RECERTIFY, projs)
+    assert nxt.step == "balanced" and nxt.action == "run", nxt.message
+    st.step("balanced").status = "done"
     assert wh.next_decision(st, wh.RECERTIFY, projs).step == "caption_iso"
     # its per-attempt cap is the split lab's whole upper: attempt 1's spend is not taken off it
     assert wh.plan_caps(wh.RECERTIFY, projs)["lab"] >= projs["lab"].usd_upper

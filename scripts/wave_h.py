@@ -67,14 +67,14 @@ recorded ones, in this checkout, before any app (:func:`noise_all_check`), so it
 v4 code lands (once it landed the check refuses: f2 is then already done in this state). (b) is
 read from ``reports/wave-h/certified/state.json`` (``--source-state``), never written, so the
 certified run's finished steps keep their records. Then, on the v4 code (``"4" in
-certkey.GENERATOR_VERSIONS``, :func:`require_code_landed`): **d'** J1 + the segment-only J1w,
-**d2'** the Captioner lab only (TempSeg's saved result reused, :func:`run_recert_lab`; after
-d', the certified run's order: the lab still reads the certified run's (d) segments), **g** J2
-+ J2w, **e'** ``flora certify`` v4 (segment: J1 + J1w + noise-12; caption: J2 + J2w +
-noise-12 with the digests, the staged oracle segments, J1's captions reported only, the
-families and (b)'s old noise run as the repeat: :func:`certify_view`). Its jobs, configs and
-apps take the ``rc-`` prefix (:attr:`PlanSpec.job_prefix`): it shares (b)'s run id, work dir
-and store, so none may be (b)'s. Same stop rules, billing watermark and caps rule as
+certkey.GENERATOR_VERSIONS``, :func:`require_code_landed`): **d2'** the Captioner lab only
+(TempSeg's saved result reused, :func:`run_recert_lab`; on the certified run's (d) segments,
+so it needs no d'), **d'** J1 + the segment-only J1w, **g** J2 + J2w, **e'** ``flora
+certify`` v4 (segment: J1 + J1w + noise-12; caption: J2 + J2w + noise-12 with the digests,
+the staged oracle segments, J1's captions reported only, the families and (b)'s old noise
+run as the repeat: :func:`certify_view`). Its jobs, configs and apps take the ``rc-`` prefix
+(:attr:`PlanSpec.job_prefix`): it shares (b)'s run id, work dir and store, so none may be
+(b)'s. Same stop rules, billing watermark and caps rule as
 ``certified``; its global cap is the uppers' sum rounded up to $0.10, never above the
 user-approved :data:`RECERT_GLOBAL_CAP_USD` (f2 included) unless ``--global-cap`` raises it: a
 done f2 counts at its actual cost (spent), the later steps at their uppers.
@@ -223,12 +223,12 @@ PLANS: dict[str, tuple[str, ...]] = {
     # The certified run (module docstring): b, f, d -> (d2 after d, skipped when done) -> e
     # (in this order with --max-parallel 1; b, f and d at once otherwise: CERT_DEPS).
     "certified": ("exact_e2e", "noise", "balanced", "lab", "caption_iso", "certify"),
-    # The stage-isolated re-certification of human (module docstring, "recertify"): f2 -> d'
-    # -> d2' -> g -> e', one after the other, on (b)'s oracle (read from the certified state).
-    # d' before d2' as (d) before (d2) in the certified run. It does not warm the lab: the lab
-    # builds its engines on its own unkeyed caches (balanced_lab.cache_env), J1 publishes to
-    # the keyed balanced-cc/ ones, and the 2026-10-22 certified lab (after (d)) was cold too.
-    "recertify": ("noise_all", "balanced", "lab", "caption_iso", "certify"),
+    # The stage-isolated re-certification of human (module docstring, "recertify"): f2 -> d2'
+    # -> d' -> g -> e', one after the other, on (b)'s oracle (read from the certified state).
+    # The lab first (user's choice, 2026-10-23): it reads the certified run's (d) segments, and
+    # no order warms it (its caches are its own, never J1's keyed balanced-cc/ ones), so a lab
+    # problem shows before J1 is paid for.
+    "recertify": ("noise_all", "lab", "balanced", "caption_iso", "certify"),
 }
 # What each step needs done first (``--max-parallel``; ``_runbook.run_parallel``). The
 # certified plan: (b), (f) and (d) are independent (one data dir, staged once:
@@ -513,7 +513,7 @@ def spec_for(plan: str, embodiment: str = EMBODIMENT) -> PlanSpec:
 # with it every finished step's record (b, f, d, d2, e), is never written; it reads (b) from the
 # certified state, read-only (:func:`oracle_source`), and takes that run's ``run_id``: (b)'s
 # config writes into that run's store and reads that run's staged media. The later steps
-# (PLANS[RECERTIFY]: d' balanced, d2' lab, g caption_iso, e' certify) run on the v4 code: the
+# (PLANS[RECERTIFY]: d2' lab, d' balanced, g caption_iso, e' certify) run on the v4 code: the
 # noise run is all 12 (noise == episodes), the witnesses (b)'s old noise subset (its n- local
 # ids, so (b)'s uids), the J1 witness segment-only, the lab JSON in RECERT_ROOT, and every job,
 # config and app of theirs prefixed ``rc-`` (it shares (b)'s run id and work dir).

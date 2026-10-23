@@ -160,7 +160,7 @@ def test_noise_all_is_priced_as_b_on_all_twelve_and_capped_by_the_rounding_rule(
     # Captioner lab split): over the approved $11.70, so a fresh f2 here is stopped (it runs
     # from main's checkout instead, under main's f2-only cap; this plan then finds it done at
     # its actual cost) ...
-    assert d.action == "stop" and "reserve for balanced, lab, caption_iso" in d.message
+    assert d.action == "stop" and "reserve for lab, balanced, caption_iso" in d.message
     # ... and runs with a raise the user approves
     st.cap_override, st.cap_override_plan = 13.1, wh.RECERTIFY
     d = wh.decide(st, wh.RECERTIFY, "noise_all", projs)
@@ -440,10 +440,10 @@ def v3(monkeypatch):
 
 
 def test_recertify_steps_state_root_and_chain():
-    # d' before d2' (the certified run's order); e' after g
-    assert wh.PLANS[wh.RECERTIFY] == ("noise_all", "balanced", "lab", "caption_iso", "certify")
-    assert wh.plan_deps(wh.RECERTIFY) == {"noise_all": (), "balanced": ("noise_all",),
-                                         "lab": ("balanced",), "caption_iso": ("lab",),
+    # the lab first (the user's choice), e' after g
+    assert wh.PLANS[wh.RECERTIFY] == ("noise_all", "lab", "balanced", "caption_iso", "certify")
+    assert wh.plan_deps(wh.RECERTIFY) == {"noise_all": (), "lab": ("noise_all",),
+                                         "balanced": ("lab",), "caption_iso": ("balanced",),
                                          "certify": ("caption_iso",)}
     assert RC.state == wh.RECERT_ROOT / "state.json" and RC.state.parent != B.state.parent
     assert RC.records.parent == RC.labs == wh.RECERT_ROOT and RC.work == B.work
@@ -769,7 +769,7 @@ def test_dry_run_shows_the_whole_sequence_with_caps_and_the_split(tmp_path, caps
     args, state = _main_args(tmp_path, source, "--dry-run", "--offline")
     assert wh.main(args) == 0
     out = capsys.readouterr().out
-    assert "plan recertify (f2 -> d' -> d2' -> g -> e')" in out
+    assert "plan recertify (f2 -> d2' -> d' -> g -> e')" in out
     for title in ("f2. noise-12", "d2'. Captioner lab", "d'. balanced J1 (12 ep) + segment-only",
                   "g. caption-only isolated J2 (12 ep)", "e'. flora certify (v4)"):
         assert title in out, title
