@@ -68,7 +68,7 @@ DEFAULT_EPISODE_S = 60.0  # assumed mean episode length when only total hours ar
 Certification = Literal["reference", "certified", "needs certificates"]
 # The ``unavailable`` reason (and flag) of a preset without certificates; :func:`with_certificates`
 # removes both from an option whose every pool is certified.
-UNCERTIFIED = "uncertified (not every stage of {preset} is certified for this config)"
+UNCERTIFIED = "not every stage of {preset} is certified for this config"
 # Every "uncertified" flag starts with this (``with_certificates`` drops it).
 _UNCERTIFIED_FLAG = "{preset}: uncertified"
 _UNCERTIFIED_BLOCKED = ("{preset}: uncertified until every stage is certified; set "
@@ -238,9 +238,11 @@ class PlanOption:
 
 
 def episodes_label(k: KindPlan) -> str:
-    """``x4 ep`` (episodes in flight inside one input) or ``x4`` (Modal inputs) for the plan
-    table's GPUs column."""
-    return f" x{k.max_inputs} ep" if k.kind in IN_WORKER_CONCURRENCY else f" x{k.max_inputs}"
+    """``4 episodes each`` (episodes in flight inside one input, per container) or ``4 inputs
+    each`` (Modal inputs per container) for the plan's pools line."""
+    n = k.max_inputs
+    what = "episode" if k.kind in IN_WORKER_CONCURRENCY else "input"
+    return f"{n} {what}{'s' if n != 1 else ''} each"
 
 
 @dataclass(frozen=True)

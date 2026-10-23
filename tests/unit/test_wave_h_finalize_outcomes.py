@@ -124,8 +124,11 @@ def findings(certified=()):
 def test_cost_block_both_or_none_is_one_price(certified):
     block = fin.cost_block(findings(certified))
     assert block.startswith("`balanced` costs about **$5.28 per video-hour** of GPU work (±50%) "
-                            "for segmentation + captioning (`exact`: $36.39),\n")
-    assert len(block.splitlines()) == 3
+                            "for segmentation + captioning,\n")
+    lines = block.splitlines()
+    # the planner's `exact` figure on its own line, labelled as the planner's (not this run's)
+    assert lines[2] == "`exact` is priced at $36.39: the planner's rate (an older measurement)."
+    assert len(lines) == 4
 
 
 def test_cost_block_segment_only_never_prices_certified_captioning():
@@ -140,6 +143,18 @@ def test_cost_block_segment_only_never_prices_certified_captioning():
     assert all(len(line) <= 125 for line in lines)
     assert lines[3].startswith("at Modal list prices; a projection from rates")
     assert "`flora plan` shows the all-in estimate" in block
+
+
+def test_cost_block_segment_only_also_names_this_runs_exact_measurement():
+    f = findings(("segment",))
+    f.cost["exact"] = {"usd_per_video_h": 25.35, "uncertainty": 0.41}
+    f.ms = {("exact", "segcap"): SimpleNamespace(n=2, uncertainty=0.41)}
+    lines = fin.cost_block(f).splitlines()
+    assert lines[2] == "or `exact` runs certified segmentation + captioning for $36.39,"
+    assert lines[3].startswith("at Modal list prices; a projection from rates")
+    assert lines[4] == ("The 2026-10-22 validation run measured `exact` at $25.35 (±41%, n=2 "
+                        "jobs), not yet folded into the planner.")
+    assert all(len(line) <= 125 for line in lines)
 
 
 def test_committed_readme_and_limitations_reproduce():

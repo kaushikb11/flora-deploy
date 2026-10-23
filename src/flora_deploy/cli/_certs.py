@@ -67,9 +67,12 @@ def certificate_report(cfg: Any, pools: Mapping[str, str | None], *,
         if st == "reference":
             why = "exact is NVIDIA's reference stack: no certificate needed"
         elif st == "unverified_weights":
-            names = ", ".join(needed_derived(preset, kind))
-            why = (f"no content digest for derived weight(s) {names}: run `flora prepare` "
-                   "(weights.derived) so the certificate key can be computed")
+            names = needed_derived(preset, kind)
+            unchecked = getattr(derived_content, "unchecked", None) or {}
+            reasons = [unchecked[n] for n in names if n in unchecked]
+            why = ("certificate not checked: " + "; ".join(reasons) if reasons else
+                   f"no content digest for derived weight(s) {', '.join(names)}: run `flora "
+                   "prepare` (weights.derived) so the certificate key can be computed")
         elif st == "none":
             why = _why_none(preset, kind, str(gpu), embodiment)
         else:

@@ -76,7 +76,7 @@ def test_plan_json_and_table_label_episode_concurrency(tmp_path):
     assert all(k["episode_concurrency"] is None for k in kinds if k["kind"] != "segcap")
     r = CliRunner().invoke(app, ["plan", "-c", str(cfg_path), *ARGS, "--preset", "exact"])
     assert r.exit_code == 0, r.output
-    assert "x4 ep" in r.output, r.output
+    assert "4 episodes each" in r.output, r.output
 
 
 def test_budget_prices_the_episode_concurrency_rate():

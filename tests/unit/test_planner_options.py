@@ -279,7 +279,7 @@ def test_never_recommends_an_unavailable_option():
         for o in bal:
             why = " ".join(o.unavailable)
             # uncertified, whatever its rates: never recommendable without certificates
-            assert "uncertified" in why, why  # deployable since P1b-1
+            assert "not every stage" in why, why  # deployable since P1b-1
             assert any(f.startswith("unavailable:") for f in o.flags)
             ph = {k.kind for k in o.kinds if k.rate_status == "placeholder"}
             if kinds is not None:
@@ -316,17 +316,18 @@ def test_certified_pools_drop_the_uncertified_reason():
                       max_gpus=10)
     opts = plan_options(req)
     bal = next(o for o in opts if o.preset == "balanced")
-    assert any(u.startswith("uncertified") for u in bal.unavailable)
+    assert any(u.startswith("not every stage") for u in bal.unavailable)
     out = with_certificates(opts, {bal.name})
     cbal = next(o for o in out if o.preset == "balanced")
     assert cbal.certification == "certified"
-    assert not any(u.startswith("uncertified") for u in cbal.unavailable)
+    assert not any(u.startswith("not every stage") for u in cbal.unavailable)
     assert set(cbal.unavailable) == set(bal.unavailable) - {
-        u for u in bal.unavailable if u.startswith("uncertified")}
+        u for u in bal.unavailable if u.startswith("not every stage")}
     assert not any("uncertified until" in f for f in cbal.flags)
     assert with_certificates(opts, set()) == list(opts)  # nothing certified: unchanged
     # once its rates are measured and its workers deploy, the certified, cheaper balanced wins
     ready = [replace(o, rate_status="measured", unavailable=()) if o is cbal else o for o in out]
     assert recommended(ready, certified={bal.name}).preset == "balanced"
-    assert recommended([replace(bal, rate_status="measured", unavailable=tuple(
-        u for u in bal.unavailable if u.startswith("uncertified")))] + opts[1:]).preset == "exact"
+    blocked = tuple(u for u in bal.unavailable if u.startswith("not every stage"))
+    assert recommended([replace(bal, rate_status="measured", unavailable=blocked)]
+                       + opts[1:]).preset == "exact"

@@ -25,7 +25,10 @@ from typing import Annotated, Any
 import typer
 from rich.table import Table
 
-from flora_deploy.cli._app import app, console
+from flora_deploy.cli._app import app, console, term_width
+
+# Below this terminal width the deploy table drops its kind and image columns.
+WIDE_COLUMNS = 100
 
 
 def _fail(msg: str, code: int = 2) -> typer.Exit:
@@ -145,18 +148,32 @@ def _print_plan(plan: Any) -> None:
             if getattr(plan, "fake_models", False) else "")
     console.print(f"[bold]{plan.app_name}[/bold]  (environment {plan.environment}, "
                   f"preset {plan.preset}, store {plan.store.uri}){fake}")
-    t = Table("object", "kind", "gpu", "cpu", "memory MiB", "containers", "inputs", "image")
+    # Below WIDE_COLUMNS the low-value kind / image columns are dropped and cells wrap, so a
+    # standard 80-column terminal shows every value whole (no "Segment…").
+    wide = term_width() >= WIDE_COLUMNS
+    cols = ["object", *(["kind"] if wide else []), "gpu", "cpu", "memory MiB", "containers",
+            "inputs", *(["image"] if wide else [])]
+    t = Table()
+    for c in cols:
+        t.add_column(c, overflow="fold")
     for o in plan.objects:
         mem = "/".join(str(m) for m in o.memory) if isinstance(o.memory, tuple) else str(o.memory)
         containers = ("-" if o.max_containers is None
                       else f"{o.min_containers or 0}..{o.max_containers}")
-        t.add_row(o.name, o.kind if not o.schedule else f"cron {o.schedule}", o.gpu or "-",
-                  f"{o.cpu:g}", mem, containers, str(o.max_inputs or 1), o.image)
+        kind = o.kind if not o.schedule else f"cron {o.schedule}"
+        t.add_row(o.name, *([kind] if wide else []), o.gpu or "-", f"{o.cpu:g}", mem,
+                  containers, str(o.max_inputs or 1), *([o.image] if wide else []))
     console.print(t)
+    if not wide:
+        console.print("  (memory MiB: request/limit; widen the terminal for the kind and image "
+                      "columns, or use --json)", soft_wrap=True)
     for kind, h in plan.stage_hashes.items():
-        console.print(f"  stage hash {kind}: {h}")
+        console.print(f"  stage hash {kind}: {h}", soft_wrap=True)
     for what, why in plan.skipped.items():
-        console.print(f"  [yellow]not deployed[/yellow] {what}: {why}")
+        if what == "index":  # harmless: indexing is its own app, not part of this deployment
+            why = ("indexing runs as its own app (flora-index) when you run `flora index`; it "
+                   "is not part of this deployment")
+        console.print(f"  [yellow]not deployed[/yellow] {what}: {why}", soft_wrap=True)
 
 
 @app.command()
@@ -185,7 +202,8 @@ def deploy(
         "--emit", help="Write the equivalent standalone script here instead of deploying.")
     ] = None,
     dry_run: Annotated[bool, typer.Option(
-        "--dry-run", help="Print the plan; do not contact Modal.")] = False,
+        "--dry-run", help="Print the plan; deploy nothing (it only reads the derived-weight "
+                          "receipts from the flora-weights Volume, read-only).")] = False,
     as_json: Annotated[bool, typer.Option("--json", help="Print the plan as JSON.")] = False,
     fake_models: Annotated[bool, typer.Option(
         "--fake-models", help="Test app: fake engines on CPU workers (no GPU, no weights; "
@@ -201,9 +219,16 @@ def deploy(
     if store is not None and (why := unsupported_sink_message(store)):
         raise _fail(f"store {store!r}: {why}")
     overrides = _receipts(receipt)
+    # A deploy and --dry-run read each derived-weight receipt this machine has not verified
+    # (`flora prepare`) from the flora-weights Volume (free, read-only) to check its content
+    # against the pin, and remember it. --emit contacts no Modal, and when the Volume cannot be
+    # read (offline, no credentials) the receipt is reported as not checked, with the reason.
+    from flora_deploy.config.receipts import read_volume_receipt
+
+    reader = None if (emit is not None or fake_models) else read_volume_receipt
     try:
         cfg, content = load_certified(config, allow_uncertified=allow_uncertified,
-                                      overrides=overrides)
+                                      overrides=overrides, read_receipt=reader)
     except (ConfigError, OSError) as e:
         raise _fail(str(e)) from None
     try:

@@ -57,9 +57,9 @@ def report(job: JobArg = None, store: StoreOpt = None,
        f"{escape(r['app_name'])}")
     vh, per = r["video_hours"], r["usd_per_video_hour"]
     if sp.get("simulated"):
-        from flora_deploy.cli.run import SIMULATED_SPEND
+        from flora_deploy.cli.run import simulated_spend
 
-        _p(SIMULATED_SPEND)
+        _p(simulated_spend(sp.get("total_usd"), sp.get("budget_usd")))
         if sp["containers"]:
             done = all(c["stopped"] for c in sp["containers"])
             _p(f"  containers: {len(sp['containers'])} local stand-ins, "

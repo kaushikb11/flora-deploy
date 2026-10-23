@@ -1354,23 +1354,58 @@ def cost_block(f: Findings) -> str | None:
     if not bal:
         return None
     # README wording (no internal run names): the busy-only figure, said plainly to be
-    # busy-only and a projection; `exact` as `flora plan` prices it, so the two agree. Three
-    # lines of at most ~125 characters (the README's changed lines stay short).
-    tail = (f"at Modal list prices; a projection from rates {projection_basis(f)}.\n"
-            "Startup, idle time and rewards are extra and dominate small jobs: `flora plan` "
+    # busy-only and a projection; `exact` as `flora plan` prices it, so the two agree, on its
+    # own line so the balanced band and job are not read as its own. That figure is the
+    # planner's committed row, not this run's: when this run measured `exact` differently, say
+    # both. Lines of at most ~125 characters (the README's changed lines stay short).
+    basis = f"at Modal list prices; a projection from rates {projection_basis(f)}."
+    tail = ("Startup, idle time and rewards are extra and dominate small jobs: `flora plan` "
             "shows the all-in estimate for your dataset.")
     split = partial_cost(f, bal)
     if split is not None:  # some stages certified, not all: never price them as one certified
         (cert, cert_usd, cert_unc), (unc, unc_usd) = split
         vs = (f",\nor `exact` runs certified segmentation + captioning for "
               f"${ex['usd_per_video_h']:.2f}" if ex else "")
-        return (f"`balanced` costs about **${cert_usd:.2f} per video-hour** of GPU work "
-                f"(±{cert_unc:.0%}) for {and_list(cert)}, which is certified;\n"
-                f"{and_list(unc)} adds about ${unc_usd:.2f} but is not certified (its records say "
-                f"`certified: false`){vs},\n" + tail)
-    vs = f" (`exact`: ${ex['usd_per_video_h']:.2f})" if ex else ""
-    return (f"`balanced` costs about **${bal['usd_per_video_h']:.2f} per video-hour** of GPU "
-            f"work (±{bal['uncertainty']:.0%}) for segmentation + captioning{vs},\n" + tail)
+        lines = [f"`balanced` costs about **${cert_usd:.2f} per video-hour** of GPU work "
+                 f"(±{cert_unc:.0%}) for {and_list(cert)}, which is certified;\n"
+                 f"{and_list(unc)} adds about ${unc_usd:.2f} but is not certified (its records "
+                 f"say `certified: false`){vs},", basis]
+        run = exact_run_line(f, ex) if ex else None
+        if run:  # the planner's `exact` price above is not this run's measurement: say both
+            lines.append(run[0].upper() + run[1:] + ".")
+        return "\n".join([*lines, tail])
+    lines = [f"`balanced` costs about **${bal['usd_per_video_h']:.2f} per video-hour** of GPU "
+             f"work (±{bal['uncertainty']:.0%}) for segmentation + captioning,", basis]
+    if ex:
+        lines.append(exact_cost_line(f, ex))
+    return "\n".join([*lines, tail])
+
+
+def exact_cost_line(f: Any, ex: Mapping[str, Any]) -> str:
+    """The README's `exact` line: the planner's rate (what `flora plan` prices; its committed
+    row, an older measurement) and, when this run measured `exact` more than 10% off it, this
+    run's figure with its band and n, so neither is attributed to the other's job."""
+    rate = " + ".join(f"{t['rate']:g}" for t in ex.get("terms", ()))
+    band = f" (±{ex['uncertainty']:.0%})" if ex.get("uncertainty") is not None else ""
+    line = (f"`exact` is priced at ${ex['usd_per_video_h']:.2f}{band}: the planner's rate "
+            f"({rate + ' GPU-s per video-s, ' if rate else ''}an older measurement)")
+    run = exact_run_line(f, ex)
+    return line + (f";\n{run}" if run else "") + "."
+
+
+def exact_run_line(f: Any, ex: Mapping[str, Any]) -> str | None:
+    """This run's `exact` figure (band, n) when it is more than 10% off the planner's rate
+    ``ex``, worded as not yet folded into the planner; ``None`` otherwise."""
+    run = (getattr(f, "cost", None) or {}).get("exact")
+    if not (run and ex["usd_per_video_h"]
+            and abs(run["usd_per_video_h"] / ex["usd_per_video_h"] - 1) > 0.10):
+        return None
+    m = (getattr(f, "ms", None) or {}).get(("exact", "segcap"))
+    n = f", n={m.n} jobs" if m is not None and m.n else ""
+    when = getattr(f, "date", None)
+    return (f"the {when + ' ' if when else ''}validation run measured `exact` at "
+            f"${run['usd_per_video_h']:.2f} (±{run['uncertainty']:.0%}{n}), not yet folded "
+            "into the planner")
 
 
 def partial_cost(f: Any, bal: Mapping[str, Any]

@@ -151,3 +151,30 @@ def tempseg_pinned(monkeypatch):
         pin = replace(pin, content_sha256="c" * 64)
         monkeypatch.setitem(DERIVED_PINS_BY_KEY, "tempseg-merged", pin)
     return pin
+
+
+@pytest.fixture(autouse=True)
+def _trusted_receipts(request, monkeypatch, tmp_path_factory):
+    """Most tests record made-up derived-weight receipts (``"c" * 64``) and mean "the pinned
+    build". ``config.receipts.derived_content`` only counts a receipt whose content was
+    checked, so here every receipt reads as verified with its pinned content, and the
+    verified-receipt cache is a per-test temp file. Mark a test ``real_receipts`` to keep the
+    real check (test_receipt_verification.py)."""
+    from flora_deploy.config import receipts
+
+    monkeypatch.setenv(receipts.RECEIPT_CACHE_ENV,
+                       str(tmp_path_factory.mktemp("receipts") / "verified-receipts.json"))
+
+    def no_modal(name):  # tests never read the real flora-weights Volume; mock it to test it
+        raise ConnectionError("tests do not contact Modal")
+
+    monkeypatch.setattr(receipts, "read_volume_receipt", no_modal)
+    if request.node.get_closest_marker("real_receipts"):
+        return
+    from flora_deploy.config.pins import DERIVED_PINS_BY_KEY
+
+    def trusted(sha, name=None):
+        pin = DERIVED_PINS_BY_KEY.get(receipts.pin_key(name)) if name else None
+        return pin.content_sha256 if pin is not None else None
+
+    monkeypatch.setattr(receipts, "verified_content", trusted)

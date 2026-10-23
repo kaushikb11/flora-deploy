@@ -254,6 +254,7 @@ def _prepare_derived(config: Path, names: list[str], *, force: bool, quiet: bool
         except rc.ReceiptPinMismatch as e:
             row["error"] = str(e)
             continue
+        rc.remember_verified(sha, row["content_sha256"])  # plan / dry-run can trust it now
         row.update(ok=True, status="reused" if s.action == "reuse" else "built")
         found[name] = sha
 

@@ -2,9 +2,20 @@
 
 **Turn robot and human-demonstration videos into training labels, at dataset scale.**
 
-flora-deploy runs NVIDIA's [Flora](https://research.nvidia.com/labs/gear/flora/) models in your own
-[Modal](https://modal.com) account. Point it at a LeRobot dataset or a folder of MP4s and get back,
-for every episode:
+![A human demonstration from the public EgoDex dataset (putting dishes away) split into six numbered subtasks on a timeline, each with a frame and its caption](docs/img/hero.png)
+
+- **NVIDIA's [Flora](https://research.nvidia.com/labs/gear/flora/) models, in your own
+  [Modal](https://modal.com) account.** Subtasks, captions and rewards for a LeRobot dataset or a
+  folder of MP4s, one command per step, scaling to zero when the job ends.
+- **Two presets.** `exact` runs NVIDIA's own code; `balanced` serves the same models with vLLM
+  for less ([limitations](docs/limitations.md)).
+- **Priced before it runs.** `flora plan` estimates the cost of your dataset, `flora run` stops at
+  your budget, and `flora resume` picks up where a job stopped.
+
+The code is Apache-2.0; the Flora models are licensed by NVIDIA for non-commercial research only
+([`NOTICE.md`](NOTICE.md)). No GPU yet? [Try it locally in a few minutes](#try-it-in-a-few-minutes).
+
+For every episode you get:
 
 | Stage | You get | Example |
 |---|---|---|
@@ -16,7 +27,7 @@ for every episode:
 Labels come back as Parquet and/or JSONL (`output.formats`), keyed by episode, ready for pandas
 or 🤗 `datasets`.
 
-## Try it in two minutes
+## Try it in a few minutes
 
 No GPU or Modal account needed. This runs the full pipeline locally with stand-in models, so you
 can see the workflow and the output format before spending anything.
@@ -144,8 +155,10 @@ a finished job actually spent. With `balanced`, segmentation runs on an L40S, ca
 rewards on H100s (`exact` runs segmentation + captioning on an H200).
 
 <!-- wave-h:cost -->
-`balanced` costs about **$5.28 per video-hour** of GPU work (±50%) for segmentation + captioning (`exact`: $36.39),
+`balanced` costs about **$5.28 per video-hour** of GPU work (±50%) for segmentation + captioning,
 at Modal list prices; a projection from rates measured on one 3.9-min job (2026-10-22, n=1), not yet confirmed at scale.
+`exact` is priced at $36.39 (±35%): the planner's rate (6.4 GPU-s per video-s, an older measurement);
+the 2026-10-22 validation run measured `exact` at $25.35 (±41%, n=2 jobs), not yet folded into the planner.
 Startup, idle time and rewards are extra and dominate small jobs: `flora plan` shows the all-in estimate for your dataset.
 <!-- /wave-h:cost -->
 

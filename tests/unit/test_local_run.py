@@ -105,7 +105,7 @@ def test_results_cli_reads_the_composed_outputs(clean):
     lines = [json.loads(x) for x in out.output.splitlines() if x.strip()]
     assert len(lines) == 6 and {x["stage"] for x in lines} == {"caption"}
     table = results_cli(clean.store_root, "reward.terminal")
-    assert table.exit_code == 0 and "6 records" in table.output
+    assert table.exit_code == 0 and "6 episodes" in table.output
 
 
 def test_reruns_are_deterministic_and_resumable(demo, clean, tmp_path):
