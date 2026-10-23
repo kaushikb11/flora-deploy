@@ -2,7 +2,7 @@
 
     python scripts/readme_blocks.py try-it [README.md]
 
-prints the quickstart ("Try it in two minutes") bash block as a shell script without its install
+prints the quickstart ("Try it in a few minutes") bash block as a shell script without its install
 line (``uv tool install ...`` / ``pip install ...``: CI installs the built wheel instead), so CI
 runs exactly the commands the README tells a new user to type (``mkdir``, ``cd``, every
 ``flora`` line) in an empty directory.
@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 README = Path(__file__).resolve().parents[1] / "README.md"
-TRY_IT_HEADING = "Try it in two minutes"  # the quickstart block
+TRY_IT_HEADING = "Try it in a few minutes"  # the quickstart block
 _FENCE = re.compile(r"^```(\w*)\s*$")
 _SPLIT = {"&&", "||", ";", "|"}
 

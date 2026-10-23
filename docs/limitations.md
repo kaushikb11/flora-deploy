@@ -36,8 +36,12 @@ when NVIDIA's own two runs rarely disagree, counted over every episode measured,
 cold containers together, to the nearest episode: 2 of 18 pass. That 10% is a floor. When
 NVIDIA's two runs disagree more often, the limit is 1.5 times their rate: on the `human`
 segmentation certificate they split 1 of 6 episodes differently, so the limit is 25% (5 of 18),
-and `balanced` split 1 of 18. Boundaries and captions must still agree closely on average, in
-the cold container on its own too. Each certificate records its exact thresholds.
+and `balanced` split 1 of 18. The 18 are the certificate's 12 episodes plus its 6-episode cold
+witness (6 of those episodes run again in a container forced to compile cold), counted together;
+"1 of 6" comes from running NVIDIA's pipeline twice on those same 6 episodes (the noise run).
+[`wave-h-report.md`](wave-h-report.md) lists these as 12 episodes and 6 noise episodes.
+Boundaries and captions must still agree closely on average, in the cold container on its own
+too. Each certificate records its exact thresholds.
 It covers only the embodiment, GPU and software it was measured on. Details:
 [`certification.md`](certification.md).
 

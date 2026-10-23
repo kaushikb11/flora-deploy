@@ -1243,14 +1243,38 @@ def cost_block(f: Findings) -> str | None:
     if not bal:
         return None
     # README wording (no internal run names): the busy-only figure, said plainly to be
-    # busy-only and a projection; `exact` as `flora plan` prices it, so the two agree. Three
-    # lines of at most ~125 characters (the README's changed lines stay short).
-    vs = f" (`exact`: ${ex['usd_per_video_h']:.2f})" if ex else ""
-    return (f"`balanced` costs about **${bal['usd_per_video_h']:.2f} per video-hour** of GPU "
-            f"work (±{bal['uncertainty']:.0%}) for segmentation + captioning{vs},\n"
-            f"at Modal list prices; a projection from rates {projection_basis(f)}.\n"
-            "Startup, idle time and rewards are extra and dominate small jobs: `flora plan` "
-            "shows the all-in estimate for your dataset.")
+    # busy-only and a projection; `exact` as `flora plan` prices it, so the two agree, on its
+    # own line so the balanced band and job are not read as its own. That figure is the
+    # planner's committed row, not this run's: when this run measured `exact` differently, say
+    # both. Lines of at most ~125 characters (the README's changed lines stay short).
+    lines = [f"`balanced` costs about **${bal['usd_per_video_h']:.2f} per video-hour** of GPU "
+             f"work (±{bal['uncertainty']:.0%}) for segmentation + captioning,",
+             f"at Modal list prices; a projection from rates {projection_basis(f)}."]
+    if ex:
+        lines.append(exact_cost_line(f, ex))
+    lines.append("Startup, idle time and rewards are extra and dominate small jobs: `flora plan` "
+                 "shows the all-in estimate for your dataset.")
+    return "\n".join(lines)
+
+
+def exact_cost_line(f: Any, ex: Mapping[str, Any]) -> str:
+    """The README's `exact` line: the planner's rate (what `flora plan` prices; its committed
+    row, an older measurement) and, when this run measured `exact` more than 10% off it, this
+    run's figure with its band and n, so neither is attributed to the other's job."""
+    rate = " + ".join(f"{t['rate']:g}" for t in ex.get("terms", ()))
+    rate = f", {rate} GPU-s per video-s" if rate else ""
+    line = (f"`exact` is priced at ${ex['usd_per_video_h']:.2f} (±{ex['uncertainty']:.0%}): the "
+            f"planner's rate ({rate[2:] + ', ' if rate else ''}an older measurement)")
+    run = (getattr(f, "cost", None) or {}).get("exact")
+    if run and ex["usd_per_video_h"] and abs(
+            run["usd_per_video_h"] / ex["usd_per_video_h"] - 1) > 0.10:
+        m = (getattr(f, "ms", None) or {}).get(("exact", "segcap"))
+        n = f", n={m.n} jobs" if m is not None and m.n else ""
+        when = getattr(f, "date", None)
+        line += (f";\nthe {when + ' ' if when else ''}validation run measured `exact` at "
+                 f"${run['usd_per_video_h']:.2f} (±{run['uncertainty']:.0%}{n}), not yet folded "
+                 "into the planner")
+    return line + "."
 
 
 def projection_basis(f: Any) -> str:

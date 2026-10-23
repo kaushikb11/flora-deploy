@@ -96,7 +96,7 @@ jobs:
           test "$code" -eq 3
           uv run flora results --job local-demo.fake --stage caption --store "$demo/faults"
           uv run flora results --job local-demo.fake --stage reward.terminal --store "$demo/faults"
-      # README-as-test: the quickstart ("Try it in two minutes") block exactly as written, through
+      # README-as-test: the quickstart ("Try it in a few minutes") block exactly as written, through
       # `flora results caption`, in an empty directory, with flora-deploy installed from the
       # built wheel into a fresh venv (no dev group, no checkout on the path), as `uv tool
       # install` / `pip install` give a user. Only the install line is replaced (by the wheel);

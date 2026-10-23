@@ -45,9 +45,10 @@ in [`limitations.md`](limitations.md#accuracy-certificates). So:
   `allow_uncertified: true` in `flora.yaml`, or `--allow-uncertified` on `flora deploy` / `flora
   run`. The refusal says either "has no accuracy certificate for ..." (nothing certified) or "is
   not certified for every stage of this config (certified: ...; reference: ...): ..." (partial
-  coverage). With the opt-in, `flora plan` keeps the option's `uncertified` label, ranks it on
-  cost and flags it "balanced: uncertified, allowed by `allow_uncertified: true`"; without it the
-  option is `unavailable`.
+  coverage). With the opt-in, `flora plan` keeps the option's label (`uncertified`, or `partly
+  certified (...)` naming which stages are reference, certified or not certified; the table, the
+  flags and `--json` use the same words), ranks it on cost and flags it "balanced: partly
+  certified (...), allowed by `allow_uncertified: true`"; without it the option is `unavailable`.
 - The uncovered stages' records say `certified: false`. `flora export` refuses uncertified
   records unless you pass `--allow-uncertified` (the `flora.yaml` key does not carry over); the
   choice is recorded in the export's metadata.
