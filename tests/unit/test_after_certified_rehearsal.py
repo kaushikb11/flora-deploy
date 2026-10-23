@@ -26,7 +26,19 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import after_certified as ac  # noqa: E402
 import limitations_status  # noqa: E402
 
-pytestmark = pytest.mark.skipif(R.VERSION != "3", reason="the generator predates rule 3")
+
+@pytest.fixture(autouse=True)
+def no_volume(monkeypatch):
+    """No test here reaches Modal: ``flora results`` (``fetch_records``' default runner) and
+    the audit reads are refused unless a test passes its own runner."""
+    real = ac.fin.fetch_records
+
+    def guarded(paths, st, run=None, **kw):
+        if run is None or run is ac.subprocess.run:
+            pytest.fail("fetch_records would read the Volume (flora results)")
+        return real(paths, st, run=run, **kw)  # a stand-in runner: no audits are read
+
+    monkeypatch.setattr(ac.fin, "fetch_records", guarded)
 
 EMBODIMENTS = ("human", "yam", "yam32", "dex", "tianji")
 
@@ -143,10 +155,11 @@ def test_human_then_yam_lists_both(human, tmp_path, capsys):
 # A partly certified run: segment certified, caption fail (the real human run, 2026-10-22)
 
 
-def _partial(tmp_path, *, record_fail: bool = True) -> A.AfterFake:
-    """The witness's captions all differ, so caption fails and only segment certifies. The
-    runbook records each stage's verdict in the certify step (``wave_h.run_certify``)."""
-    f = A.build(tmp_path, R.Options(witness_drift="caption"))
+def _partial(tmp_path, *, record_fail: bool = True, plan: str = "certified") -> A.AfterFake:
+    """The caption witness's (J2w) captions all differ, so caption fails and only segment
+    certifies. The runbook records each stage's verdict in the certify step
+    (``wave_h.run_flora_certify``). ``plan``: the certified or the recertify layout."""
+    f = A.build(tmp_path, R.Options(iso_witness_drift=True), plan=plan)
     if record_fail:
         st = json.loads(f.state.read_text(encoding="utf-8"))
         st["steps"]["certify"]["status"] = "failed"
@@ -158,20 +171,23 @@ def _partial(tmp_path, *, record_fail: bool = True) -> A.AfterFake:
     return f
 
 
-def test_a_partial_run_flips_only_segment(tmp_path, capsys):
-    f = _partial(tmp_path)
-    assert run(f) == ac.OK  # the dry run
+@pytest.mark.parametrize("plan", ["certified", "recertify"])
+def test_a_partial_run_flips_only_segment(tmp_path, capsys, plan):
+    """Outcome (b) of the v4 pre-registration: segment certified, caption fail. Only the
+    segment certificate (and its lock) lands; caption stays uncertified."""
+    f = _partial(tmp_path, plan=plan)
+    extra = ("--plan", plan)
+    assert run(f, *extra) == ac.OK  # the dry run
     out = capsys.readouterr().out
     assert ("Verdict: segment certified, caption fail (divergence_above_noise_floor; no "
             "certificate, it stays uncertified).") in out
-    assert run(f, "--write") == ac.OK
+    assert run(f, *extra, "--write") == ac.OK
     capsys.readouterr()
     readme = (f.root / "README.md").read_text()
     lim = (f.root / "docs" / "limitations.md").read_text()
-    assert ac.block(readme, "certified") == (
-        "Accuracy certificates: segmentation for `human` data (`L40S`).\n"
-        "Rewards run NVIDIA's own engine, as `exact` does, and need none. Everything else runs "
-        "uncertified.")
+    certified = ac.block(readme, "certified")
+    assert certified.startswith("Accuracy certificates: segmentation for `human` data (`L40S`).")
+    assert "captioning for" not in certified
     assert "Certified today: segmentation for `human` data (`L40S`)." in \
         ac.block(readme, "allow-uncertified")
     rows = limitations_rows(lim)
@@ -179,6 +195,32 @@ def test_a_partial_run_flips_only_segment(tmp_path, capsys):
     assert "Certified today: `segment` for `human`.\n" in lim
     certs = [json.loads(p.read_text()) for p in f.cert_dir.glob("cert_*.json")]
     assert [(c["stage"], c["verdict"]) for c in certs] == [("segment", "certified")]
+    locks = list((f.cert_dir / "freeze").glob("*.json"))
+    assert [q.stem for q in locks] == [certs[0]["id"]]
+
+
+def test_a_recertify_run_certifies_both_stages_from_its_own_layout(tmp_path, capsys):
+    """Outcome (a), the recertify layout: its state on the certified run's id, f2 as the noise
+    run, (b)'s oracle and old noise run from the certified state (``wave_h.certify_view``),
+    the lab JSON beside its state; no record is missing, so nothing is exported."""
+    f = A.build(tmp_path, plan="recertify")
+    assert f.run_root.name == "recertified"
+    assert run(f, "--plan", "recertify") == ac.OK
+    out = capsys.readouterr().out
+    assert "Verdict: caption certified, segment certified." in out
+    assert "exporting the records" not in out and "cert_check: PASS" in out
+    assert run(f, "--plan", "recertify", "--write") == ac.OK
+    capsys.readouterr()
+    certs = sorted((json.loads(p.read_text()) for p in f.cert_dir.glob("cert_*.json")),
+                   key=lambda c: c["stage"])
+    assert [(c["stage"], c["verdict"]) for c in certs] == [("caption", "certified"),
+                                                           ("segment", "certified")]
+    assert certs[0]["scoring"] == {"caption": "stage_isolated"}
+    assert ac.block((f.root / "README.md").read_text(), "certified").startswith(
+        "Accuracy certificates: segmentation and captioning for `human` data")
+    # a recertify state is not read as a certified run, nor the other way round
+    assert run(f) == ac.USAGE
+    assert "run under plan 'recertify', not certified" in capsys.readouterr().err
 
 
 def test_a_missing_certificate_without_the_runs_fail_is_still_refused(tmp_path, capsys):

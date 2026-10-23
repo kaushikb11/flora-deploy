@@ -32,6 +32,7 @@ the real workers only print them, and the H0 rehearsal checks them.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import os
 from collections.abc import Callable
@@ -160,9 +161,10 @@ class FakeCaptionJob(_FakeJob):
 
     def __init__(self, *args, segments=None, **kw):
         super().__init__(*args, **kw)
-        from flora_deploy.workers_impl.caption import UpstreamSegments
+        from flora_deploy.workers_impl.caption import segments_for
 
-        self.segments = segments or UpstreamSegments()
+        # pinned oracle segments when the env pins them (as the real worker), else upstream
+        self.segments = segments or segments_for(os.environ)
 
     async def run(self, ref: EpisodeRef, batcher, ctx: ShardContext) -> EpisodeOutcome:
         from flora_deploy.local.engines import _OBJECTS, _VERBS
@@ -173,7 +175,10 @@ class FakeCaptionJob(_FakeJob):
         async with gates.prep():
             with phase("inputs"):
                 seg = await asyncio.to_thread(self.segments, ref, ctx)
-                spans = S.rows_from_record(seg)
+                from flora_deploy.workers_impl.caption import PinnedSegments, pinned_rows
+
+                pinned = isinstance(self.segments, PinnedSegments)
+                spans = pinned_rows(seg) if pinned else S.rows_from_record(seg)
             inp, digest, _duration, _frames = await self._prepare(ref, ctx)
         async with gates.infer(batcher):
             with phase("nvidia"):
@@ -192,8 +197,11 @@ class FakeCaptionJob(_FakeJob):
             rows.append({"start_s": sp["start_s"], "end_s": sp["end_s"], "caption": caption,
                          "status": "complete", "segmentation_provenance": "fake"})
         with phase("records"):
+            prov = self.provenance(inp)
+            if pinned:
+                prov = dataclasses.replace(prov, segments_from=self.segments.segments_from)
             rec = C.caption_record(rows, uid=ref.uid, dataset=ref.dataset,
-                                   episode_id=ref.episode_id, provenance=self.provenance(inp))
+                                   episode_id=ref.episode_id, provenance=prov)
             audit = {"uid": ref.uid, "stage": "caption", "segments": len(rows), "fake": True,
                      "upstream_engine_hash": seg.provenance.engine_hash,
                      "instruction": inp.instruction}

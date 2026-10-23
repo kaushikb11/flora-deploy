@@ -32,9 +32,11 @@ def _load(name: str):
 
 wh = _load("wave_h")
 rb = sys.modules["_runbook"]
-CERT = wh.PLANS[wh.CERTIFIED]  # exact_e2e, noise, balanced, lab, certify
-UPPER = {"exact_e2e": 4.0, "noise": 2.0, "balanced": 4.5, "lab": 2.3, "certify": 0.0}
-CAPS = {"exact_e2e": 4.2, "noise": 2.15, "balanced": 4.55, "lab": 2.35, "certify": 0.0}
+CERT = wh.PLANS[wh.CERTIFIED]  # exact_e2e, noise, balanced, lab, caption_iso, certify
+UPPER = {"exact_e2e": 4.0, "noise": 2.0, "balanced": 4.5, "lab": 2.3, "caption_iso": 2.9,
+         "certify": 0.0}
+CAPS = {"exact_e2e": 4.2, "noise": 2.15, "balanced": 4.55, "lab": 2.35, "caption_iso": 2.95,
+        "certify": 0.0}
 GCAP = round(sum(CAPS.values()), 2)
 
 
@@ -111,7 +113,8 @@ def _run(st, path, run, *, steps=CERT, deps=None, max_parallel=3, caps=CAPS, gca
 def test_certified_dag_b_f_d_independent_d2_after_d_e_after_all():
     assert wh.plan_deps(wh.CERTIFIED) == {
         "exact_e2e": (), "noise": (), "balanced": (), "lab": ("balanced",),
-        "certify": ("exact_e2e", "noise", "balanced", "lab")}
+        "caption_iso": ("exact_e2e",),  # g captions (b)'s own segment records
+        "certify": ("exact_e2e", "noise", "balanced", "lab", "caption_iso")}
     for plan in ("balanced-only", "full"):  # one chain: nothing runs beside another
         deps = wh.plan_deps(plan)
         steps = wh.PLANS[plan]
@@ -426,11 +429,11 @@ def test_status_shows_running_steps_and_their_reservations():
 
 
 def test_status_next_never_names_a_step_whose_dependency_runs():
-    """b and f done, d running: lab needs d and certify needs everything, so nothing can
+    """b, f and g done, d running: lab needs d and certify needs everything, so nothing can
     start; --status must not say `next: lab: run` (cert_preflight reads that line), nor that
     every step is done."""
     st = rb.State("r", 0.0, "x", plan=wh.CERTIFIED)
-    for n in ("exact_e2e", "noise"):
+    for n in ("exact_e2e", "noise", "caption_iso"):
         st.step(n).status = "done"
     st.step("balanced").status = "running"
     st.step("balanced").attempts.append(rb.Attempt(
@@ -449,10 +452,11 @@ def test_dry_run_prints_wall_clock_sequential_vs_parallel():
     projs = wh.plan_projections(wh.CERTIFIED, m)
     st = rb.State("r", 0.0, "x")
     lines = wh.wall_lines(st, projs, wh.CERTIFIED, CERT, wh.titles(wh.CERTIFIED))
-    assert lines[0] == "  order: b, f, d first; d2 after d; e after b, f, d, d2"
+    assert lines[0] == "  order: b, f, d first; d2 after d; g after b; e after b, f, d, d2, g"
     walls = {n: projs[n].wall_s() for n in CERT}
     seq = sum(walls.values())
-    par = max(walls["exact_e2e"], walls["noise"], walls["balanced"] + walls["lab"])
+    par = max(walls["exact_e2e"] + walls["caption_iso"], walls["noise"],
+              walls["balanced"] + walls["lab"])
     assert rb.wall_clock(CERT, wh.CERT_DEPS, walls, 1) == pytest.approx(seq)
     assert rb.wall_clock(CERT, wh.CERT_DEPS, walls, 3) == pytest.approx(par)
     assert f"sequential {seq / 60:.0f} /" in lines[1] and f"--max-parallel 3 {par / 60:.0f} /" \

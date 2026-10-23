@@ -192,11 +192,13 @@ def test_balanced_needs_certificates_or_explicit_opt_in(monkeypatch, tmp_path):
 
 def _committed_certified(gpu_of: dict[str, str]) -> dict[str, dict]:
     """The committed ``certified`` balanced certificates covering ``human`` on the base
-    config's GPUs, by kind."""
+    config's GPUs, by kind (a retired generator version matches nothing, so it is left out;
+    the drift guard keeps every other committed one matching)."""
     from flora_deploy.validate import certkey
 
     return {c["kind"]: c for c in certkey.load_certificates()
             if c["preset"] == "balanced" and c["verdict"] == "certified"
+            and not certkey.policy_problems(c)
             and "human" in c["covered_pools"] and gpu_of.get(c["kind"]) == c["gpu"]}
 
 
@@ -206,7 +208,10 @@ def test_balanced_refusal_names_the_committed_certificates():
     d = with_(base(), "preset", "balanced")
     gpus = {k: p.gpu for k, p in parse_config(d, allow_uncertified=True).pools().items()}
     certs = _committed_certified(gpus)
-    dc = {n: h for c in certs.values() for n, h in (c.get("derived_weights") or {}).items()}
+    from flora_deploy.validate import certkey
+
+    dc = {n: h for c in certkey.load_certificates()  # the prepared weights' digests
+          for n, h in (c.get("derived_weights") or {}).items()}
     needs = [k for k in gpus if k != "reward.terminal"]  # rewards are the reference
     if all(k in certs for k in needs):
         assert parse_config(d, derived_content=dc).preset == "balanced"
@@ -219,8 +224,10 @@ def test_balanced_refusal_names_the_committed_certificates():
         assert f"(certified: {', '.join(ok)}; reference: reward.terminal)" in msg
     else:
         assert "(reference: reward.terminal)" in msg
-    for k in needs:
-        assert (f"{k} on {gpus[k]}: no certificate" in msg) is (k not in certs), (k, msg)
+    for k in needs:  # a retired (older generator) certificate is for another build
+        named = (f"{k} on {gpus[k]}: no certificate" in msg
+                 or f"{k} on {gpus[k]}: certified for another build" in msg)
+        assert named is (k not in certs), (k, msg)
     assert "allow_uncertified: true" in msg and "--allow-uncertified" in msg
 
 

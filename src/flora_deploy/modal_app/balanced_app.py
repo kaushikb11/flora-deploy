@@ -417,9 +417,11 @@ def build_stage(kind: str, env: Mapping[str, str] = os.environ) -> BalancedStage
         job: Any = SegmentEpisodeJob(SegmentStage(nv, processor), info, inputs)
     else:
         from flora_deploy.stages.caption import CaptionStage
-        from flora_deploy.workers_impl.caption import CaptionEpisodeJob
+        from flora_deploy.workers_impl.caption import CaptionEpisodeJob, segments_for
 
-        job = CaptionEpisodeJob(CaptionStage(nv, processor), info, inputs)
+        # pinned oracle segments (stage-isolated certification) or this job's own
+        job = CaptionEpisodeJob(CaptionStage(nv, processor), info, inputs,
+                                segments=segments_for(env))
     active = apply_accel(nv)
     stats = prefetch.wait(timeout=0) if prefetch is not None else None
     startup = {"kind": kind, "preflight": facts, "marks": marks, "spec": spec.as_json(),
@@ -517,6 +519,15 @@ def _start(kind: str) -> tuple[Any, dict]:
         print(f"balanced {kind} worker refused: {e}", flush=True)
         return (RefusedRunner(e.store, str(e), call_id=modal.current_function_call_id),
                 {"kind": kind, "refused": str(e)})
+    except BaseException as exc:  # no shard ever starts here: tell the orchestrator why
+        from flora_deploy.jobs.attempts import record_startup_failure
+        from flora_deploy.modal_app.workers_app import store_from_env
+
+        try:
+            record_startup_failure(store_from_env(), exc)
+        except Exception:  # noqa: BLE001 - the store itself is broken: nowhere to write it
+            pass
+        raise
 
 
 class SegmentWorker:

@@ -183,6 +183,8 @@ def _extra(d: dict[str, Any], stage: str) -> str | None:
 def flatten(rec: StageRecord, pool: str | None = None) -> list[dict[str, Any]]:
     """Parquet rows of one record (see the module docstring)."""
     d = asdict(rec)
+    if d["provenance"].get("segments_from") is None:  # as StageRecord.to_json
+        d["provenance"].pop("segments_from", None)
     base = {
         "uid": rec.uid, "dataset": rec.dataset, "episode_id": rec.episode_id,
         "stage": rec.stage, "pool": pool, "certified": rec.certified,

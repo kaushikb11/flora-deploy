@@ -1,8 +1,9 @@
 # vLLM engines and the `balanced` segment / caption stages
 
-Status: 2026-10-22. CPU tests, conformance and nvlink tests are green. A first GPU pass ran on
-2026-10-22 (see Results): TempSeg's in-engine checks passed, the Captioner's are still to do, and
-no `balanced` certificate exists yet.
+Status: 2026-10-23. CPU tests, conformance and nvlink tests are green. A first GPU pass ran on
+2026-10-22 (see Results). The Captioner's H100 limits changed on 2026-10-23 (`max_num_seqs` 11,
+worst case 17,920 tokens; "Engine settings"), which re-keys both video stages, so no `balanced`
+certificate matches until the v4 re-certification ([`certification.md`](certification.md)).
 
 Terms used below (maintainer doc):
 
@@ -155,7 +156,12 @@ episode coroutines (one event loop; ≤ 8 preparing, ≤ 64 segment / 32 caption
   NVIDIA's arguments (profile, yam32, instruction source). Caption shards read their episodes'
   `segment` records from the upstream shard's parts, including bisection children, filtered to the
   segment stage key (`JobFiles.accepts("segment")`). The full NVIDIA segment metadata travels in `Segment.nv_metadata`, and
-  `rows_from_record` turns it back into NVIDIA's rows. Both workers are registered in
+  `rows_from_record` turns it back into NVIDIA's rows. A stage-isolated caption-only job
+  (`pipeline.caption_segments`, certification only; [`certification.md`](certification.md))
+  instead reads a pinned, sha256-checked copy of the `exact` oracle's `segment` records
+  (`PinnedSegments`), rebuilds rows from spans and `segmentation_provenance`, and stamps
+  `provenance.segments_from`. Each caption episode audit row carries `input_digests`, one
+  Captioner input digest per caption row (NVIDIA's digest rule, restated in the tap). Both workers are registered in
   `tests/conformance/registry.py` and pass all 10 conformance checks.
 - **Provenance.** The engine label is `vllm-0.24.0-offline` or `…+dtbias`. Records carry the
   model pins, the GPU and the per-camera source. The job's segment / caption **stage hashes**
@@ -186,7 +192,7 @@ processor cache to be off.
 | `mm_processor_kwargs` | `{"fps": 4, "max_frames": 128}` | `{"fps": 8, "max_frames": 40}` |
 | `limit_mm_per_prompt` | `{"image": 0, "video": 3}` | same |
 | `max_model_len` | 32768 | 32768 |
-| `max_num_seqs` / `max_num_batched_tokens` / `gpu_memory_utilization` | L40S 48 / 16384 / 0.90; A100-80GB 48; H100 48; H200 64 (on L40S a full batch of worst-case 5.1k-token requests fits in the cache: room for 55) | H100 16 / 16384 / 0.90 (worst case 10.75k tokens: room for 18); H200 32 |
+| `max_num_seqs` / `max_num_batched_tokens` / `gpu_memory_utilization` | L40S 48 / 16384 / 0.90; A100-80GB 48; H100 48; H200 64 (on L40S a full batch of worst-case 5.1k-token requests fits in the cache: room for 55) | H100 11 / 16384 / 0.90 (worst case 17,920 tokens, 26 blocks each: room for 12 in the estimated 313-block pool); H200 32 |
 | `seed` | 0 | 0 |
 | sampling | greedy, 1024 tokens, `stop_token_ids=[<|im_end|>]` | greedy, 512 tokens, `stop_token_ids=[<|im_end|>]` |
 
@@ -199,8 +205,33 @@ Notes:
   `tokenizer_mode`.
 - The limits are checked at build: `check_mamba_blocks` fails the engine if `max_num_seqs`
   exceeds the Mamba cache blocks vLLM allocated (#49064). TempSeg on the L40S runs 48: 64 would
-  not fit a full batch of worst-case requests (room for 55). The H100 Captioner stays at 16 (room
-  for 18) until a measured run shows a higher value holds.
+  not fit a full batch of worst-case requests (room for 55); its numbers are unchanged.
+- **The H100 Captioner runs 11** (2026-10-23, fixed before the re-certification run; it was 16).
+  The old worst case, 10,752 tokens, was a 1-view figure. The 3-view (yam) caption prompt has a
+  fixed upper bound of 16,811 tokens (12 / 40 / 12 frames of a fixed 768x648 mosaic), so
+  `WORST_CASE_TOKENS["captioner"]` is now **17,920**: that prompt, about 600 tokens of
+  instruction and the 512-token budget. Sixteen such sequences would need about 20 GiB of
+  cache, against a pool of about 15 GiB, and vLLM would preempt.
+- **Block-based fit for the Captioner.** The Qwen3.5 Captioner is a hybrid model (16 attention
+  and 48 Gated DeltaNet layers, in 1 attention and 3 GDN cache groups), and vLLM pads the
+  attention block to one GDN page: 784 tokens per block, 49 MiB per block id. A sequence of `T`
+  tokens takes `ceil(T / 784) + 3` blocks, so 26 at 17,920. `worst_case_fit` is therefore
+  block-granular for the Captioner: `floor(pool_blocks / (ceil(T / 784) + 3))`, with
+  `pool_blocks = floor(15 GiB / 49 MiB) = 313`, which gives 12 >= 11. (The linear `KV_FIT` slope
+  gives 10 at 17,920 and would wrongly fail the `max_num_seqs <= fit` test.) Eleven sequences
+  need 286 blocks: about 9% margin on the estimate, and the build fails closed below 286. 12
+  would have left one block of margin.
+- **Chunked prefill.** `max_num_batched_tokens` 16384 holds every human prompt (at most ~7k) and
+  the 1-view golden worst case (14.7k) in one prefill chunk. 3-view yam prompts reach ~16.8k, so
+  they are **always** prefilled in two chunks; that chunked GDN path is what the yam certificate
+  measures. The limit stays 16384, because changing it moves chunk boundaries (GDN numerics)
+  for every kind, TempSeg included.
+- **Cache evidence on the Volume.** The balanced shard audit row (`shard_audit: true`) now
+  records `cache_blocks`: `num_gpu_blocks`, `block_size`, `blocks_per_seq`, `needed`,
+  `max_num_seqs`, `worst_case_tokens`, `gpu_memory_utilization` and the per-group `groups`
+  (`None` when the engine did not report it). Before, the build check's numbers were only printed
+  to container stdout, so the real H100 pool size was never stored; future limits are chosen
+  from this measured row, not from the estimate.
 - `logprobs_mode` / `max_logprobs` are settable only for the `dt_bias` drift check (Gate A). They change what
   the engine *returns* for logprob requests, not greedy outputs.
 - The startup recipe follows `docs/cold-start.md`: a t=0 `warm.start_prefetch`, then a keyed

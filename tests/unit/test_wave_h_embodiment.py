@@ -98,8 +98,13 @@ def test_yam_spec_has_its_own_episodes_data_dir_and_state():
     assert YAM.name == HUMAN.name == wh.CERTIFIED and YAM.shared_data
     assert YAM.golden == "golden/v3-yam" and YAM.embodiment == "yam"
     assert len(YAM.episodes) >= wh.MIN_CERT_EPISODES
-    assert set(YAM.noise) < set(YAM.episodes)
-    assert len(YAM.noise) == wh.MIN_NOISE_EPISODES + wh.NOISE_SPARES  # the selection's 5 + a spare
+    # v4 (R2): the noise run repeats the oracle on all 12; the cold witnesses keep the
+    # selection's noise subset (5 + a spare) and its n- local ids
+    assert YAM.noise == YAM.episodes and YAM.noise_limit is None
+    assert set(YAM.witness) < set(YAM.episodes) and YAM.witness == wh.CERT_YAM_NOISE
+    assert len(YAM.witness) == wh.MIN_NOISE_EPISODES + wh.NOISE_SPARES
+    assert YAM.witness_limit == len(YAM.witness) and YAM.segment_only_witness
+    assert "caption_iso" in wh.PLANS[wh.CERTIFIED]
     assert wh.balanced_episodes(_manifest(YAM), YAM) == YAM.episodes
     # nothing shared with the human run: state, work dir, records, report, data dir (uids)
     for attr in ("state", "work", "records", "report"):
@@ -113,8 +118,8 @@ def test_yam_spec_has_its_own_episodes_data_dir_and_state():
     assert HUMAN.embodiment == "human" and HUMAN.scale == {}
 
 
-def test_yam_noise_subset_is_what_index_limit_selects(tmp_path):
-    """Three-view episodes are directories; ``flora index --limit 5`` still takes the noise
+def test_yam_witness_subset_is_what_index_limit_selects(tmp_path):
+    """Three-view episodes are directories; ``flora index --limit 6`` still takes the witness
     subset first."""
     from flora_deploy.media.sources.mp4_dir import Mp4DirSource
 
@@ -127,8 +132,8 @@ def test_yam_noise_subset_is_what_index_limit_selects(tmp_path):
     eps = Mp4DirSource(tmp_path).list_episodes()
     assert len(eps) == len(YAM.episodes)
     assert all(len(e.cameras) == 3 for e in eps)
-    first = [e.episode_id for e in eps[:YAM.noise_limit]]
-    assert sorted(first) == sorted(YAM.local_id(g) for g in YAM.noise)
+    first = [e.episode_id for e in eps[:YAM.witness_limit]]
+    assert sorted(first) == sorted(YAM.local_id(g) for g in YAM.witness)
 
 
 def test_stage_local_renames_three_view_directories(tmp_path, monkeypatch):
@@ -306,3 +311,28 @@ def test_yam_certify_step_does_not_run_finalize(tmp_path):
     ctx = wh.Ctx(st, _manifest(YAM), tmp_path, state_path=tmp_path / "s.json", spec=YAM)
     res = wh.run_flora_certify(ctx, finalize=Fin(), sh=lambda *a, **k: calls.append(a))
     assert res["ok"] and calls == [] and "not run for yam" in res["finalize"]
+
+
+def test_yam_noise_is_all_twelve_and_it_runs_the_isolated_caption_steps(no_lab):
+    """v4 (pre-registration §3.3, yam): f on all 12 (no ``--limit``), d's cold witness the
+    segment stage alone, g's J2 (12) and J2w (the 6 witnesses), priced single-pool with the
+    three-view caption scale; the 3-view lab (d2) stays in the plan, skipped when done."""
+    man = _manifest(YAM)
+    dur = wh.durations(man)
+    v = sum(dur[g] for g in YAM.episodes)
+    wv = sum(dur[g] for g in YAM.witness)
+    ps = wh.plan_projections(wh.CERTIFIED, man, spec=YAM, lab_done=True)
+    assert "(12 ep" in ps["noise"].items[0]["what"]
+    assert ps["noise"].usd == ps["exact_e2e"].usd  # the oracle's job, all of it
+    wit = [i for i in ps["balanced"].items if "cold witness" in i["what"]]
+    assert len(wit) == 1 and "segment-only" in wit[0]["what"]
+    n, u = wh.single_pool_seconds("segment", wv, scale=YAM.scale)
+    assert (wit[0]["seconds"], wit[0]["upper_seconds"]) == (round(n, 1), round(u, 1))
+    j2, j2w = ps["caption_iso"].items
+    assert "(12 ep" in j2["what"] and "(6 ep" in j2w["what"] and "3-view" in j2["what"]
+    for item, vs in ((j2, v), (j2w, wv)):
+        n, u = wh.single_pool_seconds("caption", vs, scale=YAM.scale)
+        assert (item["seconds"], item["upper_seconds"]) == (round(n, 1), round(u, 1))
+    assert ps["lab"].usd_upper == 0.0  # lab_done: the optional 3-view lab is skipped
+    assert wh.plan_projections(wh.CERTIFIED, man, spec=YAM)["lab"].usd_upper > 0
+    assert wh.cert_titles(YAM)["caption_iso"].startswith("g. caption-only isolated J2")

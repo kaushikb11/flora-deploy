@@ -190,6 +190,27 @@ class ReferenceWorker:
 
     @modal.enter()
     def load(self) -> None:
+        """``_load``; a startup failure is recorded for the orchestrator before it re-raises
+        (``jobs.attempts.record_startup_failure``): no shard ever starts on this container."""
+        try:
+            self._load()
+        except BaseException as exc:
+            if job_worker_env():
+                from flora_deploy.jobs.attempts import record_startup_failure
+
+                store = getattr(self, "job_store", None)
+                if store is None:
+                    try:
+                        from flora_deploy.modal_app.workers_app import store_from_env
+
+                        store = store_from_env()
+                    except Exception:  # noqa: BLE001 - nowhere to write it
+                        store = None
+                if store is not None:
+                    record_startup_failure(store, exc)
+            raise
+
+    def _load(self) -> None:
         t0 = time.monotonic()
         self.started = time.time()
         self.state = "loading"

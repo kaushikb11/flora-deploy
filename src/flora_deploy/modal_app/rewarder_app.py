@@ -319,6 +319,17 @@ def expanded_jobs(nv, jobs: str, variants: int) -> Path:
 class Rewarder:
     @modal.enter()
     def start(self) -> None:
+        """``_start``; as a job worker, a startup failure is recorded for the orchestrator
+        before it re-raises (``workers_app.record_start_failure``)."""
+        try:
+            self._start()
+        except BaseException as exc:
+            from flora_deploy.modal_app.workers_app import record_start_failure
+
+            record_start_failure(exc)
+            raise
+
+    def _start(self) -> None:
         self.started = time.time()
         t0 = time.perf_counter()
         from flora_deploy.modal_app import warm

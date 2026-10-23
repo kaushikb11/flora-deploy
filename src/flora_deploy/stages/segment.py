@@ -189,6 +189,52 @@ def request_digest(prompt: str, videos: Sequence[tuple[Any, Mapping]]) -> str:
     return h.hexdigest()
 
 
+def nvidia_input_digest(processor: Any, captured: CapturedRequest) -> str:
+    """NVIDIA's ``input_tensor_digest`` of a captured model call: the call replayed through the
+    real HF ``processor`` (``nv.capture.replay``: the same prompt, frames and metadata NVIDIA's
+    builder passed), then sha256 over the canonical JSON of ``{name: {dtype, shape, sha256 of
+    the tensor's bytes}}`` for every tensor of the processor's output.
+
+    It is what NVIDIA's ``models.generate`` logs as ``generation_start.input_tensor_digest``
+    for that call on the exact path, so a balanced Captioner call can be proven input-identical
+    to an oracle call (stage-isolated caption certification, ``docs/certification.md``). It
+    changes no output: the model runs on vLLM's own processing of the same captured request.
+
+    LICENSE REVIEW FLAG (PLAN.md §7): restates the digest rule of NVIDIA's ``models.generate``
+    (``batch_utils/models.py``, the ``input_tensors`` / ``input_tensor_digest`` lines).
+    ``tests/nvlink/test_balanced_nvlink.py`` checks it against NVIDIA's own logged digest."""
+    import torch
+
+    from flora_deploy.nv.capture import replay
+
+    inputs = dict(replay(processor, captured))
+    inputs.pop("video_metadata", None)
+    tensors = {k: {"dtype": str(v.dtype), "shape": list(v.shape),
+                   "sha256": hashlib.sha256(
+                       v.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+                   ).hexdigest()}
+               for k, v in inputs.items() if torch.is_tensor(v)}
+    return hashlib.sha256(json.dumps(tensors, sort_keys=True, separators=(",", ":")).encode()
+                          ).hexdigest()
+
+
+@dataclass
+class InputDigests:
+    """NVIDIA input digests of the calls one ``run_tapped`` made (``sentinel -> hex``; None when
+    it could not be computed, with the reason in ``errors``)."""
+
+    processor: Any
+    by_sentinel: dict[str, str | None] = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)
+
+    def add(self, call: TappedCall) -> None:
+        try:
+            self.by_sentinel[call.sentinel] = nvidia_input_digest(self.processor, call.captured)
+        except Exception as exc:  # noqa: BLE001 - evidence only: never fails an episode
+            self.by_sentinel[call.sentinel] = None
+            self.errors.append(f"{type(exc).__name__}: {exc}"[:500])
+
+
 def to_vllm_request(captured: CapturedRequest, n: int) -> VllmRequest:
     d = vllm_prompt(captured)
     videos = tuple((frames, md) for frames, md in d["multi_modal_data"]["video"])
@@ -258,14 +304,19 @@ class CallStats:
 
 async def run_tapped(nv, batcher, fn: Callable[[], Any], *, tokenizer, eos: int,
                      sampling_for: Callable[[TappedCall], Sampling] | None = None,
-                     stats: CallStats | None = None) -> tuple[Any, dict[str, str]]:
+                     stats: CallStats | None = None,
+                     digests: InputDigests | None = None) -> tuple[Any, dict[str, str]]:
     """Run NVIDIA function ``fn`` in a worker thread with generate tapped, send its calls to
     ``batcher`` together, accept the completions in call order. Returns ``(fn's result,
-    {sentinel: text})``; raises the first NVIDIA failure."""
+    {sentinel: text})``; raises the first NVIDIA failure. ``digests``: also compute each call's
+    NVIDIA input digest (:func:`nvidia_input_digest`) into it, in the same worker thread."""
     collector = Collector()
 
     def collect() -> tuple[Any, list[VllmRequest]]:
         out = run_collecting(collector, fn)
+        if digests is not None:
+            for c in collector.calls:
+                digests.add(c)
         # building the requests hashes every frame (request_digest): off the loop (review 6 L5)
         return out, [to_vllm_request(c.captured, i) for i, c in enumerate(collector.calls)]
 

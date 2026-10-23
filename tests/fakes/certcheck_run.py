@@ -7,8 +7,13 @@
   records with the binding provenance (the current ``cert_key``, stage hash, ``nvidia-smi``
   GPU name, embodiment, engine label, model revisions) and, for the balanced vLLM workers,
   ``compile_cache`` and ``engine_preemptions``. 12 oracle episodes (``n-`` noise subset of 6,
-  ``x-`` the rest; uids ``cert-human--<episode id>``), the noise run on the 6, balanced on the
-  12, the cold witness on the 6 (``cold:forced``);
+  ``x-`` the rest; uids ``cert-human--<episode id>``), the noise run on the 6, balanced (J1,
+  end to end) on the 12, its cold witness (J1w, segment only) on the 6 (``cold:forced``);
+- the stage-isolated caption evidence (generator v4): ``records/isolated/human/caption.jsonl``
+  (J2: captions of the oracle's own segments, ``provenance.segments_from``),
+  ``records/isolated_witness/human/caption.jsonl`` (J2w, forced cold), each caption side's
+  ``digests.json`` (a stand-in input digest per captioned row), the staged oracle segment file
+  ``work/oracle-segments/<oracle hash>.jsonl`` and ``families.json``;
 - ``lab/balanced-{tempseg,captioner}.json``: L0 rows, Gate A and the engine-settings hashes;
 - ``certs/<id>.json`` and ``certs/freeze/<id>.json``: written by the **real** generator
   (``validate.certify.certify_stage``, ``write_certificate``, ``certfreeze.write_freeze``), so a
@@ -51,6 +56,7 @@ import cert_check as cc  # noqa: E402
 STAMP = "2026-10-23T00:00:00Z"
 DATA = "cert-human"
 ORACLE_HASH, CAND_HASH = "a" * 64, "b" * 64
+ISO_HASH = "c" * 64  # J2's caption stage hash (caption_segments is in it; the key is J1's)
 GPU_NAME = {"L40S": "NVIDIA L40S", "H100!": "NVIDIA H100 80GB HBM3", "H200": "NVIDIA H200"}
 POOL = {"segment": "L40S", "caption": "H100!"}
 WARM = "warm:92c7ffabd3:0123456789abcdef"
@@ -139,8 +145,9 @@ class Options:
     witness: bool = True
     witness_cache: str = cc.FORCED_COLD
     witness_flips: int = 0  # the first noise episodes' witness records split one subtask
-    witness_drift: str | None = None  # "boundary" (+0.2 s) or "caption" (every caption differs)
-    preemptions: int | None = 0  # on the first balanced record
+    witness_drift: str | None = None  # J1w (segment): "boundary" (+0.2 s) or "nan"
+    iso_witness_drift: bool = False  # every J2w caption differs (caption witness fails)
+    preemptions: int | None = 0  # on the first balanced record (J1 and J2)
     lab_hash: str | None = None  # None: the current engine-settings hash
     gate_requests: int = 6
 
@@ -211,6 +218,19 @@ class Fake:
         fn(rows)
         write_jsonl(self.records(side, stage), rows)
 
+    def digests(self, side: str) -> Path:
+        """The digest JSON of a ``flora certify --digests`` side."""
+        return self.inp.records / cc.DIGEST_DIRS[side] / "human" / cc.DIGESTS_FILE
+
+    def edit_digests(self, side: str, fn: Callable[[dict], None]) -> None:
+        d = json.loads(self.digests(side).read_text(encoding="utf-8"))
+        fn(d)
+        self.digests(side).write_text(json.dumps(d, sort_keys=True) + "\n", encoding="utf-8")
+
+    @property
+    def oracle_segments(self) -> Path:
+        return self.root / "work" / "oracle-segments" / f"{ORACLE_HASH}.jsonl"
+
     def cert_path(self, stage: str) -> Path:
         return self.cert_dir / f"{self.certs[stage]['id']}.json"
 
@@ -244,10 +264,18 @@ class Fake:
         import shutil
 
         shutil.copytree(self.root, dst, dirs_exist_ok=True)
+        state = json.loads((dst / "state.json").read_text(encoding="utf-8"))
+        iso = state["steps"].get("caption_iso", {}).get("result", {})
+        for r in [iso.get("oracle_segments") or {},
+                  *((j.get("oracle_segments") or {}) for j in (iso.get("jobs") or {}).values())]:
+            if r.get("path"):
+                r["path"] = str(dst / Path(r["path"]).relative_to(self.root))
+        (dst / "state.json").write_text(json.dumps(state, indent=1), encoding="utf-8")
         inp = dataclasses.replace(self.inp, run_root=dst, cert_dir=dst / "certs",
                                   lab_dir=dst / "lab", report=dst / "report.md",
                                   records=dst / "records", state=dst / "state.json",
-                                  nv_root=dst / "nv")
+                                  nv_root=dst / "nv",
+                                  families=dst / "families.json" if self.inp.families else None)
         return Fake(dst, inp, copy.deepcopy(self.certs))
 
     def run(self, **kw) -> list[cc.Row]:
@@ -269,6 +297,8 @@ def build(tmp: Path, opts: Options | None = None, *,
             bal.append(record("balanced", stage, e, b, balanced_captions(i, o, len(b)),
                               preemptions=o.preemptions if i == 0 else 0))
         sets["balanced"][stage] = bal
+        if stage == "caption":  # J1w is segment only (v4: J2w is the caption witness)
+            continue
         by_eid = {r["episode_id"]: r for r in bal}
         sets["witness"][stage] = []
         if o.witness:
@@ -281,19 +311,55 @@ def build(tmp: Path, opts: Options | None = None, *,
                         b = b[:2] + [(5.0, 7.0), (7.0, 9.0)]
                     if o.witness_drift == "boundary":
                         b = [(s + 0.2, t + 0.2) for s, t in b]
-                    caps = balanced_captions(i, o, len(b))
-                    if o.witness_drift == "caption":
-                        caps = ["then " + c for c in caps]
                     if o.witness_drift == "nan" and j == 0:  # one boundary not finite
                         b = [b[0], (b[1][0], float("nan")), *b[2:]]
-                    r = record("balanced", stage, e, b, caps)
+                    r = record("balanced", stage, e, b, balanced_captions(i, o, len(b)))
                 r["provenance"]["compile_cache"] = o.witness_cache
                 r["provenance"]["engine_preemptions"] = 0
                 sets["witness"][stage].append(r)
-        for side in cc.SIDES:
-            if side == "witness" and not o.witness:
-                continue
-            write_jsonl(recs / side / "human" / f"{stage}.jsonl", sets[side][stage])
+    for side in ("exact", "noise", "balanced", "witness"):
+        for stage, rows in sets[side].items():
+            if side != "witness" or o.witness:
+                write_jsonl(recs / side / "human" / f"{stage}.jsonl", rows)
+
+    # the stage-isolated caption evidence: the staged oracle segment file, J2 and J2w
+    seg_file = tmp / "work" / "oracle-segments" / f"{ORACLE_HASH}.jsonl"
+    seg_file.parent.mkdir(parents=True, exist_ok=True)
+    seg_bytes = "".join(_stage_record(r).to_json() + "\n"
+                        for r in sets["exact"]["segment"]).encode("utf-8")
+    seg_file.write_bytes(seg_bytes)
+    import hashlib
+
+    segs = {"records": f"volume://flora-store/test/oracle-segments/{ORACLE_HASH}.jsonl",
+            "sha256": hashlib.sha256(seg_bytes).hexdigest(), "oracle_stage_hash": ORACLE_HASH,
+            "path": str(seg_file), "episodes": len(o.episodes), "oracle_job": "wave-h-test-x"}
+    sf = {"sha256": segs["sha256"], "oracle_stage_hash": ORACLE_HASH}
+    iso = []
+    for i, e in enumerate(o.episodes):
+        r = record("balanced", "caption", e, BOUNDS, balanced_captions(i, o, len(BOUNDS)),
+                   preemptions=o.preemptions if i == 0 else 0)
+        r["provenance"].update(config_hash=ISO_HASH, segments_from=dict(sf))
+        iso.append(r)
+    iso_wit = []
+    if o.witness:
+        by_eid = {r["episode_id"]: r for r in iso}
+        for e in o.noise:
+            r = copy.deepcopy(by_eid[e])
+            if o.iso_witness_drift:
+                for s in r["segments"]:
+                    s["caption"] = "then " + s["caption"]
+            r["provenance"]["compile_cache"] = o.witness_cache
+            r["provenance"]["engine_preemptions"] = 0
+            iso_wit.append(r)
+        write_jsonl(recs / "isolated_witness" / "human" / "caption.jsonl", iso_wit)
+    write_jsonl(recs / "isolated" / "human" / "caption.jsonl", iso)
+    digests = {"exact": sets["exact"]["caption"], "noise": sets["noise"]["caption"],
+               "balanced": iso, **({"witness": iso_wit} if o.witness else {})}
+    for side, rows in digests.items():
+        p = recs / cc.DIGEST_DIRS[side] / "human" / cc.DIGESTS_FILE
+        p.write_text(json.dumps(digests_of(rows), sort_keys=True) + "\n", encoding="utf-8")
+    families = {uid(e): ("n-egodex" if e.startswith("n-") else "x-wgo") for e in o.episodes}
+    (tmp / "families.json").write_text(json.dumps(families, sort_keys=True), encoding="utf-8")
 
     labs = tmp / "lab"
     labs.mkdir(parents=True, exist_ok=True)
@@ -308,19 +374,28 @@ def build(tmp: Path, opts: Options | None = None, *,
         l0 = {"kind": lab["kind"], "baseline": {"gpu": POOL[stage], "l0": lab["baseline"]["l0"]},
               "gate_a": lab["gate_a"], "engine_hashes": lab["engine_hashes"]}
         kw: dict[str, Any] = {}
-        if SUPPORTS_WITNESS and o.witness:
+        cand = sets["balanced"][stage]
+        if stage == "caption":  # v4: what wave_h_finalize.isolated_inputs passes
+            cand = iso
+            kw.update(digests={k: digests_of(v) for k, v in digests.items()},
+                      oracle_segments=seg_file,
+                      reported_e2e=[_stage_record(r) for r in sets["balanced"][stage]],
+                      families=families)
+            if o.witness:
+                kw["witness"] = [_stage_record(r) for r in iso_wit]
+        elif SUPPORTS_WITNESS and o.witness:
             kw["witness"] = [_stage_record(r) for r in sets["witness"][stage]]
         doc = key("balanced", stage)
         cert = CY.certify_stage(
             stage, exact=[_stage_record(r) for r in sets["exact"][stage]],
-            balanced=[_stage_record(r) for r in sets["balanced"][stage]],
+            balanced=[_stage_record(r) for r in cand],
             noise=[_stage_record(r) for r in sets["noise"][stage]], engine_spec=doc,
             gpu=POOL[stage], preset="balanced", kind=stage, l0=l0, generated_at=STAMP, **kw)
         CY.write_certificate(cert, certs)
         F.write_freeze(cert, doc, certs)
         written[stage] = cert
 
-    state = state_doc(o)
+    state = state_doc(o, segs)
     (tmp / "state.json").write_text(json.dumps(state, indent=1), encoding="utf-8")
     (tmp / "report.md").write_text(report_text(state, written), encoding="utf-8")
 
@@ -331,8 +406,22 @@ def build(tmp: Path, opts: Options | None = None, *,
         (d / "prompts.txt").write_text(f"{k}: {FAKE_NV}\n", encoding="utf-8")
 
     inp = cc.Inputs(run_root=tmp, cert_dir=certs, lab_dir=labs, report=tmp / "report.md",
-                    nv_root=nv, drift_runner=drift_runner)
+                    nv_root=nv, drift_runner=drift_runner, families=tmp / "families.json")
     return Fake(tmp, inp, written)
+
+
+def row_digest(u: str, seg: dict[str, Any]) -> str:
+    """A stand-in for NVIDIA's input digest of a Captioner call: a function of the episode and
+    the row's bounds (two runs on the same segments agree; a moved boundary does not)."""
+    import hashlib
+
+    return hashlib.sha256(f"{u}|{seg['start_s']:.6f}|{seg['end_s']:.6f}".encode()).hexdigest()
+
+
+def digests_of(rows: list[dict[str, Any]]) -> dict[str, list[str | None]]:
+    """``{uid: [digest | None per row]}``: a digest for every ``complete`` row."""
+    return {r["uid"]: [row_digest(r["uid"], s) if s.get("status") == "complete" else None
+                       for s in r["segments"]] for r in rows}
 
 
 def attempt(tracked: float, *, budget: float = 1.0, status: str = "done",
@@ -343,13 +432,19 @@ def attempt(tracked: float, *, budget: float = 1.0, status: str = "done",
             "notes": []}
 
 
-def state_doc(o: Options) -> dict[str, Any]:
-    containers = [{"kind": "segment", "gpu": "L40S", "startup_s": 300.0, "busy_s": 60.0,
-                   "seconds": 400.0}, {"kind": "caption", "gpu": "H100!", "startup_s": 320.0,
-                                       "busy_s": 90.0, "seconds": 450.0}]
+def state_doc(o: Options, segs: dict[str, Any]) -> dict[str, Any]:
+    seg_c = {"kind": "segment", "gpu": "L40S", "startup_s": 300.0, "busy_s": 60.0,
+             "seconds": 400.0}
+    cap_c = {"kind": "caption", "gpu": "H100!", "startup_s": 320.0, "busy_s": 90.0,
+             "seconds": 450.0}
+    containers = [seg_c, cap_c]
+    # J1w is segment only; J2w is the caption witness
     witness = {"human": {"job_id": "wave-h-test-cold-human", "state": "done",
                          "compile_cache": "off", "episodes": len(o.noise),
-                         "containers": containers}} if o.witness else {}
+                         "stages": ["segment"], "containers": [seg_c]}} if o.witness else {}
+    iso_witness = {"human": {"job_id": "wave-h-test-isocold-human", "state": "done",
+                             "compile_cache": "off", "episodes": len(o.noise),
+                             "stages": ["caption"], "containers": [cap_c]}} if o.witness else {}
     step = {"status": "done", "projected_usd": 1.0, "projected_upper_usd": 2.0,
             "billed_usd": None, "notes": [], "result": {}}
     return {"run_id": "102300000000", "created": 1792690000.0, "billing_since": "2026-10-22",
@@ -367,6 +462,12 @@ def state_doc(o: Options) -> dict[str, Any]:
                     "witness_jobs": witness}},
                 "lab": {**step, "attempts": [attempt(0.3, budget=1.5, report_error=True,
                                                      status="failed"), attempt(0.6)]},
+                "caption_iso": {**step, "attempts": [attempt(0.0)], "result": {
+                    "jobs": {"human": {"cfg": None, "state": "done", "job_id": "wave-h-test-iso",
+                                       "stages": ["caption"],
+                                       "stage_hashes": {"caption": ISO_HASH},
+                                       "oracle_segments": dict(segs), "containers": [cap_c]}},
+                    "witness_jobs": iso_witness, "oracle_segments": dict(segs)}},
                 "certify": {**step, "attempts": [attempt(0.0)]}}}
 
 

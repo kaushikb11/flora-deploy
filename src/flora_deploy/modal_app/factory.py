@@ -508,6 +508,30 @@ def balanced_env(cfg: Any, kinds: list[str], pools: Mapping[str, PoolSettings],
                                              sort_keys=True)}
 
 
+def caption_segments_env(cfg: Any, st: StoreSpec) -> dict[str, str]:
+    """``workers_impl.caption.CAPTION_SEGMENTS_ENV`` of a stage-isolated caption job
+    (``pipeline.caption_segments``): the staged oracle segment file's key in the job store, its
+    sha256 and the oracle stage hash. The file must be inside the job store (same Volume or
+    bucket, under its root). Empty for every other job."""
+    from flora_deploy.workers_impl.caption import CAPTION_SEGMENTS_ENV
+
+    cs = getattr(cfg.pipeline, "caption_segments", None)
+    if cs is None:
+        return {}
+    try:
+        rec = parse_store(cs.records, bucket_secret=st.secret or DEFAULT_BUCKET_SECRET)
+    except DeployError as e:
+        raise DeployError(f"pipeline.caption_segments.records: {e}") from None
+    same = (rec.kind, rec.volume, rec.bucket) == (st.kind, st.volume, st.bucket)
+    prefix = f"{st.root}/" if st.root else ""
+    if not same or not rec.root.startswith(prefix) or rec.root == st.root:
+        raise DeployError(f"pipeline.caption_segments.records {cs.records!r} is not a file in "
+                          f"the job store {st.uri!r}: stage it there")
+    return {CAPTION_SEGMENTS_ENV: json.dumps({"key": rec.root[len(prefix):], "sha256": cs.sha256,
+                                              "oracle_stage_hash": cs.oracle_stage_hash},
+                                             sort_keys=True)}
+
+
 def plan_app(
     cfg: Any,
     *,
@@ -672,6 +696,8 @@ def plan_app(
         if ref.recipe == "balanced":
             env.update(balanced_env(cfg, kinds, rs.pools, derived_receipts or {},
                                     fake_models=fake_models))
+            if "caption" in kinds:
+                env.update(caption_segments_env(cfg, st))
             if pool.max_inputs > 1:
                 raise DeployError(f"{cls_name}: max_inputs {pool.max_inputs} > 1, but a balanced "
                                   "worker runs one shard per container (its episodes run "

@@ -1,10 +1,12 @@
-"""Go / no-go before the certified run (``wave_h.py --plan certified --yes-spend``).
+"""Go / no-go before the certified run (``wave_h.py --plan certified --yes-spend``) or the
+human re-certification (``--plan recertify``).
 
 Usage::
 
     uv run python scripts/cert_preflight.py                     # human (default), text
     uv run python scripts/cert_preflight.py --json              # the same, as JSON
     uv run python scripts/cert_preflight.py --embodiment yam    # golden/v3-yam episodes
+    uv run python scripts/cert_preflight.py --plan recertify    # human phase 2 (d2', d', g, e')
     uv run python scripts/cert_preflight.py --repo ../flora-deploy   # check another checkout
 
 Every check is ``pass``, ``warn`` or ``fail`` and carries a one-line fix. Any ``fail`` is
@@ -22,6 +24,10 @@ match), ``weights`` (``DERIVED_PINS`` match the receipts), ``images`` (the image
 current), ``apps`` (no ``flora*`` app running), ``lab`` (the lab runs, or its saved evidence was
 taken with the current engine settings), ``freeze`` (the certificate freeze guard works) and
 ``budget`` (billed + the plan's upper total fits the project budget with a margin).
+
+``--plan recertify`` (human only) reads that plan instead: its steps (f2, d2', d', g, e'), its
+state and lab JSON (``reports/wave-h/recertified/``), and for the budget the upper total of the
+steps not done (f2 is already billed there). The ``git`` row is the same for every plan.
 
 The plan is read from ``wave_h.py --status --plan certified --json`` when the runbook has it
 (the shared ``scripts/_runbook.py`` ``decide()``); otherwise from ``--status`` text plus the
@@ -52,7 +58,11 @@ ROOT = Path(__file__).resolve().parents[1]
 PROJECT_BUDGET_USD = project_budget_usd()
 MARGIN_USD = 2.0  # kept free on top of the upper projection (billing lags about an hour)
 BILLING_SINCE = "2026-10-20"
-PLAN = "certified"
+PLAN = "certified"  # the default plan
+PLANS = ("certified", "recertify")
+# where each plan's lab JSON lives (wave_h.py: LAB_OUT, and recertify's PlanSpec.lab_dir)
+LAB_DIRS = {"certified": Path("reports") / "wave-h",
+            "recertify": Path("reports") / "wave-h" / "recertified"}
 GOLDEN_VOLUME = "flora-golden"
 GOLDEN = {"human": ("golden/v2", "human"), "yam": ("golden/v3-yam", "yam")}
 LAB_KINDS = ("tempseg", "captioner")
@@ -229,10 +239,13 @@ class PlanInfo:
 
 
 _MONEY = r"\$(-?[0-9.]+)"
-_STEP = re.compile(r"^\s{2}(?P<title>(?P<letter>[a-z0-9][0-9]?)\.\s.*?)\s+\[(?P<status>[^\]]+)\]\s+"
+_STEP = re.compile(r"^\s{2}(?P<title>(?P<letter>[a-z0-9][0-9]?'?)\.\s.*?)\s+"
+                   r"\[(?P<status>[^\]]+)\]\s+"
                    rf"cap {_MONEY}\s+nominal {_MONEY}\s+upper {_MONEY}\s+rule: (?P<rule>.*)$")
 _LETTERS = {"b": "exact_e2e", "f": "noise", "d": "balanced", "d2": "lab", "e": "certify",
-            "a": "preflight", "0": "tempseg"}
+            "a": "preflight", "0": "tempseg", "g": "caption_iso",
+            # recertify (wave_h.cert_titles)
+            "f2": "noise_all", "d2'": "lab", "d'": "balanced", "e'": "certify"}
 
 
 def parse_dry_run(text: str) -> PlanInfo:
@@ -311,39 +324,42 @@ def parse_status_json(doc: Mapping[str, Any]) -> PlanInfo:
         lab_hashes=dict(lab.get(HASH_KEY) or {}))
 
 
-def load_plan(env: Env, embodiment: str = "human") -> tuple[PlanInfo | None, str]:
+def load_plan(env: Env, embodiment: str = "human", plan: str = PLAN
+              ) -> tuple[PlanInfo | None, str]:
     """``--status --json`` when the runbook has it; else ``--status`` text over ``--dry-run``,
-    all for ``embodiment``'s certified plan."""
-    wave, emb = "scripts/wave_h.py", ("--embodiment", embodiment)
-    r = env.py(wave, "--status", "--plan", PLAN, "--json", *emb)
+    all for ``embodiment``'s ``plan`` (recertify: human only, so no ``--embodiment``)."""
+    wave = "scripts/wave_h.py"
+    emb = ("--embodiment", embodiment) if plan == PLAN else ()
+    r = env.py(wave, "--status", "--plan", plan, "--json", *emb)
     if r.rc == 0:
         try:
             return parse_status_json(json.loads(r.out)), ""
         except ValueError:
             pass  # an older --status without JSON output
-    d = env.py(wave, "--plan", PLAN, "--dry-run", *emb)
+    d = env.py(wave, "--plan", plan, "--dry-run", *emb)
     if d.rc != 0:
         return None, f"wave_h.py --dry-run exited {d.rc}: {_tail(d)}"
     p = parse_dry_run(d.out)
-    s = env.py(wave, "--status", "--plan", PLAN, *emb)
+    s = env.py(wave, "--status", "--plan", plan, *emb)
     if s.rc == 0:
         parse_status_text(s.out, p)
     return p, ""
 
 
-def check_plan(env: Env, plan: PlanInfo | None, why: str, embodiment: str) -> Check:
+def check_plan(env: Env, plan: PlanInfo | None, why: str, embodiment: str,
+               plan_name: str = PLAN) -> Check:
     name = "plan"
     if plan is None:
         return Check(name, FAIL, f"the runbook could not be read: {why}",
-                     "run `uv run python scripts/wave_h.py --plan certified --dry-run` and fix "
-                     "what it reports")
+                     f"run `uv run python scripts/wave_h.py --plan {plan_name} --dry-run` and "
+                     "fix what it reports")
     d = asdict(plan)
     caps = ", ".join(f"{s['name']} ${float(s.get('cap') or 0):.2f}" for s in plan.steps)
     held = f"; holding: {' | '.join(plan.held)}" if plan.held else ""
     if plan.embodiment and plan.embodiment != embodiment:
-        return Check(name, FAIL, f"the certified plan runs {plan.embodiment}, not {embodiment}",
-                     f"run the preflight with --embodiment {plan.embodiment}, or add a "
-                     f"{embodiment} certified plan", d)
+        return Check(name, FAIL, f"the {plan_name} plan runs {plan.embodiment}, not "
+                     f"{embodiment}", f"run the preflight with --embodiment {plan.embodiment}, "
+                     f"or add a {embodiment} {plan_name} plan", d)
     if not plan.steps and plan.source == "dry-run":
         return Check(name, FAIL, "the dry run listed no steps (output format changed?)",
                      "update parse_dry_run in scripts/cert_preflight.py, or land --status "
@@ -358,14 +374,15 @@ def check_plan(env: Env, plan: PlanInfo | None, why: str, embodiment: str) -> Ch
     if plan.next_action == "run":
         return Check(name, PASS, head, "", d)
     if plan.next_action == "done":
-        return Check(name, FAIL, "every step of the certified plan is already done",
-                     "nothing to run; read reports/wave-h/certified/ instead", d)
+        return Check(name, FAIL, f"every step of the {plan_name} plan is already done",
+                     f"nothing to run; read {LAB_DIRS[plan_name].as_posix()}/"
+                     f"{'' if plan_name != PLAN else 'certified/'} instead", d)
     if plan.next_action == "wait":
         return Check(name, FAIL, f"{head}: {plan.next_message}",
                      "wait until billing covers the held attempts (the time above), then "
                      "re-run this preflight", d)
     return Check(name, FAIL, f"{head}: {plan.next_message}",
-                 "fix what the stop rule names (`wave_h.py --plan certified --status`); never "
+                 f"fix what the stop rule names (`wave_h.py --plan {plan_name} --status`); never "
                  "raise --global-cap without the user's approval", d)
 
 
@@ -536,7 +553,7 @@ def saved_hash(res: Mapping[str, Any]) -> str | None:
             or (res.get("baseline") or {}).get(HASH_KEY))
 
 
-def check_lab(env: Env, plan: PlanInfo | None) -> Check:
+def check_lab(env: Env, plan: PlanInfo | None, plan_name: str = PLAN) -> Check:
     name = "lab"
     if plan is None:
         return Check(name, FAIL, "plan unknown (see the plan check)", "fix the plan check first")
@@ -551,10 +568,12 @@ def check_lab(env: Env, plan: PlanInfo | None) -> Check:
             current = json.loads(r.out.strip().splitlines()[-1]) if r.rc == 0 else {}
         except (ValueError, IndexError):
             current = {}
-    rerun = f"move reports/wave-h/balanced-<kind>.json aside so the lab re-runs ({PLAN} plan)"
+    lab_dir = LAB_DIRS[plan_name]
+    rerun = (f"move {lab_dir.as_posix()}/balanced-<kind>.json aside so the lab re-runs "
+             f"({plan_name} plan)")
     fails, warns, oks, d = [], [], [], {}
     for kind in LAB_KINDS:
-        p = env.repo / "reports" / "wave-h" / f"balanced-{kind}.json"
+        p = env.repo / lab_dir / f"balanced-{kind}.json"
         try:
             res = json.loads(p.read_text())
         except (OSError, ValueError):
@@ -610,13 +629,18 @@ def billed_total(env: Env, budget: float = PROJECT_BUDGET_USD) -> tuple[float | 
     return (float(m.group(1)), "") if m else (None, _tail(r) or "no TOTAL line")
 
 
-def check_budget(env: Env, plan: PlanInfo | None, *, budget: float, margin: float) -> Check:
+def check_budget(env: Env, plan: PlanInfo | None, *, budget: float, margin: float,
+                 plan_name: str = PLAN) -> Check:
     name = "budget"
     billed, why = billed_total(env, budget)
     if billed is None:
         return Check(name, FAIL, f"billing unreadable: {why}", "check `modal token`, then "
                      "`uv run python scripts/spend.py`")
     upper = None if plan is None else plan.upper
+    if plan_name != PLAN and plan is not None and plan.steps:
+        # recertify: its done steps (f2) are billed already; only the rest can still spend
+        upper = round(sum(float(s.get("upper") or 0) for s in plan.steps
+                          if s.get("status") != "done"), 2)
     if upper is None:
         return Check(name, FAIL, f"billed ${billed:.2f}; the plan's upper total is unknown",
                      "fix the plan check first", {"billed": billed})
@@ -635,18 +659,18 @@ def check_budget(env: Env, plan: PlanInfo | None, *, budget: float, margin: floa
 
 
 def preflight(env: Env, *, embodiment: str = "human", budget: float = PROJECT_BUDGET_USD,
-              margin: float = MARGIN_USD) -> list[Check]:
-    plan, why = load_plan(env, embodiment)
+              margin: float = MARGIN_USD, plan_name: str = PLAN) -> list[Check]:
+    plan, why = load_plan(env, embodiment, plan_name)
     checks: list[Callable[[], Check]] = [
         lambda: check_git(env),
-        lambda: check_plan(env, plan, why, embodiment),
+        lambda: check_plan(env, plan, why, embodiment, plan_name),
         lambda: check_episodes(env, embodiment),
         lambda: check_weights(env),
         lambda: check_images(env),
         lambda: check_apps(env),
-        lambda: check_lab(env, plan),
+        lambda: check_lab(env, plan, plan_name),
         lambda: check_freeze(env),
-        lambda: check_budget(env, plan, budget=budget, margin=margin),
+        lambda: check_budget(env, plan, budget=budget, margin=margin, plan_name=plan_name),
     ]
     out = []
     for i, c in enumerate(checks):
@@ -677,20 +701,27 @@ def render(checks: Sequence[Check]) -> str:
 def main(argv: list[str] | None = None, env: Env | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--embodiment", choices=tuple(GOLDEN), default="human")
+    ap.add_argument("--plan", choices=PLANS, default=PLAN,
+                    help="certified (default) or recertify (human: its state and lab JSON "
+                         "under reports/wave-h/recertified/)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--repo", type=Path, default=None, help="checkout to check (default: this)")
     ap.add_argument("--budget", type=float, default=PROJECT_BUDGET_USD,
                     help=f"project budget in USD (default: ${BUDGET_ENV}, else 50)")
     ap.add_argument("--margin", type=float, default=MARGIN_USD)
     args = ap.parse_args(argv)  # a usage error exits 2
+    if args.plan != PLAN and args.embodiment != "human":
+        ap.error(f"--plan {args.plan} is human only")
     if args.repo is not None and not (args.repo / "scripts" / "wave_h.py").is_file():
         ap.error(f"--repo {args.repo}: no scripts/wave_h.py there")
     env = env or Env()
     if args.repo is not None:
         env.repo = args.repo.resolve()
-    checks = preflight(env, embodiment=args.embodiment, budget=args.budget, margin=args.margin)
+    checks = preflight(env, embodiment=args.embodiment, budget=args.budget, margin=args.margin,
+                       plan_name=args.plan)
     if args.json:
         print(json.dumps({"verdict": verdict(checks), "embodiment": args.embodiment,
+                          "plan": args.plan,
                           "checks": [asdict(c) for c in checks]}, indent=2, default=str))
     else:
         print(render(checks))

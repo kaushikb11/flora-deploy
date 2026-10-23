@@ -743,7 +743,10 @@ class BalancedShardRunner:
                                "batcher": dict(self.last_stats), "gates": dict(self.last_gates),
                                "preemptions": (p1 - p_shard if p1 is not None
                                                and p_shard is not None else None),
-                               "compile_cache": self._cache_identity()}
+                               "compile_cache": self._cache_identity(),
+                               # the build's cache block facts (check_mamba_blocks), persisted
+                               # with the shard so future limits rest on measured counts
+                               "cache_blocks": getattr(self.engine, "cache_blocks", None)}
         if self.sampler is not None:
             try:
                 self.sampler.sample()

@@ -52,9 +52,18 @@ CERT_LOGIC_SCHEMA = "flora-cert-logic/v1"
 CERT_DIR = Path(__file__).resolve().parent.parent / "config" / "certificates"
 VERDICTS = ("certified", "provisional", "fail")
 GENERATOR = "flora-certify"
-# generator versions whose certificates matching() accepts; "3" (review 13): count-bounded
-# floors, spares, preemption and compile-cache evidence, the engine-hash-bound L0
-GENERATOR_VERSIONS = ("3",)
+# generator versions whose certificates matching() accepts. "3" (review 13): count-bounded
+# floors, spares, preemption and compile-cache evidence, the engine-hash-bound L0. "4" (caption
+# pre-registration, 2026-10-23): caption certificates are stage-isolated (the candidate captions
+# the oracle's own segments, every call input-identical; end-to-end metrics reported only), the
+# noise run covers every oracle episode. Older versions are retired: they match nothing and the
+# drift guard reports them as ``retired`` (validate/certfreeze.py), not as errors.
+GENERATOR_VERSIONS = ("4",)
+RETIRED_GENERATOR_VERSIONS = ("1", "2", "3")
+# v4 caption certificates: the scoring they must declare and the only metrics they may gate on.
+CAPTION_SCORING = "stage_isolated"
+CAPTION_GATED_METRICS = ("caption_mismatch", "caption_edit_distance",
+                         "caption_similarity_divergence")
 
 # ``provenance.certificate`` values of records made by fake engines (``local/engines.py``).
 FAKE_CERTIFICATES = frozenset({"fake-models", "local-fake-models"})
@@ -403,6 +412,8 @@ def policy_problems(cert: Mapping[str, Any]) -> list[str]:
         out += floor_problems(th)
     except (KeyError, TypeError, ValueError, AttributeError):
         return [*out, "thresholds missing or malformed"]
+    if cert.get("stage") == "caption":
+        out += caption_policy_problems(cert)
     if cert.get("verdict") != "certified":
         return out
     metrics = cert.get("metrics") or {}
@@ -476,6 +487,33 @@ def _count_flip_problems(metrics: Mapping[str, Any], cand: Mapping[str, Any],
     return out
 
 
+def caption_policy_problems(cert: Mapping[str, Any]) -> list[str]:
+    """v4 caption rules: stage-isolated scoring declared, input identity shown for the
+    candidate and the witness, and only the isolated caption metrics gate (no ``count_mismatch``
+    and nothing from ``metrics.reported``)."""
+    out = []
+    if (cert.get("scoring") or {}).get("caption") != CAPTION_SCORING:
+        out.append(f"caption certificate is not scored {CAPTION_SCORING!r}")
+    ii = cert.get("input_identity") or {}
+    if (ii.get("candidate") or {}).get("status") != "pass":
+        out.append("caption candidate input identity not shown (input_identity.candidate)")
+    if (cert.get("metrics") or {}).get("witness") is not None and \
+            (ii.get("witness") or {}).get("status") != "pass":
+        out.append("caption witness input identity not shown (input_identity.witness)")
+    for ch in cert.get("checks") or ():
+        m = (ch or {}).get("metric")
+        if m == COUNT_METRIC:
+            out.append("caption checks gate count_mismatch (the segment certificate does)")
+        elif m not in CAPTION_GATED_METRICS:
+            out.append(f"caption check on {m!r}, which is not a gated caption metric")
+    for block in [*((cert.get("metrics") or {}).get("candidate") or {}).values(),
+                  (cert.get("metrics") or {}).get("witness")]:
+        extra = sorted(set((block or {}).get("means") or {}) - set(CAPTION_GATED_METRICS))
+        if extra:
+            out.append(f"caption means carry ungated metrics {extra}")
+    return out
+
+
 def floor_problems(th: Mapping[str, Any]) -> list[str]:
     """Why a certificate's recorded floors are not :data:`POLICY`'s (its ``noise_floor``,
     ``absolute_floor`` and each ``per_metric`` ``floor`` / ``absolute_floor``)."""
@@ -531,6 +569,31 @@ def matching(preset: str, pools: Mapping[str, Any], *,
             out[kind] = sorted(ok, key=lambda c: (c["generated_at"], VERDICTS.index(c["verdict"]),
                                                   c["id"]), reverse=True)
     return out
+
+
+def deciding_for_key(preset: str, kind: str, gpu: str, embodiment: str | None, key: str, *,
+                     cert_dir: Path | None = None) -> dict[str, Any] | None:
+    """The committed certificate that decides (preset, kind, GPU, embodiment) for the stack
+    whose key is ``key`` (the sha256 of a record's ``provenance.cert_key``), by
+    :func:`matching`'s rule (newest; ``fail`` before ``provisional`` before ``certified``;
+    a certified / provisional one must meet the policy). None when none applies."""
+    if not embodiment:
+        return None
+    ok = [c for c in load_certificates(cert_dir)
+          if c.get("preset") == preset and c.get("kind") == kind and c.get("gpu") == gpu
+          and _covers(c, embodiment) and c.get("engine_spec_hash") == key
+          and (c["verdict"] == "fail" or not policy_problems(c))]
+    if not ok:
+        return None
+    return max(ok, key=lambda c: (c["generated_at"], VERDICTS.index(c["verdict"]), c["id"]))
+
+
+def certified_for_key(preset: str, kind: str, gpu: str, embodiment: str | None, key: str, *,
+                      cert_dir: Path | None = None) -> str | None:
+    """The id of the deciding certificate (:func:`deciding_for_key`) when it is ``certified``,
+    else None: what makes a non-reference record ``certified: true``."""
+    c = deciding_for_key(preset, kind, gpu, embodiment, key, cert_dir=cert_dir)
+    return c["id"] if c is not None and c["verdict"] == "certified" else None
 
 
 REFERENCE_PRESET = "exact"

@@ -54,6 +54,39 @@ class CertStamp:
     cert_key: Mapping[str, Any] | None = None
     gpu: str | None = None  # the nvidia-smi name; a record's own gpu wins
     extra: Mapping[str, Any] = field(default_factory=dict)
+    # What a certificate is matched on (:meth:`certify`): the preset, shard kind and pool GPU
+    preset: str | None = None
+    kind: str | None = None
+    pool_gpu: str | None = None
+    cert_dir: Any = None  # the certificate registry (default: the package's)
+
+    def certificate(self) -> str | None:
+        """The id of the committed ``certified`` certificate that decides this stack (its
+        key, preset, kind, pool GPU and embodiment: ``certkey.certified_for_key``), or None."""
+        from flora_deploy.validate.certkey import certified_for_key, sha256_hex
+
+        if self.cert_key is None or not (self.preset and self.kind and self.pool_gpu):
+            return None
+        return certified_for_key(self.preset, self.kind, self.pool_gpu, self.embodiment,
+                                 sha256_hex(dict(self.cert_key)), cert_dir=self.cert_dir)
+
+    def certify(self, rec: StageRecord, envelope_ok: bool | None) -> StageRecord:
+        """A non-reference stack's record (the balanced ``segment`` / ``caption`` workers):
+        ``certified`` by ``records.certification`` (a matching committed certificate **and**
+        an in-envelope episode), ``provenance.certificate`` the certificate id. A record that
+        is not certified keeps its own reason unless the envelope decides it."""
+        from flora_deploy.records import certification
+
+        if rec.uncertified_reason == "fake_models":  # never real labels, whatever matches
+            return rec
+        cert = self.certificate()
+        ok, reason = certification(envelope_ok, stack_certified=cert is not None,
+                                   stack_reason=rec.uncertified_reason or "uncertified_stack")
+        prov = rec.provenance
+        if cert is not None:
+            prov = dataclasses.replace(prov, certificate=cert)
+        return dataclasses.replace(rec, certified=ok, uncertified_reason=reason,
+                                   provenance=prov)
 
     def apply(self, rec: StageRecord) -> StageRecord:
         p = rec.provenance
@@ -105,7 +138,7 @@ def cert_stamp(preset: str, kind: str, pool_gpu: str, *, embodiment: str | None,
                            dtbias_fp32=dtbias_fp32, **key_kw)
     except (CertKeyError, KeyError) as e:
         raise CertStampError(f"{kind}: cannot compute the certification key: {e}") from None
-    return CertStamp(embodiment, doc, gpu)
+    return CertStamp(embodiment, doc, gpu, preset=preset, kind=kind, pool_gpu=pool_gpu)
 
 
 def _read_env(kind: str, env: Mapping[str, str]) -> tuple[str, str, dict[str, Any]]:

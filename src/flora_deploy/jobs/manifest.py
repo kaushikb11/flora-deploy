@@ -26,7 +26,8 @@
   placeholders until measured rates exist (S2 → ``rates.json``).
 * Kinds: exactly the shard kinds in ``settings.pools`` (the config's stages; H2: a rewards-only
   config plans no ``segcap`` shards), in pipeline order. ``caption`` shards ``depends_on`` the
-  ``segment`` shards that hold their episodes.
+  ``segment`` shards that hold their episodes; a caption-only job on pinned oracle segments
+  (``settings.caption_segments``) has no segment shards and its caption shards none.
 * Shard ids are content-addressed (H4): ``<kind>-<16 hex of sha256(kind + sorted uids)>``
   (:func:`shard_id_for`), so re-planning under the same config hash (a re-index that added
   episodes, another ``shard_target_gpu_minutes``) gives a changed shard a new id and an old
@@ -89,8 +90,10 @@ def stages_of(kind: ShardKind) -> tuple[Stage, ...]:
 def kinds_for(settings: RunSettings) -> tuple[ShardKind, ...]:
     """The shard kinds a job plans: those its pools configure (= its stages), pipeline order."""
     kinds = tuple(k for k in ALL_KINDS if k in settings.pools)
-    if "caption" in kinds and "segment" not in kinds:
-        raise ValueError("a caption pool needs a segment pool (captions are per segment)")
+    if ("caption" in kinds and "segment" not in kinds
+            and getattr(settings, "caption_segments", None) is None):
+        raise ValueError("a caption pool needs a segment pool (captions are per segment), "
+                         "unless the job pins the oracle's segments (caption_segments)")
     if not kinds:
         raise ValueError("settings.pools is empty: nothing to plan")
     return kinds
@@ -224,7 +227,7 @@ def build_manifest(
         out = [Shard(shard_id=shard_id_for(kind, uids), kind=kind, episodes=tuple(uids),
                      est_gpu_seconds=round(est, 6))
                for uids, est in packed]
-        if kind == "caption":
+        if kind == "caption" and "segment" in by_kind:  # pinned segments: no upstream shard
             owner = {u: s.shard_id for s in by_kind["segment"] for u in s.episodes}
             out = [replace(s, depends_on=tuple(dict.fromkeys(owner[u] for u in s.episodes)))
                    for s in out]

@@ -162,7 +162,8 @@ def test_balanced_step_runs_the_cold_witness_on_the_noise_subset(tmp_path, monke
     def stage_job(ctx, job, ids, **kw):
         calls.append(("stage", job, tuple(ids)))
         cfg = tmp_path / f"{job}.yaml"
-        cfg.write_text(f"# header\nproject: wave-h-r-{job}\npreset: balanced\n")
+        cfg.write_text(f"# header\nproject: wave-h-r-{job}\npreset: balanced\npipeline:\n"
+                       "  stages: [segment, caption]\n")
         return cfg, f"wave-h-r-{job}"
 
     def index(ctx, cfg, job_id, tag, *, limit=None):
@@ -193,9 +194,11 @@ def test_balanced_step_runs_the_cold_witness_on_the_noise_subset(tmp_path, monke
     cold = f"wave-h-r-cold-{emb}-a1"  # this attempt's own job and app
     assert [c for c in calls if c[0] == "run"] == [
         ("run", main, None), ("run", cold, "off")]
-    assert ("index", cold, len(spec.noise)) in calls
+    assert ("index", cold, len(spec.witness)) in calls  # the witnesses, not the noise run
     wcfg = (tmp_path / f"flora-cold-{emb}.yaml").read_text()
     assert f"project: {cold}\n" in wcfg and "preset: balanced" in wcfg
+    # v4: yam's J1w runs the segment stage alone (the caption witness is g's J2w)
+    assert ("  stages: [segment]\n" in wcfg) == spec.segment_only_witness == (emb == "yam")
     assert "FLORA_COMPILE_CACHE" not in os.environ  # restored
     assert set(res["witness_jobs"]) == {wh.JOB} and res["tracked_usd"] == pytest.approx(0.5)
     assert res["witness_jobs"][wh.JOB]["compile_cache"] == "off"

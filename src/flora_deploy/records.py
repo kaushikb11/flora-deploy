@@ -54,6 +54,11 @@ class Provenance:
     # recomputed; ``None``: unknown). ``flora certify`` reads both.
     compile_cache: str | None = None
     engine_preemptions: int | None = None
+    # Stage-isolated caption certification only (docs/certification.md): the caption stage
+    # captioned the pinned oracle segment records ``{"sha256": <file sha256>,
+    # "oracle_stage_hash": <exact segcap stage hash>}`` instead of its own job's segments.
+    # Omitted from the JSON when None, so every other record's bytes are unchanged.
+    segments_from: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -113,8 +118,13 @@ class StageRecord:
             raise ValueError("certified records have no reason; uncertified records need one")
 
     def to_json(self) -> str:
-        """Canonical JSON. NaN/inf are rejected (ValueError): stages must not emit them."""
-        return json.dumps(asdict(self), sort_keys=True, separators=(",", ":"), allow_nan=False)
+        """Canonical JSON. NaN/inf are rejected (ValueError): stages must not emit them.
+        ``provenance.segments_from`` is left out when None (records predating it, and every
+        record but a stage-isolated caption record, keep their bytes)."""
+        d = asdict(self)
+        if d["provenance"].get("segments_from") is None:
+            d["provenance"].pop("segments_from", None)
+        return json.dumps(d, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> StageRecord:
@@ -139,6 +149,24 @@ class StageRecord:
     @classmethod
     def from_json(cls, line: str) -> StageRecord:
         return cls.from_dict(json.loads(line))
+
+
+def certification(envelope_ok: bool | None, *, stack_certified: bool = True,
+                  stack_reason: UncertifiedReason | None = "uncertified_stack"
+                  ) -> tuple[bool, UncertifiedReason | None]:
+    """The one rule for a record's ``certified`` / ``uncertified_reason`` (every worker kind):
+    certified only when the episode's **measured** envelope verdict is ``True`` (D13: the
+    envelope policy decides which episodes run, never ``certified``; no certificate's evidence
+    covers an out-of-envelope input) **and** the stack is certified: the reference (``exact``,
+    and kinds that are the reference by identity) or a matching committed certificate.
+    ``stack_reason``: the reason when only the stack is not certified."""
+    if envelope_ok is False:
+        return False, "outside_reference_envelope"
+    if envelope_ok is not True:
+        return False, "oracle_ineligible_source"  # no envelope verdict
+    if not stack_certified:
+        return False, stack_reason
+    return True, None
 
 
 def record_key(rec: StageRecord) -> tuple[str, str]:

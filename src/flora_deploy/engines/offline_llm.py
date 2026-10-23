@@ -89,43 +89,84 @@ class GpuLimits:
 
 
 # Per (kind, GPU) scheduler limits. TempSeg is 9B (19.3 GB merged), the Captioner 27B (54.7 GB
-# BF16). ``max_num_batched_tokens`` 16384 equals the offline LLM's H100 default and holds the
-# longest golden prompt (14.7k tokens) in one prefill chunk; it stays 16384 everywhere, because
-# chunk boundaries change the GDN prefill numerics. ``max_num_seqs`` must fit a full batch of
-# **worst-case** requests (``WORST_CASE_TOKENS``) in the KV / Mamba cache, so that vLLM never
-# preempts: a preempted GDN sequence recomputes its generated tokens through the chunked-prefill
-# kernel, a path no certificate measured (review 13 B1). ``KV_FIT`` is the arithmetic
-# (:func:`worst_case_fit`); :func:`check_mamba_blocks` checks the same bound on the built engine
-# against the blocks vLLM actually allocated, and fails the build otherwise.
+# BF16). ``max_num_batched_tokens`` 16384 equals the offline LLM's H100 default. It holds every
+# human prompt (at most ~7k tokens) and the 1-view golden worst case (14.7k) in one prefill
+# chunk; 3-view (yam) Captioner prompts reach ~16.8k tokens and are **always** prefilled in two
+# chunks, and that chunked path is what a yam certificate measures. It stays 16384 for every
+# kind, because changing it moves chunk boundaries, and chunk boundaries change the GDN prefill
+# numerics. ``max_num_seqs`` must fit a full batch of **worst-case** requests
+# (``WORST_CASE_TOKENS``) in the KV / Mamba cache, so that vLLM never preempts: a preempted GDN
+# sequence recomputes its generated tokens through the chunked-prefill kernel, a path no
+# certificate measured (review 13 B1). :func:`worst_case_fit` is the arithmetic;
+# :func:`check_mamba_blocks` checks the same bound on the built engine against the blocks vLLM
+# actually allocated, and fails the build otherwise.
 # TempSeg/L40S: 64 needs about 19.5 GiB at the worst case and has about 17: 48 (fit 55).
-# Captioner/H100: 16, the lab-validated value (fit 18; 24 needed about 20 GiB of 15).
+# Captioner/H100: 11 (caption pre-registration, 2026-10-23). At the 3-view worst case (17,920
+# tokens) one sequence holds 26 cache blocks of 784 tokens; 11 need 286 of the ~313 estimated
+# (12 would need 312, a 1-block margin; 16, the earlier value, 416). One limit for every
+# embodiment: the certificate key has no embodiment.
 GPU_LIMITS: Mapping[tuple[str, str], GpuLimits] = {
     ("tempseg", "L40S"): GpuLimits(48, 16384, 0.90),
     ("tempseg", "A100-80GB"): GpuLimits(48, 16384, 0.90),
     ("tempseg", "H100"): GpuLimits(48, 16384, 0.90),
     ("tempseg", "H200"): GpuLimits(64, 16384, 0.90),
-    # raise it only after a measured H100 run (peak KV use, zero preemptions) shows it holds
-    ("captioner", "H100"): GpuLimits(16, 16384, 0.90),
+    # raise it only after a measured H100 run (``num_gpu_blocks`` from the shard audit's
+    # ``cache_blocks``, peak KV use, zero preemptions) shows it holds
+    ("captioner", "H100"): GpuLimits(11, 16384, 0.90),
     ("captioner", "H200"): GpuLimits(32, 16384, 0.90),
 }
 # The longest request (prompt + NVIDIA's output budget) a kind sends, in tokens. TempSeg: one
 # window per request; the 64-frame window measures 1.84-1.86k prompt tokens on every lab call
 # (reports/wave-h/balanced-tempseg.json), the 128-frame ``yam32`` window at most twice that:
-# 4096 + 1024 budget. Captioner: one segment of up to 40 frames x 3 views; the lab's 72 calls
-# average 5.1k, the worst case is taken as 10k (the Batch fill estimate) + 512 budget.
-WORST_CASE_TOKENS: Mapping[str, int] = {"tempseg": 4096 + 1024, "captioner": 10240 + 512}
-# (KV GiB left after the weights at gpu_memory_utilization 0.90, GiB per 1k tokens of one
-# sequence incl. its Mamba state): the Batch fill (WP1c) estimates, TempSeg 0.11 GiB at 1.85k
-# tokens, the Captioner 0.77 GiB at 10k.
+# 4096 + 1024 budget. Captioner: the 3-view (yam) bound, BEFORE/TARGET/AFTER blocks of at most
+# 12/40/12 fixed-size mosaic frames: 16,811 prompt tokens (local tokenizer count), plus up to
+# ~600 for an episode instruction, plus the 512-token budget. Human prompts average ~5-6k.
+WORST_CASE_TOKENS: Mapping[str, int] = {"tempseg": 4096 + 1024, "captioner": 17920}
+
+
+@dataclass(frozen=True)
+class BlockFit:
+    """The cache layout of one (kind, GPU), estimated (vLLM 0.24 hybrid cache, prefix caching
+    off): one block id holds ``block_tokens`` tokens of every attention layer and one GDN state
+    per Mamba group, so a sequence of L tokens holds ``ceil(L / block_tokens) + mamba_groups``
+    blocks (:func:`blocks_per_sequence`) and the pool ``floor(pool / block)`` blocks."""
+
+    pool_gib: float  # KV / Mamba cache left after the weights at gpu_memory_utilization 0.90
+    block_mib: float  # one block id across all groups
+    block_tokens: int
+    mamba_groups: int
+
+    @property
+    def pool_blocks(self) -> int:
+        return int(self.pool_gib * 1024 // self.block_mib)
+
+    def blocks_per_seq(self, tokens: int) -> int:
+        return -(-int(tokens) // self.block_tokens) + self.mamba_groups
+
+
+# Captioner/H100 (Qwen3.5-27B: 16 attention + 48 GDN layers, 1 + 3 groups of 16): 784-token
+# blocks of 49 MiB in ~15 GiB, 313 blocks. Estimates: the built engine's own count is checked by
+# :func:`check_mamba_blocks` and recorded in the shard audit row (``cache_blocks``).
+BLOCK_FIT: Mapping[tuple[str, str], BlockFit] = {
+    ("captioner", "H100"): BlockFit(15.0, 49.0, 784, 3),
+}
+# Linear estimate where no block layout was derived: (KV GiB left after the weights at
+# gpu_memory_utilization 0.90, GiB per 1k tokens of one sequence incl. its Mamba state), the
+# Batch fill (WP1c) estimate, TempSeg 0.11 GiB at 1.85k tokens.
 KV_FIT: Mapping[tuple[str, str], tuple[float, float]] = {
     ("tempseg", "L40S"): (17.0, 0.11 / 1.85),
-    ("captioner", "H100"): (15.0, 0.77 / 10.0),
 }
 
 
 def worst_case_fit(kind: str, gpu: str) -> int:
-    """How many worst-case sequences (``WORST_CASE_TOKENS``) the ``KV_FIT`` memory holds."""
-    kv_gib, per_1k = KV_FIT[(kind, normalize_gpu(gpu))]
+    """How many worst-case sequences (``WORST_CASE_TOKENS``) the cache holds: block-granular
+    (``BLOCK_FIT``: ``floor(pool_blocks / blocks_per_seq)``) where the layout is known, else
+    the linear ``KV_FIT`` estimate."""
+    key = (kind, normalize_gpu(gpu))
+    if key in BLOCK_FIT:
+        fit = BLOCK_FIT[key]
+        return fit.pool_blocks // fit.blocks_per_seq(WORST_CASE_TOKENS[kind])
+    kv_gib, per_1k = KV_FIT[key]
     return int(kv_gib // (per_1k * WORST_CASE_TOKENS[kind] / 1000.0))
 
 
@@ -541,9 +582,13 @@ def check_mamba_blocks(spec: EngineSpec, llm, *, blocks: int | None = None) -> d
                                 ) from None
     n = min(counts)
     needed = seqs * per_seq
+    groups = [dict(g) for g in layout[0].get("groups") or ()]
+    attn = [g.get("block_size") for g in groups if _group_kind(str(g.get("spec"))) == "attention"]
     out = {"num_gpu_blocks": n, "max_num_seqs": seqs, "worst_case_tokens": tokens,
            "blocks_per_seq": per_seq, "needed": needed, "checked": True,
-           "groups": [dict(g) for g in layout[0].get("groups") or ()]}
+           "block_size": attn[0] if attn else None,
+           "gpu_memory_utilization": spec.limits.gpu_memory_utilization,
+           "groups": groups}
     if n < needed:
         raise EngineVerifyError(
             f"{where}: max_num_seqs={seqs} worst-case sequences ({tokens} tokens, {per_seq} "

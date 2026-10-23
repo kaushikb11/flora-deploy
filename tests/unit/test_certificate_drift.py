@@ -88,6 +88,16 @@ def make_cert(doc, *, verdict="certified", gpu="L40S", pools=("human",), stamp=S
                        "noise_floor": {m: K.NOISE_FLOOR[m] for m in SEG_METRICS},
                        "absolute_floor": {"count_mismatch": K.ABSOLUTE_FLOOR["count_mismatch"]}},
     }
+    if doc["kind"] == "caption":  # v4: stage-isolated caption certificates
+        cap = dict.fromkeys(("caption_mismatch", "caption_edit_distance"), 0.0)
+        body["metrics"].update(candidate={p: {"n": 12, "slots": 36, "means": cap}
+                                          for p in pools},
+                               noise={"n": 5, "means": cap}, count_flips=None)
+        body["thresholds"].update(noise_floor={m: K.NOISE_FLOOR[m] for m in cap},
+                                  absolute_floor={})
+        body["scoring"] = {"caption": K.CAPTION_SCORING}
+        body["input_identity"] = {"candidate": {"pairs": 36, "equal": 36, "episodes": 12,
+                                                "status": "pass"}, "witness": None}
     body["id"] = K.certificate_id(body)
     return body
 

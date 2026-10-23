@@ -10,10 +10,27 @@ Usage::
         --cert-dir src/flora_deploy/config/certificates --report docs/wave-h-report.md
 
 Run it after ``scripts/wave_h.py --plan certified`` and ``scripts/wave_h_finalize.py --write``,
-before the README flip and the push. It reads the records (``<run-root>/records/{exact,noise,
-balanced,witness}/<job>/<stage>.jsonl``), the run state (``<run-root>/state.json``), the lab
-JSON (``reports/wave-h/balanced-<kind>.json``), the certificates and their freeze locks, and
-the report. It writes nothing and starts nothing. Exit 0 only when every row is PASS.
+before the README flip and the push. It reads the records (``<run-root>/records/<side>/<job>/
+<stage>.jsonl``), the run state (``<run-root>/state.json``), the lab JSON
+(``reports/wave-h/balanced-<kind>.json``), the certificates and their freeze locks, and the
+report. It writes nothing and starts nothing. Exit 0 only when every row is PASS.
+
+**Caption (generator v4) is stage-isolated.** Its candidate is the caption-only job that
+captioned the oracle's own segments (J2, records side ``isolated``) and its cold witness J2w
+(side ``isolated_witness``); the e2e job's caption records (J1, side ``balanced``) are reported
+only. It takes the evidence ``flora certify`` took, each defaulting to where
+``wave_h_finalize.py --fetch`` and ``wave_h.py`` put it::
+
+    --digests SIDE=PATH      per-row Captioner input digests {uid: [hex64|null per row]}; SIDE
+                             exact, noise, balanced (J2), witness (J2w), repeat (default
+                             <records>/<exact|noise|isolated|isolated_witness|repeat>/<job>/
+                             digests.json)
+    --oracle-segments PATH   the staged oracle segment JSONL (default: the state's
+                             caption_iso oracle_segments path)
+    --reported-e2e PATH      J1's caption records (default <records>/balanced/<job>/caption.jsonl)
+    --reported-repeat PATH   an older exact repeat's caption records (default
+                             <records>/repeat/<job>/caption.jsonl), with --digests repeat=
+    --families PATH          JSON {uid: label}: the reported family split is recomputed
 
 **Independence.** Nothing here imports ``validate/certify.py``. The metric math (interval IoU,
 the monotone alignment, Levenshtein, Spearman, the means and their episode basis), the pass rule
@@ -32,11 +49,17 @@ Checks (one or more rows each):
 
 1. **metrics**: every certificate metric recomputed from the raw records (oracle vs balanced,
    oracle vs noise, oracle vs the cold witness), with ``n``, ``count_matched``, ``missing``,
-   ``unpaired`` and ``coverage``, within :data:`TOL`;
+   ``unpaired`` and ``coverage``, within :data:`TOL`. Caption (v4): row i vs row i over the rows
+   the oracle captioned; the candidate's and the witness's rows are the pinned oracle segments
+   (``segments_from``, count and bounds); every Captioner call's input digest equals the
+   oracle's (None vs a digest is a mismatch); the noise over the IoU-aligned pairs whose inputs
+   were identical in the two exact runs; ``metrics.reported`` recomputed too;
 2. **pass rule**: knobs within policy, recorded floors equal to the policy's, every threshold
    and check recomputed, the count-flip tolerance (over the union of the candidate's and the
    witness's episodes, per-group figures recorded), the provisional and fail reasons, the
-   verdict, and whether it may be published (``certified``, or ``--allow-provisional``);
+   verdict, and whether it may be published (``certified``, or ``--allow-provisional``).
+   Caption (v4): ``scoring.caption == "stage_isolated"``, no ``count_mismatch`` check, and
+   nothing from ``metrics.reported`` gates (checks, thresholds, means, verdict);
 3. **coverage**: the hashed episode ids equal the matched episodes; noise and witness episodes
    are the oracle's; one stage hash and one key on the balanced records, equal to the current
    code's key; the oracle binding; the embodiment and GPU;
@@ -70,8 +93,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # --- Policy, restated from docs/certification.md (not imported from validate/) ---------------
-SUPPORTED_VERSIONS = ("2", "3")  # generator versions whose rules this checker knows
-CURRENT_RULE = "3"  # the rule with the count-flip tolerance (the user's decision, review 13)
+SUPPORTED_VERSIONS = ("2", "3", "4")  # generator versions whose rules this checker knows
+ACCEPTED_VERSIONS = ("4",)  # the only version a publishable certificate may carry
+RETIRED_VERSIONS = ("1", "2", "3")  # match nothing (the caption pre-registration, 2026-10-23)
+CURRENT_RULE = "4"  # the count-flip tolerance (review 13) and the stage-isolated caption
+RULE3 = ("3", "4")  # versions with count-bounded floors, spares, witness and cache evidence
 TOLERANCE_BOUNDS = (1.0, 2.0)
 MIN_SAMPLES = 10
 MIN_NOISE_SAMPLES = 5
@@ -101,7 +127,20 @@ METRICS_V2 = {
 }
 METRICS_V3 = {**METRICS_V2,
               "caption": ("caption_mismatch", "caption_edit_distance", "count_mismatch")}
+# v4: caption is stage-isolated, so count_mismatch is structurally 0 (the segment certificate
+# gates counts): it is neither a caption metric nor a caption check
+METRICS_V4 = {**METRICS_V3, "caption": ("caption_mismatch", "caption_edit_distance")}
 COUNT_BASIS_STAGES = ("segment", "caption")  # v3: other metrics over count-matched episodes
+ISOLATED_STAGE = "caption"
+ISOLATED_SCORING = "stage_isolated"
+ISOLATED_BASIS = "input_identical"
+BOUNDS_EPS = 1e-6  # |candidate bound - oracle bound| allowed (float round trips only)
+HEX64 = re.compile(r"^[0-9a-f]{64}\Z")
+FAMILY = re.compile(r"^[a-z0-9_.-]{1,32}\Z")
+# digest side (``flora certify --digests``) -> the records directory of that side
+DIGEST_DIRS = {"exact": "exact", "noise": "noise", "balanced": "isolated",
+               "witness": "isolated_witness", "repeat": "repeat"}
+DIGESTS_FILE = "digests.json"
 LAB_KIND = {"segment": "tempseg", "caption": "captioner"}
 FORCED_COLD = "cold:forced"
 WITNESS_CLASS = "cold-witness"
@@ -109,7 +148,11 @@ RETURN_ONLY_KWARGS = ("logprobs_mode", "max_logprobs")  # not engine settings (G
 CACHE_ID = re.compile(r"^(cold|cold:forced|unknown|warm:[0-9a-f]{6,64}:[0-9a-f]{6,64}"
                       r"|legacy:[0-9a-f]{6,64})\Z")
 TOL = 2e-6  # certificates round means and thresholds to 6 places
-SIDES = ("exact", "noise", "balanced", "witness")
+SIDES = ("exact", "noise", "balanced", "witness", "isolated", "isolated_witness", "repeat")
+# (candidate side, witness side) per stage: caption's are the stage-isolated jobs (J2, J2w)
+CAND_SIDES = {"caption": ("isolated", "isolated_witness")}
+# the runbook step whose jobs made a stage's candidate and witness records
+CAND_STEP = {"caption": "caption_iso"}
 DEFAULT_RUN_ROOT = ROOT / "reports" / "wave-h" / "certified"
 DEFAULT_LAB_DIR = ROOT / "reports" / "wave-h"
 DEFAULT_REPORT = ROOT / "docs" / "wave-h-report.md"
@@ -144,6 +187,12 @@ class Inputs:
     allow_provisional: bool = False
     # the drift test file run as a subprocess when cert_dir is the committed directory
     drift_runner: Callable[[Path], tuple[int, str]] | None = None
+    # v4 caption evidence (``flora certify``'s flags); None: the run layout's defaults
+    digests: Mapping[str, Path] | None = None  # side -> {uid: [hex64 | None per row]} JSON
+    oracle_segments: Path | None = None  # default: the state's caption_iso oracle_segments
+    reported_e2e: Path | None = None  # default: <records>/balanced/<job>/caption.jsonl
+    reported_repeat: Path | None = None  # default: <records>/repeat/<job>/caption.jsonl
+    families: Path | None = None  # JSON {uid: label}; without it the split is not recomputed
 
     def __post_init__(self) -> None:
         from flora_deploy.validate.certkey import CERT_DIR
@@ -153,6 +202,21 @@ class Inputs:
         self.records = Path(self.records) if self.records else self.run_root / "records"
         self.state = Path(self.state) if self.state else self.run_root / "state.json"
         self.lab_dir, self.report = Path(self.lab_dir), Path(self.report)
+
+    def digest_path(self, side: str) -> tuple[Path, bool]:
+        """(the side's digest JSON, whether it was named explicitly)."""
+        got = (self.digests or {}).get(side)
+        if got is not None:
+            return Path(got), True
+        return self.records / DIGEST_DIRS[side] / self.job / DIGESTS_FILE, False
+
+    def reported_path(self, which: str) -> tuple[Path, bool]:
+        """``e2e`` / ``repeat``: (the reported-only caption records, named explicitly)."""
+        got = self.reported_e2e if which == "e2e" else self.reported_repeat
+        if got is not None:
+            return Path(got), True
+        side = "balanced" if which == "e2e" else "repeat"
+        return self.records / side / self.job / "caption.jsonl", False
 
 
 # ---------------------------------------------------------------------------------------------
@@ -373,11 +437,18 @@ EPISODE = {"segment": seg_episode, "caption": cap_episode, "reward.terminal": te
 
 
 def metric_names(stage: str, version: str) -> tuple[str, ...]:
-    return (METRICS_V3 if version == "3" else METRICS_V2)[stage]
+    return {"4": METRICS_V4, "3": METRICS_V3}.get(version, METRICS_V2)[stage]
+
+
+def isolated_rule(stage: str, version: str) -> bool:
+    """v4 caption: stage-isolated (row i vs row i, input-identical pairs)."""
+    return version == "4" and stage == ISOLATED_STAGE
 
 
 def basis(stage: str, metric: str, version: str) -> str:
-    if version == "3" and stage in COUNT_BASIS_STAGES and metric != "count_mismatch":
+    if isolated_rule(stage, version):
+        return ISOLATED_BASIS
+    if version in RULE3 and stage in COUNT_BASIS_STAGES and metric != "count_mismatch":
         return "count_matched"
     return "all"
 
@@ -405,7 +476,7 @@ def means(stage: str, version: str, eps: Mapping[str, Mapping[str, float | None]
 
 def threshold(metric: str, noise: float, tolerance: float, slack: float, version: str) -> float:
     t = tolerance * max(float(noise), FLOOR.get(metric, 0.0)) + float(slack)
-    if version == "3":
+    if version in RULE3:
         t = max(t, ABS_FLOOR_V3.get(metric, 0.0))
     if metric in CAP:
         t = min(t, CAP[metric])
@@ -415,6 +486,335 @@ def threshold(metric: str, noise: float, tolerance: float, slack: float, version
 def episode_block(uids: Iterable[str]) -> dict[str, Any]:
     hashes = sorted(uid_hash(u) for u in uids)
     return {"count": len(hashes), "digest": sha(hashes), "uid_sha256": hashes}
+
+
+# ---------------------------------------------------------------------------------------------
+# Stage-isolated caption (generator v4; docs/certification.md, "Metrics: caption"),
+# reimplemented. The candidate captioned the oracle's own segments, so oracle row i pairs with
+# candidate row i over S_u, the rows the oracle captioned (its input digest is not None); every
+# Captioner call's input digest must equal the oracle's (a call on one side only is a
+# mismatch). The noise: the IoU-aligned oracle / repeat pairs whose digests are equal.
+
+Rec = Mapping[str, Any]
+
+
+def cap_text(seg: Mapping[str, Any]) -> str:
+    return (seg.get("caption") or "").strip()
+
+
+def ned(a: str, b: str) -> float:
+    longest = max(len(a), len(b))
+    return lev(a, b) / longest if longest else 0.0
+
+
+def texts_metrics(texts: Sequence[tuple[str, str]]) -> dict[str, float]:
+    k = len(texts)
+    return {"caption_mismatch": sum(x != y for x, y in texts) / k,
+            "caption_edit_distance": sum(ned(x, y) for x, y in texts) / k}
+
+
+def row_digests(d: Mapping[str, Any] | None, rec: Rec) -> list[str | None] | None:
+    """The record's per-row digests when well formed (one per row, each 64-hex or None)."""
+    got = d.get(str(rec.get("uid"))) if isinstance(d, Mapping) else None
+    n = len(rec.get("segments") or ())
+    if not isinstance(got, list) or len(got) != n or not all(
+            x is None or (isinstance(x, str) and HEX64.match(x)) for x in got):
+        return None
+    return list(got)
+
+
+def exact_row_digests(d: Mapping[str, Any] | None, rec: Rec) -> list[str | None] | None:
+    """An exact run's digests: a digest exactly on the rows NVIDIA captioned (``complete``)."""
+    ds = row_digests(d, rec)
+    if ds is None or any((s.get("status", "complete") == "complete") != (x is not None)
+                         for s, x in zip(rec.get("segments") or (), ds, strict=True)):
+        return None
+    return ds
+
+
+def same_rows(a: Rec, b: Rec) -> bool:
+    """Same row count, every bound within :data:`BOUNDS_EPS` (a NaN bound never is)."""
+    x, y = _intervals(a), _intervals(b)
+    return len(x) == len(y) and all(abs(p[0] - q[0]) <= BOUNDS_EPS
+                                    and abs(p[1] - q[1]) <= BOUNDS_EPS
+                                    for p, q in zip(x, y, strict=True))
+
+
+def parse_pinned(data: bytes) -> dict[str, Rec]:
+    out: dict[str, Rec] = {}
+    for line in data.decode("utf-8").splitlines():
+        if line.strip():
+            r = json.loads(line)
+            out[str(r.get("uid"))] = r
+    return out
+
+
+@dataclass
+class Isolation:
+    """What the v4 caption evidence shows: the problems that make it not stage-isolated (each
+    one is a refusal in the generator: no certificate may exist), and the scores."""
+
+    problems: dict[str, list[str]]  # "segments" | "oracle digests" | "identity" -> why
+    segments_from: dict[str, Any]
+    oracle_hash: str | None
+    d_ref: dict[str, list[str | None]]
+    cand: dict[str, dict[str, float]]
+    witness: dict[str, dict[str, float]] | None
+    noise: dict[str, dict[str, float]] | None
+    slots: dict[str, int]
+    noise_pairs: dict[str, list[tuple[int, int]]]
+    identity: dict[str, dict[str, Any] | None]
+
+    @property
+    def ok(self) -> bool:
+        return not any(self.problems.values())
+
+
+def isolate(ref: Mapping[str, Rec], cand: Mapping[str, Rec], nz: Mapping[str, Rec] | None,
+            wit: Mapping[str, Rec] | None, digests: Mapping[str, Mapping[str, Any] | None],
+            pinned: bytes | None) -> Isolation:
+    """The v4 caption recompute over plain record dicts. ``nz`` / ``wit``: their records (not
+    yet restricted to the oracle's episodes); ``digests``: side -> ``{uid: [...]}``;
+    ``pinned``: the oracle segment file's bytes."""
+    P: dict[str, list[str]] = {"segments": [], "oracle digests": [], "identity": []}
+    hashes = {(r.get("provenance") or {}).get("config_hash") for r in ref.values()}
+    oh = next(iter(hashes)) if len(hashes) == 1 else None
+    if oh is None:
+        P["segments"].append("the oracle records do not share one stage hash")
+    sha_pin = hashlib.sha256(pinned).hexdigest() if pinned is not None else None
+    if pinned is None:
+        P["segments"].append("no oracle segment file (--oracle-segments)")
+    else:
+        try:
+            recs = parse_pinned(pinned)
+        except (UnicodeDecodeError, ValueError):
+            recs = {}
+        if not recs:
+            P["segments"].append("the oracle segment file holds no records")
+        bad = [u for u, r in recs.items() if r.get("stage") != "segment"
+               or (r.get("provenance") or {}).get("preset") != "exact"
+               or (r.get("provenance") or {}).get("config_hash") != oh]
+        if bad:
+            P["segments"].append(f"{len(bad)} records of the oracle segment file are not the "
+                                 "oracle's segment records (stage, preset or stage hash)")
+        off = [u for u in set(recs) & set(ref) if not same_rows(recs[u], ref[u])]
+        if off:
+            P["segments"].append(f"{len(off)} episodes of the oracle segment file have other "
+                                 "rows than the oracle's captions")
+        for name, side in (("candidate", cand), ("witness", wit)):
+            outside = sorted(set(side or {}) - set(recs))
+            if outside:
+                P["segments"].append(f"{name}: {len(outside)} episodes not in the oracle "
+                                     "segment file")
+    sf = {"sha256": sha_pin, "oracle_stage_hash": oh}
+    for name, side in (("candidate", cand), ("witness", wit)):
+        if side is None:
+            continue
+        wrong = [u for u, r in side.items()
+                 if not isinstance((r.get("provenance") or {}).get("segments_from"), Mapping)
+                 or {k: r["provenance"]["segments_from"].get(k) for k in sf} != sf]
+        if wrong:
+            P["segments"].append(f"{name}: {len(wrong)} records were not made from the pinned "
+                                 "oracle segments (provenance.segments_from)")
+        moved = [u for u in side if u in ref and not same_rows(ref[u], side[u])]
+        if moved:
+            P["segments"].append(f"{name}: {len(moved)} episodes' rows are not the oracle's "
+                                 "(count or bounds)")
+    d_ex = digests.get("exact")
+    d_ref: dict[str, list[str | None]] = {}
+    if d_ex is None:
+        P["oracle digests"].append("no oracle digests (--digests exact=)")
+    else:
+        for u, r in ref.items():
+            ds = exact_row_digests(d_ex, r)
+            if ds is not None:
+                d_ref[u] = ds
+        if len(d_ref) != len(ref):
+            P["oracle digests"].append(f"{len(ref) - len(d_ref)} oracle episodes without a "
+                                       "digest on exactly the rows NVIDIA captioned")
+    identity: dict[str, dict[str, Any] | None] = {"candidate": None, "witness": None}
+    for name, side, key in (("candidate", cand, "balanced"), ("witness", wit, "witness")):
+        if side is None:
+            continue
+        d = digests.get(key)
+        pairs = equal = episodes = malformed = 0
+        for u in sorted(set(ref) & set(side)):
+            dc = row_digests(d, side[u])
+            if dc is None:
+                malformed += 1
+                continue
+            do = d_ref.get(u)
+            if do is None or len(do) != len(dc):
+                continue
+            episodes += 1
+            for x, y in zip(do, dc, strict=True):
+                if x is None and y is None:
+                    continue
+                pairs += 1
+                equal += x == y
+        before = len(P["identity"])
+        if d is None:
+            P["identity"].append(f"no {name} digests (--digests {key}=)")
+        elif malformed:
+            P["identity"].append(f"{name}: {malformed} episodes without valid per-row digests")
+        if equal != pairs:
+            P["identity"].append(f"{name}: {pairs - equal} of {pairs} Captioner calls were "
+                                 "not given the oracle's inputs (input digest differs)")
+        identity[name] = {"pairs": pairs, "equal": equal, "episodes": episodes,
+                          "status": "pass" if len(P["identity"]) == before else "fail"}
+
+    def scored(side: Mapping[str, Rec]) -> tuple[dict[str, dict[str, float]], int]:
+        out, slots = {}, 0
+        for u in sorted(set(ref) & set(side)):
+            do = d_ref.get(u)
+            if do is None:
+                continue
+            S = [i for i, x in enumerate(do) if x is not None]
+            a, b = ref[u].get("segments") or [], side[u].get("segments") or []
+            if not S or len(b) != len(a):
+                continue
+            out[u] = texts_metrics([(cap_text(a[i]), cap_text(b[i])) for i in S])
+            slots += len(S)
+        return out, slots
+
+    cand_ep, cand_slots = scored(cand)
+    wit_ep, wit_slots = scored(wit) if wit is not None else (None, 0)
+    noise_ep: dict[str, dict[str, float]] | None = None
+    noise_pairs: dict[str, list[tuple[int, int]]] = {}
+    if nz is not None:
+        noise_ep = {}
+        d_nz = digests.get("noise")
+        if d_nz is None:
+            P["oracle digests"].append("no noise digests (--digests noise=)")
+        bad = 0
+        for u in sorted(set(ref) & set(nz)):
+            dn = exact_row_digests(d_nz, nz[u]) if d_nz is not None else None
+            if dn is None:
+                bad += d_nz is not None
+                continue
+            do = d_ref.get(u)
+            A, B = _intervals(ref[u]), _intervals(nz[u])
+            if do is None or not _bounds_finite(A, B):
+                continue
+            ps = [(i, j) for i, j, _ in alignment(A, B) if do[i] is not None and do[i] == dn[j]]
+            if ps:
+                a, b = ref[u]["segments"], nz[u]["segments"]
+                noise_pairs[u] = ps
+                noise_ep[u] = texts_metrics([(cap_text(a[i]), cap_text(b[j])) for i, j in ps])
+        if bad:
+            P["oracle digests"].append(f"{bad} noise episodes without a digest on exactly the "
+                                       "rows NVIDIA captioned")
+    return Isolation(P, sf, oh, d_ref, cand_ep, wit_ep, noise_ep,
+                     {"candidate": cand_slots, "witness": wit_slots,
+                      "noise": sum(len(p) for p in noise_pairs.values())},
+                     noise_pairs, identity)
+
+
+def plain_means(eps: Mapping[str, Mapping[str, float | None]], names: Sequence[str]
+                ) -> dict[str, float | None]:
+    out = {}
+    for m in names:
+        vals = [eps[u][m] for u in eps if eps[u].get(m) is not None]
+        out[m] = r6(sum(vals) / len(vals)) if vals else None
+    return out
+
+
+def differing(ref: Mapping[str, Rec], side: Mapping[str, Rec],
+              pairs: Mapping[str, Sequence[tuple[int, int]]]) -> dict[str, Any]:
+    k = sum(cap_text(ref[u]["segments"][i]) != cap_text(side[u]["segments"][j])
+            for u, ps in pairs.items() for i, j in ps)
+    n = sum(len(ps) for ps in pairs.values())
+    return {"slots": n, "differing": k, "rate": r6(k / n) if n else None}
+
+
+def reported_block(ref: Mapping[str, Rec], cand: Mapping[str, Rec],
+                   nz: Mapping[str, Rec] | None, iso: Isolation, th: Mapping[str, Any], *,
+                   e2e: Mapping[str, Rec] | None, repeat: Mapping[str, Rec] | None,
+                   repeat_digests: Mapping[str, Any] | None,
+                   families: Mapping[str, str] | None) -> dict[str, Any]:
+    """``metrics.reported`` as the definitions give it (never gated). ``families`` None: that
+    block is not recomputed (the caller compares what it can)."""
+    names = METRICS_V4["caption"]
+    nzp = {u: r for u, r in (nz or {}).items() if u in ref} if nz is not None else None
+    slots = {u: [(i, i) for i, d in enumerate(iso.d_ref[u]) if d is not None] for u in iso.cand}
+    out: dict[str, Any] = {
+        "reported_only": True,
+        "micro": {"candidate": differing(ref, cand, slots),
+                  "noise": differing(ref, nzp, iso.noise_pairs) if nzp is not None else None},
+        "e2e": None, "families": None, "repeat": None, "set_valued": None}
+    if e2e:
+        paired = {u: r for u, r in e2e.items() if u in ref}
+        per = per_episode("caption", ref, paired)
+        e2e_names = METRICS_V3["caption"]
+        block: dict[str, Any] = {
+            "reported_only": True, "n": len(per),
+            "count_matched": sum(1 for x in per.values() if not x.get("count_mismatch")),
+            "count_flips": sum(1 for x in per.values() if x.get("count_mismatch")),
+            "means": {m: v if finite(v) else None
+                      for m, v in means("caption", "3", per).items()},
+            "noise": None, "would_be_thresholds": None}
+        if nzp is not None:
+            nper = per_episode("caption", ref, nzp)
+            nm = means("caption", "3", nper)
+            block["noise"] = {"reported_only": True, "n": len(nper),
+                              "means": {m: v if finite(v) else None for m, v in nm.items()}}
+            slack = th.get("slack") or {}
+            block["would_be_thresholds"] = {
+                m: threshold(m, nm[m], float(th["tolerance"]), float(slack.get(m, 0.0)), "3")
+                for m in e2e_names if nm.get(m) is not None and finite(nm[m])}
+        out["e2e"] = block
+    if families:
+        groups: dict[str, dict[str, dict[str, float]]] = {}
+        for u, label in families.items():
+            if u in iso.cand:
+                groups.setdefault(label, {})[u] = iso.cand[u]
+        out["families"] = {k: {"reported_only": True, "n": len(v), "means": plain_means(v, names)}
+                           for k, v in sorted(groups.items())}
+    if repeat and repeat_digests is not None:
+        ep, pairs = {}, {}
+        for u in sorted(set(repeat) & set(ref)):
+            dn, do = exact_row_digests(repeat_digests, repeat[u]), iso.d_ref.get(u)
+            A, B = _intervals(ref[u]), _intervals(repeat[u])
+            if dn is None or do is None or not _bounds_finite(A, B):
+                continue
+            ps = [(i, j) for i, j, _ in alignment(A, B) if do[i] is not None and do[i] == dn[j]]
+            if ps:
+                pairs[u] = ps
+                ep[u] = texts_metrics([(cap_text(ref[u]["segments"][i]),
+                                        cap_text(repeat[u]["segments"][j])) for i, j in ps])
+        out["repeat"] = {"reported_only": True, "n": len(ep), "means": plain_means(ep, names),
+                         "micro": differing(ref, repeat, pairs)}
+    if nzp is not None:
+        agree = total = 0
+        for u, ps in slots.items():
+            by_i = dict(iso.noise_pairs.get(u, ()))
+            for i, _ in ps:
+                c = cap_text(cand[u]["segments"][i])
+                total += 1
+                agree += (c == cap_text(ref[u]["segments"][i])
+                          or (i in by_i and c == cap_text(nzp[u]["segments"][by_i[i]])))
+        out["set_valued"] = {"reported_only": True, "slots": total, "agree": agree,
+                             "rate": r6(agree / total) if total else None}
+    return out
+
+
+def tree_diff(got: Any, want: Any, path: str = "$") -> list[str]:
+    """Where two JSON-shaped values differ (numbers within :data:`TOL`)."""
+    if isinstance(want, Mapping):
+        if not isinstance(got, Mapping):
+            return [path]
+        out = [f"{path}.{k}" for k in sorted(set(got) ^ set(want))]
+        for k in sorted(set(got) & set(want)):
+            out += tree_diff(got[k], want[k], f"{path}.{k}")
+        return out
+    if isinstance(want, list | tuple):
+        if not isinstance(got, list | tuple) or len(got) != len(want):
+            return [path]
+        return [d for i, (g, w) in enumerate(zip(got, want, strict=True))
+                for d in tree_diff(g, w, f"{path}[{i}]")]
+    if isinstance(want, bool) or want is None or isinstance(want, str | int):
+        return [] if got == want and type(got) is type(want) else [path]
+    return [] if not isinstance(got, bool) and close(got, want) else [path]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -431,9 +831,32 @@ class Run:
     labs: dict[str, dict[str, Any] | None] = field(default_factory=dict)
     report: str | None = None
     keys: dict[str, dict[str, Any] | None] = field(default_factory=dict)  # current_key cache
+    # v4 caption evidence: side -> {uid: [digest | None]} (None: not there), the oracle
+    # segment file's bytes, the reported-only records and the family labels
+    digests: dict[str, dict[str, Any] | None] = field(default_factory=dict)
+    pinned: bytes | None = None
+    reported: dict[str, dict[str, dict[str, Any]] | None] = field(default_factory=dict)
+    families: dict[str, str] | None = None
+    isolation: dict[str, Isolation] = field(default_factory=dict)  # recompute cache
 
     def side(self, side: str, stage: str) -> dict[str, dict[str, Any]]:
         return self.records.get(side, {}).get(stage, {})
+
+    def cand_side(self, stage: str) -> str:
+        return CAND_SIDES.get(stage, ("balanced", "witness"))[0]
+
+    def wit_side(self, stage: str) -> str:
+        return CAND_SIDES.get(stage, ("balanced", "witness"))[1]
+
+    def cand(self, stage: str) -> dict[str, dict[str, Any]]:
+        """The candidate's records of ``stage`` (caption: the stage-isolated job's)."""
+        return self.side(self.cand_side(stage), stage)
+
+    def wit(self, stage: str) -> dict[str, dict[str, Any]]:
+        return self.side(self.wit_side(stage), stage)
+
+    def wit_or_none(self, stage: str) -> dict[str, dict[str, Any]] | None:
+        return self.records.get(self.wit_side(stage), {}).get(stage)
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -449,30 +872,89 @@ def _decide_key(c: Mapping[str, Any]) -> tuple[str, int]:
     return (str(c.get("generated_at") or ""), order.get(str(c.get("verdict")), 3))
 
 
+def _load_records(run: Run, p: Path, label: str, stage: str) -> dict[str, dict[str, Any]] | None:
+    try:
+        rows = load_jsonl(p)
+    except (OSError, ValueError) as e:
+        run.load_errors.append(f"{label}/{stage}: unreadable ({type(e).__name__})")
+        return None
+    by: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        if r.get("stage") != stage:
+            continue
+        if r.get("uid") in by:
+            run.load_errors.append(f"{label}/{stage}: two records for one episode")
+        by[str(r.get("uid"))] = r
+    return by
+
+
+def _load_json(run: Run, p: Path, label: str, named: bool) -> Any:
+    """A JSON evidence file; absent: None (a failed input when it was named explicitly)."""
+    if not p.exists():
+        if named:
+            run.load_errors.append(f"{label}: no file at {p}")
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        run.load_errors.append(f"{label}: unreadable ({type(e).__name__})")
+        return None
+
+
+def oracle_segments_path(run: Run) -> tuple[Path | None, bool]:
+    """(the staged oracle segment file, named explicitly): ``--oracle-segments``, else the
+    path the state's ``caption_iso`` step recorded (``wave_h.stage_oracle_segments``)."""
+    if run.inp.oracle_segments is not None:
+        return Path(run.inp.oracle_segments), True
+    job = cand_job(run, ISOLATED_STAGE)
+    res = step_result(run, CAND_STEP[ISOLATED_STAGE])
+    segs = job.get("oracle_segments") or res.get("oracle_segments") or {}
+    return (Path(str(segs["path"])) if segs.get("path") else None), False
+
+
 def load_run(inp: Inputs) -> Run:
     run = Run(inp)
     for side in SIDES:
         for stage in inp.stages:
             p = inp.records / side / inp.job / f"{stage}.jsonl"
-            if not p.exists():
-                continue
-            try:
-                rows = load_jsonl(p)
-            except (OSError, ValueError) as e:
-                run.load_errors.append(f"{side}/{stage}: unreadable ({type(e).__name__})")
-                continue
-            by: dict[str, dict[str, Any]] = {}
-            for r in rows:
-                if r.get("stage") != stage:
-                    continue
-                if r.get("uid") in by:
-                    run.load_errors.append(f"{side}/{stage}: two records for one episode")
-                by[str(r.get("uid"))] = r
-            run.records.setdefault(side, {})[stage] = by
+            if p.exists():
+                by = _load_records(run, p, side, stage)
+                if by is not None:
+                    run.records.setdefault(side, {})[stage] = by
     try:
         run.state = json.loads(inp.state.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         run.state = None
+    if ISOLATED_STAGE in inp.stages:
+        for side in DIGEST_DIRS:
+            p, named = inp.digest_path(side)
+            d = _load_json(run, p, f"digests {side}", named)
+            if d is not None and not isinstance(d, dict):
+                run.load_errors.append(f"digests {side}: not a {{uid: [...]}} mapping")
+                d = None
+            run.digests[side] = d
+        p, named = oracle_segments_path(run)
+        if p is not None and p.is_file():
+            run.pinned = p.read_bytes()
+        elif named or p is not None:
+            run.load_errors.append(f"oracle segments: no file at {p}")
+        for which in ("e2e", "repeat"):
+            p, named = inp.reported_path(which)
+            if p.exists():
+                run.reported[which] = _load_records(run, p, f"reported {which}", ISOLATED_STAGE)
+                if run.reported[which] is not None:  # scanned for leaks with the rest
+                    run.records.setdefault(f"reported_{which}", {})[ISOLATED_STAGE] = \
+                        run.reported[which]
+            elif named:
+                run.load_errors.append(f"reported {which}: no file at {p}")
+        if inp.families is not None:
+            fam = _load_json(run, Path(inp.families), "families", True)
+            if isinstance(fam, dict) and all(isinstance(v, str) and FAMILY.match(v)
+                                             for v in fam.values()):
+                run.families = {str(k): v for k, v in fam.items()}
+            elif fam is not None:
+                run.load_errors.append("families: not {uid: label} with labels "
+                                       "[a-z0-9_.-]{1,32}")
     cands: dict[str, list[tuple[Path, dict[str, Any]]]] = {}
     for p in sorted(inp.cert_dir.glob("*.json")) if inp.cert_dir.is_dir() else ():
         try:
@@ -529,7 +1011,7 @@ def _current_key(run: Run, stage: str, cert: Mapping[str, Any] | None) -> dict[s
     preset = run.inp.preset
     kind = get_preset(preset).stage_kinds[stage]
     modes = dict((cert or {}).get("modes") or {})
-    cfg = balanced_job(run).get("cfg")
+    cfg = cand_job(run, stage).get("cfg")
     if cfg and Path(cfg).exists():
         try:
             from flora_deploy.config.hashing import kind_modes
@@ -551,12 +1033,15 @@ def step_result(run: Run, step: str) -> dict[str, Any]:
     return dict((((run.state or {}).get("steps") or {}).get(step) or {}).get("result") or {})
 
 
-def balanced_job(run: Run) -> dict[str, Any]:
-    return dict((step_result(run, "balanced").get("jobs") or {}).get(run.inp.job) or {})
+def cand_job(run: Run, stage: str) -> dict[str, Any]:
+    """The state record of the job that made ``stage``'s candidate records (caption: J2)."""
+    step = CAND_STEP.get(stage, "balanced")
+    return dict((step_result(run, step).get("jobs") or {}).get(run.inp.job) or {})
 
 
-def witness_job(run: Run) -> dict[str, Any]:
-    return dict((step_result(run, "balanced").get("witness_jobs") or {}).get(run.inp.job) or {})
+def witness_job(run: Run, stage: str = "segment") -> dict[str, Any]:
+    step = CAND_STEP.get(stage, "balanced")
+    return dict((step_result(run, step).get("witness_jobs") or {}).get(run.inp.job) or {})
 
 
 # ---------------------------------------------------------------------------------------------
@@ -579,11 +1064,30 @@ class Recomputed:
     oracle_n: int
 
 
+def isolation(run: Run) -> Isolation:
+    """The v4 caption recompute of this run (cached)."""
+    s = ISOLATED_STAGE
+    if s not in run.isolation:
+        run.isolation[s] = isolate(run.side("exact", s), run.cand(s),
+                                   run.records.get("noise", {}).get(s), run.wit_or_none(s),
+                                   run.digests, run.pinned)
+    return run.isolation[s]
+
+
 def recompute(run: Run, stage: str, version: str) -> Recomputed:
     ref = run.side("exact", stage)
-    bal = run.side("balanced", stage)
+    bal = run.cand(stage)
     nz = run.records.get("noise", {}).get(stage)
-    wit = run.records.get("witness", {}).get(stage)
+    wit = run.wit_or_none(stage)
+    if isolated_rule(stage, version):
+        iso = isolation(run)
+        names = metric_names(stage, version)
+        return Recomputed(
+            version, names, iso.cand, iso.noise, iso.witness, plain_means(iso.cand, names),
+            plain_means(iso.noise, names) if iso.noise is not None else None,
+            plain_means(iso.witness, names) if iso.witness is not None else None,
+            len(set(ref) - set(bal)), len(set(nz or {}) - set(ref)),
+            len(set(wit or {}) - set(ref)), len(ref))
     cand = per_episode(stage, ref, bal)
     noise = per_episode(stage, ref, nz) if nz is not None else None
     witness = per_episode(stage, ref, wit) if wit is not None else None
@@ -622,8 +1126,9 @@ def check_metrics(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
     v = version_of(cert)
     if v not in SUPPORTED_VERSIONS:
         return [Row(C, stage, FAIL, f"generator version {v!r}: no rule known here")]
-    if not run.side("exact", stage) or not run.side("balanced", stage):
-        return [Row(C, stage, FAIL, "oracle or balanced records missing")]
+    if not run.side("exact", stage) or not run.cand(stage):
+        return [Row(C, stage, FAIL, f"oracle or {run.cand_side(stage)} records missing")]
+    iso_rule = isolated_rule(stage, v)
     rc = recompute(run, stage, v)
     m = cert.get("metrics") or {}
     rows: list[Row] = []
@@ -633,8 +1138,12 @@ def check_metrics(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
     pools = sorted((m.get("candidate") or {}).keys())
     if pools != [run.inp.embodiment]:
         rows.append(Row(C, f"{stage} candidate pools", FAIL, f"{pools}"))
-    matched = sum(1 for x in rc.cand.values() if not x.get("count_mismatch"))
-    extra: dict[str, Any] = {"count_matched": matched} if v == "3" else {}
+    iso = isolation(run) if iso_rule else None
+    if iso is not None:
+        extra: dict[str, Any] = {"slots": iso.slots["candidate"]}
+    else:
+        matched = sum(1 for x in rc.cand.values() if not x.get("count_mismatch"))
+        extra = {"count_matched": matched} if v in RULE3 else {}
     rows += _compare_block(C, f"{stage} oracle vs balanced",
                            (m.get("candidate") or {}).get(run.inp.embodiment),
                            len(rc.cand), rc.cand_means, extra)
@@ -645,25 +1154,100 @@ def check_metrics(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
         else:
             rows.append(Row(C, f"{stage} oracle vs noise", FAIL, "no noise run"))
     else:
-        nx: dict[str, Any] = {"unpaired": rc.noise_unpaired} if v == "3" else {}
+        nx: dict[str, Any] = {"unpaired": rc.noise_unpaired} if v in RULE3 else {}
+        if iso is not None:
+            nx["pairs"] = iso.slots["noise"]
         rows += _compare_block(C, f"{stage} oracle vs noise", m.get("noise"), len(rc.noise),
                                rc.noise_means or {}, nx)
         eps = episode_block(rc.noise)
         got = (m.get("noise") or {}).get("episodes") or {}
         if got.get("count") != eps["count"] or got.get("digest") != eps["digest"]:
             rows.append(Row(C, f"{stage} noise episodes", FAIL, "count/digest differ"))
-    if v == "3":
+    if v in RULE3:
         if rc.witness is None:
             rows.append(Row(C, f"{stage} oracle vs cold witness", FAIL, "no witness records"))
         else:
+            wx: dict[str, Any] = {"unpaired": rc.witness_unpaired}
+            if iso is not None:
+                wx["slots"] = iso.slots["witness"]
+                eps = episode_block(rc.witness)
+                wx["episodes"] = {"count": eps["count"], "digest": eps["digest"]}
             rows += _compare_block(C, f"{stage} oracle vs cold witness", m.get("witness"),
-                                   len(rc.witness), rc.witness_means or {},
-                                   {"unpaired": rc.witness_unpaired})
+                                   len(rc.witness), rc.witness_means or {}, wx)
         if m.get("missing") != rc.missing:
             rows.append(Row(C, f"{stage} missing", FAIL, f"{m.get('missing')} != {rc.missing}"))
     cov = r6(len(rc.cand) / rc.oracle_n) if rc.oracle_n else None
     rows.append(Row(C, f"{stage} coverage", PASS if close(m.get("coverage"), cov) else FAIL,
                     f"{m.get('coverage')} (recomputed {cov})"))
+    if iso is not None:
+        rows += check_isolation(run, stage, cert, iso)
+    return rows
+
+
+def check_isolation(run: Run, stage: str, cert: Mapping[str, Any], iso: Isolation) -> list[Row]:
+    """v4 caption: the evidence is stage-isolated (each problem is a refusal in the generator,
+    so a certificate with one must not exist), the certificate states it as recomputed, and
+    ``metrics.reported`` is what the definitions give."""
+    C = "1 metrics"
+    rows: list[Row] = []
+    P = iso.problems
+    seg = list(P["segments"])
+    if cert.get("segments_from") != iso.segments_from:
+        seg.append("certificate segments_from is not the pinned file's sha256 / oracle hash")
+    rows.append(Row(C, f"{stage} segments are the oracle's", FAIL if seg else PASS,
+                    "; ".join(seg) or f"{len(run.cand(stage))} candidate and "
+                    f"{len(run.wit(stage))} witness records caption the pinned oracle segments"))
+    rows.append(Row(C, f"{stage} oracle digests", FAIL if P["oracle digests"] else PASS,
+                    "; ".join(P["oracle digests"])
+                    or f"{len(iso.d_ref)} oracle episodes, a digest on every captioned row"))
+    want = {}
+    sh = (cert.get("oracle") or {}).get("stage_hash")
+    for name, got in iso.identity.items():
+        want[name] = None if got is None else {**got, "stage_hash": cert.get("stage_hash"),
+                                               "oracle_stage_hash": sh}
+    bad = list(P["identity"])
+    stated = cert.get("input_identity")
+    if not isinstance(stated, Mapping) or tree_diff(dict(stated), want):
+        bad.append(f"certificate input_identity {stated} != recomputed {want}")
+    if sh != iso.oracle_hash:
+        bad.append("certificate oracle stage hash is not the oracle records'")
+    c = iso.identity.get("candidate") or {}
+    rows.append(Row(C, f"{stage} input identity", FAIL if bad else PASS,
+                    "; ".join(bad) or f"{c.get('equal')} of {c.get('pairs')} candidate calls "
+                    f"input-identical" + (
+                        f", {iso.identity['witness']['equal']} of "
+                        f"{iso.identity['witness']['pairs']} witness calls"
+                        if iso.identity.get("witness") else "")))
+    # reported only: recomputed (it never gates; see check 2's exclusion row)
+    th = cert.get("thresholds") or {}
+    got = (cert.get("metrics") or {}).get("reported")
+    rb: list[str] = []
+    e2e = run.reported.get("e2e")
+    if e2e:
+        keys = _key_hashes(e2e.values())
+        if keys != _key_hashes(run.cand(stage).values()):
+            rb.append("reported e2e records are another stack's (cert_key)")
+    try:
+        want_rep = reported_block(
+            run.side("exact", stage), run.cand(stage), run.records.get("noise", {}).get(stage),
+            iso, th, e2e=e2e, repeat=run.reported.get("repeat"),
+            repeat_digests=run.digests.get("repeat"), families=run.families)
+    except (KeyError, TypeError, ValueError, IndexError) as e:
+        want_rep = None
+        rb.append(f"cannot recompute: {type(e).__name__}")
+    if not isinstance(got, Mapping):
+        rb.append("no metrics.reported block")
+    elif want_rep is not None:
+        cmp_got = dict(got)
+        if run.families is None:  # labels not given: only the shape is checked (exclusion row)
+            cmp_got["families"] = None
+        diff = tree_diff(cmp_got, want_rep, "reported")
+        if diff:
+            rb.append(f"differs at {diff[:6]}")
+    rows.append(Row(C, f"{stage} reported (not gated)", FAIL if rb else PASS,
+                    "; ".join(rb) or "recomputed: micro, e2e, set-valued"
+                    + (", families" if run.families is not None else "")
+                    + (", repeat" if run.reported.get("repeat") else "")))
     return rows
 
 
@@ -688,7 +1272,7 @@ def l0_status(run: Run, stage: str, cert: Mapping[str, Any]) -> dict[str, Any]:
     lab_hash = got if isinstance(got, str) and re.fullmatch(r"[0-9a-f]{64}", got) else None
     status = "pass" if ok else "fail"
     want = engine_settings_hash((cert.get("engine") or {}).get("vllm"))
-    if ok and version_of(cert) == "3" and want is not None and lab_hash != want:
+    if ok and version_of(cert) in RULE3 and want is not None and lab_hash != want:
         status = "stale"
     return {"status": status, "requests": len(rows),
             "ids_equal": sum(r.get("ids_equal") is True for r in rows),
@@ -700,7 +1284,7 @@ def l0_status(run: Run, stage: str, cert: Mapping[str, Any]) -> dict[str, Any]:
 def engine_records(run: Run, stage: str) -> list[dict[str, Any]]:
     if stage not in LAB_KIND:
         return []
-    return [*run.side("balanced", stage).values(), *run.side("witness", stage).values()]
+    return [*run.cand(stage).values(), *run.wit(stage).values()]
 
 
 def preemption_counts(run: Run, stage: str) -> dict[str, int]:
@@ -728,7 +1312,7 @@ def check_pass_rule(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
             bad.append(f"min_samples {min_s}")
         if min_n < MIN_NOISE_SAMPLES:
             bad.append(f"min_noise_samples {min_n}")
-        if v == "3":
+        if v in RULE3:
             max_missing = int(th["max_missing"])
             if not 0 <= max_missing <= MAX_MISSING:
                 bad.append(f"max_missing {max_missing}")
@@ -747,7 +1331,7 @@ def check_pass_rule(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
     rc = recompute(run, stage, v)
     pm = th.get("per_metric") or {}
     fl = []
-    if v == "3":
+    if v in RULE3:
         for m in rc.names:
             if not close((th.get("noise_floor") or {}).get(m), FLOOR.get(m, 0.0), 1e-12):
                 fl.append(f"noise_floor {m}")
@@ -759,6 +1343,10 @@ def check_pass_rule(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
         if dict(th.get("absolute_floor") or {}) != {m: ABS_FLOOR_V3[m] for m in rc.names
                                                     if m in ABS_FLOOR_V3}:
             fl.append("absolute_floor table")
+        extra = sorted(set(pm) - set(rc.names)) + sorted(set(th.get("noise_floor") or {})
+                                                         - set(rc.names))
+        if extra:
+            fl.append(f"thresholds for metrics that are not gated: {extra}")
     for m in rc.names:
         if not close((pm.get(m) or {}).get("floor"), FLOOR.get(m, 0.0), 1e-12):
             fl.append(f"floor {m}")
@@ -781,9 +1369,9 @@ def check_pass_rule(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
     blocks: dict[str, dict[str, float | None]] = {}
     if rc.cand:
         blocks[run.inp.embodiment] = rc.cand_means
-    if v == "3" and rc.witness is not None:
+    if v in RULE3 and rc.witness is not None:
         blocks[WITNESS_CLASS] = rc.witness_means or {}
-    union = v == "3" and "count_mismatch" in rc.names
+    union = v in RULE3 and "count_mismatch" in rc.names
     want_checks = {}
     non_finite = set()  # a NaN / inf mean (or its noise floor): a failed check
     for cls, mm in blocks.items():
@@ -829,7 +1417,16 @@ def check_pass_rule(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
                                       + (f"; failing: {', '.join(failing)}" if failing else ""))))
 
     # the count-flip tolerance (user decision): one episode in ten may differ in count
-    if stage in COUNT_BASIS_STAGES and "count_mismatch" not in rc.names:
+    if isolated_rule(stage, v):  # structurally 0: the segment certificate gates counts
+        got_cf = (cert.get("metrics") or {}).get("count_flips")
+        ok = got_cf is None and not any((c or {}).get("metric") == "count_mismatch"
+                                        for c in cert.get("checks") or ())
+        rows.append(Row(C, f"{stage} count-flip tolerance", PASS if ok else FAIL,
+                        "not a caption check under v4 (the rows are the oracle's; the segment "
+                        "certificate gates counts)" if ok else
+                        f"a stage-isolated caption certificate gates count_mismatch "
+                        f"(count_flips {got_cf})"))
+    elif stage in COUNT_BASIS_STAGES and "count_mismatch" not in rc.names:
         rows.append(Row(C, f"{stage} count-flip tolerance", FAIL,
                         f"generator version {v} does not check count_mismatch for {stage}"))
     elif "count_mismatch" in rc.names:
@@ -875,7 +1472,7 @@ def check_pass_rule(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
         prov.add("too_few_noise_samples")
     if not rc.cand or len(rc.cand) < min_s:
         prov.add("too_few_samples")
-    if v == "3":
+    if v in RULE3:
         if rc.missing > int(th["max_missing"]):
             prov.add("incomplete_coverage")
     elif rc.oracle_n and len(rc.cand) / rc.oracle_n < float(th["min_coverage"]):
@@ -886,13 +1483,13 @@ def check_pass_rule(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
         prov.add("stale_l0")
     if nz_n is not None and any(ok is None for *_, ok in want_checks.values()):
         prov.add("metric_not_evaluable")
-    if v == "3":
+    if v in RULE3:
         pre = preemption_counts(run, stage)
         if pre["preempted"]:
             prov.add("engine_preempted")
         if pre["unknown"]:
             prov.add("preemptions_unknown")
-        paired = [r for r in run.side("witness", stage).values()
+        paired = [r for r in run.wit(stage).values()
                   if r.get("uid") in run.side("exact", stage)]
         cold = [r for r in paired
                 if (r.get("provenance") or {}).get("compile_cache") == FORCED_COLD]
@@ -917,9 +1514,80 @@ def check_pass_rule(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
                     "; ".join(rb) or f"{verdict}" + (f" ({', '.join(sorted(reasons))})"
                                                      if reasons else "")))
     ok_pub = verdict == "certified" or (verdict == "provisional" and run.inp.allow_provisional)
-    rows.append(Row(C, f"{stage} publishable", PASS if ok_pub and not rb else FAIL,
+    refused = isolated_rule(stage, v) and not isolation(run).ok
+    rows.append(Row(C, f"{stage} publishable",
+                    PASS if ok_pub and not rb and not refused else FAIL,
                     f"{verdict}" + ("" if ok_pub else " (publishing needs certified; "
-                                    "--allow-provisional accepts provisional)")))
+                                    "--allow-provisional accepts provisional)")
+                    + ("; the evidence is not stage-isolated: flora certify refuses it"
+                       if refused else "")))
+    if stage == ISOLATED_STAGE:
+        rows += check_caption_policy(run, stage, cert, v, rc)
+    return rows
+
+
+def _reported_only_problems(rep: Any) -> list[str]:
+    """Every block of ``metrics.reported`` says it is reported only."""
+    if not isinstance(rep, Mapping):
+        return ["no metrics.reported block"]
+    out = [] if rep.get("reported_only") is True else ["metrics.reported is not reported_only"]
+    e2e = rep.get("e2e")
+    blocks = [("e2e", e2e), ("e2e.noise", e2e.get("noise") if isinstance(e2e, Mapping) else None),
+              ("repeat", rep.get("repeat")), ("set_valued", rep.get("set_valued"))]
+    fam = rep.get("families")
+    if fam is not None and not isinstance(fam, Mapping):
+        out.append("metrics.reported.families is not a mapping")
+    for k, b in (fam.items() if isinstance(fam, Mapping) else ()):
+        if not FAMILY.match(str(k)):
+            out.append("a family label outside [a-z0-9_.-]{1,32}")
+        blocks.append((f"families.{k}", b))
+    for name, b in blocks:
+        if b is not None and (not isinstance(b, Mapping) or b.get("reported_only") is not True):
+            out.append(f"metrics.reported.{name} is not marked reported_only")
+    return out
+
+
+def check_caption_policy(run: Run, stage: str, cert: Mapping[str, Any], v: str,
+                         rc: Recomputed) -> list[Row]:
+    """v4 caption policy: scored ``stage_isolated``; only the isolated caption metrics gate, on
+    the pool and the cold witness, and nothing from ``metrics.reported`` (its e2e
+    ``count_mismatch`` included) reaches a check, a threshold, a mean or the verdict."""
+    C = "2 pass rule"
+    rows: list[Row] = []
+    sc = cert.get("scoring")
+    ok = v == "4" and sc == {"caption": ISOLATED_SCORING}
+    rows.append(Row(C, f"{stage} stage-isolated scoring", PASS if ok else FAIL,
+                    f"scoring {sc}" + ("" if v == "4" else
+                                       f" (generator version {v}: not stage-isolated)")))
+    if v != "4":
+        return rows
+    m = cert.get("metrics") or {}
+    gated = set(rc.names)
+    classes = {run.inp.embodiment, WITNESS_CLASS}
+    bad = _reported_only_problems(m.get("reported"))
+    for c in cert.get("checks") or ():
+        c = c if isinstance(c, Mapping) else {}
+        if c.get("class") not in classes or c.get("metric") not in gated:
+            bad.append(f"check {c.get('class')} {c.get('metric')} is not an isolated caption "
+                       "check")
+    for name, blk in [*(m.get("candidate") or {}).items(), ("noise", m.get("noise")),
+                      (WITNESS_CLASS, m.get("witness"))]:
+        blk = blk if isinstance(blk, Mapping) else {}
+        extra = sorted(set(blk.get("means") or {}) - gated)
+        if extra:
+            bad.append(f"{name} means carry {extra}")
+        if "count_matched" in blk:
+            bad.append(f"{name} states an e2e count_matched basis")
+    th = cert.get("thresholds") or {}
+    for k in ("per_metric", "noise_floor", "absolute_floor"):
+        extra = sorted(set(th.get(k) or {}) - gated)
+        if extra:
+            bad.append(f"thresholds.{k} carries {extra}")
+    if m.get("count_flips") is not None:
+        bad.append("metrics.count_flips is set")
+    rows.append(Row(C, f"{stage} reported metrics never gate", FAIL if bad else PASS,
+                    "; ".join(bad[:6]) or f"checks on {sorted(gated)} only; metrics.reported is "
+                    "reported only"))
     return rows
 
 
@@ -970,8 +1638,8 @@ def check_coverage(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
     from flora_deploy.validate.certkey import GENERATOR_VERSIONS
 
     rows: list[Row] = []
-    ref, bal = run.side("exact", stage), run.side("balanced", stage)
-    nz, wit = run.side("noise", stage), run.side("witness", stage)
+    ref, bal = run.side("exact", stage), run.cand(stage)
+    nz, wit = run.side("noise", stage), run.wit(stage)
     v = version_of(cert)
     rc = recompute(run, stage, v if v in SUPPORTED_VERSIONS else CURRENT_RULE)
     want = episode_block(rc.cand)
@@ -986,7 +1654,7 @@ def check_coverage(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
     for side, recs, block in (("noise", nz, "noise"), ("witness", wit, "witness")):
         extra = sorted(set(recs) - set(ref))
         unpaired = ((cert.get("metrics") or {}).get(block) or {}).get("unpaired")
-        ok = not extra or (v == "3" and unpaired == len(extra))
+        ok = not extra or (v in RULE3 and unpaired == len(extra))
         rows.append(Row(C, f"{stage} {side} episodes within the oracle's",
                         PASS if ok and recs else FAIL,
                         f"{len(recs)} records, {len(extra)} not the oracle's"
@@ -994,7 +1662,7 @@ def check_coverage(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
                         if recs else "no records"))
     # one stage hash, one key, equal to the current code's
     hashes = _prov(bal.values(), "config_hash") | _prov(wit.values(), "config_hash")
-    st_hash = (balanced_job(run).get("stage_hashes") or {}).get(stage)
+    st_hash = (cand_job(run, stage).get("stage_hashes") or {}).get(stage)
     ok = len(hashes) == 1 and cert.get("stage_hash") in hashes and (st_hash in (None, *hashes))
     rows.append(Row(C, f"{stage} one balanced stage hash", PASS if ok else FAIL,
                     f"{len(hashes)} distinct" + ("" if ok else
@@ -1011,9 +1679,11 @@ def check_coverage(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
         detail = (f"{len(keys)} record key(s); certificate {str(cert.get('engine_spec_hash'))[:12]}"
                   f"; current {str(cur_hash)[:12]}" + (f"; differs in {diff}" if diff else ""))
     rows.append(Row(C, f"{stage} cert_key is the current code's", PASS if ok else FAIL, detail))
-    gen_ok = v in GENERATOR_VERSIONS and v in SUPPORTED_VERSIONS
+    gen_ok = v in GENERATOR_VERSIONS and v in ACCEPTED_VERSIONS and v not in RETIRED_VERSIONS
     rows.append(Row(C, f"{stage} generator version", PASS if gen_ok else FAIL,
-                    f"{v} (current code accepts {list(GENERATOR_VERSIONS)})"))
+                    f"{v}" + (" (retired)" if v in RETIRED_VERSIONS else "")
+                    + f" (this checker accepts {list(ACCEPTED_VERSIONS)}, the current code "
+                    f"{list(GENERATOR_VERSIONS)})"))
     # oracle binding
     o = cert.get("oracle") or {}
     ob = []
@@ -1037,7 +1707,7 @@ def check_coverage(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
                     "; ".join(ob) or f"{exact_gpu}, determinism {o.get('determinism')}"))
     # embodiment and GPU
     embs = set()
-    for side in SIDES:
+    for side in {"exact", "noise", run.cand_side(stage), run.wit_side(stage)}:
         embs |= _prov(run.side(side, stage).values(), "embodiment")
     ok = embs == {run.inp.embodiment} and cert.get("covered_pools") == [run.inp.embodiment]
     rows.append(Row(C, f"{stage} embodiment", PASS if ok else FAIL,
@@ -1069,7 +1739,7 @@ def check_evidence(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
     C = "4 evidence"
     rows: list[Row] = []
     v = version_of(cert)
-    bal, wit = run.side("balanced", stage), run.side("witness", stage)
+    bal, wit = run.cand(stage), run.wit(stage)
     if stage in LAB_KIND:
         # warm vs cold
         missing = [r for r in [*bal.values(), *wit.values()]
@@ -1080,14 +1750,14 @@ def check_evidence(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
                         "cache identity" if missing else f"{len(bal) + len(wit)} records"))
         forced = [r for r in wit.values()
                   if (r.get("provenance") or {}).get("compile_cache") == FORCED_COLD]
-        wj = witness_job(run)
+        wj = witness_job(run, stage)
         kinds = {c.get("kind") for c in wj.get("containers") or ()}
         ok = bool(forced) and len(forced) == len(wit) and wj.get("state") == "done" \
             and stage in kinds
         rows.append(Row(C, f"{stage} forced-cold container", PASS if ok else FAIL,
                         f"{len(forced)} of {len(wit)} witness records cold:forced; witness job "
                         f"{wj.get('state')!r}, containers for {sorted(map(str, kinds))}"))
-        if v == "3":
+        if v in RULE3:
             cc = cert.get("compile_cache") or {}
             want = {"candidate": _counts(bal.values()), "witness": _counts(wit.values())}
             covers = sorted({k for d in want.values() for k in d})
@@ -1103,12 +1773,12 @@ def check_evidence(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
         pre = preemption_counts(run, stage)
         clean = not pre["preempted"] and not pre["unknown"]
         ok = clean or cert.get("verdict") == "provisional"
-        if v == "3" and cert.get("preemptions") != pre:
+        if v in RULE3 and cert.get("preemptions") != pre:
             ok = False
         rows.append(Row(C, f"{stage} preemptions", PASS if ok else FAIL,
                         f"{pre['preempted']} preempted, {pre['unknown']} unknown"
                         + ("" if clean else f"; certificate {cert.get('verdict')}")
-                        + ("" if v != "3" or cert.get("preemptions") == pre
+                        + ("" if v not in RULE3 or cert.get("preemptions") == pre
                            else f"; certificate states {cert.get('preemptions')}")))
         # lab: L0 and Gate A under the current engine settings
         rows += check_lab(run, stage, cert)
@@ -1142,7 +1812,7 @@ def check_lab(run: Run, stage: str, cert: Mapping[str, Any]) -> list[Row]:
                     f"{str(cert_eng)[:12]}, lab GPU {lab_gpu}"))
     got = cert.get("l0") or {}
     keys = ("status", "requests", "ids_equal", "render_ids_equal", "grid_equal") + (
-        ("engine_hash",) if version_of(cert) == "3" else ())
+        ("engine_hash",) if version_of(cert) in RULE3 else ())
     bad = [k for k in keys if got.get(k) != l0.get(k)]
     ga = cert.get("gate_a") or {}
     for k in ("requests", "greedy_identical", "positions", "max_abs_dlogit", "mean_abs_dlogit"):
@@ -1312,7 +1982,7 @@ def our_strings(run: Run, stage: str, cert: Mapping[str, Any]) -> set[str]:
                 "too_few_noise_samples", "too_few_samples", "incomplete_coverage", "no_l0",
                 "stale_l0", "metric_not_evaluable", "engine_preempted", "preemptions_unknown",
                 "too_few_witness_samples", "witness_not_forced_cold", "no_witness",
-                "non_finite_metric"}
+                "non_finite_metric", ISOLATED_SCORING, ISOLATED_BASIS}
 
     def walk(o: Any) -> None:
         if isinstance(o, str):
@@ -1429,6 +2099,10 @@ def check_leakage(run: Run) -> list[Row]:
     forbidden, ids = record_strings(run), record_ids(run)
     for stage, (_, cert) in sorted(run.certs.items()):
         allowed = our_strings(run, stage, cert)
+        # the reported family labels (ours: [a-z0-9_.-]{1,32}), never a record id
+        fam = ((cert.get("metrics") or {}).get("reported") or {}).get("families")
+        allowed |= {str(k) for k in (fam if isinstance(fam, Mapping) else {})
+                    if FAMILY.match(str(k)) and str(k) not in ids}
         free = free_text(cert, allowed, ids)
         rows.append(Row(C, f"{stage} certificate string fields", FAIL if free else PASS,
                         f"not ours: {free[:8]}" if free else "every string is ours"))
@@ -1545,7 +2219,7 @@ def check_all(inp: Inputs) -> list[Row]:
     for e in run.load_errors:
         rows.append(Row("0 inputs", "records", FAIL, e))
     for stage in inp.stages:
-        for side in ("exact", "balanced"):
+        for side in ("exact", run.cand_side(stage)):
             if not run.side(side, stage):
                 rows.append(Row("0 inputs", f"{side} {stage} records", FAIL,
                                 f"none under {inp.records / side / inp.job}"))
@@ -1609,12 +2283,32 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--nv-root", type=Path, help="fetched NVIDIA code (default the cache)")
     ap.add_argument("--allow-provisional", action="store_true",
                     help="a provisional verdict may pass (it unlocks nothing)")
+    ap.add_argument("--digests", action="append", metavar="SIDE=PATH",
+                    help="caption: per-row input digests JSON (repeatable; SIDE "
+                         f"{', '.join(DIGEST_DIRS)}; default <records>/<side dir>/<job>/"
+                         f"{DIGESTS_FILE})")
+    ap.add_argument("--oracle-segments", type=Path,
+                    help="caption: the staged oracle segment JSONL (default the state's)")
+    ap.add_argument("--reported-e2e", type=Path,
+                    help="caption: J1's caption records (default <records>/balanced/<job>)")
+    ap.add_argument("--reported-repeat", type=Path,
+                    help="caption: an older exact repeat's caption records (reported only)")
+    ap.add_argument("--families", type=Path,
+                    help="caption: JSON {uid: label} for the reported family split")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
+    digests: dict[str, Path] = {}
+    for item in a.digests or ():
+        side, sep, path = item.partition("=")
+        if not sep or side not in DIGEST_DIRS or not path:
+            ap.error(f"--digests {item!r}: use SIDE=PATH, SIDE one of {', '.join(DIGEST_DIRS)}")
+        digests[side] = Path(path)
     inp = Inputs(run_root=a.run_root, records=a.records, state=a.state, cert_dir=a.cert_dir,
                  lab_dir=a.lab_dir, report=a.report, job=a.job, embodiment=a.embodiment,
                  stages=tuple(a.stage or ("segment", "caption")), nv_root=a.nv_root,
-                 allow_provisional=a.allow_provisional)
+                 allow_provisional=a.allow_provisional, digests=digests or None,
+                 oracle_segments=a.oracle_segments, reported_e2e=a.reported_e2e,
+                 reported_repeat=a.reported_repeat, families=a.families)
     rows = check_all(inp)
     ok = all(r.status == PASS for r in rows)
     if a.json:

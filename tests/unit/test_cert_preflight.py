@@ -457,3 +457,69 @@ def test_a_crashing_check_is_a_fail(tmp_path):
     env.volume = lambda name: (_ for _ in ()).throw(RuntimeError("x"))
     checks = by_name(cp.preflight(env))
     assert checks["episodes"].status == cp.FAIL
+
+
+# --plan recertify --------------------------------------------------------------------------------
+
+RECERT_DRY_RUN = """\
+Wave H-lite run 10221548f1b8 (human only), plan recertify (f2 -> d2' -> d' -> g -> e'): spent $5.87 of $15.38 (billing read never)
+  episodes: 12 human, 250.2 video s (golden/v2 manifest)
+  f2. noise-12: (b) repeated on all its episodes, (b)'s stage hash/GPU/mode [done] cap $4.00  nominal $2.59  upper $3.97  rule: done
+  d2'. Captioner lab L0 / Gate A, new engine (TempSeg's reused)      [pending] cap $1.70  nominal $1.28  upper $1.69  rule: ok
+  d'. balanced J1 (12 ep) + segment-only cold witness J1w (6 ep)     [pending] cap $3.05  nominal $1.66  upper $3.03  rule: ok
+  g. caption-only isolated J2 (12 ep) + cold witness J2w (6 ep), oracle segments [pending] cap $3.00  nominal $1.54  upper $2.95  rule: ok
+  e'. flora certify (v4), then wave_h_finalize.py                    [pending] cap $0.00  nominal $0.00  upper $0.00  rule: ok
+  lab (d2): runs (tempseg: no balanced-tempseg.json; captioner: no balanced-captioner.json)
+  total: nominal $7.08, upper $11.64 (incl. 240 s client slack per app); global cap $15.38 (user-approved override for plan recertify; derived $11.70)
+dry run: nothing started (run with --yes-spend after the user approves)
+"""  # noqa: E501
+
+
+def recert_table(**over):
+    return {"wave_h.py --status --plan recertify --json": cp.Result(2, "", "no --json"),
+            "wave_h.py --plan recertify --dry-run": ok(RECERT_DRY_RUN), **over}
+
+
+def test_recertify_plan_rows_read_its_own_plan_lab_and_budget(tmp_path):
+    env, fake = make_env(tmp_path, **recert_table())
+    p = cp.parse_dry_run(RECERT_DRY_RUN)
+    assert [s["name"] for s in p.steps] == ["noise_all", "lab", "balanced", "caption_iso",
+                                            "certify"]
+    assert p.next_step == "lab" and p.next_action == "run" and p.global_cap == 15.38
+    checks = by_name(cp.preflight(env, plan_name="recertify"))
+    assert any("--plan recertify --dry-run" in c for c in fake.calls)
+    assert not any("--plan certified" in c for c in fake.calls)
+    assert not any("--embodiment" in c and "recertify" in c for c in fake.calls)
+    assert checks["plan"].status == cp.PASS and "next lab: run" in checks["plan"].message
+    assert "noise_all $4.00" in checks["plan"].message and "certify $0.00" in \
+        checks["plan"].message
+    # budget: billed + the upper of the steps not done (f2 is billed already)
+    b = checks["budget"]
+    assert b.details["upper"] == round(1.69 + 3.03 + 2.95, 2)
+    # the git row is the same for every plan
+    assert checks["git"].status == by_name(cp.preflight(make_env(tmp_path)[0]))["git"].status
+    # the lab row reads recertify's lab JSON, beside its state
+    skipped = cp.parse_dry_run(RECERT_DRY_RUN)
+    skipped.lab_runs, skipped.lab_why = False, "already done"
+    d = tmp_path / "reports" / "wave-h" / "recertified"
+    d.mkdir(parents=True)
+    for k, h in (("tempseg", "t" * 64), ("captioner", "c" * 64)):
+        (d / f"balanced-{k}.json").write_text(json.dumps({cp.LAB_HASHES: {"baseline": h}}))
+    assert cp.check_lab(env, skipped, "recertify").status == cp.PASS
+    c = cp.check_lab(env, skipped)  # the certified plan's lab dir has none
+    assert c.status == cp.FAIL and "reports/wave-h/balanced-<kind>.json" in c.fix
+    # a stopped step names recertify's command
+    stopped = RECERT_DRY_RUN.replace("upper $1.69  rule: ok", "upper $1.69  rule: STOP: x")
+    env, _ = make_env(tmp_path, **recert_table(**{
+        "wave_h.py --plan recertify --dry-run": ok(stopped)}))
+    c = by_name(cp.preflight(env, plan_name="recertify"))["plan"]
+    assert c.status == cp.FAIL and "--plan recertify --status" in c.fix
+
+
+def test_recertify_flag(tmp_path, capsys):
+    env, _ = make_env(tmp_path, **recert_table())
+    assert cp.main(["--plan", "recertify", "--json"], env=env) in (0, 1)
+    assert json.loads(capsys.readouterr().out)["plan"] == "recertify"
+    with pytest.raises(SystemExit) as e:
+        cp.main(["--plan", "recertify", "--embodiment", "yam"], env=env)
+    assert e.value.code == 2

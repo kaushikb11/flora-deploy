@@ -42,7 +42,9 @@ Per shard kind:
   live in ``batch_utils/`` and are bound by the code-manifest digests;
 - its derived-weight receipt identities (e.g. ``captioner_bf16``), passed in by the caller;
 - ``depends_on``: the stage hashes of the kinds whose outputs it consumes (``balanced`` caption
-  consumes segment).
+  consumes segment);
+- ``caption_segments`` (``balanced`` caption, stage-isolated certification only): the sha256 and
+  oracle stage hash of the pinned oracle segments it captions instead (no ``depends_on`` then).
 
 Excluded (they don't change outputs; they go to provenance instead): GPU type and count,
 container counts, max inputs, cpu/memory, budget, max_gpus, region, tags, Modal environment,
@@ -256,6 +258,12 @@ def hash_document(
             "derived_weights": {r: receipts[r] for r in weights},
             "depends_on": [d for d in KIND_DEPENDS_ON.get(kind, ()) if d in kinds],
         }
+        pinned = getattr(cfg.pipeline, "caption_segments", None)
+        if kind == "caption" and pinned is not None:
+            # stage-isolated caption certification: the pinned oracle segments are this kind's
+            # input, so they key its shards; not a mode, so not in the certificate key. Absent
+            # otherwise, so production caption hashes do not depend on the option existing.
+            shard_kinds[kind]["caption_segments"] = pinned.as_hashed()
 
     inp = cfg.input
     dataset = inp.dataset

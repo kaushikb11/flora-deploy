@@ -60,8 +60,9 @@ G3 scheduling (``docs/exact-cost.md``; not hashed: no model input changes):
 ``FLORA_SEGCAP_SCHEDULING``. Shards never overlap: one shard per container (review 7b).
 
 Records: ``provenance.config_hash`` is the stage hash (stamped by the part sink);
-``certified`` per the episode's envelope verdict (``EpisodeRef.envelope_ok``, D13;
-``envelope="ignore"`` certifies regardless); ``provenance.engine`` is the engine label
+``certified`` per the episode's measured envelope verdict (``EpisodeRef.envelope_ok``, D13;
+the envelope policy decides only which episodes run, never ``certified``);
+``provenance.engine`` is the engine label
 (``nvidia-hf``, ``+deterministic`` when the D-1 mode is on, since that is a different
 reference); ``provenance.source`` the camera sources. Everything else that describes how the
 output was produced (exact profile, active ``accel`` patches, ``gpu_thread``, determinism record,
@@ -482,7 +483,7 @@ class SegcapWorkerSettings:
     models: Mapping[str, str] = field(default_factory=dict)
     gpu: str | None = None
     certificate: str | None = None  # None for exact (reference by construction)
-    envelope: str = "warn"  # D13: "ignore" certifies regardless of the envelope verdict
+    envelope: str = "warn"  # D13 planning policy; never changes ``certified``
     instruction_text: str | None = None  # NVIDIA's instruction for a ``fixed`` source
     media_root: str | None = None
     # D-1 mode the job was configured (and hashed) with: ``RunSettings.determinism``, the
@@ -528,13 +529,13 @@ def order_episodes(uids: list[str], refs: Mapping[str, EpisodeRef], order: str) 
     return sorted(uids, key=lambda u: (-float(refs[u].duration_s or 0.0), pos[u]))
 
 
-def certification(ref: EpisodeRef, envelope: str = "warn") -> tuple[bool, str | None]:
-    """certified only inside NVIDIA's reference envelope (``stages.reward.certification``)."""
-    if envelope == "ignore" or ref.envelope_ok is True:
-        return True, None
-    if ref.envelope_ok is False:
-        return False, "outside_reference_envelope"
-    return False, "oracle_ineligible_source"
+def certification(ref: EpisodeRef) -> tuple[bool, str | None]:
+    """certified only inside NVIDIA's reference envelope (``records.certification``). The
+    envelope policy never certifies: no certificate's evidence covers an out-of-envelope
+    episode, so its records are ``certified: false`` under ``warn`` and ``ignore`` alike."""
+    from flora_deploy.records import certification as rule
+
+    return rule(ref.envelope_ok)
 
 
 def engine_mode(engine: Any) -> str:
@@ -907,7 +908,7 @@ class SegcapShardRunner:
                 "mode": engine_mode(self.engine)})
             audit_report = self.engine.check()  # nv.audit + determinism, before records
             ref, inp = refs[uid], inputs[uid]
-            certified, reason = certification(ref, s.envelope)
+            certified, reason = certification(ref)
             records = stage_records(result, uid=uid, dataset=ref.dataset,
                                     episode_id=ref.episode_id, provenance=self._provenance(inp),
                                     certified=certified, uncertified_reason=reason,

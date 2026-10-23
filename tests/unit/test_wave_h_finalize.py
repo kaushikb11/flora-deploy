@@ -103,8 +103,66 @@ def _jsonl(path: Path, records) -> None:
     path.write_text("".join(r.to_json() + "\n" for r in records))
 
 
+def _digest(uid: str, j: int) -> str:
+    import hashlib
+
+    return hashlib.sha256(f"{uid}/{j}".encode()).hexdigest()
+
+
+def _read(path: Path) -> list:
+    from flora_deploy.records import StageRecord
+
+    return [StageRecord.from_json(x) for x in path.read_text().splitlines() if x.strip()]
+
+
+def _add_isolated(st, w: Path, cfgs: dict, jobs) -> None:
+    """(g) per balanced job: the oracle's segment JSONL staged as ``wave_h`` stages it, the
+    caption-only isolated job's config and records (the oracle's bounds and captions,
+    ``segments_from``), and the digest JSON of the oracle, the noise run and the candidate."""
+    import hashlib
+
+    from tests.fakes.certrecords import ORACLE_HASH
+
+    r = w / "records"
+    s = st.step("caption_iso")
+    s.status = "done"
+    s.result = {"jobs": {}}
+    for job in jobs:
+        ex = _read(r / "exact" / job / "segment.jsonl")
+        data = wh.oracle_segment_bytes(ex, ORACLE_HASH, [x.uid for x in ex])
+        seg = w / "work" / f"oracle-segments-{job}" / f"{ORACLE_HASH}.jsonl"
+        seg.parent.mkdir(parents=True, exist_ok=True)
+        seg.write_bytes(data)
+        sha = hashlib.sha256(data).hexdigest()
+        d = yaml.safe_load(cfgs[job].read_text())
+        d["project"] = f"wave-h-r1-iso-{job}"
+        d["pipeline"] = {**d["pipeline"], "stages": ["caption"], "caption_segments": {
+            "records": f"s3://b/p/oracle-segments/{ORACLE_HASH}.jsonl", "sha256": sha,
+            "oracle_stage_hash": ORACLE_HASH}}
+        cfg = w / "work" / f"flora-iso-{job}.yaml"
+        cfg.write_text(yaml.safe_dump(d))
+        iso = [rec(x.uid, "caption", "balanced", embodiment=job, fp=None,
+                   segments=segs([(g.start_s, g.end_s) for g in x.segments],
+                                 [g.caption for g in x.segments]),
+                   segments_from={"sha256": sha, "oracle_stage_hash": ORACLE_HASH})
+               for x in _read(r / "exact" / job / "caption.jsonl")]
+        _jsonl(r / "isolated" / job / "caption.jsonl", iso)
+        for side in ("exact", "noise", "isolated"):
+            p = r / side / job / "caption.jsonl"
+            if p.exists():
+                (p.parent / fin.DIGESTS).write_text(json.dumps(
+                    {x.uid: [_digest(x.uid, j) for j in range(len(x.segments))]
+                     for x in _read(p)}))
+        # one staged file per job (two embodiments in one state here): on the job's record
+        s.result["jobs"][job] = {"job_id": f"wave-h-r1-iso-{job}", "state": "done",
+                                 "cfg": str(cfg), "stages": ["caption"],
+                                 "oracle_segments": {"path": str(seg), "sha256": sha,
+                                                     "oracle_stage_hash": ORACLE_HASH}}
+
+
 def build(tmp: Path, *, jobs=("human", "yam"), labs=("tempseg", "captioner"),
-          billed_lag_s: float = 7200.0, billed: dict | None = None) -> Path:
+          billed_lag_s: float = 7200.0, billed: dict | None = None,
+          isolated: bool = True) -> Path:
     """A repo root with the files the script owns, a runbook state, records and lab JSON."""
     for rel in ("src/flora_deploy/planner/rates.json", "docs/balanced-engines.md", "README.md"):
         (tmp / rel).parent.mkdir(parents=True, exist_ok=True)
@@ -165,6 +223,9 @@ def build(tmp: Path, *, jobs=("human", "yam"), labs=("tempseg", "captioner"),
                        _records(n, "balanced", stage, job, shift=0.01))
     for stage in ("segment", "caption"):
         _jsonl(r / "noise" / "human" / f"{stage}.jsonl", _records(2, "exact", stage, "human"))
+    if isolated:
+        _add_isolated(st, w, cfgs, [j for j in JOBS if j in jobs])
+        wh.save_state(st, w / "state.json")
     if "tempseg" in labs:
         (w / "balanced-tempseg.json").write_text(json.dumps(_lab("tempseg", "NVIDIA L40S", 0.12)))
     if "captioner" in labs:

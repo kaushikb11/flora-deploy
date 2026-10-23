@@ -391,3 +391,114 @@ def test_tempseg_and_captioner_stop_on_im_end(procs):
     for kind in ("tempseg", "captioner"):
         tok = procs[kind].tokenizer
         assert tok.convert_ids_to_tokens(tok.eos_token_id) == "<|im_end|>"
+
+
+
+# ---------------------------------------------------------------------------------------------
+# N1 (caption pre-registration, 2026-10-23): the stage-isolated caption certificate's premises,
+# on NVIDIA's real code and processor with fakes, at $0.
+# (i) the restated digest (stages.segment.nvidia_input_digest) equals the input_tensor_digest
+#     NVIDIA's own models.generate logs for the same call;
+# (ii) captioning from the rows rebuilt from an oracle segment record (spans and
+#     segmentation_provenance only: workers_impl.caption.pinned_rows) gives the same per-call
+#     digests as captioning from TempSeg's full-metadata rows.
+
+FULL_ROWS = [dict(start_s=2.0, end_s=5.0, metadata={
+                 "segmentation_provenance": "fine", "fine_event_id": "fine_0001",
+                 "window_index": 0, "label": "reach", "confidence": 0.9}),
+             dict(start_s=6.0, end_s=9.5, metadata={
+                 "segmentation_provenance": "fine_repaired_by_fine_retry",
+                 "fine_event_id": "fine_0002", "window_index": 1, "label": "lift"}),
+             dict(start_s=12.0, end_s=16.0, metadata={"window_index": 2})]
+
+
+class _DigestModel:
+    """What NVIDIA's ``models.generate`` needs of a model: a parameter (its device) and a
+    ``generate`` that appends a short answer and EOS."""
+
+    def __init__(self, tokenizer):
+        self.tok = tokenizer
+        self.p = torch.nn.Parameter(torch.zeros(1))
+
+    def parameters(self):
+        return iter([self.p])
+
+    def generate(self, input_ids=None, **kw):
+        tail = self.tok.encode("the arm lifts", add_special_tokens=False) + [kw["eos_token_id"]]
+        return torch.cat([input_ids, torch.tensor([tail], dtype=input_ids.dtype)], dim=1)
+
+
+class _ModelSession:
+    def __init__(self, model, proc):
+        self.model, self.proc, self.audit = model, proc, {}
+
+    def load(self, kind):
+        assert kind == "captioner"
+        return self.model, self.proc
+
+    def close(self):
+        pass
+
+
+def _caption(nv, videos, rows, session, profile):
+    if len(videos) == 3:
+        return nv.pipeline.caption_three(videos, [dict(r) for r in rows], session, "",
+                                         no_progress, profile=profile)
+    return nv.pipeline.caption_single(videos, [dict(r) for r in rows], profile, session, "",
+                                      no_progress)
+
+
+def nvidia_logged_digests(nv, procs, monkeypatch, videos, profile, rows):
+    """The input_tensor_digest of every Captioner call, as NVIDIA's own generate logs it."""
+    logged = []
+
+    def event(name, **values):
+        if name == "generation_start":
+            logged.append(values["input_tensor_digest"])
+
+    model = _DigestModel(procs["captioner"].tokenizer)
+    with monkeypatch.context() as m:
+        m.setattr(nv.media, "decode_selected", fake_decode)
+        m.setattr(nv.models, "runtime_event", event)
+        _caption(nv, videos, rows, _ModelSession(model, procs["captioner"]), profile)
+    return logged
+
+
+def restated_digests(nv, procs, monkeypatch, videos, profile, rows):
+    """The digest the balanced stage computes per call (captured request -> real processor)."""
+    out = []
+
+    def generate(model, proc, inputs, budget):
+        out.append(S.nvidia_input_digest(procs["captioner"], proc.pop_request()))
+        return "the arm lifts"
+
+    with monkeypatch.context() as m:
+        m.setattr(nv.media, "decode_selected", fake_decode)
+        m.setattr(nv.pipeline, "generate", generate)
+        session = CachedSession(lambda: FakeNvSession(
+            {"captioner": CaptureProcessor(procs["captioner"], budget=512)}))
+        _caption(nv, videos, rows, session, profile)
+    return out
+
+
+@pytest.mark.parametrize(("profile", "n_views"), [("Human", 1), ("YAM", 3)])
+def test_n1_restated_digest_and_reduced_rows(nv, procs, monkeypatch, profile, n_views):
+    import dataclasses
+
+    from flora_deploy.records import Provenance
+    from flora_deploy.workers_impl.caption import pinned_rows
+
+    videos = make_videos(nv, ROLES3[:n_views], 20.0, tag="n1")
+    logged = nvidia_logged_digests(nv, procs, monkeypatch, videos, profile, FULL_ROWS)
+    assert logged and len(logged) == len(FULL_ROWS)
+    assert restated_digests(nv, procs, monkeypatch, videos, profile, FULL_ROWS) == logged  # (i)
+    oracle = S.segment_record(FULL_ROWS, uid="u", dataset="ds", episode_id="u",
+                              provenance=Provenance(models={}, engine="e", preset="exact",
+                                                    config_hash="a" * 64, logic_version="l",
+                                                    framework="f"))
+    oracle = dataclasses.replace(oracle, segments=tuple(  # oracle records carry no metadata
+        dataclasses.replace(s, nv_metadata={}) for s in oracle.segments))
+    reduced = pinned_rows(oracle)
+    assert all(set(r["metadata"]) <= {"segmentation_provenance", "fine_event_id"}
+               for r in reduced)
+    assert nvidia_logged_digests(nv, procs, monkeypatch, videos, profile, reduced) == logged

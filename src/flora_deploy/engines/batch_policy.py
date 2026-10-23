@@ -9,7 +9,10 @@ to ``kind_modes`` (``config.hashing``); otherwise it would escape the key.
 Per shard kind:
 
 - ``infer_episodes``: episodes inside ``MicroBatcher.episode()`` at once (the inference phase).
-  Segment 64 (``max_num_seqs`` 64 on the L40S, ``engines.offline_llm.GPU_LIMITS``), caption 32.
+  Segment 64, caption 32. These bound the requests handed to one ``llm.generate`` (an episode
+  sends several windows / segments at once), not vLLM's residency: vLLM runs at most
+  ``max_num_seqs`` of them at a time (``engines.offline_llm.GPU_LIMITS``: TempSeg 48 on the
+  L40S, the Captioner 11 on the H100) and queues the rest.
 - ``prefetch_episodes``: episodes in the CPU preparation phase (input resolve, NVIDIA's
   ``prepare_videos`` probe) or prepared and waiting for an inference slot. Preparation runs
   *outside* the batcher's episode context, so a preparing episode never holds a round back

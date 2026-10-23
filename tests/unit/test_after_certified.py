@@ -20,7 +20,19 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import after_certified as ac  # noqa: E402
 import cert_check as cc  # noqa: E402
 
-pytestmark = pytest.mark.skipif(R.VERSION != "3", reason="the generator predates rule 3")
+
+@pytest.fixture(autouse=True)
+def no_volume(monkeypatch):
+    """No test here reaches Modal: ``flora results`` (``fetch_records``' default runner) and
+    the audit reads are refused unless a test passes its own runner."""
+    real = ac.fin.fetch_records
+
+    def guarded(paths, st, run=None, **kw):
+        if run is None or run is ac.subprocess.run:
+            pytest.fail("fetch_records would read the Volume (flora results)")
+        return real(paths, st, run=run, **kw)  # a stand-in runner: no audits are read
+
+    monkeypatch.setattr(ac.fin, "fetch_records", guarded)
 
 
 def drift_ok(root):
@@ -155,7 +167,7 @@ def test_a_leak_in_a_changed_file_is_refused(fake, capsys, monkeypatch, leak, wh
 
 
 def test_missing_records_are_exported_first(fake, capsys):
-    gone = fake.records / "witness" / "human" / "caption.jsonl"
+    gone = fake.records / "isolated_witness" / "human" / "caption.jsonl"  # J2w
     keep = fake.root.parent / "keep.jsonl"
     shutil.copyfile(gone, keep)
     gone.unlink()

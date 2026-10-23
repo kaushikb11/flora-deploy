@@ -27,16 +27,18 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from flora_deploy.nv.capture import CaptureProcessor
 from flora_deploy.nv.errors import NvidiaRuntimeError  # NVIDIA's rejection (api.py:55)
 from flora_deploy.stages.segment import (
+    SENTINEL_PREFIX,
     UNCERTIFIED,
     CallStats,
     EpisodeVideos,
     GenerateTap,
+    InputDigests,
     run_tapped,
     substitute,
 )
@@ -63,6 +65,11 @@ class CaptionResult:
     rows: list[dict]  # NVIDIA's caption rows (+ segmentation_provenance), in segment order
     audit: list[dict]  # NVIDIA's caption_inputs audit
     stats: CallStats
+    # Per row, NVIDIA's input digest of the Captioner call that produced its caption
+    # (``stages.segment.nvidia_input_digest``); None for a row without a call (e.g.
+    # ``unsupported_target_frames``) or when the digest could not be computed (``digest_errors``).
+    input_digests: list[str | None] = field(default_factory=list)
+    digest_errors: list[str] = field(default_factory=list)
 
 
 def _noop_progress(*_a, **_k) -> None:
@@ -99,10 +106,15 @@ class CaptionStage:
         segs = [dict(s) for s in segments]
         proc = CaptureProcessor.for_kind(self.nv, self.processor, "captioner")
         stats = CallStats()
+        digests = InputDigests(self.processor)
         (rows, audit), texts = await run_tapped(
             self.nv, batcher, lambda: self._nvidia(ep, segs, proc), tokenizer=self.tokenizer,
-            eos=self.eos, stats=stats)
+            eos=self.eos, stats=stats, digests=digests)
         rows = [dict(r) for r in rows]
+        # a row made a Captioner call iff NVIDIA put that call's sentinel in it
+        row_digests = [digests.by_sentinel.get(r["caption"])
+                       if isinstance(r.get("caption"), str)
+                       and r["caption"].startswith(SENTINEL_PREFIX) else None for r in rows]
         for row in rows:
             row["caption"] = substitute(row.get("caption"), texts)
         for row, seg in zip(rows, segs, strict=True):
@@ -113,7 +125,7 @@ class CaptionStage:
             s, e = row["start_s"], row["end_s"]
             if not (math.isfinite(s) and math.isfinite(e) and 0 <= s < e <= duration + 0.001):
                 raise NvidiaRuntimeError("The pipeline returned an invalid caption interval.")
-        return CaptionResult(rows, list(audit), stats)
+        return CaptionResult(rows, list(audit), stats, row_digests, list(digests.errors))
 
 
 def caption_record(rows: Sequence[Mapping], *, uid: str, dataset: str, episode_id: str,

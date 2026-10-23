@@ -221,7 +221,9 @@ for `balanced/tempseg`, `balanced/captioner` and `balanced/tempseg-dtbias`;
 **Batch fill.** (d) runs the batch-fill engine limits and batch policy, and the dry run says so:
 TempSeg on the L40S with `max_num_seqs` 48 and 64 episodes per batcher, the Captioner on the
 H100 with `max_num_seqs` 16 and 32 episodes per batcher. Its rates were measured before batch
-fill, so they can only overstate it.
+fill, so they can only overstate it. Since 2026-10-23 the Captioner runs `max_num_seqs` 11
+(`docs/balanced-engines.md`); the effect on caption time is estimated at 2-3% of container
+time, inside the rates' ±50% bands, and not separately priced.
 
 **Scale-to-zero.** When a pool has no work left, mid-job or at job end, the orchestrator drops
 that worker class's `scaledown_window` to 2 s within one 15 s poll (`jobs/pools.py`), and it
@@ -377,9 +379,10 @@ preflight then rather than starting the run early.
 
 ## The certified run (`--plan certified`)
 
-This run makes `balanced` **certified** for the `human` embodiment, so human data no longer
-needs `allow_uncertified: true`. It is prepared and priced, **not run**: it spends GPU money and
-waits for the user's go-ahead and cap.
+This run made the (v3) `balanced` `segment` certificate for the `human` embodiment; its caption
+certificate failed. The steps below are kept as they ran on 2026-10-22 (run `10221548f1b8`).
+Human is re-certified under generator v4 by `--plan recertify` ("The re-certification run"
+below), and yam runs this plan with the v4 changes listed under "Other embodiments".
 
 ```
 uv run python scripts/golden_stage.py --version golden/v2 --verify-only  # golden/v2 is staged
@@ -525,7 +528,28 @@ uv run python scripts/wave_h.py --plan certified --embodiment yam --dry-run
 | total, lab runs (global cap) | $8.23 / $13.13 ($13.20) | $9.29 / $14.60 ($14.70) |
 | total, lab already done (global cap) | $6.48 / $10.83 ($10.90) | $7.55 / $12.29 ($12.30) |
 
-These are offline dry-run figures (expected durations +10%).
+These are offline dry-run figures (expected durations +10%) from before generator v4.
+
+**yam under v4** (the same rules, code and keys as human's `recertify`; spec 2026-10-23). The
+yam plan runs every step from scratch on the v4 code, with the noise on **all 12** episodes
+(`noise_limit` None) and the stage-isolated caption steps added:
+
+| Step | What | Expected | Upper |
+|---|---|---|---|
+| b | oracle, 12 episodes, H200, `nvidia` mode (segcap x1.30) | $3.37 | $5.02 |
+| f | noise on all 12 episodes (6 would have been $1.39 / $2.34) | $3.37 | $5.02 |
+| d | J1 balanced end to end: segment $0.64 / $1.02 + caption $0.94 / $1.73 | $1.58 | $2.75 |
+| d | J1w segment-only forced-cold witness (6) | $0.31 | $0.64 |
+| g | J2 caption-only stage-isolated job (12) | $0.94 | $1.73 |
+| g | J2w caption-only stage-isolated forced-cold witness (6) | $0.67 | $1.32 |
+| d2 | lab: human's L0 reused (same engine hash), $0 | $0 | $0 |
+| | **total** | **$10.24** | **$16.47** |
+
+An optional 3-view yam lab (TempSeg + Captioner) adds $1.74 / $2.31; L0 has never covered
+3-view or chunked-prefill prompts. These use the **unmeasured** 3-view scaling below. Acceptance
+for yam: `engine_preemptions == 0` on every caption record; otherwise `engine_preempted` makes the
+certificate provisional, and the pre-registered remedy is a lower `max_num_seqs`, which re-keys
+human too.
 
 - **Separate runs.** Each embodiment has its own state file, so the two runs never collide and
   resume independently. `--state` pointing at the other embodiment's state is refused. Caps are
@@ -607,6 +631,122 @@ anything. The test also checks:
 - that the noise subset is exactly what `--limit 6` indexes;
 - that the oracle's and balanced's uids pair;
 - the caps and the "lab already done" skip.
+
+## The re-certification run (`--plan recertify`)
+
+This run re-certifies `balanced` for `human` under **generator v4**: `segment` (its v3
+certificate is retired) and `caption`, now scored **stage-isolated** (the balanced Captioner
+captions the oracle's own segments, with byte-identical inputs checked per call;
+`docs/certification.md`, "Caption"). Its rules were fixed on 2026-10-23, before the run
+(`docs/certification.md`, "Pre-registration and re-runs"): one attempt per job, infrastructure
+re-runs only, and the outcome committed in advance.
+
+```
+uv run python scripts/wave_h.py --plan recertify --dry-run                 # steps, prices, caps
+#   phase 1, from main before the v4 code lands: f2 noise_all (main's recertify plan writes
+#   reports/wave-h/recertified/state.json with f2 done). Then land the v4 code (tests green):
+uv run python scripts/wave_h.py --plan recertify --yes-spend      # phase 2: lab, balanced, caption_iso, certify
+uv run python scripts/wave_h.py --plan recertify --status
+```
+
+- **State.** Its own state, work dir and records under `reports/wave-h/recertified/`. It reads
+  the oracle's result (step (b) of run `10221548f1b8`) from `reports/wave-h/certified/state.json`,
+  read-only, and never writes there.
+- **Episodes and uids.** The 12 golden/v2 human episodes of the certified run, in the same data
+  dir (`cert-human`). The local ids stay `n-<id>` / `x-<id>`, keyed on the **old** 6-episode noise
+  subset, so every uid still pairs with (b)'s. The noise run is no longer that subset
+  (`noise_limit` None: all 12); the witnesses are (`PlanSpec.witness`, now separate from the
+  noise).
+
+### Ordering: A (chosen) or B
+
+The noise run must reproduce the oracle's stage hash and key (`docs/certification.md`, "Binding
+checks"). The v4 code edits `common`-group modules (`config/schema.py`, `records.py`), which
+change the `exact` segcap stage hash. So:
+- **A (chosen, 2026-10-23):** run the noise on all 12 episodes **from the unchanged checkout,
+  before the v4 package code lands**, and reuse (b) as the oracle. The checkout that ran (b) has
+  no diff in the segcap modules, so it reproduces (b)'s stage hash; P0 checks it before any
+  spend. The noise job runs from today's `main` checkout (phase 1), and this whole change (the
+  v4 package code, the `recertify` plan and these docs) lands only **after** it has finished.
+  It is `recertify`'s own first step: main's plan records f2 in the recertify state, and after
+  the merge phase 2 reads it from there (`noise_all.result.jobs.human`, in (b)'s store; phase-2
+  job ids are prefixed `rc-` so they never collide with (b)'s). f2's guard (config and stage
+  hashes equal to (b)'s) refuses on the merged checkout, as it should: f2 is done by then. `flora certify` still checks that the noise records repeat the oracle's
+  stage hash, key, GPU and determinism mode.
+- **B (not chosen):** land the code first, then re-run the oracle **and** the noise, for
+  +$2.74 / +$4.17 (total $9.86 / $15.85).
+
+### Steps
+
+| Step | What | Gate before it | Expected | Upper |
+|---|---|---|---|---|
+| P0 | $0, no GPU: (i) `flora plan` on `work/flora-exact_e2e-human.yaml` prints (b)'s segcap stage hash (`cf788111…`) and config hash (`516d72d7…`); (ii) the Captioner cache-block count, which the old shard audits do not hold (only container stdout did), so with `max_num_seqs` fixed at 11 the build check is the guard and the new audit row records it; (iii) (b)'s 12 audit lines hold 98 Captioner `input_digest`s (verified 98/98 on 2026-10-22) | any mismatch: stop and re-plan (falls to B) | $0 | $0 |
+| P1 | commit the pre-registration: the v4 text of `docs/certification.md` and this runbook (docs are not hashed) | | $0 | $0 |
+| `noise_all` | exact repeat of (b)'s job on **all 12** episodes: same config file and data dir, no `--limit`, a new job id, `nvidia` mode, H200, cold. Run from the **unchanged** checkout | the script recomputes the segcap stage hash and refuses unless it equals (b)'s | $2.74 | $4.17 |
+| (land) | land the v4 package code, tests green | | | |
+| `lab` | Captioner lab only (L0 + Gate A) on the new Captioner engine hash (`max_num_seqs` changed, so the old L0 is stale). TempSeg's saved L0 is **reused**: its engine settings are unchanged | code landed (`"4" in GENERATOR_VERSIONS`) | $1.28 | $1.69 |
+| `balanced` | J1: `balanced` end to end (segment + caption on its own segments), 12 episodes ($1.41 / $2.49: segment $0.54 / $0.86, caption $0.87 / $1.63). Then J1w: a **segment-only** forced-cold witness on the 6 `n-` episodes ($0.27 / $0.58; the segment stage hash does not depend on whether `caption` is in the job) | code landed; the built Captioner engine passes `check_mamba_blocks` at 11 | $1.68 | $3.06 |
+| `caption_iso` | stage the oracle's `segment` records as a JSONL on the job store (sha256 pinned in the config's `pipeline.caption_segments`). J2: caption-only stage-isolated job, 12 episodes ($0.87 / $1.63). Then J2w: the same config, caption-only, forced cold, on the 6 `n-` episodes ($0.69 / $1.36) | code landed | $1.57 | $2.99 |
+| `certify` | `wave_h_finalize.py --fetch` exports the records and the per-side digest JSONs (hex only). Then `flora certify` per stage: `segment` from J1 + J1w + the noise-12 run (TempSeg L0 reused); `caption` from J2 + J2w + the noise-12 run, with the oracle segment file, the digests and `metrics.reported.e2e` from J1. Then `scripts/cert_check.py` | | $0 | $0 |
+| | **total (order A)** | | **$7.26** | **$11.90** |
+
+- **Prices** come from `wave_h.project` / `balanced_job_seconds` on `planner/rates.json` at list
+  $/h (segcap H200, balanced caption H100, balanced segment L40S), measured cold startups, their
+  uncertainty bands and 240 s client slack per app. Single-pool jobs (the witnesses, J2) are
+  priced as start + work + 30 s, with no segment scale-down tail. Of the total, `noise_all` is
+  $2.74 / $4.17; **phase 2** (`lab`, `balanced`, `caption_iso`, `certify`) is **$4.53 / $7.73**.
+  The pre-registration priced the plan at $7.12 / $11.69 (phase 2 $4.38 / $7.52) on the rates
+  before (b)'s measured balanced rates were folded into `rates.json` (caption cold start 325 ->
+  373 s); the table above is the current projection.
+- **Cap.** The user approved a global cap of **$11.70** of **real** spend for the plan, noise
+  run included (`RECERT_GLOBAL_CAP_USD`; the derived cap is never higher). Step caps are each
+  step's upper rounded up to $0.05; on the staged manifest's durations (what a run gates on):
+  lab $1.70, balanced **$3.05** (upper $3.03), caption_iso $3.00 (the offline dry run, +10%
+  durations, shows $3.10 for balanced).
+- **What f2 actually charged.** `noise_all` is done in the state with **two attempts charged
+  $5.87**: attempt 1 is stored with `tracked_usd` $4.00 (`report_error: true`: its `flora
+  report` failed, so it was charged its budget) and its own apps billed only about $0.17-0.32;
+  attempt 2 tracked $1.87. `Attempt.charged()` takes the larger of tracked and billed even once
+  billing has settled, so that **$4.00 phantom is permanent**: the bookkeeping total stays $5.87
+  while the real billed cost of f2 is about **$2.06**. With the $11.70 cap, d2' and d' are then
+  stopped by the reserve ($5.87 + phase 2's upper $7.67 = $13.54).
+- **`--global-cap 15.38` (bookkeeping cap, user-approved).** It keeps *real* spend within
+  $11.70: bookkeeping cap = $11.70 + ($4.00 phantom − $0.32 real for attempt 1) = **$15.38**
+  (real ≤ $11.70 exactly when bookkeeping ≤ $15.38; $15.35 is the $0.05-grid value). Pass it
+  once with the first phase-2 `--yes-spend`; it is saved in the recertify state only, scoped to
+  this plan (`cap_override_plan`), and replaces the stale `--global-cap 8.00`. At $15.38 every
+  pending step runs: $5.87 + $7.67 = $13.54 ≤ $15.38; the step caps bind each attempt (lab
+  $1.70, balanced $3.05, caption_iso $3.00), so the worst case is bookkeeping $13.62, real about
+  $9.94. **Consequence:** the gated cap (`gate_cap`), `cert_check.py`'s "total over the gated
+  cap" row and the finalize report will all print **$15.38**: read it as the $11.70 real cap
+  plus the $3.68 phantom of f2's attempt 1, not as a raised budget.
+- **Before phase 2:** `uv run python scripts/cert_preflight.py --plan recertify` (its plan, lab
+  and budget rows read the recertify state and `reports/wave-h/recertified/`; the budget row
+  counts only the steps not done). The `git` row is the same for every plan: clean tree, HEAD
+  pushed to `main`, CI green for that SHA.
+- **After phase 2:** `uv run python scripts/after_certified.py --plan recertify` (dry run), then
+  `--write`. It reads the run through `wave_h.certify_view` (the oracle and the old noise run
+  from the certified state f2 recorded it repeated, f2 as the noise run) and the lab JSON
+  beside the recertify state.
+- **What each job is for.** J1 gives the `segment` candidate and the reported-only end-to-end
+  caption block; J2 is the `caption` candidate; J1w and J2w are the forced-cold witnesses of their
+  stages; the noise-12 run is the noise floor for both stages. The old 6-episode noise run (f)
+  enters only the reported block (`repeat`).
+- **Not reused:** the v3 balanced job, its witness and the old lab (old keys), and the v3
+  certificates (`GENERATOR_VERSIONS = ("4",)` matches neither).
+- **Outcome.** `certified`: publish after `cert_check.py` passes. `fail`: no re-roll; ship
+  balanced `segment` with `exact`'s Captioner, or fund diagnostics toward a new stack with its
+  own pre-registration. **(b) segment certified, caption fail:** the certify step (e') is
+  final: its result says `outcome: "segment certified, caption fail"` (`partial: true`), it
+  still runs `wave_h_finalize.py --write`, which writes the `segment` certificate and its
+  freeze lock and never a certificate for the fail, so `caption` stays uncertified;
+  `after_certified.py --plan recertify` reports the same verdict and applies only that. `provisional` for an infrastructure reason or a preemption: re-run only
+  the affected job. `inputs_not_isolated` is a harness bug: fix the harness (not scoring code)
+  and re-run the isolated jobs only.
+
+yam follows on the same v4 code and keys: `--plan certified --embodiment yam`, every step from
+scratch, with the noise on all 12 and the same J2 / J2w steps ("Other embodiments", "yam under
+v4").
 
 ## What H0 proves first
 
