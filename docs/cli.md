@@ -58,7 +58,7 @@ As grouped in `flora --help`:
 | Run | [`index`](#flora-index), [`plan`](#flora-plan), [`deploy`](#flora-deploy), [`run`](#flora-run), [`resume`](#flora-resume), [`cancel`](#flora-cancel) |
 | Inspect results | [`status`](#flora-status), [`report`](#flora-report), [`results`](#flora-results), [`logs`](#flora-logs), [`export`](#flora-export) |
 | Certification | [`certify`](#flora-certify) |
-| Advanced | [`estimate`](#flora-estimate), [`compose`](#flora-compose), [`version`](#flora-version) |
+| Advanced | [`compose`](#flora-compose), [`version`](#flora-version) |
 
 ### `flora init`
 
@@ -382,20 +382,6 @@ flora certify [OPTIONS]
 | `--reported-e2e` |  | Caption: the stack's end-to-end caption records, JSONL (reported only). |
 | `--reported-repeat` |  | Caption: another exact repeat's caption records, JSONL, with --digests repeat= (reported only). |
 | `--families` |  | Caption: JSON {uid: label} (label [a-z0-9_.-]{1,32}) for the reported family split. |
-
-### `flora estimate`
-
-Show the per-stage rates of a rates.json (--rates). Measuring them on a sample of your dataset is not wired yet: without --rates it says so and exits 2.
-
-```
-flora estimate [OPTIONS]
-```
-
-| Argument / option | Default | |
-|---|---|---|
-| `--config`, `-c` | `flora.yaml` | flora.yaml |
-| `--sample` | `20` | Episodes to run for calibration (not wired yet: without --rates it exits 2). |
-| `--rates` |  | A rates.json to show, per stage of this config. |
 
 ### `flora compose`
 

@@ -84,19 +84,58 @@ def fidelity_detail(o, certs: dict[str, dict] | None = None) -> str:
 def display_flags(o, certs: dict[str, dict] | None = None) -> tuple[str, ...]:
     """``o.flags`` with the planner's ``<preset>: uncertified`` wording replaced by the same
     fidelity words the table shows (:func:`fidelity_detail`), so one option has one label."""
+    from flora_deploy.planner.options import UNCERTIFIED
+
     head = f"{o.preset}: uncertified"
+    blocked = f"{head} until every stage is certified; set "
     detail = fidelity_detail(o, certs)
-    return tuple(f"{o.preset}: {detail}{f[len(head):]}" if f.startswith(head) else f
-                 for f in o.flags)
+    out = []
+    for f in o.flags:
+        if f == "unavailable: " + UNCERTIFIED.format(preset=o.preset):
+            continue  # the uncertified flag below already says it and how to opt in
+        if f.startswith(blocked):
+            f = f"{o.preset}: {detail}; set {f[len(blocked):]}"
+        elif f.startswith(head):
+            f = f"{o.preset}: {detail}{f[len(head):]}"
+        out.append(f)
+    return tuple(out)
+
+
+NEEDS_OPT_IN = "needs allow_uncertified: true"
 
 
 def status_label(o) -> str:
-    """``unavailable`` when something blocks the option, ``projection`` when it needs a feature
-    that is not deployed, else ``ok`` / ``at risk`` / ``infeasible`` (budget, deadline or GPU
-    cap)."""
+    """``needs allow_uncertified: true`` when the only thing blocking the option is that a stage
+    is not certified, ``unavailable`` when something else blocks it, ``projection`` when it
+    needs a feature that is not deployed, else ``ok`` / ``at risk`` / ``infeasible`` (budget,
+    deadline or GPU cap)."""
+    from flora_deploy.planner.options import UNCERTIFIED
+
     if o.unavailable and o.status != "infeasible":
+        if tuple(o.unavailable) == (UNCERTIFIED.format(preset=o.preset),):
+            return NEEDS_OPT_IN
         return "unavailable"
     return "projection" if o.requires else o.status
+
+
+_PINNED_GPU = re.compile(r"\b([A-Z][A-Za-z0-9-]*)!")
+
+
+def gpu_text(text: str) -> str:
+    """User-facing GPU names: flora.yaml's ``H100!`` (exactly an H100, never upgraded) reads
+    ``H100 only``."""
+    return _PINNED_GPU.sub(r"\1 only", text)
+
+
+def write_command(n: int, config: Path, args: list[str]) -> str:
+    """The ``flora plan`` command that writes option ``n``: the options the user passed (they
+    change the options and their numbers), then ``--write n``."""
+    import shlex
+
+    parts = ["flora", "plan"]
+    if config != Path("flora.yaml"):
+        parts += ["-c", str(config)]
+    return shlex.join([*parts, *args, "--write", str(n)])
 
 
 def certificate_note(cfg, o, content, certs: dict[str, dict] | None = None) -> str | None:
@@ -116,12 +155,13 @@ def _gpus_label(o) -> str:
 
     def one(k) -> str:
         boxes = f"{k.containers} container{'s' if k.containers != 1 else ''}"
-        return f"{k.kind} {boxes} × {k.gpu_count} {k.gpu}, {episodes_label(k)}"
+        return f"{k.kind} {boxes} × {k.gpu_count} {gpu_text(k.gpu)}, {episodes_label(k)}"
 
     return "; ".join(one(k) for k in o.kinds)
 
 
-def _print_plan(cfg, workload, req, deadline_s, options, best, rates, table, content) -> None:
+def _print_plan(cfg, workload, req, deadline_s, options, best, rates, table, content,
+                write_cmd=None) -> None:
     from rich.markup import escape
     from rich.table import Table
 
@@ -137,7 +177,7 @@ def _print_plan(cfg, workload, req, deadline_s, options, best, rates, table, con
                   f"video-hours{views}, {workload.episodes:,} episodes; budget "
                   f"{_money(req.budget_usd or 0)}{dl}, max {req.max_gpus} GPUs", soft_wrap=True)
     colour = {"ok": "green", "at risk": "yellow", "infeasible": "red", "unavailable": "red",
-              "projection": "yellow"}
+              "projection": "yellow", NEEDS_OPT_IN: "yellow"}
 
     def cost(o) -> str:
         return f"{_money(o.cost_usd)} ({_money(o.cost_low_usd)}-{_money(o.cost_high_usd)})"
@@ -169,15 +209,17 @@ def _print_plan(cfg, workload, req, deadline_s, options, best, rates, table, con
             console.print(f"   cost {cost(o)}", soft_wrap=True)
             console.print(f"   wall-clock {wall(o)}, {o.peak_gpus} GPUs at peak", soft_wrap=True)
             console.print(f"   rates {escape(rates_label(o))}", soft_wrap=True)
-        console.print(f"  {i}. pools: {escape(_gpus_label(o))}", soft_wrap=True)
+        if wide:  # the table names the option; the stacked layout has its heading above
+            console.print(f"[bold]{i}. {escape(o.name)}[/bold]", soft_wrap=True)
+        console.print(f"   pools: {escape(_gpus_label(o))}", soft_wrap=True)
         for f in display_flags(o, cs.get(o.name)):
-            console.print(f"  {i}. {escape(f)}", soft_wrap=True)
+            console.print(f"   {escape(gpu_text(f))}", soft_wrap=True)
         note = certificate_note(cfg, o, content, cs.get(o.name))
         if note:
-            console.print(f"  {i}. certificates: {escape(note)}", soft_wrap=True)
+            console.print(f"   certificates: {escape(gpu_text(note))}", soft_wrap=True)
     if any("!" in k.gpu for o in options for k in o.kinds):
-        console.print("H100! means exactly an H100 (Modal never upgrades it to a pricier GPU).",
-                      soft_wrap=True)
+        console.print("H100 only: exactly an H100; Modal never upgrades it to a pricier GPU "
+                      "(flora.yaml writes it `H100!`).", soft_wrap=True)
     from flora_deploy.planner.options import POOL_END_TAIL_S
 
     console.print("Cost: the all-in estimate for this workload at Modal list prices: GPU work, "
@@ -191,14 +233,22 @@ def _print_plan(cfg, workload, req, deadline_s, options, best, rates, table, con
                   soft_wrap=True)
     if best is not None:
         n = options.index(best) + 1
+        cmd = write_cmd(n) if write_cmd else f"flora plan --write {n}"
         console.print(f"Recommended: {n} ({escape(best.name)}), the cheapest option your "
-                      f"config can run. Write it with `flora plan ... --write {n}`.",
+                      f"config can run. Write it into flora.yaml with `{escape(cmd)}`.",
                       soft_wrap=True)
         return
     fits = [o for o in options if o.status != "infeasible" and not o.requires]
     if fits:  # something fits the budget and deadline but cannot run: say why, not "raise it"
-        why = "; ".join(f"{options.index(o) + 1} ({o.name}): {', '.join(o.unavailable)}"
-                        for o in fits)
+        from flora_deploy.planner.options import UNCERTIFIED
+
+        def reasons(o) -> str:
+            opt_in = (f"{UNCERTIFIED.format(preset=o.preset)} (set `allow_uncertified: true` "
+                      "in flora.yaml to run it anyway)")
+            return ", ".join(opt_in if u == UNCERTIFIED.format(preset=o.preset) else u
+                             for u in o.unavailable)
+
+        why = "; ".join(f"{options.index(o) + 1} ({o.name}): {reasons(o)}" for o in fits)
         console.print(f"[red]No runnable option: {escape(why)}.[/red]", soft_wrap=True)
     else:
         console.print("[red]No option fits the budget, deadline and GPU cap: raise --budget / "
@@ -332,6 +382,18 @@ def plan(
     except ConfigError as e:
         raise _fail(str(e)) from None
 
+    passed: list[str] = []  # the options that shape the plan, for the `--write N` hint
+    for flag, value in (("--budget", budget), ("--deadline", deadline),
+                        ("--video-hours", video_hours), ("--episodes", episodes),
+                        ("--cameras", cameras), ("--index", index), ("--max-gpus", max_gpus),
+                        ("--rates", rates_file)):
+        if value is not None:
+            passed += [flag, f"{value:g}" if isinstance(value, float) else str(value)]
+    for p in preset or ():
+        passed += ["--preset", p]
+    passed += [f for f, on in (("--live-prices", live_prices), ("--check-cache", check_cache),
+                               ("--assume-warm", assume_warm)) if on]
+
     try:
         if index is None and video_hours is None:
             from flora_deploy.cli.index import default_index_summary
@@ -397,7 +459,8 @@ def plan(
             "recommended": options.index(best) + 1 if best else None,
             "options": [option_json(o) for o in options]}, indent=2))
     else:
-        _print_plan(cfg, workload, req, deadline_s, options, best, rates, table, content)
+        _print_plan(cfg, workload, req, deadline_s, options, best, rates, table, content,
+                    write_cmd=lambda n: write_command(n, config, passed))
 
     if write is not None:
         if not 1 <= write <= len(options):
@@ -418,7 +481,7 @@ def plan(
                       f"(previous file, with its comments, saved as {escape(str(backup))}).")
 
 
-@app.command()
+@app.command(hidden=True)  # measuring rates on a sample is not wired yet
 def estimate(
     config: Annotated[Path, typer.Option("--config", "-c", help="flora.yaml")] = Path("flora.yaml"),
     sample: Annotated[int, typer.Option(

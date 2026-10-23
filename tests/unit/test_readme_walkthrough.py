@@ -90,7 +90,7 @@ def test_plan_without_opt_in_says_why_not_no_option_fits(tmp_path):
     assert not load_config(cfg).allow_uncertified
     r = _plan(cfg, "--preset", "balanced", "--budget", "100", "--max-gpus", "4")
     assert r.exit_code == 0, r.output
-    assert "unavailable" in r.output and "allow_uncertified: true" in r.output
+    assert "needs allow_uncertified: true" in r.output and "unavailable" not in r.output
     assert "No option fits" not in r.output
     assert "No runnable option" in r.output and "uncertified" in r.output
 
@@ -109,7 +109,8 @@ def test_plan_readable_at_80_columns(balanced_cfg):
 def test_plan_cost_says_what_it_includes(balanced_cfg):
     out = _plan(balanced_cfg).output
     assert "all-in estimate" in out and "startup" in out
-    assert "H100! means exactly an H100" in out
+    assert "H100 only: exactly an H100" in out and "H100!," not in out
+    assert "plan ... --write" not in out and "--write 1`" in out
     assert_no_jargon(out, "flora plan")
 
 
@@ -662,7 +663,7 @@ def test_plan_labels_one_option_one_way(balanced_cfg):
 def test_plan_pools_say_containers_and_gpus(balanced_cfg):
     """`2 containers × 1 H200, 4 episodes each`, never `2xH200 x4 ep` (item 9)."""
     out = _plan(balanced_cfg, "--budget", "100").output
-    pools = [ln for ln in out.splitlines() if ". pools: " in ln]
+    pools = [ln for ln in out.splitlines() if ln.startswith("   pools: ")]
     assert pools and all("×" in ln and " each" in ln for ln in pools), pools
     assert not re.search(r"\d+x(H200|H100|L40S)", out), out
     assert re.search(r"segcap \d+ containers? × 1 H200, \d+ episodes? each", out), out

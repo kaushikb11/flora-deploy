@@ -185,8 +185,8 @@ def test_plan_recommends_the_certified_option(human_certs, tmp_path):
     out = runner.invoke(app, ["plan", "-c", str(p), "--video-hours", "1"],
                         env={"COLUMNS": "80"}).output
     assert "(recommended): ok, certified" in out
-    assert ("certificates: segment certified (human, L40S); caption certified (human, H100!)"
-            in " ".join(out.split()))
+    assert ("certificates: segment certified (human, L40S); caption certified (human, H100 "
+            "only)" in " ".join(out.split()))  # the CLI's words for flora.yaml's `H100!`
 
 
 def test_plan_shows_partly_certified(human_certs, tmp_path):

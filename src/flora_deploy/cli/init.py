@@ -20,9 +20,9 @@ DEFAULT_TEMPLATE = "balanced_lerobot"
 # the reference / certification templates.
 TEMPLATE_INFO: dict[str, tuple[str, str]] = {
     "balanced_lerobot": ("balanced_lerobot.yaml",
-                         "LeRobot dataset, balanced preset (vLLM; L40S + H100!); the default"),
+                         "LeRobot dataset, balanced preset (vLLM; L40S + H100); the default"),
     "balanced_mp4_dir": ("balanced_mp4_dir.yaml",
-                         "folder of MP4s, balanced preset (vLLM; L40S + H100!)"),
+                         "folder of MP4s, balanced preset (vLLM; L40S + H100)"),
     "exact_lerobot": ("exact_lerobot.yaml",
                       "LeRobot dataset, exact preset (NVIDIA's HF code on H200); reference / "
                       "certification"),
