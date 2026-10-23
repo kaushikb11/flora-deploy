@@ -33,7 +33,8 @@ FORBIDDEN = [
 # Content (relocated code, pasted prompts, model cards) is checked against the fetched NVIDIA
 # files in tests/nvlink/test_license_content.py.
 MAX_BYTES = 1_000_000
-ALLOW_LARGE = {"uv.lock"}
+# The README figure (scripts/render_hero.py: frames + captions of one public EgoDex episode).
+ALLOW_LARGE = {"uv.lock", "docs/img/hero.png", "docs/img/hero.svg"}
 
 
 def tracked_files() -> list[str]:
