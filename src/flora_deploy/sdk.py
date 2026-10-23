@@ -65,9 +65,10 @@ from flora_deploy.jobs.store import (
     fake_job_id,
     is_fake_job_id,
     prefetch,
-    prefetch_areas,
+    snapshot,
 )
 from flora_deploy.jobs.stores.client_volume import ClientVolumeStore
+from flora_deploy.jobs.types import safe_key
 
 RUN_SPEC_SCHEMA = "flora_run_v1"
 FACTORY = "flora_deploy.sdk:deployed_deps"  # the deps factory the deployed orchestrator loads
@@ -367,6 +368,13 @@ class JobView:
         return dataclasses.asdict(self)
 
 
+FRESH_VIEW_S = 10.0  # see ``Job._opened_at``
+
+# Job-level directories (outside every config / stage hash) that status and report read every
+# file of: control records, container receipts and startup facts.
+JOB_LEVEL_DIRS = ("control", "containers", "startup")
+
+
 def _ledgers(store: Store, job_id: str, config_hash: str, manifest: Any) -> list[Any]:
     from flora_deploy.jobs.orchestrator import ShardLedger
 
@@ -415,6 +423,11 @@ class Job:
     spec: dict[str, Any]
     backend: Backend = field(default_factory=get_backend)
     clock: Callable[[], float] = time.time
+    # ``time.monotonic()`` when ``open_job_in`` read this job through the store (its cached view
+    # is that recent): a status within :data:`FRESH_VIEW_S` of it uses that view instead of
+    # refreshing and listing everything again (the CLI opens a job and asks for its status
+    # straight away). Consumed by the first status.
+    _opened_at: float | None = field(default=None, repr=False, compare=False)
 
     # -- derived pieces --------------------------------------------------------------------
     @property
@@ -436,15 +449,34 @@ class Job:
         return bool(self.spec.get("local"))
 
     def _refresh(self) -> None:
+        """See other processes' writes: drop the store's cached view (unless it was taken while
+        opening this job, see ``_opened_at``), then list the whole job directory in one call
+        (``jobs.store.snapshot``), so the reconcile, budget and report passes that follow ask
+        the store no further listing round trips."""
         fn = getattr(self.store, "refresh", None)
-        if callable(fn):
+        fresh = (self._opened_at is not None
+                 and time.monotonic() - self._opened_at < FRESH_VIEW_S)
+        self._opened_at = None
+        if callable(fn) and not fresh:
             fn()
+        snapshot(self.store, JobPaths(self.job_id).root)
 
-    def _prefetch(self, manifest: Any, areas: Iterable[str]) -> None:
-        """Read the job's ``areas`` ahead, in parallel (``jobs.store.prefetch_areas``: one
-        Volume round trip per shard file otherwise; a no-op on a mounted or local store)."""
+    def _prefetch(self, manifest: Any, areas: Iterable[str], *,
+                  extra: Iterable[str] = ()) -> None:
+        """Read ahead, in parallel and in one batch, the job's per-hash ``areas``, its job-level
+        files (:data:`JOB_LEVEL_DIRS`) and the ``extra`` files that exist: one Volume round trip
+        per file otherwise; a no-op on a mounted or local store."""
+        if not callable(getattr(self.store, "prefetch", None)):
+            return
+        root = JobPaths(self.job_id).root
         hashes = [self.config_hash, *dict(getattr(manifest, "stage_hashes", None) or {}).values()]
-        prefetch_areas(self.store, JobPaths(self.job_id).root, hashes, areas)
+        paths = [p for p in extra if self.store.exists(p)]
+        for h in dict.fromkeys(hashes):
+            for area in areas:
+                paths += self.store.list(f"{root}/{safe_key(h)}/{area}/")
+        for d in JOB_LEVEL_DIRS:
+            paths += self.store.list(f"{root}/{d}/")
+        prefetch(self.store, paths)
 
     def _deps(self) -> Any:
         from flora_deploy.jobs.deps import build_deps
@@ -474,13 +506,24 @@ class Job:
 
     # -- status ----------------------------------------------------------------------------
     def status(self) -> JobView:
+        return self._status(("calls", "receipts"))
+
+    def _status(self, areas: tuple[str, ...]) -> JobView:
+        """:meth:`status`, reading ``areas`` ahead (``report`` adds the attempt markers so
+        they come in the same parallel batch)."""
         from flora_deploy.jobs.driver import budget_state_from_ledgers
+        from flora_deploy.jobs.pools import drains_path
         from flora_deploy.jobs.reconciler import reconcile
 
         self._refresh()
         deps = self._deps()
         settings = deps.settings
-        self._prefetch(deps.manifests.load(), ("calls", "receipts"))
+        root = JobPaths(self.job_id).root
+        if "attempts" not in areas and not self.store.exists(self._summary_path()):
+            areas = (*areas, "attempts")  # not composed: likely running (the projection reads
+            # the markers below); in the same batch rather than a second one after reconcile
+        self._prefetch(deps.manifests.load(), areas,
+                       extra=(self._summary_path(), drains_path(root, self.config_hash)))
         st = reconcile(job_id=self.job_id, config_hash=self.config_hash, store=self.store,
                        manifests=deps.manifests, attempts=deps.attempts, lease=self._lease(),
                        clock=self.clock, max_starts=settings.max_starts_before_quarantine,
@@ -687,11 +730,11 @@ class Job:
         )
         from flora_deploy.jobs.driver import budget_state_from_ledgers
 
-        v = self.status()
+        # the per-container rows read every attempt marker: in status's read-ahead batch
+        v = self._status(("calls", "receipts", "attempts"))
         settings = self.settings
         deps = self._deps()
         manifest = deps.manifests.load()
-        self._prefetch(manifest, ("attempts",))  # the per-container rows read every marker
         now = self.clock()
         rates = pinned_rates(region_multiplier=region_multiplier_for(settings.region))
         calls = budget_state_from_ledgers(
@@ -884,7 +927,8 @@ def open_job_in(st: Store, job_id: str, *, store_uri: str, config_hash: str | No
     check_results_namespace(st, job_id, config_hash)
     spec = read_run_spec(st, job_id, config_hash)
     check_job_namespace(job_id, spec)
-    return Job(job_id, spec["config_hash"], spec.get("store", store_uri), st, spec, be)
+    return Job(job_id, spec["config_hash"], spec.get("store", store_uri), st, spec, be,
+               _opened_at=time.monotonic())
 
 
 def _plan_deployment(cfg: Any, **kw: Any) -> Any:
