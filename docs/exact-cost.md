@@ -1,11 +1,10 @@
-# G3: cutting the `exact` preset's cost without changing any model input
+# Cutting the `exact` preset's cost without changing any model input
 
-Status: analysis plus a CPU-proven implementation, 2026-10-21; revised 2026-10-22 after review
-7b. **No GPU or Modal time was used.**
+Status: analysis plus a CPU-proven implementation, 2026-10-21; revised 2026-10-22. **No GPU or Modal time was used.**
 
-> **Revision (review 7b, Fix-SC merge).** Shard overlap (lever 1) was **removed**. `exact` is
+> **Revision (2026-10-22).** Shard overlap (lever 1) was **removed**. `exact` is
 > now only the certification reference, and overlap conflicted with the segcap worker's
-> one-shard-per-container contract (review 6 H2: plan, factory and runner all use
+> one-shard-per-container contract (plan, factory and runner all use
 > `max_inputs = 1` for segcap). It also had defects of its own: an engine-wide cancel flag that
 > failed sibling shards and newcomers, crash blame shared between co-tenant shards (a healthy
 > episode could be poison-pilled), and a Volume-refresh guard that counted running shards
@@ -13,9 +12,9 @@ Status: analysis plus a CPU-proven implementation, 2026-10-21; revised 2026-10-2
 > the worker** (`FLORA_SEGCAP_SCHEDULING`). The refresh guard is kept, keyed on live episode
 > threads. Lever 1's cost range is corrected below for the record: **$28.6–31.2**, not
 > $28.6–29.8.
-Every projection below comes from component times already measured and recorded in
-`docs/exact-worker.md` (P1a-5s), `docs/perf-1.md`, `docs/exact-concurrency.md` (W3-A) and
-`docs/cold-start.md` (W3-B). It also uses the P1a-5s per-episode results (`flora-golden:/reference_runs/p1a5s-20261021T155655Z-ba42121d-fast/`).
+Every projection below comes from component times already measured: the `exact` worker's
+baseline run (2026-10-21, one 6-episode shard, with its per-episode results), the `exact`
+concurrency measurements and [`cold-start.md`](cold-start.md).
 Prices are Modal list prices as these docs use them:
 - H200 container (8 cores, 96 GiB): **$5.68/h**;
 - H100: $3.95/h;
@@ -27,18 +26,18 @@ The rule for every option: **every model call gets exactly the input it gets tod
 file changes, every model call is still NVIDIA's batch-1 `generate`, and the rest of the
 orchestration stays NVIDIA's own code.
 
-## Baseline (measured, P1a-5s)
+## Baseline (measured)
 
 One H200 container, c=4, `gpu_thread` on, cold cuDNN graph cache. One 6-episode shard of 80.97 video-s.
 
 | Quantity | Value | Source |
 |---|---|---|
-| Batch wall | 519 s | exact-worker.md |
+| Batch wall | 519 s | baseline run |
 | Generation GPU-s (lock held) | 408.2 s = TempSeg 188.8 s (10 calls) + Captioner 219.4 s (31 calls) | per-episode `generation` stats |
 | Container-s per video-s | 519 / 80.97 = **6.41** | rates.json default (6.4) |
 | $/video-h | 6.41 × $5.68 = **$36.4** | |
 | GPU floor (cold) | 408.2 / 80.97 = 5.04 container-s/video-s, which is **$28.6** | |
-| `@enter` | 78 s; plus ≈23 s of scheduling (S1: 126 s from submit to ready, against 103 s for `@enter`) | exact-worker.md |
+| `@enter` | 78 s; plus ≈23 s of scheduling (126 s from submit to ready, against 103 s for `@enter`) | baseline run |
 
 **Where the 111 s of GPU idle went.** Each result's `batch.end_s − timings_s.total` gives when it started.
 - All four first episodes started **54–60 s** after the batch began. Nothing ran before them, and the cause is not attributed. The run overlapped the validation-only FP32 Captioner prefetch and hash, so this is possibly an artifact; it could also be the per-episode `nv.audit` / `accel.episode()` entry under that I/O load.
@@ -47,16 +46,16 @@ One H200 container, c=4, `gpu_thread` on, cold cuDNN graph cache. One 6-episode 
 
 **So the idle is a per-shard *fill*, not a drain.** It is 50–111 s per shard: ≈50 s for certain, and up to 111 s if the pre-start gap is real in production.
 
-**The measured run was already longest-first.** `validate_shard` sorts its golden episodes longest first. Production runs in manifest plan order (see lever 2).
+**The measured run was already longest-first.** `validate_shard` sorts its certification-set episodes longest first. Production runs in manifest plan order (see lever 2).
 
 ## Options
 
 | # | Lever | Input-identical? | Projected container-s/video-s | **$/video-h** | Complexity | Implemented |
 |---|---|---|---|---|---|---|
-| 0 | Today, P1a-5s as measured (longest-first order) | — | 6.41 | **$36.4** | — | — |
+| 0 | Today, as measured (longest-first order) | — | 6.41 | **$36.4** | — | — |
 | 0′ | Today in production: plan order | yes | ≈7.0 (model: +9.7%) | **≈$40** | — | — |
 | 2 | Longest-first order (LPT) | yes: start order only | 6.41 (recovers 0′ → 0) | **$36.4** (−9% vs 0′) | low | **yes, wired** (`episode_order`) |
-| 1 | Shard overlap, `max_inputs` 2, shared slots (+ LPT) | yes: start time only | 5.04–5.49 | $28.6–31.2 (for the record) | medium | **removed** (review 7b) |
+| 1 | Shard overlap, `max_inputs` 2, shared slots (+ LPT) | yes: start time only | 5.04–5.49 | $28.6–31.2 (for the record) | medium | **removed** (2026-10-22) |
 | 4a | Larger shards (3× target) instead of overlap | yes | 5.25–5.50 | $29.8–31.2 | config only | no |
 | 4b | Long-lived containers (warm cuDNN cache) + 1 + 2 | yes (Perf-1: same graph key, same heuristics) | ≈3.9–4.1 at c=4; ≈2.5 at c=8 | **≈$22–23**; ≈$14 at c=8 | config + measurement | no (needs GPU measurement) |
 | 3 | Split pools: TempSeg on L40S, Captioner on H100 | yes, *given the same TempSeg output*; but the GPU class changes the reference (below) | — | **$24.9–30.5** | high | core + CPU proof only, not wired |
@@ -65,14 +64,14 @@ One H200 container, c=4, `gpu_thread` on, cold cuDNN graph cache. One 6-episode 
 
 ### Lever 1: overlap shards inside one container (removed)
 
-**Removed in review 7b; kept here as the analysis of record.** The code (`max_shards`,
+**Removed on 2026-10-22; kept here as the analysis of record.** The code (`max_shards`,
 `FastExactEngine(overlap=True)`, `EpisodeSlots`, `pipeline.exact_scheduling.shard_overlap`) and
 its tests are gone. Why:
 - it needs `resources.segcap.max_inputs` ≥ 2, but segcap runs one shard per container, and
-  plan, factory and runner all agree on `max_inputs = 1` (review 6 H2);
+  plan, factory and runner all agree on `max_inputs = 1`;
 - the engine-wide cancel flag failed sibling shards and later newcomers (error marks, so
   `shard_failed`);
-- a co-tenant's crash or `os._exit` left the sibling's marker unmarked, so D15 counted it as a
+- a co-tenant's crash or `os._exit` left the sibling's marker unmarked, so the quarantine rule (D15, [`architecture.md`](architecture.md)) counted it as a
   crash and could poison-pill a healthy episode;
 - the Volume-refresh guard counted running shards rather than live episode threads.
 
@@ -84,7 +83,7 @@ container, and the factory already scales the call timeout by `max_inputs`. The 
 Now:
 - `SegcapShardRunner(max_shards=N)` runs up to N shards. Each has its own marker, part sink, receipt and step 0–6 path.
 - The engine `FastExactEngine(overlap=True)` shares its `concurrency` episode slots between them through `stages.reference.EpisodeSlots`.
-- A free slot always goes to the earliest shard's next queued episode, so a later shard only fills slots a draining shard frees. Running episodes never exceed c=4, so RSS is unchanged (W3-A: +3.2 GiB per slot).
+- A free slot always goes to the earliest shard's next queued episode, so a later shard only fills slots a draining shard frees. Running episodes never exceed c=4, so RSS is unchanged (measured: +3.2 GiB per slot).
 
 The fill (probe, decode, input resolution) of shard N+1 therefore runs while shard N keeps the
 GPU busy. It is paid once per container, not once per shard.
@@ -100,14 +99,14 @@ The saving is therefore $3–7 per video-h. It depends on whether the 56 s pre-s
 
 **Why inputs are identical.** Each episode still runs NVIDIA's own `api.DataEnginePipeline().annotate` alone in its thread, with its own processor clones. Only the moment it starts changes.
 
-This is W3-A's proven setting: episode threads sharing resident models under one GPU lock. Overlap only lets two batches feed the same thread budget.
+This is the measured concurrency setting: episode threads sharing resident models under one GPU lock. Overlap only lets two batches feed the same thread budget.
 
 **Risks found and handled:**
 1. **Volume reload during an overlapped shard.** `store.refresh()` at a shard's start would reload the Volume while another shard's NVIDIA thread has a media file open. That happens when `stage_to` names the store Volume (`factory.media_for` then puts the media under the store mount). A reload fails, or blanks the mount, while files are open.
    - The runner now skips the refresh in exactly that case: another shard in flight, and media under the store's mount. It counts `skipped_refreshes`.
    - That shard then sees the container's last view, which the store contract already tolerates (eventually consistent).
    - **The same hazard exists for `RewardShardRunner` with `max_inputs > 1`**, which refreshes unconditionally. That belongs to the reward owner.
-2. **Preempt ordering.** A cancelled shard's thread used to be able to write its `mark_exception` before `preempt()` reached it. Its start then counted toward D15.
+2. **Preempt ordering.** A cancelled shard's thread used to be able to write its `mark_exception` before `preempt()` reached it. Its start then counted toward the quarantine rule (D15).
    - `preempt()` now marks every shard in flight *first*, then cancels the queued episodes.
    - The new test caught this race in about 1 run in 3.
 3. **Lock statistics** are reset only by the first batch in flight (`reset_lock`). A newcomer never clears a running batch's cancel.
@@ -187,16 +186,16 @@ Overlap gets the benefit without those costs.
 - Perf-1 puts generation fully warm at 1.8 GPU-s/video-s, against 5.04 cold.
 - TempSeg warms quickly: its prompt length is fixed per profile (1,832–1,859 human, 5,509–5,566 3-view).
 - Captioner prompt lengths cluster (this shard: 31 calls, 22 distinct lengths; 4,369 ×3, 4,391 ×5).
-- The model at warm = 0.45 (GPU 408 → 184 s per shard) gives 3.9–4.0 container-s/video-s, **≈$22–23**. That matches W3-A's c=4 measurement on cu130, where graph builds cost 18 ms (4.08).
+- The model at warm = 0.45 (GPU 408 → 184 s per shard) gives 3.9–4.0 container-s/video-s, **≈$22–23**. That matches the c=4 concurrency measurement on cu130, where graph builds cost 18 ms (4.08).
 - Once warm, c=8 (`rates.json`'s 2.5, `requires: long_lived_container`) gives ≈$14.
 - **How fast the Captioner warms is the key unknown.** Measure it.
 
 ### Lever 5: other input-identical levers
 
 - **Memory 96 → 48 GiB** cuts the hourly price from $5.68 to $5.30 (−6.7%).
-  - The batch needs ≤26 GiB RSS at c=4 (P1a-5s: 25.9 GiB), plus ≈18 GiB of CPU BF16 staging at load.
+  - The batch needs ≤26 GiB RSS at c=4 (baseline run: 25.9 GiB), plus ≈18 GiB of CPU BF16 staging at load.
   - The cost: the 68.9 GiB t=0 prefetch no longer fits in the page cache, so the Captioner GPU load reads from the Volume again (≈54.7 GB at 3–5 GB/s, ≈+15 s of startup). Measure it.
-- **Decode-ahead and input prefetch.** NVIDIA's `_inputs` probe (45–60 s at 1080p) and our serial input resolution (review 5 L1) only cost GPU time during the fill. Overlap hides them. A separate prefetch would mean caching NVIDIA probe objects for no extra gain.
+- **Decode-ahead and input prefetch.** NVIDIA's `_inputs` probe (45–60 s at 1080p) and our serial input resolution only cost GPU time during the fill. Overlap hides them. A separate prefetch would mean caching NVIDIA probe objects for no extra gain.
 - **The 56 s pre-start gap.** Attribute it first. If it is the per-episode `nv.audit` or `accel.episode()` entry, it is a per-episode cost that concurrency hides, except during the fill.
 - **cpu 8 → 6** saves 1.7%. That is noise against the risk of a longer fill.
 
@@ -219,7 +218,7 @@ It changes only *when* an episode starts: no argument, processor state or model 
 |---|---|
 | `tests/unit/test_exact_scheduling.py` | LPT order; env parsing; longest-first in the production runner (`FastExactEngine` composite over the fake NVIDIA family) against plan order: **identical records, strict per-call input digests**; refresh guard skips the reload while an earlier batch's episode threads still run; config validated, not hashed, overlap knob rejected; **wired**: config → factory env → `segcap_settings_from_env`, with segcap `max_inputs` staying 1 |
 | `tests/nvlink/test_exact_scheduling_nvlink.py` (2) | **NVIDIA's real code**, real processors, synthetic H.264/AV1 clips: one concurrent batch in reversed start order (all accel patches) against NVIDIA unmodified, `identity_summary` strict and full results identical. Split TempSeg/Captioner (above) |
-| `tests/unit/test_exact_scheduling_local.py` (1) | **G2 end to end.** A whole local job (segcap + rewards) with `longest_first` and a preemption fault is `done`, keeps the same config hash, and gives byte-identical records to a clean plan-order run |
+| `tests/unit/test_exact_scheduling_local.py` (1) | **End to end.** A whole local job (segcap + rewards) with `longest_first` and a preemption fault is `done`, keeps the same config hash, and gives byte-identical records to a clean plan-order run |
 
 ## Recommendation
 
@@ -230,7 +229,7 @@ It changes only *when* an episode starts: no argument, processor state or model 
 
 ## What to measure in the next approved GPU session (≈$3)
 
-One H200 container, `--memory-gib 96`, longest-first, `max_inputs` 1. Three consecutive 6-episode golden shards, with 1-view and 3-view kept separate. About 25 min × $5.68 ≈ $2.4.
+One H200 container, `--memory-gib 96`, longest-first, `max_inputs` 1. Three consecutive 6-episode certification-set shards, with 1-view and 3-view kept separate. About 25 min × $5.68 ≈ $2.4.
 
 Record:
 1. per-shard wall and `gpu_busy_fraction` over the whole container (the per-shard fill);
@@ -249,4 +248,4 @@ uv run pytest -q tests/unit/test_exact_scheduling.py tests/unit/test_exact_sched
 uv run pytest -q -m nvlink tests/nvlink/test_exact_scheduling_nvlink.py
 ```
 
-The cost model I used for levers 1–2 is a discrete-event simulation calibrated to the P1a-5s shard: c slots, one GPU server, per-episode probe plus n×(CPU, GPU) phases. Its inputs are the per-episode `timings_s` and `generation` numbers from the P1a-5s results listed above.
+The cost model I used for levers 1–2 is a discrete-event simulation calibrated to the baseline shard: c slots, one GPU server, per-episode probe plus n×(CPU, GPU) phases. Its inputs are the per-episode `timings_s` and `generation` numbers from the baseline run's results.

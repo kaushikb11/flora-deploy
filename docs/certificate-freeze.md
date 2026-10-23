@@ -5,9 +5,9 @@ For contributors. Once an accuracy certificate for a stack is committed under
 does not break anything you can see. The certificate just stops matching, and users of that
 stack see the stage as `not certified` (and the option as `partly certified` or `uncertified`)
 in `flora plan` and `flora deploy`, with `certified: false` in its records. This page says what
-is frozen, how to tell whether your change touches it, and what to do when it does. How
-certificates are computed and matched, and what partial certification looks like to users, is
-in [`certification.md`](certification.md).
+is frozen, how to tell whether your change touches it, and what to do when it does. What
+`certified` means to users is in [`certification.md`](certification.md); how a certificate is
+computed and matched is in `validate/certify.py` and `validate/certkey.py`.
 
 ## What is frozen
 
@@ -117,7 +117,7 @@ The drift report ends with the choice:
 On the commit that carries the change:
 
 ```bash
-# 1. the certified run: exact oracle, noise run and balanced on the golden human episodes
+# 1. the certified run: exact oracle, noise run and balanced on the certification-set human episodes
 uv run python scripts/wave_h.py --plan certified --dry-run    # check the steps and the cap
 uv run python scripts/wave_h.py --plan certified
 

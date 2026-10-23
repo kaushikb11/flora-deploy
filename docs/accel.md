@@ -1,10 +1,10 @@
-# Accelerated NVIDIA: runtime patches (OPT-1)
+# Accelerated NVIDIA: runtime patches
 
 Status: first patch set, 2026-10-21. Package: `src/flora_deploy/accel/`. Tests:
 `tests/nvlink/test_accel_parity.py`, `tests/nvlink/test_accel_bench.py`,
 `tests/unit/test_accel_registry.py`, `tests/unit/test_accel_decoder.py`.
 
-`docs/reference-smoke.md` measured that model generation is only 9–31% of each reference stage.
+An early profile of NVIDIA's reference pipeline measured that model generation is only 9–31% of each reference stage.
 The rest is CPU work inside NVIDIA's code. These patches take that CPU work out of the critical
 path **without changing a single output**. This is form (1) of decision D17 ([`architecture.md`](architecture.md)): runtime wraps in our
 process, each proven output-identical to NVIDIA's unmodified code, which stays the oracle.
@@ -43,15 +43,15 @@ active.restore()                                  # NVIDIA's attributes back, LI
   PIL and PyAV release the GIL in their codecs. Measured: 4 concurrent PyAV decodes cost the
   wall time of 1.
 
-### Episodes and concurrency (W3-A)
+### Episodes and concurrency
 
-`active.episode()` opens a scope bound to the **current context** (a `ContextVar`). W3-A runs
+`active.episode()` opens a scope bound to the **current context** (a `ContextVar`). The `exact` worker runs
 several episodes of a batch at once on threads that share one `ActivePatches`:
 
 - Enter `active.episode()` **inside** the thread (or asyncio task) that runs the episode. Each
   overlapping episode then has its own scope, and that scope is closed when *its* episode exits
   (decoder files closed, caches dropped, keys forgotten), whatever the other episodes do. Before
-  this, one shared depth counter kept everything open until the last episode ended (review M2:
+  this, one shared depth counter kept everything open until the last episode ended (for example,
   40 short episodes beside a long one held 40 decoders and their file descriptors).
 - Work the patches submit to the shared pools runs in a copy of the submitting context, so it
   sees the same scope. NVIDIA's `asyncio.to_thread` predictor call copies the context too.
@@ -74,7 +74,7 @@ that every tensor of every `generate()` call equals serial, unpatched NVIDIA's.
 
 Whole-result digests cannot show that NVIDIA's model got identical inputs: later TempSeg windows
 and all Captioner inputs depend on earlier model *outputs*, which vary run to run on the GPU
-(`docs/exact-concurrency.md`). `accel.identity` compares two runs call by call from NVIDIA's own
+([`determinism.md`](determinism.md)). `accel.identity` compares two runs call by call from NVIDIA's own
 log:
 
 - `model_calls(events)` reads one episode's `FLORA_RUNTIME generation_start`
@@ -233,7 +233,7 @@ The level-6 encode was the largest CPU item of the caption stage: 18 s of 34 s o
    Any other `save` call goes to Pillow unchanged.
    - The bytes are identical by construction: the PNG writer emits its chunks through the same
      path for a file and for a buffer. The test checks this.
-   - This is the WS-E concern: compressed size depends on the Pillow and zlib build. It still
+   - Compressed size depends on the Pillow and zlib build. It still
      comes from the very same build and call.
 2. **Decode once.** The worker also decodes those bytes (`Image.open` + `load` +
    `convert('RGB')`, as NVIDIA does) and precomputes `load_frames`' single-view downscale. Both
@@ -314,7 +314,7 @@ Results:
 - Every processor tensor is bit-identical.
 - `..._tiny_cache` repeats two cases with a 100 kB cache.
 
-Real staged samples (HomER, ALOHA) live only on the `flora-golden` Volume, so these runs use
+Real staged samples (HomER, ALOHA) live only on the certification Volume, so these runs use
 generated fixtures only. Running the same suite against the samples is a Modal-side follow-up.
 
 ## Measured speedup
@@ -371,7 +371,7 @@ are the ones removed or parallelized here. Those costs are full-resolution decod
   Retaining raw decoded frames across stages would cost about 3 MB per 1080p frame and was left
   out.
 - **Not patched.** The HF processor, `temporal_inputs`' BICUBIC resize and the prompt building
-  run unchanged. They are inside NVIDIA's functions, and the processor is WS-B's
+  run unchanged. They are inside NVIDIA's functions, and the processor goes through the
   `CaptureProcessor` path. Decoder threading (`thread_count > 1`) is also not used: FFmpeg
   documents threaded decoding as bit-exact, but it changes NVIDIA's decoder configuration.
   GOP-parallel decode from verified random-access points gives the parallelism instead.

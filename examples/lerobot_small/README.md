@@ -16,7 +16,7 @@ for an S3 bucket instead). Run `flora doctor -c flora.yaml` and follow the
 say `certified: true`), while segment and caption have no certificate for `yam` (`certified:
 false`), so `flora export` needs `--allow-uncertified`.
 
-**Estimated cost: $2.53 ($1.69-$3.81)** for the labelling job (segment, caption,
+**Estimated cost: $2.53 ($1.69-$3.81)** for the labeling job (segment, caption,
 terminal and dense rewards), from `flora plan --video-hours 0.11 --episodes 50`. That is the
 all-in estimate: GPU work plus each container's startup, from rates measured on one small run
 (±50%). It does not include the one-time `flora prepare` and weight conversions.

@@ -13,13 +13,13 @@ Start with the repository [`README.md`](../README.md).
 | [`limitations.md`](limitations.md) | What flora-deploy doesn't do yet: which stages are certified, measured vs estimated costs, unsupported inputs |
 | [`export.md`](export.md) | `flora export --to lerobot`: which labels go where in the dataset copy, and alignment rules |
 | [`output-format.md`](output-format.md) | Every field a finished job writes (JSONL, Parquet, `summary.json`, exclusions) |
-| [`certification.md`](certification.md) | How `balanced` is measured against `exact`, what a certificate binds to, and when it unlocks a preset |
+| [`certification.md`](certification.md) | What `certified` in a record means, why `exact` needs no certificate, and what `allow_uncertified` does |
 
 ## Contributing
 
 | Doc | What it covers |
 |---|---|
-| [`architecture.md`](architecture.md) | The pipeline from dataset to labels, the design decisions (D1-D18), determinism and licensing |
+| [`architecture.md`](architecture.md) | The pipeline from dataset to labels, the design decisions, determinism and licensing |
 | [`ci.md`](ci.md) | What each CI gate protects against, and how to run the gates locally |
 | [`certificate-freeze.md`](certificate-freeze.md) | What a committed certificate freezes and how the CI certificate-drift check works |
 

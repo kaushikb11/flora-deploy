@@ -1,9 +1,9 @@
 # Architecture
 
 How flora-deploy is put together: the pipeline from dataset to labels, the design decisions
-behind it, and what determinism and licensing mean here. Code comments that cite `PLAN.md §N`,
-`PLAN §N` or `PLAN-v3` refer to earlier internal build plans, which are not part of the
-repository; the decisions (`D1`-`D18`) below keep their numbers.
+behind it, and what determinism and licensing mean here. Some source comments cite internal
+planning notes that are not part of this repository; the design decisions below are numbered
+`D1`-`D18`, and other docs refer to them by those numbers.
 
 **Presets.** `balanced` serves NVIDIA's Flora models with vLLM (TempSeg on an L40S, the Captioner
 and the Rewarder on H100s) and is what the templates use. `exact` runs NVIDIA's own code on one
@@ -34,7 +34,7 @@ user machine:  flora CLI / SDK  (init · doctor · prepare · index · plan · d
                                           ▼  parts, receipt last
            stores (state of record): bucket (s3/gs/r2) · Modal Volume · local (tests)
            Volumes: flora-weights (snapshots + derived) · flora-cache (compile caches)
-                    flora-golden (golden set, oracle runs) · media staging Volumes
+                    certification Volume (reference episodes, oracle runs) · media staging Volumes
 ```
 
 | Step | What it does | Code |
@@ -65,16 +65,16 @@ decision named).
 |---|---|---|---|
 | D1 | **Linked mode.** NVIDIA's modules are imported at runtime from the user's HF snapshot, under unique module names, one process per NVIDIA repo family. We replace only model invocation and media I/O. | Faithful by construction; no noncommercial code in the repo; contains the three `batch_utils` name collisions. | active |
 | D2 | **vLLM 0.24.0 with explicit engine args everywhere** (`gdn_prefill_backend="triton"`, `max_num_seqs`, `max_num_batched_tokens`, `generation_config="vllm"` / stop tokens, prefix caching per stage, `mm_processor_cache_gb=0`). | Matches NVIDIA's stack; removes GPU-dependent defaults from certificates. | active (`engines/offline_llm.py` refuses missing or uncertified values) |
-| D3 | **TempSeg served as an FP32-merged checkpoint** (BF16 at runtime) as a plain model; HF+PEFT is the oracle. | vLLM #52568 (NaN with LoRA on hybrid GDN); HF padding with recurrent state is unsafe. | active; merge built and checked ([`tempseg-merge.md`](tempseg-merge.md)); merger v2 content digest not pinned yet, so `SegmentWorker` refuses until it is; Gate B pending |
-| D4 | **Captioner gets a one-time BF16 conversion**, `A_log`/`dt_bias` FP32. | Halves size; checkable. | active; proven bit-identical to NVIDIA's in-memory weights, also used by `exact` (OPT-2, [`captioner-bf16.md`](captioner-bf16.md)) |
-| D5 | **FP32 `dt_bias` patch is gated (Gate A)**, via `vllm.general_plugins` if shipped. | Upstream fix closed unmerged; pay for it only if drift matters. | active; plugin built, **off**; Gate A not measured; plugin-on is a different certificate key |
+| D3 | **TempSeg served as an FP32-merged checkpoint** (BF16 at runtime) as a plain model; HF+PEFT is the oracle. | vLLM #52568 (NaN with LoRA on hybrid GDN); HF padding with recurrent state is unsafe. | active; merge built and checked ([`tempseg-merge.md`](tempseg-merge.md)); merger v2 content digest not pinned yet, so `SegmentWorker` refuses until it is; serving it in `balanced` waits on certification |
+| D4 | **Captioner gets a one-time BF16 conversion**, `A_log`/`dt_bias` FP32. | Halves size; checkable. | active; proven bit-identical to NVIDIA's in-memory weights, also used by `exact` ([`captioner-bf16.md`](captioner-bf16.md)) |
+| D5 | **FP32 `dt_bias` patch is gated by a drift check**, via `vllm.general_plugins` if shipped. | Upstream fix closed unmerged; pay for it only if drift matters. | active; plugin built, **off** (drift check in [`balanced-engines.md`](balanced-engines.md)); plugin-on is a different certificate key |
 | D6 | **State of record is the user's store.** Whole-file writes under hash-prefixed directories. | Volume v2 is beta; 262k files per directory; reload fails on open files. | revised: a Modal Volume sink (`volume://`) is a supported store with commit/reload discipline, not only a warned fallback |
 | D7 | **Range decode from the source; per-episode probe equivalence; stream-copy cuts for oracle runs.** | Re-encoding changes time base and colour tags; a clip cache is ≈PB at scale. | active for index and cuts; the `balanced` workers still call NVIDIA's own `media.probe` and decode per camera (see `balanced-engines.md`, known limits) |
 | D8 | **Stage-separated GPU pools**, chained per shard. | Different GPUs per stage; independent scaling. | revised: `balanced` uses separate pools chained **per episode**; `exact` keeps one fused `segcap` H200 worker (both models resident), as the reference |
 | D9 | **Presets** `exact` / `balanced` / `budget` / `interactive`; uncertified combinations refused unless allowed. | Makes the trade-off explicit. | revised by D18: the opt-in is the `allow_uncertified` config key; `budget` / `interactive` are declared but refused |
 | D10 | **App factory.** Module-scope worker classes decorated in `build_app(cfg)`; `--emit`; no `serialized=True`. | Modal needs global-scope definitions; version-independent deploys. | active |
 | D11 | **Config hash** over logic version, NVIDIA code and manifests, prompt pool, model revisions, derived-weight receipts, preset / engine / patches, all engine args, sampling, mm kwargs, decode pins; **excludes GPU type** (provenance). | Fixes invalidate old results; GPU fallback does not break resume. | revised: also a sha256 over the source of every output-affecting module (`config/logic.py`), per-GPU engine limits, the image fingerprint and a `fake_models` component |
-| D12 | **CPU work in a process pool** with budgets; vLLM preprocessing in its own workers. | GIL contention; CPU billed whether used or not. | superseded by D17 form (1): CPU work is cut by identity-proven runtime patches (decode-once, in-memory PNG, transport and geometry pools) plus episode concurrency, not a separate pool ([`accel.md`](accel.md), [`exact-concurrency.md`](exact-concurrency.md)) |
+| D12 | **CPU work in a process pool** with budgets; vLLM preprocessing in its own workers. | GIL contention; CPU billed whether used or not. | superseded by D17 form (1): CPU work is cut by identity-proven runtime patches (decode-once, in-memory PNG, transport and geometry pools) plus episode concurrency, not a separate pool ([`accel.md`](accel.md)) |
 | D13 | **Envelope policy `warn`** by default: out-of-envelope episodes run and are marked `certified:false`; `enforce` skips; `ignore` runs them like `warn` (their records are still `certified:false`: no certificate covers them). | Data gets labeled, status stays honest. | active |
 | D14 | **Batch = offline `vllm.LLM` with a round-based micro-batcher**; online = AsyncLLM with pre-rendering. | NVIDIA's validated defaults; deterministic batch composition; AsyncLLM preprocesses on the event loop. | active for batch (`engines/microbatch.py`); online deferred to `interactive` (Gate E) |
 | D15 | **Poison pills and OOM.** Attempt markers; quarantine after K=3 starts; bisection; `errors/`; `cancel()`; `memory=(request, limit)`. | Modal retries crashes and OOMs forever. | revised: a CUDA fault or dead engine marks the shard crashed and replaces the container |
@@ -84,8 +84,7 @@ decision named).
 
 ## Determinism
 
-Evidence: [`determinism.md`](determinism.md), [`exact-concurrency.md`](exact-concurrency.md),
-[`rewarder-smoke.md`](rewarder-smoke.md).
+Evidence: [`determinism.md`](determinism.md).
 
 - **`exact` means identical model inputs, not identical outputs.** On H200, PyTorch SDPA's
   cuDNN attention is not bit-reproducible between runs; occasionally a greedy token flips and

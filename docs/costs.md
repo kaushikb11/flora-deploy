@@ -67,7 +67,7 @@ memory. A job pays for four things:
 - **Startup.** A fresh container loads the models and builds its GPU kernels before it labels
   anything: about 5 minutes per container today. It costs the same however much video the
   container then labels.
-- **GPU work.** The seconds spent labelling. This grows with the video, at the same rate for a
+- **GPU work.** The seconds spent labeling. This grows with the video, at the same rate for a
   small job as for a big one.
 - **Idle at the end.** Once a stage has no work left, the orchestrator notices within one 15 s
   poll and drops that pool's idle window to 2 s, so its containers stay up about 17 s more and

@@ -1,4 +1,4 @@
-# OPT-2: BF16 Captioner, loaded bit-identically
+# BF16 Captioner, loaded bit-identically
 
 Status: measured 2026-10-21 on Modal (app `flora-convert`, ephemeral). The proof covers the
 Captioner pin `nvidia/Flora-Captioner@fef0bbfe` with NVIDIA's SEGCAP code at `78a0e4ac`, using
@@ -7,8 +7,7 @@ torch 2.11.0+cu130 and transformers 5.8.1 on an H200.
 ## Why
 
 NVIDIA ships the Captioner as FP32: 109.4 GB in 11 shards. Its loader builds the model in BF16
-anyway. Every reference-worker start used to pay for all of this
-(`docs/reference-smoke.md`):
+anyway. Every reference-worker start used to pay for all of this:
 
 - a 109 GB copy from the Volume to local disk, which `snapshot_download` needs because it takes
   a filelock inside `local_dir`;
@@ -87,7 +86,7 @@ module globals, and a unit test checks that against NVIDIA's bytecode.
 - `validate_manifest(derived_dir)` checks our receipt instead. Any other path goes to NVIDIA's
   function.
 
-The checks (review 3, H1 and M1) run at install and again inside `Session.load`:
+The checks run at install and again inside `Session.load`:
 
 - **Pinned content.** The pin is a *content digest*, not the sha256 of the receipt file.
   `content_digest(receipt)` (`prep/convert_captioner.py`) is the sha256 of a canonical JSON of
@@ -124,7 +123,7 @@ The checks (review 3, H1 and M1) run at install and again inside `Session.load`:
 - **Opt-out.** `full_verify=False` or `FLORA_CAPTIONER_FULL_VERIFY=0` falls back to the fast
   check: sizes, full hashes of non-shard and small files, header hashes of large shards. It is
   recorded as `full_verify_opt_out: true` in `patch.provenance()`.
-- **Toolchain (M1).** The torch, transformers and safetensors versions of the process (local
+- **Toolchain.** The torch, transformers and safetensors versions of the process (local
   build tag such as `+cu128` ignored) must equal both the receipt's `tools` and
   `DerivedPin.proven_with` (torch 2.11.0, transformers 5.8.1, safetensors 0.7.0). The dtype plan
   is rebuilt with NVIDIA's own `_keep_native_gdn_fp32` (from the linked snapshot) and

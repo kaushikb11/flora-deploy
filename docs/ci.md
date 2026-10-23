@@ -28,15 +28,15 @@ module fixtures behave as in a serial run).
 
 | Step | Command | Protects against | Motivated by |
 | --- | --- | --- | --- |
-| `Gate: uv.lock in sync with pyproject.toml` | `uv lock --check` (and `UV_LOCKED=1` for every later `uv` call) | A pin bumped in `pyproject.toml` without re-locking, so CI resolves something nobody reviewed | [Images: hashed transitive locks (review M3)](https://github.com/kaushikb11/flora-deploy/commit/7cc7648470769a68b003a1770f04f9bf981b6cd0) |
+| `Gate: uv.lock in sync with pyproject.toml` | `uv lock --check` (and `UV_LOCKED=1` for every later `uv` call) | A pin bumped in `pyproject.toml` without re-locking, so CI resolves something nobody reviewed | [Images: hashed transitive locks](https://github.com/kaushikb11/flora-deploy/commit/7cc7648470769a68b003a1770f04f9bf981b6cd0) |
 | `Gate: certificate drift` | `scripts/cert_freeze.py --check --github` (on failure, also `--markdown` into the step summary), then `pytest tests/unit/test_certificate_drift.py`. First gate after install, so its report is the first failure a PR shows | A change to code, pins, engine settings, derived-weight pins or modes that makes a committed `certified` certificate stop matching, so users silently see "uncertified". The report diffs the key documents (per module, engine kwarg, pin, derived digest) and names the choice: revert or re-certify ([`certificate-freeze.md`](certificate-freeze.md)). No NVIDIA code needed: pins enter the key as hashes | The first `balanced` certificate (certified run) |
 | `Gate: ruff` | `uv run ruff check .` | Lint/import-order regressions (one `main` run failed only on this) | CI run 39623409791 |
 | `Gate: license guard` | `pytest tests/unit/test_license_guard.py` | NVIDIA code, prompts, weights or `LICENSE.pdf` (OneWay Noncommercial, see `NOTICE.md`), or local-only `research_notes/` / `reports/` (at any depth), being committed to this public Apache-2.0 repo; also NVIDIA's chat templates and HF tokenizer/processor/generation configs under any path, weights of any size (`.safetensors`, `.bin`, `.pt`, `.pth`, `.ckpt`, `.onnx`, `.gguf`), and any file over 1 MB. Paths only: the content half runs in the `nvlink` job | [WS0 shared contracts](https://github.com/kaushikb11/flora-deploy/commit/4fdb5835a478ef4feab01c4ec64e587090c475cb), `NOTICE.md` |
-| `Gate: logic-digest classification coverage` | `pytest tests/unit/test_config_logic.py` | A new module that changes outputs but is left out of the logic digest, so old results get reused after a behaviour change. Every module found on disk must be classified as output-affecting or not | Review 3 ([logic digest](https://github.com/kaushikb11/flora-deploy/commit/a3f7e961708e4e10916ba18505a9d41814ae4063)) and review 4 M2 ([every module classified](https://github.com/kaushikb11/flora-deploy/commit/e5431eb2a0b4c7d38ceabb29099c6f7ba3d61ff6)) |
-| `Gate: pin / lock consistency` | `pytest tests/unit/test_pins.py tests/unit/test_modal_app_images.py` | NVIDIA pins that are not full commit SHAs, image locks that drift from the runtime pins or are not fully hashed, unpinned bases, or a `modal` client that differs from the pin the image fingerprints were made with | [review M3](https://github.com/kaushikb11/flora-deploy/commit/7cc7648470769a68b003a1770f04f9bf981b6cd0), [review 3 modal pin](https://github.com/kaushikb11/flora-deploy/commit/a3f7e961708e4e10916ba18505a9d41814ae4063) |
+| `Gate: logic-digest classification coverage` | `pytest tests/unit/test_config_logic.py` | A new module that changes outputs but is left out of the logic digest, so old results get reused after a behaviour change. Every module found on disk must be classified as output-affecting or not | [logic digest](https://github.com/kaushikb11/flora-deploy/commit/a3f7e961708e4e10916ba18505a9d41814ae4063)), [every module classified](https://github.com/kaushikb11/flora-deploy/commit/e5431eb2a0b4c7d38ceabb29099c6f7ba3d61ff6)) |
+| `Gate: pin / lock consistency` | `pytest tests/unit/test_pins.py tests/unit/test_modal_app_images.py` | NVIDIA pins that are not full commit SHAs, image locks that drift from the runtime pins or are not fully hashed, unpinned bases, or a `modal` client that differs from the pin the image fingerprints were made with | [hashed image locks](https://github.com/kaushikb11/flora-deploy/commit/7cc7648470769a68b003a1770f04f9bf981b6cd0), [modal pin](https://github.com/kaushikb11/flora-deploy/commit/a3f7e961708e4e10916ba18505a9d41814ae4063) |
 | `Gate: conformance suites` | `pytest tests/conformance` | A `ShardWorker` or `Store` implementation that breaks the shared contract (completion, retries, idempotent re-runs, refresh). Every check is also proven to fail on a deliberately broken worker | [C1 conformance suites](https://github.com/kaushikb11/flora-deploy/commit/09fcdce33e7184bc655562a525f7ebc79a1aa397) (they found 3 bugs in [the merge](https://github.com/kaushikb11/flora-deploy/commit/ec182263e43a814d5c7d61325af832b872eea845)) |
 | `Gate: full CPU suite` | `pytest -n auto --dist loadfile -m "not nvlink and not modal and not torch"` | Everything else that runs on CPU | — |
-| `Gate: local end-to-end job` | `flora run --local --fake-models` twice: once clean, once with injected preemption, OOM, failure, infra, spawn and NVIDIA errors (must exit 3 = `completed_with_errors`), then `flora results` | Problems that only show up when the real orchestrator, stores, workers, compose and CLI run together | [G2 local runner](https://github.com/kaushikb11/flora-deploy/commit/208ab2d25441185de0b30c788b7833c6a3f6dbac) |
+| `Gate: local end-to-end job` | `flora run --local --fake-models` twice: once clean, once with injected preemption, OOM, failure, infra, spawn and NVIDIA errors (must exit 3 = `completed_with_errors`), then `flora results` | Problems that only show up when the real orchestrator, stores, workers, compose and CLI run together | [local runner](https://github.com/kaushikb11/flora-deploy/commit/208ab2d25441185de0b30c788b7833c6a3f6dbac) |
 | `README quickstart block (from the built wheel)` | `uv build --wheel`, install it into a fresh venv (dependencies pinned to `uv.lock`, no dev group), then run the README's "Try it in a few minutes" block (`scripts/readme_blocks.py try-it`: every line but the install) in an empty directory, through `flora results caption` | A quickstart that only works from the checkout: package data missing from the wheel, a dependency only the dev group provides, a missing `flora` entry point, or README commands that no longer work as written | The README rewrite for developers |
 
 The targeted gates run again inside the full suite. That costs a few seconds, and in return a
@@ -46,7 +46,7 @@ failure names the guarantee that broke.
 
 | Step | Command | Protects against | Motivated by |
 | --- | --- | --- | --- |
-| `Gate: test-order independence` | the full CPU suite with `FLORA_TEST_ORDER=reverse` (hook in `tests/conftest.py`), **serially** (`-p no:xdist`) | Tests that pass only because an earlier test left state behind (`sys.modules`, `sys.path`, env vars, module globals), which hides bugs and breaks when tests are added or filtered | [WS-B review H1: order-safe tests](https://github.com/kaushikb11/flora-deploy/commit/6bd4e496b4f9e8749cb8a809ba93f09e78a3a4e6) |
+| `Gate: test-order independence` | the full CPU suite with `FLORA_TEST_ORDER=reverse` (hook in `tests/conftest.py`), **serially** (`-p no:xdist`) | Tests that pass only because an earlier test left state behind (`sys.modules`, `sys.path`, env vars, module globals), which hides bugs and breaks when tests are added or filtered | [order-safe tests](https://github.com/kaushikb11/flora-deploy/commit/6bd4e496b4f9e8749cb8a809ba93f09e78a3a4e6) |
 
 It is serial so the order is the same on every run: under xdist the split of files across
 workers is dynamic, so a cross-file leak would show up only sometimes. It is its own job so it
@@ -61,8 +61,8 @@ NVIDIA's real code at the pinned revisions. This protects the glue between our c
 linking, capture, budget, pool and spawn safety, media/reward parity, and the reference entry
 point. `torch` tests are the ones that need real CPU torch but not NVIDIA's code (TempSeg weight
 merge, BF16 Captioner conversion, the DT-bias plugin, real-torch determinism flags); before
-review 7 they ran in no CI job. The `-m` expression repeats `not modal` because a command-line
-`-m` replaces the one in `addopts` (review 7 G4-3).
+this job they ran in no CI job. The `-m` expression repeats `not modal` because a command-line
+`-m` replaces the one in `addopts`.
 
 The suite runs on all cores with `-n auto --dist load` (per test: three files hold about 70% of
 the CPU time, so per-file scheduling would leave workers idle; module fixtures are built once per
@@ -71,7 +71,7 @@ worker that needs them).
 | Step | Protects against |
 | --- | --- |
 | `Gate: NVIDIA code and processor files present` | The nvlink tests skipping (the `nv_code` fixture skips when a pin is not fetched; about nine modules skip without the `--with-processor` files) and the job going green without testing anything |
-| `Gate: nvlink + torch` | Glue regressions against NVIDIA's real code. It includes `tests/nvlink/test_nv_link_order.py`, which runs the unit and nvlink linker suites in both orders in fresh interpreters (the unit fakes and the real SEGCAP links must not leak into each other; WS-B review H1/M5), and `tests/nvlink/test_license_content.py`, the content half of the license guard: no tracked file may contain a 6-line block of any NVIDIA text file or any long prose string (prompts, docstrings, JSON values) from NVIDIA's `.py`/`.json` files. The fingerprints are computed in the job from the fetched files and compared in memory; no NVIDIA text is stored in the repo. With `FLORA_FAIL_ON_SKIP=1`, a test skipped because a module (`could not import`, `No module named`) or an NVIDIA file (`not fetched`) is missing **fails** the run (`tests/conftest.py`; review 7 G4-1/G4-2). `-rs` lists the remaining (intended) skips and `--durations=15` shows the slowest tests |
+| `Gate: nvlink + torch` | Glue regressions against NVIDIA's real code. It includes `tests/nvlink/test_nv_link_order.py`, which runs the unit and nvlink linker suites in both orders in fresh interpreters (the unit fakes and the real SEGCAP links must not leak into each other), and `tests/nvlink/test_license_content.py`, the content half of the license guard: no tracked file may contain a 6-line block of any NVIDIA text file or any long prose string (prompts, docstrings, JSON values) from NVIDIA's `.py`/`.json` files. The fingerprints are computed in the job from the fetched files and compared in memory; no NVIDIA text is stored in the repo. With `FLORA_FAIL_ON_SKIP=1`, a test skipped because a module (`could not import`, `No module named`) or an NVIDIA file (`not fetched`) is missing **fails** the run (`tests/conftest.py`). `-rs` lists the remaining (intended) skips and `--durations=15` shows the slowest tests |
 
 ## Caching
 
@@ -103,15 +103,15 @@ worker that needs them).
   `astral-sh/setup-uv`) is pinned by commit SHA, with its version in a comment.
 - `fail-fast: false` on the Python matrix, so a failure on 3.11 does not hide the 3.12 result.
 
-## Failures fixed when the gates were added (G4)
+## Failures fixed when the gates were added
 
-- `tests/unit/test_segcap_worker.py::test_determinism_label_and_drift` failed on `main` in every
-  run from P1a-5s onward (`No module named 'torch'`). It relied on real torch being importable,
+- `tests/unit/test_segcap_worker.py::test_determinism_label_and_drift` failed on `main` for a
+  while (`No module named 'torch'`). It relied on real torch being importable,
   but the `test` job has no torch, and dev machines with torch installed passed it. The test now
   injects a stand-in with torch's CPU defaults, so the drift check (and its assertions) runs the
   same way with or without torch.
 
-- Review 7 G4-5: `test_determinism_label_and_drift` (stand-in) only reaches the "mode no longer
+- `test_determinism_label_and_drift` (stand-in) only reaches the "mode no longer
   in effect" branch. `test_determinism_flag_drift_is_refused` now puts the stand-in in
   deterministic mode and flips one flag, so the runner's "flags changed" branch is covered in the
   `test` job, and `test_accel_determinism.py::test_real_torch_deterministic_apply_then_drift_is_caught`

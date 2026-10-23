@@ -9,14 +9,13 @@ Terms used below (maintainer doc):
 
 - **oracle**: the `exact` preset's run, NVIDIA's own code on the reference GPU, which `balanced`
   is measured against.
-- **Gate C**: the capture check that vLLM's model inputs match NVIDIA's HF processor
-  ([`gate-c.md`](gate-c.md)).
+- **capture check**: the check that vLLM's model inputs match NVIDIA's HF processor, on
+  captured requests (`tests/nvlink/test_nv_link_capture_vllm_prompt.py`).
 - **L0**: the in-engine check that vLLM's prompt token ids and video grid equal NVIDIA's HF
   processor replay on captured requests.
-- **Gate A**: the `dt_bias` FP32 drift check: logit differences between the stock bf16 engine and
+- **drift check**: the `dt_bias` FP32 drift check: logit differences between the stock bf16 engine and
   the FP32 `dt_bias` plugin engine (recorded only; it does not affect certification).
-- **the 2026-10-22 GPU run** ("Wave H-lite" in `scripts/wave_h.py` and the Results block): the
-  first measured `balanced` session.
+- **the 2026-10-22 GPU run** (the Results block): the first measured `balanced` session.
 
 `balanced` deploys and runs through `flora deploy` / `flora run` (see "Deployment" below).
 Without a certificate it needs `allow_uncertified: true`. Every `segment` / `caption` record is
@@ -180,7 +179,7 @@ episode coroutines (one event loop; ≤ 8 preparing, ≤ 64 segment / 32 caption
 ## Engine settings (`engines/offline_llm.py`)
 
 `EngineSpec.engine_kwargs()` builds every argument explicitly. `validate_engine_kwargs` refuses
-any missing or uncertified value. It also runs the capture check's (Gate C) `assert_engine_kwargs`, which requires the
+any missing or uncertified value. It also runs the capture check's `assert_engine_kwargs`, which requires the
 processor cache to be off.
 
 | Argument | TempSeg (merged, `derived/tempseg-merged@114a1076…`) | Captioner (BF16, `derived/captioner-bf16@fef0bbfe…`) |
@@ -223,7 +222,7 @@ Notes:
   need 286 blocks: about 9% margin on the estimate, and the build fails closed below 286. 12
   would have left one block of margin.
 - **Chunked prefill.** `max_num_batched_tokens` 16384 holds every human prompt (at most ~7k) and
-  the 1-view golden worst case (14.7k) in one prefill chunk. 3-view yam prompts reach ~16.8k, so
+  the 1-view certification-set worst case (14.7k) in one prefill chunk. 3-view yam prompts reach ~16.8k, so
   they are **always** prefilled in two chunks; that chunked GDN path is what the yam certificate
   measures. The limit stays 16384, because changing it moves chunk boundaries (GDN numerics)
   for every kind, TempSeg included.
@@ -233,7 +232,7 @@ Notes:
   (`None` when the engine did not report it). Before, the build check's numbers were only printed
   to container stdout, so the real H100 pool size was never stored; future limits are chosen
   from this measured row, not from the estimate.
-- `logprobs_mode` / `max_logprobs` are settable only for the `dt_bias` drift check (Gate A). They change what
+- `logprobs_mode` / `max_logprobs` are settable only for the `dt_bias` drift check. They change what
   the engine *returns* for logprob requests, not greedy outputs.
 - The startup recipe follows `docs/cold-start.md`: a t=0 `warm.start_prefetch`, then a keyed
   compile cache (`engines/compile_cache.py`). A verified `flora-cache:/balanced-cc/<key>/`
@@ -336,11 +335,11 @@ uv run python scripts/spend.py --app flora-balanced-lab
 - the episodes the GPU runs would pick: the shortest episode of `human`, `yam`,
   `single_view_robot` and `dex` that can be compared with the oracle.
 
-**Golden paths.** Manifest `path`s are Volume-relative (`golden/v1/...`), so the lab opens
+**Certification-set paths.** Manifest `path`s are Volume-relative (`golden/v1/...`), so the lab opens
 camera files under the mount itself (`balanced_lab.episode_inputs`). On 2026-10-22 the lab
 joined `<mount>/golden/v1` to them. Every episode raised `FileNotFoundError` and the stage sent
 zero requests. A baseline that sends zero requests now returns `error` / `no_evidence` and skips
-the plugin engine. The runbook's lab step (`scripts/wave_h.py --only lab`) checks the files, the
+the plugin engine. The lab step of the certification run checks the files, the
 episodes and the deployed job's segments before it starts a container.
 
 **Each GPU call** runs one container with a 20 min hard timeout and two child processes:
@@ -352,21 +351,20 @@ episodes and the deployed job's segments before it starts a container.
      and `video_grid_thw` with NVIDIA's HF processor replay on 6 captured requests.
    - Greedy runs with top-20 raw logits on 6 requests.
 2. **Plugin engine** (FP32 `dt_bias`, its own compile cache) runs the same 6 requests.
-   - **Gate A** reports max/mean |Δlogit| over the shared top-k at every position up to the first
+   - **The drift check** reports max/mean |Δlogit| over the shared top-k at every position up to the first
      greedy divergence, plus greedy identical/total.
 
-The TempSeg run writes its segment rows to `flora-golden:balanced-lab/<run>/segments.json` for
+The TempSeg run writes its segment rows to the certification Volume (`balanced-lab/<run>/segments.json`) for
 the caption run. The full JSON lands in `reports/balanced-lab/` (git-ignored).
 
 **Expected cost** (estimate): two cold engine builds per call, then the work. TempSeg: 270 s +
 190 s builds, ≈ 615 s (deadline 769 s), ≈ $0.46 (upper $0.62). Captioner: 2 × 325 s builds,
-≈ 905 s (deadline 1131 s), ≈ $1.28 (upper $1.69). In total ≈ $1.74, upper $2.31
-(`wave_h.lab_seconds`). Each result says whether its cache was warm. In practice it is cold:
+≈ 905 s (deadline 1131 s), ≈ $1.28 (upper $1.69). In total ≈ $1.74, upper $2.31. Each result says whether its cache was warm. In practice it is cold:
 the lab builds on its own unkeyed `flora-cache:/balanced/<engine>[-dtbias]` dirs, which no
 deployed worker writes (workers use the keyed `balanced-cc/` caches).
 
 The certifying plans split the Captioner into two calls (`arm`: `baseline`, then `plugin` on
-the Gate A inputs the baseline staged under `flora-golden:balanced-lab/<run>/captioner-gate/`),
+the drift-check inputs the baseline staged under `balanced-lab/<run>/captioner-gate/` on the certification Volume),
 each in its own container under the 20-minute timeout. On the v4 engine, one call with both
 cold builds passed its 1131 s deadline (2026-10-23). Baseline ≈ 960 s (deadline 1200 s),
 ≈ $1.36 (upper $1.78); plugin ≈ 530 s (deadline 662 s), ≈ $0.75 (upper $1.02).
@@ -382,7 +380,7 @@ cold builds passed its 1131 s deadline (2026-10-23). Baseline ≈ 960 s (deadlin
 | Gate A (dt_bias FP32 vs bf16) | tempseg: max 0.25, mean 0.034514, greedy 4/6; captioner: max 0.25, mean 0.019797, greedy 6/6; recommendation: plugin **off** |
 <!-- /wave-h:results -->
 
-**Recommendation for the `dt_bias` drift check (Gate A):** ship with the plugin **off**, the
+**Recommendation for the `dt_bias` drift check:** ship with the plugin **off**, the
 default. The TempSeg merge check (`docs/tempseg-merge.md`) already showed BF16-level drift (mean |Δlogit| ≈ 0.025) with identical greedy
 JSON on real windows. The `dt_bias` rounding is one more BF16 rounding of 24/48 small vectors, and
 its effect should be of the same order or smaller. Run the drift check with the command above before `balanced` is
@@ -392,7 +390,7 @@ in the spec plus `install_entry_point` env) and certify that stack instead.
 ## Known limits and follow-ups
 
 - The micro-batcher packs across episodes, so batch composition differs from NVIDIA's batch-1
-  calls and changes numerics (`docs/rewarder-smoke.md`). That is allowed for `balanced`, and certification
+  calls and changes numerics. That is allowed for `balanced`, and certification
   measures it against the oracle's noise.
 - The worker uses NVIDIA's `media.probe` per camera, which fully decodes each camera, plus NVIDIA's
   decode for frames. The `accel` patches (`docs/accel.md`) (decode-once, in-memory PNG, pools) are now wired

@@ -1,9 +1,9 @@
-# P1b-0: the FP32-merged TempSeg checkpoint
+# The FP32-merged TempSeg checkpoint
 
 Status: built and measured 2026-10-21 on Modal (app `flora-convert`, ephemeral). It covers the
 adapter `nvidia/Flora-TempSeg@114a1076` on `Qwen/Qwen3.5-9B@c2022362`, with NVIDIA's SEGCAP code
-at `78a0e4ac`, torch 2.11.0 and transformers 5.8.1. This is the D3 artifact. Gate B decides
-later whether we serve it.
+at `78a0e4ac`, torch 2.11.0 and transformers 5.8.1. This is the artifact of design decision D3
+([`architecture.md`](architecture.md)). Certification decides later whether we serve it.
 
 ## What NVIDIA runs (read from `batch_utils/vendor/tempseg_fp32_loader.py`, not changed)
 
@@ -60,7 +60,7 @@ reasons:
 v2 is also the more accurate of the two. It is not bit-identical to v1 or to PEFT's FP32
 `merge_and_unload`, and the difference is not bounded by 1 BF16 ulp. Where `W + Δ` nearly
 cancels, the result is tiny, so its BF16 ulp is tiny too, while the FP32 delta's rounding error
-scales with the operands. There the two can differ by several ulps. Measured on CPU (review 8b,
+scales with the operands. There the two can differ by several ulps. Measured on CPU (
 six random 1024 × 1024 targets, r = 32, `W ~ 0.02·N(0,1)` in BF16, `A, B ~ 0.01·N(0,1)` in FP32):
 
 | | Result |
@@ -99,7 +99,7 @@ against.
   - Shapes must be A `[r,in]`, B `[out,r]`, W `[out,in]`.
   - The counts must be 248 targets and 496 tensors, and all must be FP32.
 - **Dtypes.** Nothing is hard-coded. The policy comes from transformers' `dtype_plan` with
-  NVIDIA's own `_keep_native_gdn_fp32`, plus the meta-model dtypes, as in OPT-2. The result:
+  NVIDIA's own `_keep_native_gdn_fp32`, plus the meta-model dtypes, as in the BF16 Captioner conversion. The result:
   - 48 tensors are FP32: `A_log` and `dt_bias`. 24 `dt_bias` are stored as BF16 in the base and
     upcast exactly.
   - The 24 `linear_attn.norm.weight` are stored as FP32 in the base and cast to BF16, exactly as
@@ -194,7 +194,7 @@ Reading the results:
 - On real TempSeg windows, every greedy decision along A's trajectory is the same. Both windows
   produce byte-identical JSON.
 - Top-1 flips happen only at near-tie positions on random or chat text.
-- Two windows is a smoke check, not Gate B. Gate B needs the golden-set L3 metrics.
+- Two windows is a smoke check, not certification, which needs the certification-set metrics.
 
 Load times on L40S: A takes 47.6 s and B takes 34.0 s. The whole check took 142 s, and peak GPU
 memory was 19.3 GiB.
@@ -202,7 +202,7 @@ memory was 19.3 GiB.
 ## Spend
 
 Billing for this hour had not posted when this was written: `spend.py` still showed
-`flora-convert` at $0.65, all of it from OPT-2. The figures below are estimates from wall time:
+`flora-convert` at $0.65, all of it from the BF16 Captioner conversion. The figures below are estimates from wall time:
 
 - CPU merge: about 2 min container time, ≈ $0.03.
 - L40S check: about 4 min including image start, ≈ $0.15 with CPU and memory.
@@ -220,18 +220,19 @@ uv run modal run src/flora_deploy/modal_app/convert_app.py::tempseg --step equiv
 
 ## Not done here
 
-- Wiring the merged directory into a vLLM engine or the `balanced` preset. That is Gate B.
+- Wiring the merged directory into a vLLM engine or the `balanced` preset. That is decided by
+  certification.
 - Building merger v2, re-running the equivalence check on it, and pinning its content digest
   (`DERIVED_PINS["tempseg-merged"].content_sha256`).
 
 ## Merger v2 build and equivalence (2026-10-22)
 
-Built by `scripts/wave_h.py` step 0 on Modal (CPU merge, then the equivalence check on an L40S),
+Built on Modal as the first step of the certification run (CPU merge, then the equivalence check on an L40S),
 against NVIDIA's unmerged TempSeg (`Session.load('tempseg')`, FP32 LoRA, BF16 autocast).
 
 | Check | Result |
 |---|---|
-| Model inputs on 2 real golden windows | identical |
+| Model inputs on 2 real certification-set windows | identical |
 | Greedy token ids and decoded JSON | identical |
 | `verify_gdn` (FP32 `A_log` / `dt_bias`) vs base and merged checkpoints | PASS on both |
 | Merged files verify | yes |

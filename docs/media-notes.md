@@ -1,4 +1,4 @@
-# Media notes (WS-C)
+# Media notes
 
 These are the rules behind `flora_deploy.media` (`index.py`, `cuts.py`, `rangedecode.py`,
 `sources/`). They were found empirically with PyAV 16.0.1 (bundled FFmpeg, libx264, SVT-AV1,

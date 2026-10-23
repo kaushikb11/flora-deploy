@@ -1,7 +1,6 @@
 # Cold starts: where startup time goes, and how flora cuts it
 
-This is a maintainer doc. It starts with a lab report from 2026-10-21 (the cold-start lab, run as
-"W3-B", a work-package label used in its raw-result paths), then covers what the deployed pools do
+This is a maintainer doc. It starts with a lab report from 2026-10-21 (the cold-start lab), then covers what the deployed pools do
 today: [ending idle](#ending-idle) at a stage's end (the 2 s drain and the caption pre-warm) and
 [warm starts](#warm-start-keyed-compile-caches-for-the-balanced-workers-2026-10-22) from keyed
 compile caches.
@@ -103,8 +102,8 @@ Findings:
   workers' keyed cache (`engines/compile_cache.py`) carries the same directories. Expected
   saving: about 90 s per fresh container.
 - **Weight loading is not the bottleneck when the Volume is healthy** (35 s lazy, 10 s with
-  prefetch). Prefetch is the insurance against the slow-mmap case (the 8 min Rewarder load seen in the
-  earlier Rewarder smoke test, `docs/rewarder-smoke.md`).
+  prefetch). Prefetch is the insurance against the slow-mmap case (the 8 min Rewarder load seen in an
+  earlier Rewarder smoke test).
 - vLLM's own `"prefetch"` strategy is equivalent to `warm.start_prefetch`, but it starts later (at weight
   load, not at t=0) and with 8 threads. Our t=0 prefetch overlaps the 45–55 s of imports and
   config before loading, so the weights are already resident when loading starts.
@@ -239,8 +238,8 @@ Caption is never drained while segment still produces.
 2 s) in place of nothing.
 
 **Not verified live:** whether Modal applies a lowered window to a container that is *already*
-idle, or only to containers that go idle afterwards. The H0 rehearsal settles it
-(`scripts/h0_rehearsal.py`, default `--preset balanced`): it polls Modal's running containers
+idle, or only to containers that go idle afterwards. A rehearsal run on Modal
+settles it (`scripts/h0_rehearsal.py`, default `--preset balanced`): it polls Modal's running containers
 during the jobs and checks that each one is gone at most 30 s after its class's drain, printing
 the measured gap per container. If the window only
 applies to containers going idle later, the fallback is to drain one tick *before* the last
@@ -348,8 +347,8 @@ is ours and not passed to vLLM. vLLM 0.24.0 source:
   scheduler limits from `GPU_LIMITS`, and the same `VLLM_*` env (the plugin's `VLLM_PLUGINS`
   only in the `-dtbias` caches).
 
-`tests/unit/test_compile_cache.py::test_lab_gate_a_engine_has_the_worker_key` pins this (Gate A
-is the lab's `dt_bias` FP32 drift check, `docs/balanced-engines.md`): the
+`tests/unit/test_compile_cache.py::test_lab_gate_a_engine_has_the_worker_key` pins this (the lab's
+`dt_bias` FP32 drift check, `docs/balanced-engines.md`): the
 lab's spec and the worker's spec derive the same flora key. Today's lab caches (tempseg L40S,
 captioner H100, tempseg-dtbias; captioner-dtbias is partial) are therefore used by the next
 segment and caption containers through the legacy path. The first of each then publishes the
@@ -437,7 +436,7 @@ and `experimental_options={"enable_gpu_snapshot": True}` (both accepted by the p
 (≈ $2.71/h with 8 cores and 48 GiB):
 
 1. One snapshotting container: about 5 min cold build, a sleep, then the snapshot, ≈ $0.23.
-2. Three restores, each with wake-up, the GDN dtype RPC and 2 greedy golden requests, about
+2. Three restores, each with wake-up, the GDN dtype RPC and 2 greedy certification-set requests, about
    1 min each, ≈ $0.13.
 3. Compare the token ids with a non-snapshot engine's tokens from the same lab call (reuse the
    balanced lab's recorded drift-check requests), and measure restore → first token.
