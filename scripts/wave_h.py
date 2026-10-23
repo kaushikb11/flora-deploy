@@ -2431,6 +2431,32 @@ def run_lab(ctx: Ctx, *, missing: Callable[[Iterable[str]], list[str]] | None = 
             "apps": [name]}
 
 
+def pre_v4_state(st: State, spec: PlanSpec) -> str | None:
+    """Why ``st`` is a certified state from before generator v4 (None: it is not), so the v4
+    certified plan never runs its new steps (``caption_iso``) on it. Two markers, from what such
+    a state holds: (1) its certify step (e) has attempts but (g) ``caption_iso`` never ran (under
+    v4, e needs g first: :data:`CERT_DEPS`); (2) a certificate e recorded (its
+    ``stages.<stage>.id``, written under ``<work>/certify/``) whose generator version is not
+    ``"4"``. A fresh or partly run v4 state has neither."""
+    from flora_deploy.validate.certkey import GENERATOR_VERSIONS
+
+    cert = st.steps.get("certify") or StepState()
+    iso = st.steps.get("caption_iso") or StepState()
+    if cert.attempts and not iso.attempts:
+        return "its certify step ran with no caption_iso step"
+    for stage, v in sorted(((cert.result or {}).get("stages") or {}).items()):
+        cid = (v or {}).get("id")
+        p = spec.work / "certify" / f"{cid}.json"
+        try:
+            doc = json.loads(p.read_text()) if cid else None
+        except (OSError, ValueError):
+            doc = None
+        ver = ((doc or {}).get("generator") or {}).get("version")
+        if doc is not None and ver not in GENERATOR_VERSIONS:
+            return f"its {stage} certificate {cid} is generator version {ver!r}"
+    return None
+
+
 def require_code_landed(step: str) -> None:
     """recertify's d2', d' and g run the v4 code (the stage-isolated caption certificate):
     refused, before any app, on a checkout without it (``"4" in
@@ -3003,12 +3029,16 @@ def certify_view(st: State, spec: PlanSpec | None = None) -> State:
     ``exact_e2e`` (the oracle), ``noise``, ``balanced`` (J1 + J1w), ``caption_iso`` (J2 +
     J2w) and, when there is one, ``repeat`` (an older noise run: reported only). recertify
     takes (b)'s oracle from the certified state, its own f2 as the noise run and (b)'s old
-    noise run as the repeat, each job with the store it wrote to. Other plans: ``st`` as is
-    (a copy). Never saved."""
+    noise run as the repeat, each job with the store it wrote to. The certified state is the
+    one f2 recorded it repeated (``noise_all.result.oracle.state``, :func:`run_noise_all`) when
+    that file is there, else ``spec.source``. Other plans: ``st`` as is (a copy). Never saved."""
     view = copy.deepcopy(st)
     spec = spec or SPECS.get(st.plan or "")
     if spec is None or spec.name != RECERTIFY:
         return view
+    rec = ((st.steps.get("noise_all") or StepState()).result.get("oracle") or {}).get("state")
+    if rec and Path(rec).is_file():
+        spec = replace(spec, source=Path(rec))
     src = source_state(spec)
     for name, frm in (("exact_e2e", "exact_e2e"), ("repeat", "noise")):
         s = copy.deepcopy(src.steps.get(frm) or StepState())
@@ -3069,10 +3099,26 @@ def run_flora_certify(ctx: Ctx, *, finalize: Any = None, sh: Callable[..., Any] 
             "refused": o.get("refused") or o.get("deferred")}
     # certified, and the evidence covers a forced-cold container (the cold witness, W1)
     no_witness = sorted(k for k, v in stages.items() if not v.get("witness_episodes"))
-    ok = (set(stages) == set(CERT_STAGES) and not no_witness
-          and all(v["verdict"] == "certified" for v in stages.values()))
-    res: dict[str, Any] = {"ok": ok, "stages": stages, "tracked_usd": 0.0, "apps": []}
-    if not ok:
+    complete = set(stages) == set(CERT_STAGES) and not no_witness
+    ok = complete and all(v["verdict"] == "certified" for v in stages.values())
+    # Outcome (b) of the pre-registration: each stage final (certified or fail, nothing
+    # refused or provisional) and at least one certified. A fail is final too (no re-roll):
+    # finalize still lands the certified stages' certificates and locks; it never writes a
+    # fail's (wave_h_finalize.analyze), so that stage stays uncertified.
+    partial = (complete and not ok
+               and all(v["verdict"] in ("certified", "fail") and not v.get("refused")
+                       for v in stages.values())
+               and any(v["verdict"] == "certified" for v in stages.values()))
+    order = sorted(stages, key=lambda k: k != "segment")  # "segment certified, caption fail"
+    res: dict[str, Any] = {"ok": ok or partial, "stages": stages, "tracked_usd": 0.0,
+                           "apps": [],
+                           "outcome": ", ".join(f"{k} {stages[k]['verdict'] or 'refused'}"
+                                                for k in order)}
+    if partial:
+        res["partial"] = True
+        res["note"] = (f"{res['outcome']}: the fail is final (one attempt, no re-roll); only "
+                       "the certified stage's certificate is written")
+    if not (ok or partial):
         res["error"] = "not certified: " + "; ".join(
             f"{k}: {v['verdict'] or v['refused']}" + (f" ({', '.join(v['missing'])})"
                                                       if v.get("missing") else "")
@@ -3666,6 +3712,15 @@ def main(argv: list[str] | None = None) -> int:
         st = copy.deepcopy(st)
     if is_cert(args.plan):
         st.plan = args.plan
+    if args.plan == CERTIFIED and (why := pre_v4_state(st, spec)):
+        if args.yes_spend:  # before anything starts: no app, no billing baseline written
+            print(f"refused: {args.state} is a pre-v4 certified run ({why}); its steps ran "
+                  "without the stage-isolated caption job (g), so none of its v4 steps run "
+                  "on it. Human re-certifies with `--plan recertify` (its own state, reading "
+                  "this one read-only)")
+            return 2
+        print(f"note: {args.state} is a pre-v4 certified run ({why}): --yes-spend refuses it "
+              "(use --plan recertify)")
     if adopt_balanced_job(st):
         print("note: (d)'s deployed job is done; (d) counts as done and its lab is step lab")
     if args.yes_spend:

@@ -385,12 +385,30 @@ def test_four_noise_episodes_are_provisional_and_write_nothing(tmp_path, no_fetc
     assert "at least 5 noise-run episodes" in res["error"]
 
 
-def test_a_divergent_candidate_fails_and_writes_nothing(tmp_path, no_fetch):
+def test_a_divergent_candidate_fails_and_only_the_certified_stage_lands(tmp_path, no_fetch):
+    """J1's boundaries are off (segment fail); the stage-isolated caption (J2, on the oracle's
+    own segments) still certifies. The fail is final: finalize runs and lands caption's
+    certificate only (``wave_h_finalize.analyze`` never writes a fail's)."""
     ctx, labs = certified_world(tmp_path, shift=0.6)  # boundary error 0.6 s > 1.5 x 0.1 s
     sh = Sh()
     res = wh.run_flora_certify(ctx, finalize=fin, sh=sh, lab_dir=labs)
-    assert not res["ok"] and sh.calls == []
     assert res["stages"]["segment"]["verdict"] == "fail"
+    assert res["stages"]["caption"]["verdict"] == "certified"
+    assert res["ok"] and res["partial"] and res["outcome"] == "segment fail, caption certified"
+    assert len(sh.calls) == 1 and "--write" in sh.calls[0]
+    # both fail: nothing is written
+    ctx, labs = certified_world(tmp_path / "both", shift=0.6)
+    for side in ("isolated", "isolated_witness"):
+        p = ctx.spec.records / side / wh.JOB / "caption.jsonl"
+        rows = [json.loads(x) for x in p.read_text().splitlines()]
+        for r in rows:
+            for s in r["segments"]:
+                s["caption"] = f"elsewhere {s['caption']} entirely"
+        p.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    sh = Sh()
+    res = wh.run_flora_certify(ctx, finalize=fin, sh=sh, lab_dir=labs)
+    assert not res["ok"] and not res.get("partial") and sh.calls == []
+    assert {v["verdict"] for v in res["stages"].values()} == {"fail"}
 
 
 def test_main_runs_the_certified_certify_step_and_finalize_reads_its_plan(

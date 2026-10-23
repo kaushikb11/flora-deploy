@@ -176,12 +176,14 @@ def stage_copy(real: fin.Paths, staged: fin.Paths) -> None:
 
 
 def missing_records(p: fin.Paths, st: Any) -> list[Path]:
-    """The records ``fetch_records`` would export that are not on disk."""
+    """The records ``fetch_records`` would export that are not on disk: every record set it
+    exports (``wave_h_finalize.record_sets``: J1w and J2w included), each job's own stages
+    (a segment-only J1w, a caption-only J2 / J2w)."""
     out = []
-    for side, step, key in [(s, st_, "jobs") for s, st_ in fin.SETS.items()] + [fin.WITNESS]:
+    for side, step, key in fin.record_sets():
         for job, r in sorted(fin.jobs_of(st, step, key).items()):
             if "job_id" in r:
-                out += [q for stage in fin.CERT_STAGES
+                out += [q for stage in (r.get("stages") or fin.CERT_STAGES)
                         if not (q := fin.record_path(p, side, job, stage)).exists()]
     return out
 
@@ -453,6 +455,13 @@ def main(argv: list[str] | None = None, *, fetch_run: Callable[..., Any] = subpr
          drift_runner: Callable[[Path], tuple[int, str]] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--embodiment", choices=EMBODIMENTS, default=wh.EMBODIMENT)
+    ap.add_argument("--plan", choices=wh.CERT_PLANS, default=wh.CERTIFIED,
+                    help="the run's plan: certified (default) or recertify (human; its own "
+                         "state and lab JSON under reports/wave-h/recertified/, (b)'s oracle "
+                         "and old noise run read from the certified state)")
+    ap.add_argument("--source-state", type=Path,
+                    help="recertify: the certified state its oracle is read from (default "
+                         "reports/wave-h/certified/state.json; read, never written)")
     ap.add_argument("--write", action="store_true", help="apply (default: dry run)")
     ap.add_argument("--root", type=Path, default=ROOT, help="repository root")
     ap.add_argument("--run-root", type=Path,
@@ -462,25 +471,43 @@ def main(argv: list[str] | None = None, *, fetch_run: Callable[..., Any] = subpr
         a = ap.parse_args(argv)
     except SystemExit as e:
         return USAGE if e.code else OK
-    emb = a.embodiment
-    spec = wh.spec_for(wh.CERTIFIED, emb)
+    emb, plan = a.embodiment, a.plan
+    try:
+        spec = wh.spec_for(plan, emb)
+    except KeyError:
+        print(f"usage: plan {plan} has no {emb} run", file=sys.stderr)
+        return USAGE
+    if a.source_state is not None:
+        if plan != wh.RECERTIFY:
+            print("usage: --source-state is for --plan recertify", file=sys.stderr)
+            return USAGE
+        spec = replace(spec, source=a.source_state)
     run_root = a.run_root or spec.state.parent
     state, records = run_root / "state.json", run_root / "records"
     if not state.exists():
-        print(f"usage: no run state at {state} (run scripts/wave_h.py --plan certified "
+        print(f"usage: no run state at {state} (run scripts/wave_h.py --plan {plan} "
               f"--embodiment {emb} first)", file=sys.stderr)
         return USAGE
     st = wh.State.from_json(json.loads(state.read_text(encoding="utf-8")))
-    if fin.run_plan(st) != wh.CERTIFIED:
-        print(f"usage: {state} was run under plan {fin.run_plan(st)!r}, not certified",
+    if fin.run_plan(st) != plan:
+        print(f"usage: {state} was run under plan {fin.run_plan(st)!r}, not {plan}",
               file=sys.stderr)
         return USAGE
-    real = fin.Paths(root=a.root, state=state, records=records)
+    # what certify reads: recertify's oracle and old noise run from the certified state, its
+    # f2 as the noise run (wave_h.certify_view); certified: the state as it is
+    try:
+        view = wh.certify_view(st, spec)
+    except RuntimeError as e:
+        print(f"usage: {e}", file=sys.stderr)
+        return USAGE
+    # recertify keeps its lab JSON beside its state (wave_h's PlanSpec.lab_dir)
+    lab = run_root if spec.lab_dir is not None else None
+    real = fin.Paths(root=a.root, state=state, records=records, lab=lab)
     o = Outcome(st=st)
     # 1. the records (a Volume read only when some are missing), then finalize into staging
-    if missing := missing_records(real, st):
+    if missing := missing_records(real, view):
         print(f"exporting the records ({len(missing)} missing, e.g. {real.rel(missing[0])})")
-        fin.fetch_records(real, st, run=fetch_run)
+        fin.fetch_records(real, view, run=fetch_run)
     with tempfile.TemporaryDirectory(prefix="after-certified-") as tmp:
         staged = fin.Paths(root=Path(tmp), state=state, records=records)
         stage_copy(real, staged)

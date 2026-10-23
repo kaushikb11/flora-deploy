@@ -809,3 +809,167 @@ def test_phase_2_picks_up_f2_as_recorded_and_fits_the_cap_at_its_actual_cost(tmp
     text = "\n".join(lines)
     assert "fits: spent $2.74 + the upper of the steps not done" in text
     assert "NOT HONEST" not in text and "f2 check" not in text  # done: not re-checked
+
+
+# ---------------------------------------------------------------------------------------------
+# e': the certify step, outcomes (a) both certified and (b) segment certified, caption fail
+
+
+def _e_world(tmp_path: Path, monkeypatch, *, recertify: bool, caption_fail: bool):
+    """A finished run's records and state (``test_wave_h_certified.certified_world``, v4), as
+    the certified plan or as recertify (its oracle and old noise run moved to a certified
+    state, f2 as the noise run); ``caption_fail``: J2's and J2w's captions all differ from
+    the oracle's (inputs identical: a metric fail, not a refusal)."""
+    from tests.unit import test_wave_h_certified as TC
+
+    monkeypatch.setattr(fin, "fetch_records", lambda paths, st, run=None: None)
+    ctx, labs = TC.certified_world(tmp_path)
+    if caption_fail:
+        for side in ("isolated", "isolated_witness"):
+            p = ctx.spec.records / side / wh.JOB / "caption.jsonl"
+            rows = [json.loads(x) for x in p.read_text().splitlines()]
+            for r in rows:
+                for s in r["segments"]:
+                    s["caption"] = f"elsewhere {s['caption']} entirely"
+            p.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    if not recertify:
+        return ctx, labs
+    st = ctx.st
+    src = wh.State(st.run_id, 0.0, st.billing_since, plan=wh.CERTIFIED)
+    src.steps["exact_e2e"] = st.steps.pop("exact_e2e")
+    src.steps["noise"] = st.steps.pop("noise")
+    src_path = tmp_path / "certified-state.json"
+    wh.save_state(src, src_path)
+    st.steps["noise_all"] = rb.load_state(src_path).steps["noise"]
+    st.steps["noise_all"].result["oracle"] = {"state": str(src_path)}
+    st.plan = wh.RECERTIFY
+    spec = replace(RC, state=ctx.spec.state, work=ctx.spec.work, records=ctx.spec.records,
+                   report=ctx.spec.report, lab_dir=labs, source=src_path)
+    wh.save_state(st, spec.state)
+    return replace(ctx, spec=spec), labs
+
+
+class _Sh:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, args, **kw):
+        self.calls.append(args)
+        return type("P", (), {"returncode": 0})()
+
+
+@pytest.mark.parametrize("recertify", [False, True])
+def test_e_certifies_both_stages_and_finalizes(tmp_path, monkeypatch, recertify):
+    ctx, labs = _e_world(tmp_path, monkeypatch, recertify=recertify, caption_fail=False)
+    sh = _Sh()
+    res = wh.run_flora_certify(ctx, finalize=fin, sh=sh, lab_dir=labs)
+    assert res["ok"] and not res.get("partial"), res
+    assert res["outcome"] == "segment certified, caption certified"
+    (args,) = sh.calls
+    assert "--write" in args and ("--lab" in args) == recertify
+
+
+@pytest.mark.parametrize("recertify", [False, True])
+def test_e_lands_segment_when_caption_fails(tmp_path, monkeypatch, recertify):
+    """Outcome (b): the step is final (one attempt, no re-roll), finalize still runs and lands
+    the segment certificate; the caption fail gets none."""
+    ctx, labs = _e_world(tmp_path, monkeypatch, recertify=recertify, caption_fail=True)
+    sh = _Sh()
+    res = wh.run_flora_certify(ctx, finalize=fin, sh=sh, lab_dir=labs)
+    assert res["ok"] and res["partial"], res
+    assert res["outcome"] == "segment certified, caption fail"
+    assert "segment certified, caption fail" in res["note"] and "error" not in res
+    assert res["stages"]["caption"]["verdict"] == "fail"
+    assert res["stages"]["segment"]["verdict"] == "certified"
+    (args,) = sh.calls  # wave_h_finalize.py --write on this state
+    assert args[1].endswith("wave_h_finalize.py") and "--write" in args
+    # what that finalize writes: the segment certificate, never the fail's
+    root = tmp_path / "repo"
+    for rel in ("src/flora_deploy/planner/rates.json", "docs/balanced-engines.md",
+                "README.md"):
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_bytes((REPO / rel).read_bytes())
+    paths = fin.Paths(root=root, state=ctx.state_path, records=ctx.spec.records, lab=labs,
+                      certs=root / "certs")
+    (tmp_path / "c").mkdir()
+    _, _, certs = fin.analyze(paths, cert_tmp=tmp_path / "c")
+    assert [json.loads(p.read_text())["stage"] for p in certs] == ["segment"]
+
+
+def test_e_a_refused_stage_is_not_a_partial_outcome(tmp_path, monkeypatch):
+    ctx, labs = _e_world(tmp_path, monkeypatch, recertify=False, caption_fail=False)
+    (ctx.spec.records / "isolated" / wh.JOB / fin.DIGESTS).write_text("{}")  # refused
+    sh = _Sh()
+    res = wh.run_flora_certify(ctx, finalize=fin, sh=sh, lab_dir=labs)
+    assert not res["ok"] and not res.get("partial") and sh.calls == []
+    assert "caption" in res["error"]
+
+
+# ---------------------------------------------------------------------------------------------
+# The v4 certified plan never runs on a pre-v4 (v3) certified state
+
+
+def _v3_state(path: Path, work: Path, *, cert_version: str | None = None,
+              iso: bool = False) -> None:
+    """A certified state as run 10221548f1b8 left it: b, f, d, d2 done, e ran (failed), no g;
+    ``cert_version``: also a certificate e recorded, of that generator version."""
+    st = rb.State(RUN, 0.0, "x", plan=wh.CERTIFIED)
+    for name in ("exact_e2e", "noise", "balanced", "lab"):
+        st.step(name).status = "done"
+        st.step(name).attempts.append(rb.Attempt(started=1.0, status="done", finished=2.0))
+    c = st.step("certify")
+    c.status = "failed"
+    c.attempts.append(rb.Attempt(started=3.0, status="failed", finished=4.0))
+    if iso:  # a v4-shaped g, so only the certificate marker can tell
+        st.step("caption_iso").attempts.append(rb.Attempt(started=2.5, status="done"))
+    if cert_version is not None:
+        c.result = {"stages": {"caption": {"verdict": "fail", "id": "cert_x"}}}
+        (work / "certify").mkdir(parents=True, exist_ok=True)
+        (work / "certify" / "cert_x.json").write_text(json.dumps(
+            {"id": "cert_x", "generator": {"name": "flora-certify", "version": cert_version}}))
+    rb.save_state(st, path)
+
+
+def test_certified_yes_spend_refuses_a_pre_v4_state_before_anything(tmp_path, monkeypatch,
+                                                                     capsys):
+    spec = replace(B, state=tmp_path / "certified" / "state.json", work=tmp_path / "work")
+    monkeypatch.setitem(wh.SPECS, wh.CERTIFIED, spec)
+    monkeypatch.setitem(wh.CERT_SPECS, "human", spec)
+    for name in ("load_manifest", "billed_by_app", "stop_killed"):
+        monkeypatch.setattr(wh, name, lambda *a, _n=name, **k: pytest.fail(f"{_n} reached"))
+    monkeypatch.setattr(wh, "RUNNERS", {k: (lambda ctx: pytest.fail("ran")) for k in wh.RUNNERS})
+    _v3_state(spec.state, spec.work)
+    before = spec.state.read_bytes()
+    assert wh.main(["--plan", "certified", "--yes-spend"]) == 2
+    out = capsys.readouterr().out
+    assert "pre-v4 certified run (its certify step ran with no caption_iso step)" in out
+    assert "--plan recertify" in out and spec.state.read_bytes() == before
+    # the certificate marker alone (g ran, but e's certificate is generator v3)
+    _v3_state(spec.state, spec.work, cert_version="3", iso=True)
+    assert wh.main(["--plan", "certified", "--yes-spend"]) == 2
+    assert "caption certificate cert_x is generator version '3'" in capsys.readouterr().out
+    # the dry run says so and still prints the plan
+    monkeypatch.setattr(wh, "load_manifest",
+                        lambda offline, version: wh.offline_manifest(0.0, version))
+    assert wh.main(["--plan", "certified", "--dry-run", "--offline"]) == 0
+    assert "--yes-spend refuses it (use --plan recertify)" in capsys.readouterr().out
+
+
+def test_a_fresh_or_v4_certified_state_is_not_pre_v4(tmp_path):
+    yam = wh.CERT_SPECS["yam"]
+    assert wh.pre_v4_state(rb.State("r", 0.0, "x", plan=wh.CERTIFIED), yam) is None
+    st = rb.State("r", 0.0, "x", plan=wh.CERTIFIED)  # v4 b done, interrupted before g and e
+    st.step("exact_e2e").status = "done"
+    st.step("exact_e2e").attempts.append(rb.Attempt(started=1.0, status="done"))
+    assert wh.pre_v4_state(st, yam) is None
+    # a v4 run whose e ran after g, with a v4 certificate
+    work = tmp_path / "work"
+    _v3_state(tmp_path / "s.json", work, cert_version="4", iso=True)
+    assert wh.pre_v4_state(rb.load_state(tmp_path / "s.json"), replace(yam, work=work)) is None
+
+
+def test_yam_fresh_certified_dry_run_is_not_refused(tmp_path, capsys):
+    assert wh.main(["--plan", "certified", "--embodiment", "yam", "--dry-run", "--offline",
+                    "--state", str(tmp_path / "yam.json")]) == 0
+    out = capsys.readouterr().out
+    assert "pre-v4" not in out and "g. caption-only isolated J2" in out

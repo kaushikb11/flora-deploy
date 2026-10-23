@@ -698,11 +698,36 @@ change the `exact` segcap stage hash. So:
   The pre-registration priced the plan at $7.12 / $11.69 (phase 2 $4.38 / $7.52) on the rates
   before (b)'s measured balanced rates were folded into `rates.json` (caption cold start 325 ->
   373 s); the table above is the current projection.
-- **Cap.** The user approved a global cap of **$11.70** for the plan, noise run included
-  (`RECERT_GLOBAL_CAP_USD`; never derived higher). On the current rates the all-upper total
-  ($11.90) is above it, so the plan only fits once `noise_all` is recorded at its billed cost:
-  done at $2.74, phase 2's upper $7.73 brings the total to $10.47, under $11.70. Step caps:
-  each upper rounded up to $0.05 (lab $1.70, balanced $3.10, caption_iso $3.00).
+- **Cap.** The user approved a global cap of **$11.70** of **real** spend for the plan, noise
+  run included (`RECERT_GLOBAL_CAP_USD`; the derived cap is never higher). Step caps are each
+  step's upper rounded up to $0.05; on the staged manifest's durations (what a run gates on):
+  lab $1.70, balanced **$3.05** (upper $3.03), caption_iso $3.00 (the offline dry run, +10%
+  durations, shows $3.10 for balanced).
+- **What f2 actually charged.** `noise_all` is done in the state with **two attempts charged
+  $5.87**: attempt 1 is stored with `tracked_usd` $4.00 (`report_error: true`: its `flora
+  report` failed, so it was charged its budget) and its own apps billed only about $0.17-0.32;
+  attempt 2 tracked $1.87. `Attempt.charged()` takes the larger of tracked and billed even once
+  billing has settled, so that **$4.00 phantom is permanent**: the bookkeeping total stays $5.87
+  while the real billed cost of f2 is about **$2.06**. With the $11.70 cap, d2' and d' are then
+  stopped by the reserve ($5.87 + phase 2's upper $7.67 = $13.54).
+- **`--global-cap 15.38` (bookkeeping cap, user-approved).** It keeps *real* spend within
+  $11.70: bookkeeping cap = $11.70 + ($4.00 phantom − $0.32 real for attempt 1) = **$15.38**
+  (real ≤ $11.70 exactly when bookkeeping ≤ $15.38; $15.35 is the $0.05-grid value). Pass it
+  once with the first phase-2 `--yes-spend`; it is saved in the recertify state only, scoped to
+  this plan (`cap_override_plan`), and replaces the stale `--global-cap 8.00`. At $15.38 every
+  pending step runs: $5.87 + $7.67 = $13.54 ≤ $15.38; the step caps bind each attempt (lab
+  $1.70, balanced $3.05, caption_iso $3.00), so the worst case is bookkeeping $13.62, real about
+  $9.94. **Consequence:** the gated cap (`gate_cap`), `cert_check.py`'s "total over the gated
+  cap" row and the finalize report will all print **$15.38**: read it as the $11.70 real cap
+  plus the $3.68 phantom of f2's attempt 1, not as a raised budget.
+- **Before phase 2:** `uv run python scripts/cert_preflight.py --plan recertify` (its plan, lab
+  and budget rows read the recertify state and `reports/wave-h/recertified/`; the budget row
+  counts only the steps not done). The `git` row is the same for every plan: clean tree, HEAD
+  pushed to `main`, CI green for that SHA.
+- **After phase 2:** `uv run python scripts/after_certified.py --plan recertify` (dry run), then
+  `--write`. It reads the run through `wave_h.certify_view` (the oracle and the old noise run
+  from the certified state f2 recorded it repeated, f2 as the noise run) and the lab JSON
+  beside the recertify state.
 - **What each job is for.** J1 gives the `segment` candidate and the reported-only end-to-end
   caption block; J2 is the `caption` candidate; J1w and J2w are the forced-cold witnesses of their
   stages; the noise-12 run is the noise floor for both stages. The old 6-episode noise run (f)
@@ -711,7 +736,11 @@ change the `exact` segcap stage hash. So:
   certificates (`GENERATOR_VERSIONS = ("4",)` matches neither).
 - **Outcome.** `certified`: publish after `cert_check.py` passes. `fail`: no re-roll; ship
   balanced `segment` with `exact`'s Captioner, or fund diagnostics toward a new stack with its
-  own pre-registration. `provisional` for an infrastructure reason or a preemption: re-run only
+  own pre-registration. **(b) segment certified, caption fail:** the certify step (e') is
+  final: its result says `outcome: "segment certified, caption fail"` (`partial: true`), it
+  still runs `wave_h_finalize.py --write`, which writes the `segment` certificate and its
+  freeze lock and never a certificate for the fail, so `caption` stays uncertified;
+  `after_certified.py --plan recertify` reports the same verdict and applies only that. `provisional` for an infrastructure reason or a preemption: re-run only
   the affected job. `inputs_not_isolated` is a harness bug: fix the harness (not scoring code)
   and re-run the isolated jobs only.
 

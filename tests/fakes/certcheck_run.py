@@ -441,7 +441,7 @@ def state_doc(o: Options, segs: dict[str, Any]) -> dict[str, Any]:
     # J1w is segment only; J2w is the caption witness
     witness = {"human": {"job_id": "wave-h-test-cold-human", "state": "done",
                          "compile_cache": "off", "episodes": len(o.noise),
-                         "containers": [seg_c]}} if o.witness else {}
+                         "stages": ["segment"], "containers": [seg_c]}} if o.witness else {}
     iso_witness = {"human": {"job_id": "wave-h-test-isocold-human", "state": "done",
                              "compile_cache": "off", "episodes": len(o.noise),
                              "stages": ["caption"], "containers": [cap_c]}} if o.witness else {}
