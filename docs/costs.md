@@ -45,13 +45,12 @@ more per video-hour than a single-camera one:
 | 1 | **$6.07** ($4.06-$9.09) | **$5.29** ($3.53-$7.94) |
 | 3 | **$9.36** ($6.25-$14.01) | **$8.58** ($5.72-$12.86) |
 
-Segment + caption, one container per stage, cold starts. 3-view GPU work is the 1-view rate times `segment` x2.56, `caption` x1.42: an estimate, not measured on 3-view episodes (yam certification prep: scripts/wave_h.py three_view_scale, 2026-10-22). Only the share of the work spent generating text grows with the longer three-view prompt; decoding and frame preparation are kept at 1x. `flora plan` applies the same multipliers and says so.
+Segment + caption, one container per stage, cold starts. 3-view GPU work is the 1-view rate times `segment` x2.56, `caption` x1.42: an estimate, not measured on 3-view episodes (2026-10-22). Only the share of the work spent generating text grows with the longer three-view prompt; decoding and frame preparation are kept at 1x. `flora plan` applies the same multipliers and says so.
 <!-- /cost-table:cameras -->
 
-### Why you may have seen other numbers
+### GPU work alone
 
-The README quotes the cost of GPU work alone, with no startup or idle time. A very large job
-should tend towards it:
+Without startup or idle time, GPU work alone costs this; a very large job tends towards it:
 
 <!-- cost-table:busy -->
 **$5.28 per video-hour** (segment + caption; $6.37 with rewards), projected from rates measured on one small job; not yet confirmed at scale
@@ -59,12 +58,6 @@ should tend towards it:
 
 `flora plan` gives the all-in estimate for your dataset: the rows above, worked out for your
 episodes, stages and pool sizes.
-
-The first test job (run `102207184317`, three minutes of video) cost $33.36 per video-hour all
-in. Back then each container also sat idle for five minutes after its work. Pools are now told
-to shut down as soon as their work is done, so the same job is priced at the 0.05 row above, and
-most of what is left is startup. A later 3.9-minute job cost $27.10 per
-video-hour all in, $9.90 without its cold starts.
 
 ## Where the money goes
 
@@ -241,5 +234,3 @@ Team and Enterprise plans; otherwise the usage page of the Modal dashboard).
   work (about 10 GPU-minutes by default), which these tables don't count.
 - **`reward.rubric`.** Its rate is not measured yet, so `flora plan` marks an option that
   uses it as unavailable.
-- **Certification runs.** Running the `exact` reference to certify a stack is a separate job on
-  H200s.

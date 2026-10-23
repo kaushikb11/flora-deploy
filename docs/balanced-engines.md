@@ -374,10 +374,10 @@ cold builds passed its 1131 s deadline (2026-10-23). Baseline ≈ 960 s (deadlin
 ## Results
 
 <!-- wave-h:results (owned by scripts/wave_h_finalize.py) -->
-| Item | Result (Wave H-lite, 2026-10-22) |
+| Item | Result (2026-10-22) |
 |---|---|
 | L0 in-engine (ids, grid vs HF) | tempseg: pass (6/6 ids, 6/6 grid); captioner: pass (6/6 ids, 6/6 grid) |
-| Segments / captions end to end on golden episodes | 1 `balanced` job(s) through `flora deploy` / `flora run` (run `10221548f1b8`); certificate per stage: segment (human) refused, caption (human) refused |
+| Segments / captions end to end | 1 `balanced` job(s) through `flora deploy` / `flora run` |
 | Throughput, $/video-h vs `exact` | **$5.28/video-h** ±50% vs `exact` $36.39 as `flora plan` prices it (6.9x cheaper), list prices, busy seconds; measured on one 3.9-min job (2026-10-22, n=1), not yet confirmed at scale |
 | Gate A (dt_bias FP32 vs bf16) | tempseg: max 0.25, mean 0.034514, greedy 4/6; captioner: max 0.25, mean 0.019797, greedy 6/6; recommendation: plugin **off** |
 <!-- /wave-h:results -->

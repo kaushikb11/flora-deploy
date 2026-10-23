@@ -6,9 +6,11 @@ Start with the repository [`README.md`](../README.md).
 
 | Doc | What it covers |
 |---|---|
+| [`modal.md`](modal.md) | What runs where on Modal, private or local data, S3 output, what a job creates and how to clean up |
+| [`python.md`](python.md) | The Python API: submit, wait, results and export from a script or notebook |
 | [`cli.md`](cli.md) | Every `flora` command, its options and defaults, and exit codes (generated from the CLI) |
 | [`costs.md`](costs.md) | What a job costs by size, where the money goes and how to spend less (tables generated from the rates) |
-| [`limitations.md`](limitations.md) | What flora-deploy doesn't do yet: certificate status per embodiment, measured vs estimated costs, unsupported inputs |
+| [`limitations.md`](limitations.md) | What flora-deploy doesn't do yet: which stages are certified, measured vs estimated costs, unsupported inputs |
 | [`export.md`](export.md) | `flora export --to lerobot`: which labels go where in the dataset copy, and alignment rules |
 | [`output-format.md`](output-format.md) | Every field a finished job writes (JSONL, Parquet, `summary.json`, exclusions) |
 | [`certification.md`](certification.md) | How `balanced` is measured against `exact`, what a certificate binds to, and when it unlocks a preset |
