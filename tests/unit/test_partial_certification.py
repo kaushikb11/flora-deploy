@@ -282,12 +282,14 @@ def test_results_say_certified_in_plain_words_with_the_certificate_id(human_cert
 
 
 def blocks(text: str) -> dict[str, str]:
+    """The README's generated certification block(s) present in ``text`` (today only
+    ``allow-uncertified``; the ``certified`` status block is retired)."""
     return {n: text.split(f"<!-- wave-h:{n} -->\n")[1].split(f"<!-- /wave-h:{n} -->")[0]
-            for n in ("certified", "allow-uncertified")}
+            for n in ("certified", "allow-uncertified") if f"<!-- wave-h:{n} -->\n" in text}
 
 
 def no_certificates_readme(tmp_path: Path) -> str:
-    """The committed README with its certification blocks as for an empty registry."""
+    """The committed README with its certification block as for an empty registry."""
     readme = (REPO / "README.md").read_text(encoding="utf-8")
     return fin.certification_blocks(readme, [tmp_path / "none"])
 
@@ -296,24 +298,23 @@ def test_readme_blocks_as_committed_match_the_committed_certificates(tmp_path):
     readme = (REPO / "README.md").read_text(encoding="utf-8")
     # what scripts/wave_h_finalize.py writes for the committed registry (idempotent)
     assert fin.certification_blocks(readme, [certkey.CERT_DIR]) == readme
-    assert "allow_uncertified: true           # for stages without an accuracy certificate" \
+    assert "allow_uncertified: true           # required for balanced today (see the note below)" \
         in readme
+    assert "<!-- wave-h:certified -->" not in readme  # retired
     b = blocks(no_certificates_readme(tmp_path))
-    assert "none yet" in b["certified"] and "required" in b["allow-uncertified"]
+    assert list(b) == ["allow-uncertified"]
+    assert "segment and caption records currently say `certified: false`" in b["allow-uncertified"]
+    assert "`--allow-uncertified` when you export" in b["allow-uncertified"]
 
 
 def test_readme_blocks_follow_the_certificates(human_certs, registry, tmp_path):
     readme = no_certificates_readme(tmp_path)
     new = fin.certification_blocks(readme, [registry])
     b = blocks(new)
-    assert b["certified"] == ("Accuracy certificates: segmentation and captioning for `human` "
-                              "data (`L40S` / `H100!`).\nRewards run NVIDIA's own engine, as "
-                              "`exact` does, and need none. Everything else runs uncertified.\n")
-    assert "Certified today: segmentation and captioning for `human` data (`L40S` / `H100!`)" \
-        in " ".join(b["allow-uncertified"].split())
-    assert "does not need it" in b["allow-uncertified"]
+    assert b["allow-uncertified"] == ("Every `balanced` stage is certified for `human` data; "
+                                      "remove `allow_uncertified`.\n")
     assert "cert_" not in new.replace(readme, "")
-    # only the two blocks changed, and a second pass changes nothing
+    # only the block changed, and a second pass changes nothing
     def outside(t: str) -> str:
         for name, body in blocks(t).items():
             t = t.replace(f"<!-- wave-h:{name} -->\n{body}", f"<!-- wave-h:{name} -->\n")
@@ -321,7 +322,7 @@ def test_readme_blocks_follow_the_certificates(human_certs, registry, tmp_path):
 
     assert outside(new) == outside(readme)
     assert fin.certification_blocks(new, [registry]) == new
-    # a newer provisional certificate for the same key decides: back to "none yet"
+    # a newer provisional certificate for the same key decides: back to the uncertified note
     later = tmp_path / "later"
     write_cert(later, "segment", noise=False, stamp="2026-10-23T00:00:00Z")
     write_cert(later, "caption", noise=False, stamp="2026-10-23T00:00:00Z")

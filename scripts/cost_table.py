@@ -1,7 +1,7 @@
 """Generate the tables of ``docs/costs.md`` from ``planner/rates.json`` and the planner.
 
     uv run python scripts/cost_table.py            # print the regenerated doc
-    uv run python scripts/cost_table.py --write    # rewrite docs/costs.md
+    uv run python scripts/cost_table.py --write    # rewrite docs/costs.md and README's Cost table
 
 Every number is priced by the repository's own code: ``planner.options.build_option`` (the model
 ``flora plan`` uses: GPU work + each container's startup + its idle tail at job end + the
@@ -9,7 +9,9 @@ orchestrator) at the pinned Modal list prices of ``jobs.budget``, from the shipp
 The prose of ``docs/costs.md`` is edited by hand; only the blocks between
 ``<!-- cost-table:<name> -->`` and ``<!-- /cost-table:<name> -->`` are generated.
 ``tests/unit/test_cost_docs.py`` fails when the doc differs from :func:`render`, and
-``scripts/wave_h_finalize.py`` regenerates it whenever it rewrites ``rates.json``.
+``scripts/wave_h_finalize.py`` regenerates it whenever it rewrites ``rates.json``. The README's
+``Cost`` table (between ``<!-- wave-h:cost -->`` markers) is :func:`block_readme`, written by
+:func:`render_readme`.
 
 Workloads come from ``WorkloadSummary.from_hours`` (1-view episodes of one minute, except the
 ``cameras`` block's 3-view rows, priced with ``rates.json`` ``camera_scaling``), on the
@@ -25,9 +27,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 DOC = Path(__file__).resolve().parents[1] / "docs" / "costs.md"
+README = DOC.parents[1] / "README.md"
 
 PRESET = "balanced"
 SIZES = (0.05, 0.5, 1.0, 10.0, 100.0)  # video-hours
+README_SIZES = (0.05, 1.0, 10.0)  # the README's all-in table
 SEGCAP = ("segment", "caption")
 REWARDS = ("reward.terminal", "reward.dense")  # the rewards the templates turn on
 BREAKDOWN_SIZES = (0.05, 1.0, 100.0)
@@ -227,6 +231,43 @@ def block_short(table) -> str:
             "rests on:\n\n" + "\n".join(lines) + "\n")
 
 
+def video_label(v: float) -> str:
+    """``3 min (0.05 h)``, ``1 h``, ``10 h``."""
+    return f"{v * 60:g} min ({size(v)} h)" if v < 1 else f"{size(v)} h"
+
+
+def block_readme(table=None) -> str:
+    """The README's ``Cost`` block: all-in job cost for segment + caption and with rewards, and
+    wall-clock (segment + caption), at :data:`README_SIZES`; the same prices as
+    :func:`block_short`. The caption's range is the widest bracket of those rows."""
+    from flora_deploy.planner.rates import RateTable
+
+    table = table or RateTable.load()
+    rows, lows, highs = [], [], []
+    for v in README_SIZES:
+        a = price(v, SEGCAP, table=table)
+        b = price(v, SEGCAP + REWARDS, table=table)
+        rows.append([video_label(v), usd(a.cost), usd(b.cost), hours(a.wall_s)])
+        for p in (a, b):
+            lows.append(1 - p.low / p.cost)
+            highs.append(p.high / p.cost - 1)
+    low, high = 5 * round(max(lows) * 20), 10 * round(max(highs) * 10)
+    return (table_md(["Video", "Segment + caption", "+ rewards", "Wall-clock"], rows)
+            + "\n\nAll-in estimates at Modal list prices: one-minute, single-camera episodes, "
+            "one GPU per stage.\nThe real cost can land about "
+            f"{low}% below to {high}% above.\n")
+
+
+def render_readme(text: str | None = None, *, table=None) -> str:
+    """``text`` (default: ``README.md``) with its ``wave-h:cost`` block regenerated
+    (:func:`block_readme`). Raises when the block is missing."""
+    text = README.read_text(encoding="utf-8") if text is None else text
+    m = re.search(r"(^<!-- wave-h:cost -->\n)(.*?)(^<!-- /wave-h:cost -->)", text, re.M | re.S)
+    if m is None:
+        raise ValueError("README.md misses its <!-- wave-h:cost --> block")
+    return text[:m.start(2)] + block_readme(table) + text[m.end(2):]
+
+
 def block_busy(table) -> str:
     return (f"**{usd(busy_per_video_h(SEGCAP, table))} per video-hour** "
             f"(segment + caption; {usd(busy_per_video_h(SEGCAP + REWARDS, table))} with "
@@ -328,8 +369,8 @@ def block_cameras(table) -> str:
         what = ", ".join(f"`{k}` x{f[k]:.2f}" for k in SEGCAP if k in f)
         state = ("an estimate, not measured on 3-view episodes" if cs.status == "estimate"
                  else "measured")
-        note = (f"3-view GPU work is the 1-view rate times {what}: {state} ({cs.source}, "
-                f"{cs.date}). Only the share of the work spent generating text grows with the "
+        note = (f"3-view GPU work is the 1-view rate times {what}: {state} ({cs.date}). "
+                "Only the share of the work spent generating text grows with the "
                 "longer three-view prompt; decoding and frame preparation are kept at 1x. "
                 "`flora plan` applies the same multipliers and says so.")
     return (table_md(head, rows) + "\n\nSegment + caption, one container per stage, cold "
@@ -400,7 +441,8 @@ def main(argv: list[str]) -> int:
     text = render()
     if argv[:1] == ["--write"]:
         DOC.write_text(text, encoding="utf-8")
-        print(f"wrote {DOC}")
+        README.write_text(render_readme(), encoding="utf-8")
+        print(f"wrote {DOC} and {README}")
     else:
         sys.stdout.write(text)
     return 0

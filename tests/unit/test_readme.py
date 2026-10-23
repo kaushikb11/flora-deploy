@@ -4,9 +4,10 @@ Every ``flora`` command in a fenced bash block (in an inline code span, and in a
 comment of a Python block) is a real command that parses with the real typer signature: its
 flags exist, its positional arguments fit the command's arguments (count and values), and it
 passes every required option. Every template it names ships; every repo path it mentions
-exists; the config block uses only real keys and validates; the SDK snippet's calls exist; the
-Modal flow deploys. CI runs the quickstart ("Try it in a few minutes") block verbatim from the
-built wheel (``scripts/readme_blocks.py``).
+exists; the config block uses only real keys and validates; the SDK snippet's calls exist (it
+lives in docs/python.md, which the README links); the Modal flow deploys. CI runs the
+quickstart ("Try it in a few minutes") block verbatim from the built wheel
+(``scripts/readme_blocks.py``).
 """
 
 from __future__ import annotations
@@ -278,7 +279,11 @@ def _sdk_calls(code: str) -> tuple[list[tuple[str, list[str]]], list[str]]:
 def test_sdk_snippet_calls_exist():
     from flora_deploy import sdk
 
-    (py,) = [b for b in BLOCKS if b.lang == "python" and "sdk." in b.code]
+    assert "](docs/python.md)" in TEXT
+    doc = blocks((REPO / "docs" / "python.md").read_text(encoding="utf-8"))
+    pys = [b for b in doc if b.lang == "python" and "sdk." in b.code]
+    assert pys, "docs/python.md has no SDK snippet"
+    py = pys[0]
     funcs, methods = _sdk_calls(py.code)
     assert funcs, "the SDK snippet calls no sdk function"
     for name, kws in funcs:

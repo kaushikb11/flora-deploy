@@ -21,12 +21,12 @@ starts a container, never commits and never pushes; the coordinator commits afte
    ``--write``, ``tests/unit/test_certificate_drift.py`` runs on the checkout after the files
    are applied.
 4. **Generated docs.** ``docs/costs.md`` (``scripts/cost_table.py``), ``docs/limitations.md``
-   (``scripts/limitations_status.py``), the README blocks ``wave-h:certified`` and
-   ``wave-h:allow-uncertified`` (``wave_h_finalize.certification_blocks``; ``wave-h:cost`` is
-   finalize's) and ``docs/cli.md`` (``scripts/cli_docs.py``) are regenerated, and each must be
-   its generator's fixed point. With ``--write``, their drift tests (:data:`DRIFT_TESTS`) run
-   on the checkout after the files are applied; a failure restores every file byte for byte
-   (so does an error while writing them, and a timeout or interrupt of the drift tests).
+   (``scripts/limitations_status.py``), the README block ``wave-h:allow-uncertified``
+   (``wave_h_finalize.certification_blocks``; ``wave-h:cost`` is finalize's) and
+   ``docs/cli.md`` (``scripts/cli_docs.py``) are regenerated, and each must be its generator's
+   fixed point. With ``--write``, their drift tests (:data:`DRIFT_TESTS`) run on the checkout
+   after the files are applied; a failure restores every file byte for byte (so does an error
+   while writing them, and a timeout or interrupt of the drift tests).
 5. **Leakage.** Every file it would change is scanned for NVIDIA text (the license shingles,
    against the fetched NVIDIA code) and for record strings (``cert_check``'s scan: captions,
    ids, dataset names, NVIDIA metadata).
@@ -73,7 +73,7 @@ OK, FAILED, USAGE = 0, 1, 2
 EMBODIMENTS = tuple(wh.CERT_SPECS)
 DRIFT_TESTS = ("tests/unit/test_certificate_drift.py", "tests/unit/test_cost_docs.py",
                "tests/unit/test_limitations_doc.py", "tests/unit/test_cli_docs.py")
-README_BLOCKS = ("certified", "allow-uncertified", "cost")
+README_BLOCKS = ("allow-uncertified", "cost")
 CLI_DOC = Path("docs") / "cli.md"
 
 

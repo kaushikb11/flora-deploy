@@ -271,26 +271,35 @@ def _section(heading: str) -> str:
     return README.split(f"## {heading}", 1)[1].split("\n## ", 1)[0]
 
 
+MODAL_DOC = (ROOT / "docs" / "modal.md").read_text(encoding="utf-8")
+
+
 def test_readme_you_need_matches_what_doctor_checks():
     need = _section("Label your own data").split("```", 1)[0]
     assert "nothing to set up" not in need
-    assert "`flora deploy` creates the Volume" in need
-    assert "Hugging Face" in need and "nvidia/Flora-*" in need and "not gated" in need
-    assert "hf auth login" in need
+    assert "Modal" in need and "nvidia/Flora-*" in need and "public on Hugging" in need
+    assert "hf auth login" in _section("Label your own data")  # for --push-to-hub
+    # the sink Volume needs no setup (doctor does not fail on it; deploy creates it)
+    row = next(ln for ln in MODAL_DOC.splitlines() if ln.startswith("| Volume | your `output"))
+    assert "created on first use" in row
 
 
-def test_readme_cost_definitions_match_plan_and_report(balanced_cfg):
+def test_readme_cost_definitions_match_plan_and_report():
+    import sys
+
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import cost_table
+
     cost = _section("Cost")
-    assert "of GPU work" in cost and "`flora plan` shows the all-in estimate" in cost
-    assert "startup" in cost and "idle" in cost and "dominate small jobs" in cost
-    m = re.search(r"\*\*\$(\d+\.\d\d) per video-hour\*\*", cost)
-    assert m, cost
-    # the plan's all-in estimate includes startup and rewards, so it is above the busy figure
-    d = json.loads(_plan(balanced_cfg, "--json").output)
-    bal = next(o for o in d["options"] if o["preset"] == "balanced")
-    assert bal["cost_usd"] > float(m.group(1))
-    # index cost, and that doctor / plan are free
-    assert "`flora index`" in cost and "--local" in cost and "$0.06" in cost
+    assert "All-in estimates" in cost and "`flora plan` prices your own dataset" in cost
+    assert "startup" in cost
+    # the table is the planner's all-in price (cost_table.block_readme), not GPU work alone
+    body = cost.split("<!-- wave-h:cost -->\n", 1)[1].split("<!-- /wave-h:cost -->", 1)[0]
+    assert body == cost_table.block_readme()
+    # `flora index` and `flora plan` costs, in the flow
+    flow = _section("Label your own data")
+    assert "flora index                 # scans every episode; a few cents" in flow
+    assert "flora plan                  # cost and wall-clock options; free" in flow
 
 
 def test_readme_has_no_internal_jargon_and_links_examples():
@@ -329,19 +338,16 @@ def test_report_shows_d_done_when_only_its_inline_lab_failed():
     assert fin.step_status(st, "balanced") == "failed"
 
 
-def test_cost_block_is_plain_and_busy_only():
+def test_cost_block_is_plain_and_all_in():
     import sys
     from types import SimpleNamespace
 
     sys.path.insert(0, str(ROOT / "scripts"))
     import wave_h_finalize as fin
 
-    f = SimpleNamespace(date="2026-10-22", cost={
-        "balanced": {"usd_per_video_h": 5.61, "uncertainty": 0.5}, "exact": None})
-    block = fin.cost_block(f)
-    assert "$5.61 per video-hour** of GPU work" in block
-    assert "`flora plan` shows the all-in estimate" in block
-    assert 2 <= len(block.splitlines()) <= 3
+    block = fin.cost_block(SimpleNamespace(table=None))
+    assert "All-in estimates at Modal list prices" in block and "per video-hour" not in block
+    assert len(block.splitlines()) <= 8
     assert_no_jargon(block, "README cost block")
 
 
@@ -379,7 +385,8 @@ def test_index_local_creates_a_missing_volume_before_downloading(tmp_path, monke
     assert seen == [("modal-volume://flora-results/local-demo",
                      {"environment": "main", "create": True})], seen
     readme = " ".join((ROOT / "README.md").read_text().split())
-    assert "create the Volume first" not in readme and "is created" in readme
+    assert "create the Volume first" not in readme
+    assert "created on first use" in MODAL_DOC
 
 
 def test_results_without_a_run_says_so(tmp_path):
@@ -603,10 +610,11 @@ def test_help_groups_commands_into_panels_in_workflow_order():
     assert out.index("─ Get started ") < out.index(" init ") < out.index("─ Run ")
 
 
-def test_readme_test_command_matches_ci():
-    """The README's contributor command is the one CI runs (`-n auto --dist loadfile`), with a
-    timing that is not the old, unreachable ~30 s."""
-    line = next(ln for ln in README.splitlines() if ln.startswith("uv run pytest"))
+def test_ci_doc_test_command_matches_ci():
+    """The contributor command in docs/ci.md is the one CI runs (`-n auto --dist loadfile`),
+    with a timing that is not the old, unreachable ~30 s."""
+    doc = (ROOT / "docs" / "ci.md").read_text(encoding="utf-8")
+    line = next(ln for ln in doc.splitlines() if ln.startswith("uv run pytest -q -n auto"))
     assert "-n auto --dist loadfile" in line and "~30 s" not in line, line
 
 

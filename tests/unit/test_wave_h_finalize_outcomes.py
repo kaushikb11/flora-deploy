@@ -1,8 +1,9 @@
 """The generated certification and cost wording for the three re-certification outcomes:
 segmentation and captioning certified, segmentation only (outcome (b): captioning failed), and
-none. Outcome (b) must never advertise a certified ``balanced`` captioning stage or price, and
-must give the two honest ways to get captions (``allow_uncertified: true``, or a separate
-``exact`` job). Fake certificates only, in a temporary registry (``certkey.CERT_DIR`` patched).
+none. Outcome (b) must never advertise a certified ``balanced`` captioning stage. The README
+note is one plain sentence (no embodiment lists, GPU names or ``exact`` workaround), and the
+README cost block is the all-in table ``scripts/cost_table.py`` renders. Fake certificates only,
+in a temporary registry (``certkey.CERT_DIR`` patched).
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from scripts import cost_table as C
 from scripts import limitations_status as L
 from tests.unit.test_partial_certification import (  # noqa: F401 - registry is a fixture
     blocks,
@@ -20,7 +22,9 @@ from tests.unit.test_partial_certification import (  # noqa: F401 - registry is 
 )
 from tests.unit.test_wave_h_finalize import fin
 
-EXACT = fin.exact_price()
+NONE_NOTE = ("**Note:** `balanced` segment and caption records currently say `certified: false`, "
+             "so they need\n`allow_uncertified: true` here and `--allow-uncertified` when you "
+             "export.\n")
 
 
 @pytest.fixture
@@ -36,51 +40,35 @@ def both(registry):  # noqa: F811 - the imported fixture
     return registry
 
 
-def flat(s: str) -> str:
-    return " ".join(s.split())
-
-
-def test_the_exact_price_is_the_cost_blocks_figure():
+def test_the_exact_price_is_the_planners_figure():
     from flora_deploy.planner.rates import RateTable
 
     planned = fin.planned_usd_per_video_h(RateTable.load(), "exact")
-    assert EXACT == f"${planned['usd_per_video_h']:.2f}"
-    assert L.exact_price() == EXACT
+    assert fin.exact_price() == f"${planned['usd_per_video_h']:.2f}"
 
 
 # ---------------------------------------------------------------------------------------------
-# README wave-h:certified / wave-h:allow-uncertified
+# README wave-h:allow-uncertified
 
 
-def test_readme_blocks_segment_only(segment_only, tmp_path):
+def test_readme_note_segment_only(segment_only, tmp_path):
     readme = no_certificates_readme(tmp_path)
     b = blocks(fin.certification_blocks(readme, [segment_only]))
-    st, cfg = flat(b["certified"]), flat(b["allow-uncertified"])
-    assert st.startswith("Accuracy certificates: segmentation for `human` data (`L40S`). "
-                         "Captioning is not certified:")
-    assert "captioning for" not in st and "H100" not in st
-    assert "`allow_uncertified: true`" in st and "separate `exact` job, which captions its own " \
-        f"segments at the `exact` price (about {EXACT} per video-hour)" in st
-    assert "Certified today: segmentation for `human` data (`L40S`). Captioning is not " \
-        "certified." in cfg
-    assert "one `balanced` job with `allow_uncertified: true`: its caption records say " \
-        "`certified: false`" in cfg
-    assert "`preset: exact, stages: [segment, caption]`: it captions `exact`'s own segments, " \
-        f"at the `exact` price (about {EXACT} per video-hour)" in cfg
-    assert "One config has one preset" in cfg
-    assert all(len(line) <= 125 for v in b.values() for line in v.splitlines())
+    assert b["allow-uncertified"] == (
+        "**Note:** `balanced` caption records currently say `certified: false`, so they need\n"
+        "`allow_uncertified: true` here and `--allow-uncertified` when you export.\n")
+    assert "certified" not in b  # the status block is retired
 
 
-def test_readme_blocks_both_and_none_keep_their_wording(both, tmp_path):
+def test_readme_note_both_and_none(both, tmp_path):
     readme = no_certificates_readme(tmp_path)
     b = blocks(fin.certification_blocks(readme, [both]))
-    assert b["certified"] == ("Accuracy certificates: segmentation and captioning for `human` "
-                              "data (`L40S` / `H100!`).\nRewards run NVIDIA's own engine, as "
-                              "`exact` does, and need none. Everything else runs uncertified.\n")
-    assert "exact" not in b["allow-uncertified"] and "Captioning is not" not in b["certified"]
-    none = blocks(readme)
-    assert "none yet" in none["certified"] and "required" in none["allow-uncertified"]
-    assert "Captioning is not" not in readme
+    assert b["allow-uncertified"] == ("Every `balanced` stage is certified for `human` data; "
+                                      "remove `allow_uncertified`.\n")
+    assert blocks(readme)["allow-uncertified"] == NONE_NOTE
+    for text in (readme, fin.certification_blocks(readme, [both])):
+        note = blocks(text)["allow-uncertified"]
+        assert "Captioning is not" not in text and "H100" not in note and "L40S" not in note
 
 
 # ---------------------------------------------------------------------------------------------
@@ -90,16 +78,12 @@ def test_readme_blocks_both_and_none_keep_their_wording(both, tmp_path):
 def test_limitations_segment_only(segment_only):
     text = L.block_certification(segment_only)
     assert "Certified today: `segment` for `human`." in text
-    t = flat(text)
-    assert "Captioning is not certified for any embodiment." in t
-    assert "`allow_uncertified: true` (its caption records say `certified: false`)" in t
-    assert "`preset: exact, stages: [segment, caption]`: it captions `exact`'s own segments" in t
-    assert f"(about {EXACT} per video-hour)" in t and "One config has one preset" in t
+    assert "Captioning is not certified" not in text and "preset: exact" not in text
     row = next(line for line in text.splitlines() if line.startswith("| `human`"))
     assert row.split(" | ")[1:3] == ["**certified**", "not yet"]
 
 
-def test_limitations_both_and_none_have_no_caption_options(both, tmp_path):
+def test_limitations_both_and_none(both, tmp_path):
     assert "Captioning is not certified" not in L.block_certification(both)
     empty = tmp_path / "empty"
     empty.mkdir()
@@ -111,50 +95,25 @@ def test_limitations_both_and_none_have_no_caption_options(both, tmp_path):
 # README wave-h:cost
 
 
-def findings(certified=()):
-    return SimpleNamespace(
-        date="2026-10-22", certified=frozenset(certified), ms={},
-        cost={"balanced": {"usd_per_video_h": 5.28, "uncertainty": 0.5, "terms": [
-            {"kind": "segment", "usd_per_video_h": 2.10},
-            {"kind": "caption", "usd_per_video_h": 3.18}]}, "exact": None},
-        planned={"exact": {"usd_per_video_h": 36.39}})
-
-
-@pytest.mark.parametrize("certified", [(), ("segment", "caption")])
-def test_cost_block_both_or_none_is_one_price(certified):
-    block = fin.cost_block(findings(certified))
-    assert block.startswith("`balanced` costs about **$5.28 per video-hour** of GPU work (±50%) "
-                            "for segmentation + captioning,\n")
+def test_cost_block_is_the_all_in_table_whatever_is_certified():
+    block = fin.cost_block(SimpleNamespace(table=None))
+    assert block == C.block_readme()
     lines = block.splitlines()
-    # the planner's `exact` figure on its own line, labelled as the planner's (not this run's)
-    assert lines[2] == "`exact` is priced at $36.39: the planner's rate (an older measurement)."
-    assert len(lines) == 4
+    assert lines[0] == "| Video | Segment + caption | + rewards | Wall-clock |"
+    assert [ln.split(" | ")[0] for ln in lines[2:5]] == ["| 3 min (0.05 h)", "| 1 h", "| 10 h"]
+    assert "All-in estimates at Modal list prices" in block
+    # never the measured-vs-planner `exact` comparison
+    assert "exact" not in block and "planner" not in block and "measured" not in block
 
 
-def test_cost_block_segment_only_never_prices_certified_captioning():
-    block = fin.cost_block(findings(("segment",)))
-    lines = block.splitlines()
-    assert lines[0] == ("`balanced` costs about **$2.10 per video-hour** of GPU work (±50%) for "
-                        "segmentation, which is certified;")
-    assert lines[1:3] == ["captioning adds about $3.18 but is not certified (its records say "
-                          "`certified: false`),",
-                          "or `exact` runs certified segmentation + captioning for $36.39,"]
-    assert "$5.28" not in block and "segmentation + captioning (" not in block
-    assert all(len(line) <= 125 for line in lines)
-    assert lines[3].startswith("at Modal list prices; a projection from rates")
-    assert "`flora plan` shows the all-in estimate" in block
+def test_cost_block_rows_are_the_short_tables_prices():
+    from flora_deploy.planner.rates import RateTable
 
-
-def test_cost_block_segment_only_also_names_this_runs_exact_measurement():
-    f = findings(("segment",))
-    f.cost["exact"] = {"usd_per_video_h": 25.35, "uncertainty": 0.41}
-    f.ms = {("exact", "segcap"): SimpleNamespace(n=2, uncertainty=0.41)}
-    lines = fin.cost_block(f).splitlines()
-    assert lines[2] == "or `exact` runs certified segmentation + captioning for $36.39,"
-    assert lines[3].startswith("at Modal list prices; a projection from rates")
-    assert lines[4] == ("The 2026-10-22 validation run measured `exact` at $25.35 (±41%, n=2 "
-                        "jobs), not yet folded into the planner.")
-    assert all(len(line) <= 125 for line in lines)
+    t = RateTable.load()
+    rows = C.block_readme(t).splitlines()[2:5]
+    for v, row in zip(C.README_SIZES, rows, strict=True):
+        a, b = C.price(v, C.SEGCAP, table=t), C.price(v, C.SEGCAP + C.REWARDS, table=t)
+        assert row.split(" | ")[1:] == [C.usd(a.cost), C.usd(b.cost), C.hours(a.wall_s) + " |"]
 
 
 def test_committed_readme_and_limitations_reproduce():
@@ -162,4 +121,5 @@ def test_committed_readme_and_limitations_reproduce():
     from flora_deploy.validate import certkey
 
     assert fin.certification_blocks(readme, [certkey.CERT_DIR]) == readme
+    assert C.render_readme(readme) == readme
     assert L.render() == L.DOC.read_text(encoding="utf-8")

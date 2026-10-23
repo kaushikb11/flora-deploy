@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import after_certified as ac  # noqa: E402
 import cert_check as cc  # noqa: E402
 
+ALL_HUMAN = "Every `balanced` stage is certified for `human` data; remove `allow_uncertified`."
 
 @pytest.fixture(autouse=True)
 def no_volume(monkeypatch):
@@ -83,8 +84,8 @@ def test_dry_run_writes_nothing_and_summarizes(fake, capsys):
     assert out.count("src/flora_deploy/config/certificates/freeze/cert_") == 2
     for block in ac.README_BLOCKS:
         assert f"`wave-h:{block}`:" in out
-    assert "Accuracy certificates: segmentation and captioning for `human` data" in out
-    assert "per video-hour" in out  # the cost block in full
+    assert ALL_HUMAN in out
+    assert "All-in estimates at Modal list prices" in out  # the cost block in full
 
 
 def test_write_applies_what_cert_check_passes_and_is_idempotent(fake, capsys):
@@ -102,7 +103,7 @@ def test_write_applies_what_cert_check_passes_and_is_idempotent(fake, capsys):
                                   nv_root=fake.nv_root, drift_runner=drift_ok))
     assert [r for r in rows if r.status != cc.PASS] == []
     readme = (fake.root / "README.md").read_text()
-    assert "Accuracy certificates: segmentation and captioning for `human`" in readme
+    assert ALL_HUMAN in readme
     applied = fake.tree()
     assert run(fake, "--write") == ac.OK
     again = capsys.readouterr().out

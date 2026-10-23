@@ -334,14 +334,15 @@ def test_happy_path_updates_everything_consistently_and_is_idempotent(tmp_path, 
     assert f"${bal_cost:.2f}/video-h" in block and "plugin **off**" in block
     assert "tempseg: pass (6/6 ids, 6/6 grid)" in block and "not run" not in block
     assert doc.count("<!-- wave-h:results") == 1
+    assert "certificate per stage" not in block and "(run `" not in block  # no verdicts
     readme = (root / "README.md").read_text()
-    cost = readme.split("<!-- wave-h:cost -->")[1].split("<!-- /wave-h:cost -->")[0]
-    assert f"${bal_cost:.2f} per video-hour" in cost and "#" not in cost
-    # the planner's figure, labelled as the planner's (not this run's), on its own line
-    assert f"`exact` is priced at ${want_ex:.2f} (±" in cost and "planner's rate" in cost
-    assert "projection" in cost and "not yet confirmed at scale" in cost
-    assert "measured 20" not in cost  # never presented as an at-scale measurement
-    assert 2 <= len(cost.strip().splitlines()) <= 5
+    cost = readme.split("<!-- wave-h:cost -->\n")[1].split("<!-- /wave-h:cost -->")[0]
+    # the all-in table, priced from the rates this run wrote (scripts/cost_table.py)
+    import cost_table
+
+    new_rates = RateTable.load(root / "src/flora_deploy/planner/rates.json")
+    assert cost == cost_table.block_readme(new_rates)
+    assert "exact" not in cost and "planner" not in cost  # no measured-vs-planner line
     readme0 = before["README.md"].decode()  # as built: no certificates in this root
     outside = readme0.split("<!-- wave-h:cost -->")
     assert readme.startswith(outside[0]) and readme.endswith(outside[1].split(
@@ -759,7 +760,7 @@ def test_report_spend_shows_tracked_charged_and_billed(tmp_path, capsys):
     assert "over tracked" in rep and f"- billed ${st.billed_total:,.2f}" in rep
 
 
-README_BLOCKS = ("certified", "allow-uncertified", "cost")
+README_BLOCKS = ("allow-uncertified", "cost")
 
 
 def _strip_blocks(text: str) -> str:
@@ -789,7 +790,7 @@ def test_write_regenerates_every_readme_block_and_nothing_else(tmp_path, capsys)
     assert _strip_blocks(new) == _strip_blocks(stale)  # nothing outside the blocks changed
     certs_dir = root / "src/flora_deploy/config/certificates"
     blocks = fin.certification_blocks(stale, [certs_dir])
-    for n in ("certified", "allow-uncertified"):
+    for n in ("allow-uncertified",):
         want = blocks.split(f"<!-- wave-h:{n} -->\n")[1].split(f"<!-- /wave-h:{n} -->")[0]
         assert new.split(f"<!-- wave-h:{n} -->\n")[1].split(f"<!-- /wave-h:{n} -->")[0] == want
 

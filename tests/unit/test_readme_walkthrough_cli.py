@@ -169,12 +169,15 @@ def test_lerobot_demo_can_be_exported(tmp_path):
 
 def test_readme_export_flags_are_real_and_name_allow_fake():
     help_ = runner.invoke(app, ["export", "--help"], env={"COLUMNS": "200"}).output
-    sec = README.split("Training on LeRobot?", 1)[1].split("\n\n", 1)[0]
-    spans = re.findall(r"`(flora export [^`]+|--[a-z-]+)`", sec)  # export's own flags
-    for flag in {f for sp in spans for f in re.findall(r"--[a-z][a-z-]+", sp)}:
+    sec = README.split("## Label your own data", 1)[1].split("\n## ", 1)[0]
+    lines = [ln for ln in sec.split("```bash", 1)[1].split("```", 1)[0].replace("\\\n", " ")
+             .splitlines() if ln.startswith("flora export")]
+    assert lines, "the README flow has no `flora export` line"
+    for flag in {f for ln in lines for f in re.findall(r"--[a-z][a-z-]+", ln.split("#")[0])}:
         assert flag in help_, f"README names `flora export {flag}`, which does not exist"
-    assert "--allow-fake" in sec and "local_demo_lerobot" in sec
-    assert "allow_uncertified` doesn't apply" in sec
+    # the fake-model details live in docs/export.md
+    doc = (ROOT / "docs" / "export.md").read_text(encoding="utf-8")
+    assert "--allow-fake" in doc
 
 
 # ---------------------------------------------------------------------------------------------
@@ -290,7 +293,7 @@ def test_boto3_hint_matches_the_install(monkeypatch):
 
 def test_readme_pandas_snippet_says_what_to_write_first():
     sec = README.split("## Using the labels", 1)[1]
-    before, code = sec.split("```python", 1)
-    assert "flora results caption --format parquet --out\ncaption.parquet" in before
-    assert "pip install pandas pyarrow" in before
-    assert 'read_parquet("caption.parquet")' in code
+    code = sec.split("```python", 1)[1].split("```", 1)[0]
+    first = code.index('read_parquet("caption.parquet")')
+    assert code.index("# flora results caption --format parquet --out caption.parquet") < first
+    assert "pip install pandas pyarrow" in code

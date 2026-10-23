@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import after_certified as ac  # noqa: E402
 import limitations_status  # noqa: E402
 
+ALL_HUMAN = "Every `balanced` stage is certified for `human` data; remove `allow_uncertified`."
 
 @pytest.fixture(autouse=True)
 def no_volume(monkeypatch):
@@ -89,17 +90,9 @@ def test_the_human_flip_reads_cleanly(human, capsys):
     after = human.tree()
     readme, lim = after["README.md"].decode(), after["docs/limitations.md"].decode()
 
-    assert ac.block(readme, "certified") == (
-        "Accuracy certificates: segmentation and captioning for `human` data (`L40S` / `H100!`).\n"
-        "Rewards run NVIDIA's own engine, as `exact` does, and need none. Everything else runs "
-        "uncertified.")
-    allow = ac.block(readme, "allow-uncertified")
-    assert allow.startswith("`allow_uncertified: true` runs the stages that have no accuracy "
-                            "certificate for your embodiment and GPU;")
-    assert "Certified today: segmentation and captioning for `human` data" in allow
-    assert "does not need it; `flora doctor` tells you." in allow
+    assert ac.block(readme, "allow-uncertified") == ALL_HUMAN
     assert ac.block(readme, "cost") != ac.block(before["README.md"].decode(), "cost")
-    assert "per video-hour" in ac.block(readme, "cost")
+    assert "All-in estimates" in ac.block(readme, "cost")
 
     rows = limitations_rows(lim)
     assert list(rows) == list(EMBODIMENTS)
@@ -141,8 +134,9 @@ def test_human_then_yam_lists_both(human, tmp_path, capsys):
     capsys.readouterr()
     readme = (human.root / "README.md").read_text()
     lim = (human.root / "docs" / "limitations.md").read_text()
-    assert "segmentation and captioning for `human` and `yam` data (`L40S` / `H100!`)" in \
-        ac.block(readme, "certified")
+    assert ac.block(readme, "allow-uncertified") == (
+        "Every `balanced` stage is certified for `human` and `yam` data; remove "
+        "`allow_uncertified`.")
     assert ac.block(readme, "cost") == ac.block(readme_human, "cost")  # yam never prices
     rows = limitations_rows(lim)
     assert rows["human"][:2] == rows["yam"][:2] == ["**certified**", "**certified**"]
@@ -185,11 +179,9 @@ def test_a_partial_run_flips_only_segment(tmp_path, capsys, plan):
     capsys.readouterr()
     readme = (f.root / "README.md").read_text()
     lim = (f.root / "docs" / "limitations.md").read_text()
-    certified = ac.block(readme, "certified")
-    assert certified.startswith("Accuracy certificates: segmentation for `human` data (`L40S`).")
-    assert "captioning for" not in certified
-    assert "Certified today: segmentation for `human` data (`L40S`)." in \
-        ac.block(readme, "allow-uncertified")
+    assert ac.block(readme, "allow-uncertified") == (
+        "**Note:** `balanced` caption records currently say `certified: false`, so they need\n"
+        "`allow_uncertified: true` here and `--allow-uncertified` when you export.")
     rows = limitations_rows(lim)
     assert rows["human"][:2] == ["**certified**", "not yet"]
     assert "Certified today: `segment` for `human`.\n" in lim
@@ -216,8 +208,7 @@ def test_a_recertify_run_certifies_both_stages_from_its_own_layout(tmp_path, cap
     assert [(c["stage"], c["verdict"]) for c in certs] == [("caption", "certified"),
                                                            ("segment", "certified")]
     assert certs[0]["scoring"] == {"caption": "stage_isolated"}
-    assert ac.block((f.root / "README.md").read_text(), "certified").startswith(
-        "Accuracy certificates: segmentation and captioning for `human` data")
+    assert ac.block((f.root / "README.md").read_text(), "allow-uncertified") == ALL_HUMAN
     # a recertify state is not read as a certified run, nor the other way round
     assert run(f) == ac.USAGE
     assert "run under plan 'recertify', not certified" in capsys.readouterr().err

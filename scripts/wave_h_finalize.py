@@ -34,12 +34,13 @@ and balanced jobs (``reports/wave-h/records/{exact,noise,balanced}/<job>/<stage>
    prices (formula shown), L0, Gate A with the ``dt_bias`` plugin recommendation (the rule
    in ``docs/balanced-engines.md``) and the certificate summary. Numbers only: no NVIDIA
    text, captions, prompts or episode ids.
-4. **Docs**: the ``Results`` table of ``docs/balanced-engines.md`` and the ``Cost`` block of
-   ``README.md`` (2-3 plain lines), each between ``<!-- wave-h:<name> -->`` /
-   ``<!-- /wave-h:<name> -->`` markers. The script fills exactly those blocks and refuses when
-   the markers are missing; it never inserts a section. Until the balanced rates are measured
-   the README block is left as it is. When the rates change, the generated tables of
-   ``docs/costs.md`` are regenerated from them (``scripts/cost_table.py``).
+4. **Docs**: the ``Results`` table of ``docs/balanced-engines.md`` (engine measurements, no
+   run ids or certification verdicts) and the README's ``Cost`` table and ``allow-uncertified``
+   note, each between ``<!-- wave-h:<name> -->`` / ``<!-- /wave-h:<name> -->`` markers. The
+   script fills exactly those blocks and refuses when the markers are missing; it never inserts
+   a section. The ``Cost`` table is ``scripts/cost_table.py``'s ``block_readme`` (the all-in
+   estimate from the rates, which ``cost_table.py --write`` also renders). When the rates
+   change, the generated tables of ``docs/costs.md`` are regenerated from them too.
 
 Idempotent: a second run with the same inputs changes nothing. Nothing here starts a container.
 """
@@ -1140,7 +1141,7 @@ class Findings:
     date: str
     # what `flora plan` prices each preset at (planned_usd_per_video_h); the docs quote these
     planned: dict[str, dict[str, Any] | None] = field(default_factory=dict)
-    # the `balanced` stages a certificate unlocks (certified_kinds), for the README cost block
+    # the `balanced` stages a certificate unlocks (certified_kinds)
     certified: frozenset[str] = frozenset()
 
 
@@ -1320,13 +1321,15 @@ def replace_block(text: str, name: str, body: str) -> str:
 
 
 def results_block(f: Findings) -> str:
+    """The ``Results`` table of ``docs/balanced-engines.md``: engine measurements only (L0,
+    throughput, Gate A). No run ids and no per-run certification verdicts: those stay in the
+    report, which is not committed."""
     l0 = "; ".join(f"{r['kind']}: {r['status']}" + (
         f" ({r['ids_equal']}/{r['requests']} ids, {r['grid_equal']}/{r['requests']} grid)"
         if r["status"] != "missing" else "") for r in f.l0)
     bal_jobs = [r for r in jobs_of(f.st, "balanced").values()
                 if r.get("state") in ("done", "completed_with_errors")]
-    e2e = (f"{len(bal_jobs)} `balanced` job(s) through `flora deploy` / `flora run` "
-           f"(run `{f.st.run_id}`); certificate per stage: {stage_verdicts(f.outcomes)}")
+    e2e = f"{len(bal_jobs)} `balanced` job(s) through `flora deploy` / `flora run`"
     bal, ex = f.cost.get("balanced"), f.planned.get("exact")
     if bal and ex:
         ratio = ex["usd_per_video_h"] / bal["usd_per_video_h"]
@@ -1343,97 +1346,19 @@ def results_block(f: Findings) -> str:
                    f"{v['greedy_identical']}/{v['requests']}" for k, v in g["kinds"].items() if v)
     ga = (ga or "**not measured**") + f"; recommendation: plugin **{g['recommendation']}**"
     rows = [["L0 in-engine (ids, grid vs HF)", l0],
-            ["Segments / captions end to end on golden episodes", e2e],
+            ["Segments / captions end to end", e2e],
             ["Throughput, $/video-h vs `exact`", cost],
             ["Gate A (dt_bias FP32 vs bf16)", ga]]
-    return "\n".join([*table(["Item", f"Result (Wave H-lite, {f.date})"],
-                             rows)])
+    return "\n".join([*table(["Item", f"Result ({f.date})"], rows)])
 
 
-def cost_block(f: Findings) -> str | None:
-    bal, ex = f.cost.get("balanced"), (getattr(f, "planned", None) or {}).get("exact")
-    if not bal:
-        return None
-    # README wording (no internal run names): the busy-only figure, said plainly to be
-    # busy-only and a projection; `exact` as `flora plan` prices it, so the two agree, on its
-    # own line so the balanced band and job are not read as its own. That figure is the
-    # planner's committed row, not this run's: when this run measured `exact` differently, say
-    # both. Lines of at most ~125 characters (the README's changed lines stay short).
-    basis = f"at Modal list prices; a projection from rates {projection_basis(f)}."
-    tail = ("Startup, idle time and rewards are extra and dominate small jobs: `flora plan` "
-            "shows the all-in estimate for your dataset.")
-    split = partial_cost(f, bal)
-    if split is not None:  # some stages certified, not all: never price them as one certified
-        (cert, cert_usd, cert_unc), (unc, unc_usd) = split
-        vs = (f",\nor `exact` runs certified segmentation + captioning for "
-              f"${ex['usd_per_video_h']:.2f}" if ex else "")
-        lines = [f"`balanced` costs about **${cert_usd:.2f} per video-hour** of GPU work "
-                 f"(±{cert_unc:.0%}) for {and_list(cert)}, which is certified;\n"
-                 f"{and_list(unc)} adds about ${unc_usd:.2f} but is not certified (its records "
-                 f"say `certified: false`){vs},", basis]
-        run = exact_run_line(f, ex) if ex else None
-        if run:  # the planner's `exact` price above is not this run's measurement: say both
-            lines.append(run[0].upper() + run[1:] + ".")
-        return "\n".join([*lines, tail])
-    lines = [f"`balanced` costs about **${bal['usd_per_video_h']:.2f} per video-hour** of GPU "
-             f"work (±{bal['uncertainty']:.0%}) for segmentation + captioning,", basis]
-    if ex:
-        lines.append(exact_cost_line(f, ex))
-    return "\n".join([*lines, tail])
+def cost_block(f: Any) -> str:
+    """The README's ``Cost`` block: the all-in table ``scripts/cost_table.py`` renders from the
+    rates (``block_readme``; the same numbers as ``docs/costs.md``'s short table), priced with
+    ``f.table`` (default: the shipped ``planner/rates.json``)."""
+    import cost_table  # scripts/, on sys.path above
 
-
-def exact_cost_line(f: Any, ex: Mapping[str, Any]) -> str:
-    """The README's `exact` line: the planner's rate (what `flora plan` prices; its committed
-    row, an older measurement) and, when this run measured `exact` more than 10% off it, this
-    run's figure with its band and n, so neither is attributed to the other's job."""
-    rate = " + ".join(f"{t['rate']:g}" for t in ex.get("terms", ()))
-    band = f" (±{ex['uncertainty']:.0%})" if ex.get("uncertainty") is not None else ""
-    line = (f"`exact` is priced at ${ex['usd_per_video_h']:.2f}{band}: the planner's rate "
-            f"({rate + ' GPU-s per video-s, ' if rate else ''}an older measurement)")
-    run = exact_run_line(f, ex)
-    return line + (f";\n{run}" if run else "") + "."
-
-
-def exact_run_line(f: Any, ex: Mapping[str, Any]) -> str | None:
-    """This run's `exact` figure (band, n) when it is more than 10% off the planner's rate
-    ``ex``, worded as not yet folded into the planner; ``None`` otherwise."""
-    run = (getattr(f, "cost", None) or {}).get("exact")
-    if not (run and ex["usd_per_video_h"]
-            and abs(run["usd_per_video_h"] / ex["usd_per_video_h"] - 1) > 0.10):
-        return None
-    m = (getattr(f, "ms", None) or {}).get(("exact", "segcap"))
-    n = f", n={m.n} jobs" if m is not None and m.n else ""
-    when = getattr(f, "date", None)
-    return (f"the {when + ' ' if when else ''}validation run measured `exact` at "
-            f"${run['usd_per_video_h']:.2f} (±{run['uncertainty']:.0%}{n}), not yet folded "
-            "into the planner")
-
-
-def partial_cost(f: Any, bal: Mapping[str, Any]
-                 ) -> tuple[tuple[list[str], float, float], tuple[list[str], float]] | None:
-    """When a certificate unlocks some of ``balanced``'s priced stages but not all
-    (``f.certified``): ((certified stage words, their $/video-h, its band), (uncertified stage
-    words, their $/video-h)), from the per-stage terms of ``usd_per_video_h``. ``None`` when
-    every stage or none is certified, or the terms are missing (the one-price wording)."""
-    kinds = PRESET_KINDS["balanced"]
-    certified = set(getattr(f, "certified", None) or ()) & set(kinds)
-    terms = {t["kind"]: t for t in bal.get("terms") or ()}
-    if not certified or certified == set(kinds) or not set(kinds) <= set(terms):
-        return None
-    ms = getattr(f, "ms", None) or {}
-
-    def unc(k: str) -> float:
-        u = getattr(ms.get(("balanced", k)), "uncertainty", None)
-        return bal["uncertainty"] if u is None else u
-
-    cert = [k for k in kinds if k in certified]
-    rest = [k for k in kinds if k not in certified]
-    usd_c = sum(terms[k]["usd_per_video_h"] for k in cert)
-    band_c = (sum(terms[k]["usd_per_video_h"] * unc(k) for k in cert) / usd_c if usd_c
-              else bal["uncertainty"])
-    return (([STAGE_WORDS[k] for k in cert], round(usd_c, 2), band_c),
-            ([STAGE_WORDS[k] for k in rest],
-             round(sum(terms[k]["usd_per_video_h"] for k in rest), 2)))
+    return cost_table.block_readme(getattr(f, "table", None))
 
 
 def projection_basis(f: Any) -> str:
@@ -1451,11 +1376,6 @@ def and_list(items: Sequence[str]) -> str:
     """``a``, ``a and b``, ``a, b and c``."""
     items = list(items)
     return items[0] if len(items) == 1 else f"{', '.join(items[:-1])} and {items[-1]}"
-
-
-STAGE_WORDS = {"segment": "segmentation", "caption": "captioning",
-               "reward.terminal": "terminal rewards", "reward.dense": "dense rewards",
-               "reward.rubric": "rubric rewards"}
 
 
 def certified_kinds(cert_dirs: Sequence[Path]) -> dict[str, tuple[set[str], set[str]]]:
@@ -1481,9 +1401,9 @@ def certified_kinds(cert_dirs: Sequence[Path]) -> dict[str, tuple[set[str], set[
 
 def exact_price(table: Any = None) -> str | None:
     """``$36.39``: what ``flora plan`` prices ``exact`` segmentation + captioning at per
-    video-hour of GPU work (``planned_usd_per_video_h``, the figure the README cost block
-    quotes), from ``table`` (default: the shipped ``planner/rates.json``; finalize never
-    rewrites its ``exact`` rates). ``None`` when it cannot be priced."""
+    video-hour of GPU work (``planned_usd_per_video_h``), from ``table`` (default: the shipped
+    ``planner/rates.json``; finalize never rewrites its ``exact`` rates). ``None`` when it
+    cannot be priced."""
     try:
         if table is None:
             from flora_deploy.planner.rates import RateTable
@@ -1495,55 +1415,27 @@ def exact_price(table: Any = None) -> str | None:
     return f"${p['usd_per_video_h']:.2f}" if p else None
 
 
+EXPORT_CONSEQUENCE = ("so they need\n`allow_uncertified: true` here and `--allow-uncertified` "
+                      "when you export.")
+
+
 def certification_blocks(readme: str, cert_dirs: Sequence[Path], *, table: Any = None) -> str:
-    """``readme`` with its ``wave-h:certified`` (one status line under "Label your own data")
-    and ``wave-h:allow-uncertified`` (under the Configuration example) blocks written from the
-    ``balanced`` certificates in ``cert_dirs`` that unlock (``certified_kinds``): which stages,
-    for which embodiments, on which GPUs. Plain words, no ids. When segmentation is certified
-    and captioning is not, both blocks say so and give the two honest ways to get captions
-    (``exact``'s price from ``table``, see ``exact_price``)."""
-    words = STAGE_WORDS
+    """``readme`` with its ``wave-h:allow-uncertified`` block (the note under the Configuration
+    example) written from the ``balanced`` certificates in ``cert_dirs`` that unlock
+    (``certified_kinds``): one plain sentence naming the stages whose records still say
+    ``certified: false``. No ids, embodiment lists or GPU names. ``table`` is unused (kept for
+    callers)."""
     kinds = certified_kinds(cert_dirs)
-    groups: dict[tuple[str, ...], list[str]] = {}  # embodiments -> kinds, in stage order
-    for k in sorted(kinds, key=lambda k: list(words).index(k) if k in words else 99):
-        groups.setdefault(tuple(sorted(kinds[k][0])), []).append(k)
-    parts = []
-    for embs, ks in groups.items():
-        gpus = list(dict.fromkeys(g for k in ks for g in sorted(kinds[k][1])))  # stage order
-        parts.append(f"{and_list([words.get(k, k) for k in ks])} for "
-                     f"{and_list([f'`{e}`' for e in embs])} data "
-                     f"({' / '.join(f'`{g}`' for g in gpus)})")
-    if not parts:
-        status = ("Accuracy certificates: none yet, so `balanced` segmentation and captioning "
-                  "records say `certified: false`.\nRewards run NVIDIA's own engine, as "
-                  "`exact` does, and need none.")
-        config = ("`allow_uncertified: true` lets `balanced` run segmentation and captioning "
-                  "without accuracy certificates.\nNone exist yet, so it is required for them.")
-    elif "segment" in kinds and "caption" not in kinds:  # segmentation only: say how to caption
-        price = exact_price(table)
-        at = f"the `exact` price (about {price} per video-hour)" if price else "the `exact` price"
-        status = (f"Accuracy certificates: {'; '.join(parts)}. Captioning is not certified:\n"
-                  "run it with `allow_uncertified: true` (its records say `certified: false`), "
-                  "or as a separate `exact` job,\nwhich captions its own segments at "
-                  f"{at}.\nRewards run NVIDIA's own engine, as `exact` does, and need none.")
-        config = ("`allow_uncertified: true` runs the stages that have no accuracy certificate "
-                  "for your embodiment and GPU;\ntheir records say `certified: false`. Certified "
-                  f"today: {'; '.join(parts)}.\nCaptioning is not certified. For captions, "
-                  "either (i) run one `balanced` job with `allow_uncertified: true`:\nits caption "
-                  "records say `certified: false`; or (ii) run captions as a separate job with\n"
-                  "`preset: exact, stages: [segment, caption]`: it captions `exact`'s own "
-                  f"segments,\nat {at}. One config has one preset, so the two cannot be mixed.\n"
-                  "A config whose every stage is certified does not need `allow_uncertified`; "
-                  "`flora doctor` tells you.")
+    stages = PRESET_KINDS["balanced"]
+    open_ = [k for k in stages if k not in kinds]
+    if open_:
+        note = (f"**Note:** `balanced` {and_list(open_)} records currently say "
+                f"`certified: false`, {EXPORT_CONSEQUENCE}")
     else:
-        status = (f"Accuracy certificates: {'; '.join(parts)}.\nRewards run NVIDIA's own "
-                  "engine, as `exact` does, and need none. Everything else runs uncertified.")
-        config = ("`allow_uncertified: true` runs the stages that have no accuracy certificate "
-                  "for your embodiment and GPU;\ntheir records say `certified: false`. Certified "
-                  f"today: {'; '.join(parts)}.\nA config whose every stage is certified does "
-                  "not need it; `flora doctor` tells you.")
-    readme = replace_block(readme, "certified", status)
-    return replace_block(readme, "allow-uncertified", config)
+        embs = sorted(set.intersection(*(kinds[k][0] for k in stages)))
+        who = f" for {and_list([f'`{e}`' for e in embs])} data" if embs else ""
+        note = f"Every `balanced` stage is certified{who}; remove `allow_uncertified`."
+    return replace_block(readme, "allow-uncertified", note)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1743,10 +1635,9 @@ def analyze(paths: Paths, *, derived: Mapping[str, str] | None = None, cert_tmp:
     outputs[paths.report] = render_report(f)
     doc = paths.engines_doc.read_text(encoding="utf-8")
     outputs[paths.engines_doc] = replace_block(doc, BLOCK_RESULTS, results_block(f))
-    body = cost_block(f)
-    if body is not None:
-        readme = paths.readme.read_text(encoding="utf-8")
-        outputs[paths.readme] = replace_block(readme, BLOCK_COST, body)
+    readme = paths.readme.read_text(encoding="utf-8")
+    outputs[paths.readme] = replace_block(readme, BLOCK_COST, cost_block(SimpleNamespace(
+        table=replace(priced, source="planner/rates.json"))))
     certs = [cert_tmp / f"{o['cert']['id']}.json" for o in outcomes
              if o.get("cert") and o["cert"]["verdict"] != "fail"]
     readme = outputs.get(paths.readme) or paths.readme.read_text(encoding="utf-8")
