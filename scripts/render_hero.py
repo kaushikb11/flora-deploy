@@ -1,12 +1,14 @@
 """Render the README hero figure: one episode's subtask timeline with its captions.
 
     uv run python scripts/render_hero.py --captions caption.jsonl [--segments segment.jsonl] \\
-        [--uid UID] [--video episode.mp4] [--title TEXT] --out docs/img/hero
+        [--uid UID] [--video episode.mp4] [--title TEXT] [--svg] --out docs/img/hero
 
 The inputs are what ``flora results <stage> --format jsonl`` writes (``docs/output-format.md``).
-Writes ``<out>.png`` and ``<out>.svg``: a timeline bar of the episode's subtasks, numbered and
-colored, and below it one card per subtask with its time range, caption and (with ``--video``)
-the frame at the subtask's midpoint.
+Writes ``<out>.png`` (and ``<out>.svg`` with ``--svg``): a timeline bar of the episode's
+subtasks, numbered and colored, and below it one card per subtask with its time range, caption
+and (with ``--video``) the frame at the subtask's midpoint. The PNG is 1600 px wide and
+palette-quantized so the README figure stays small; the SVG embeds the frames as raster images,
+so with ``--video`` it is large and is not committed.
 
 Only the subtask times, the captions and the optional frames are drawn. Nothing else from the
 records reaches the figure: no uid, dataset, episode id, file path, provenance, GPU or hash,
@@ -43,7 +45,9 @@ MARGIN_IN = 0.45
 GUTTER_IN = 0.22
 MAX_COLS = 4
 CAPTION_PT = 10.5
-DPI = 200
+WIDTH_PX = 1600  # web size: crisp on GitHub, a few hundred KB after quantization
+DPI = WIDTH_PX / WIDTH_IN
+PNG_COLORS = 256
 
 
 @dataclass(frozen=True)
@@ -162,7 +166,7 @@ def _fmt_s(s: float) -> str:
 
 
 def render(ep: Episode, out: Path, title: str | None = None,
-           frames: list | None = None) -> list[Path]:
+           frames: list | None = None, svg: bool = False) -> list[Path]:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -260,12 +264,26 @@ def render(ep: Episode, out: Path, title: str | None = None,
             ax.text(x + 0.15, cy + k * line_h, line, fontsize=CAPTION_PT, color=INK, va="top")
 
     out.parent.mkdir(parents=True, exist_ok=True)
-    paths = [out.with_suffix(".png"), out.with_suffix(".svg")]
+    paths = [out.with_suffix(".png")]
     fig.savefig(paths[0], facecolor=SURFACE, metadata={"Software": None})
-    fig.savefig(paths[1], facecolor=SURFACE,
-                metadata={"Creator": None, "Date": None, "Format": None, "Type": None})
+    if svg:
+        paths.append(out.with_suffix(".svg"))
+        fig.savefig(paths[1], facecolor=SURFACE,
+                    metadata={"Creator": None, "Date": None, "Format": None, "Type": None})
     plt.close(fig)
+    _quantize_png(paths[0])
     return paths
+
+
+def _quantize_png(path: Path) -> None:
+    """Rewrite the PNG with a 256-colour palette, Floyd-Steinberg dithered so the photos keep
+    their gradients: about a third of the truecolour size. No metadata is written."""
+    from PIL import Image
+
+    with Image.open(path) as im:
+        rgb = im.convert("RGB")
+    palette = rgb.quantize(PNG_COLORS, method=Image.Quantize.FASTOCTREE)
+    rgb.quantize(palette=palette, dither=Image.Dither.FLOYDSTEINBERG).save(path, optimize=True)
 
 
 def _tick_step(duration: float) -> float:
@@ -284,8 +302,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--video-start", type=float, help="episode start in --video, seconds")
     p.add_argument("--camera", default="main", help="camera role for the default video start")
     p.add_argument("--title", help="drawn as given (default: no title)")
+    p.add_argument("--svg", action="store_true",
+                   help="also write <out>.svg (large with --video: it embeds the frames)")
     p.add_argument("--out", type=Path, default=Path("docs/img/hero"),
-                   help="output path without suffix; writes .png and .svg")
+                   help="output path without suffix; writes .png (and .svg with --svg)")
     a = p.parse_args(argv)
     caps = load_jsonl(a.captions)
     segs = load_jsonl(a.segments) if a.segments else None
@@ -294,7 +314,7 @@ def main(argv: list[str] | None = None) -> int:
     if a.video:
         start = a.video_start if a.video_start is not None else (ep.video_start_s or 0.0)
         frames = keyframes(a.video, [start + (t.start_s + t.end_s) / 2 for t in ep.subtasks])
-    for path in render(ep, a.out.with_suffix(""), a.title, frames):
+    for path in render(ep, a.out.with_suffix(""), a.title, frames, a.svg):
         print(path)
     return 0
 

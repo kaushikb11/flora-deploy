@@ -95,12 +95,13 @@ def test_render_png_and_svg(tmp_path):
     caps, segs = synthetic(tmp_path)
     out = tmp_path / "img" / "hero"
     assert rh.main(["--captions", str(caps), "--segments", str(segs), "--out", str(out),
-                    "--title", "One episode, labelled"]) == 0
+                    "--title", "One episode, labelled", "--svg"]) == 0
     png, svg = out.with_suffix(".png"), out.with_suffix(".svg")
     from PIL import Image
 
     with Image.open(png) as im:
-        assert im.format == "PNG" and im.width == rh.WIDTH_IN * rh.DPI
+        assert im.format == "PNG" and im.width == rh.WIDTH_PX == 1600
+        assert im.mode == "P"  # palette-quantized: the README figure stays small
         assert "Software" not in im.info
     text = svg.read_text()
     for c in ("One episode, labelled", "4 subtasks", "turns the", "rinses it."):
@@ -109,8 +110,16 @@ def test_render_png_and_svg(tmp_path):
     _assert_clean([png, svg])
     first = svg.read_bytes()
     rh.main(["--captions", str(caps), "--segments", str(segs), "--out", str(out),
-             "--title", "One episode, labelled"])
+             "--title", "One episode, labelled", "--svg"])
     assert svg.read_bytes() == first  # deterministic
+
+
+def test_svg_is_opt_in(tmp_path):
+    caps, segs = synthetic(tmp_path)
+    out = tmp_path / "hero"
+    assert rh.main(["--captions", str(caps), "--segments", str(segs), "--out", str(out)]) == 0
+    assert out.with_suffix(".png").exists()
+    assert not out.with_suffix(".svg").exists()
 
 
 def test_render_with_keyframes(tmp_path):
@@ -134,6 +143,6 @@ def test_render_with_keyframes(tmp_path):
     caps, segs = synthetic(tmp_path)
     out = tmp_path / "hero"
     assert rh.main(["--captions", str(caps), "--segments", str(segs), "--video", str(video),
-                    "--out", str(out)]) == 0
+                    "--out", str(out), "--svg"]) == 0
     _assert_clean([out.with_suffix(".png"), out.with_suffix(".svg")])
     assert "<image" in out.with_suffix(".svg").read_text()
