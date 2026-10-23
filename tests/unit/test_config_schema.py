@@ -219,6 +219,10 @@ def test_balanced_refusal_names_the_committed_certificates():
     with pytest.raises(ConfigError) as e:
         parse_config(d, derived_content=dc)
     msg = str(e.value)
+    if not certkey.load_certificates():  # nothing committed: the plain refusal
+        assert "has no accuracy certificate for" in msg
+        assert all(f"{k} on {gpus[k]}" in msg for k in needs), msg
+        return
     ok = [k for k in gpus if k in certs]
     if ok:
         assert f"(certified: {', '.join(ok)}; reference: reward.terminal)" in msg

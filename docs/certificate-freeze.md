@@ -70,9 +70,7 @@ What the guard reports, per certificate:
 **Retired certificates.** A certificate from an older generator version (today: any version
 other than `4`) can never match again, whatever the code does, so the guard reports it as
 `retired` instead of drifted. Keep the file until its re-certified replacement is committed,
-then delete it and its freeze lock in the commit that adds the new certificate. The committed
-v3 segment certificate (`cert_f5d6433f….json`) is in this state: while it is retired, balanced
-segmentation is uncertified.
+then delete it and its freeze lock in the commit that adds the new certificate.
 
 Other findings: a certificate committed without its freeze lock is a `no_lock` warning, a lock
 without a certificate an `orphan_lock` warning, a file not named after its id a warning, and a
@@ -112,7 +110,7 @@ The drift report ends with the choice:
    the kind's modules, or made a comment-only edit.
 2. **Re-certify**, if it was meant to (a fix, a new engine setting, new weights). Re-certifying
    costs GPU time: the oracle (the `exact` reference run), the noise run and `balanced` on the
-   human episodes. Maintainers decide the spend (`docs/wave-h-runbook.md`).
+   human episodes. Maintainers decide the spend.
 
 ### Re-certification workflow
 
@@ -162,12 +160,7 @@ of the key with its hash, the modules of the logic digest with the sha256 of the
 source, and the certificate that covers it. The hashes change with every merge on these paths,
 so they are not copied here.
 
-**No row is frozen today.** One certificate is committed, the v3 `balanced` / `segment` /
-`L40S` certificate for `human` (`cert_f5d6433f….json`, lock in `certificates/freeze/`, run
-`10221548f1b8`), and it is retired (above). `caption` failed on that run and has no
-certificate. Both rows are frozen again by the v4 re-certification
-([`wave-h-runbook.md`](wave-h-runbook.md), "The re-certification run"). What the listing
-covers:
+**No row is frozen today**: no certificate is committed. What the listing covers:
 
 - `exact`: nothing (the reference by construction).
 - `balanced` / `segment` / `L40S` and `balanced` / `caption` / `H100!`: the `vllm-offline`

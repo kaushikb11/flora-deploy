@@ -8,28 +8,15 @@ metrics (the balanced Captioner captions the oracle's own segments, with byte-id
 inputs checked per call), and the end-to-end caption metrics are published as reported-only.
 Every version-3 certificate is retired: it matches nothing under v4.
 
-What this means for the committed files:
-- One certificate is committed, the version-3 **`segment`** certificate for `human` on the L40S
-  (`config/certificates/cert_f5d6433f….json`, with its freeze lock in `certificates/freeze/`),
-  from run `10221548f1b8`. It is **retired**: v4 does not accept its generator version, and its
-  key drifted anyway when `engines/offline_llm.py` changed (the Captioner limits below). The
-  drift guard reports it as `retired` (information, not an error;
-  [`certificate-freeze.md`](certificate-freeze.md)). The file stays until the re-certified v4
-  segment certificate exists; the commit that adds the new one deletes it and its lock.
-  **Balanced segmentation is therefore uncertified** between landing the v4 code and that
-  re-certification.
-- **`caption` is not certified.** On run `10221548f1b8` it failed its end-to-end noise-floor
-  check (`caption_mismatch`, `caption_edit_distance`), and a failed certificate is never
-  committed. Both stages are re-certified under v4 by the `recertify` plan, with rules fixed
-  before that run ("Pre-registration and re-runs" below; [`wave-h-runbook.md`](wave-h-runbook.md),
-  "The re-certification run"; [`wave-h-report.md`](wave-h-report.md)).
+No certificate is committed yet, so `balanced` segmentation and captioning need
+`allow_uncertified: true` and their records say `certified: false`.
 
 Background:
 - `exact` runs NVIDIA's own HF code with model inputs proven identical. It is the reference.
 - NVIDIA's own default H200 path is **not** run-to-run deterministic (`docs/determinism.md`: cuDNN
   SDPA). Deterministic mode is a different reference, not the same bits.
 - So "faithful" can only mean: `balanced` diverges from `exact` no more than `exact` diverges from
-  itself (archive/PLAN-v3.md §9, "Self-noise").
+  itself.
 
 Contributors: once a certificate is committed, the code its key covers is frozen. CI fails a
 change that makes a `certified` certificate stop matching. What is frozen, the drift report and
@@ -69,11 +56,8 @@ in [`limitations.md`](limitations.md#accuracy-certificates). So:
   drifted `provisional` one, or one committed without its freeze lock, only warns
   ([`certificate-freeze.md`](certificate-freeze.md)).
 
-The committed (now retired) certificate came from the certified run (`scripts/wave_h.py --plan
-certified`: 12 human episodes, a noise run on 6 of them, a 6-episode cold witness). Its v4
-replacement and the first caption certificate come from the re-certification run
-(`scripts/wave_h.py --plan recertify`: 12 human episodes, a noise run on **all 12**, 6-episode
-cold witnesses; [`wave-h-runbook.md`](wave-h-runbook.md)).
+A certificate comes from a measurement run on a certification set: 12 episodes per embodiment, a
+noise run of NVIDIA's pipeline on all 12, and 6-episode cold witnesses.
 
 ## Method (contributors)
 
@@ -362,13 +346,13 @@ fail-closed for real regressions: at the floor, three count flips in 18 episodes
 without a witness), or a boundary error mean over 0.15 s with every count equal, in the
 candidate or in the witness, fail.
 
-**The committed certificate** (`segment`, `human`, L40S; version 3, now retired, kept here as
-the worked example: the v4 segment rule is the same). The 10% is a floor, not the
+**A worked example** (a version-3 `segment` certificate for `human` on the L40S, since retired;
+the v4 segment rule is the same). The 10% is a floor, not the
 threshold. The threshold is `max(0.10, 1.5 x max(noise, 0.05) + slack)`, and the noise run
 measured `count_mismatch` noise of **1 flip in 6** episodes (0.1667). So the applied threshold
 is `1.5 x 0.1667 = 0.25` (recorded as 0.250001), which allows **5 of the 18** union episodes to
 flip. The run observed **1 of 18** (5.6%): 1 of the 12 candidate episodes, 0 of the 6 witness
-episodes. Three flips would have passed this certificate too. Read the figures from
+episodes. Three flips would have passed that certificate too. Read the figures from
 `metrics.count_flips.union` (`threshold`, `allowed`, `flips`, `n`), not from the floor.
 
 ### Policy (`certkey.POLICY`)
@@ -378,7 +362,7 @@ certificate that records them.
 
 | Knob | Default | Bound |
 |---|---|---|
-| `tolerance` | 1.5 (PLAN.md §4) | [1, 2] |
+| `tolerance` | 1.5 | [1, 2] |
 | `min_samples` (candidate episodes per pool) | 10 | >= 10 |
 | `min_noise_samples` | 5 | >= 5 |
 | `max_missing` (oracle episodes without a candidate record: the spares) | 2 | [0, 2] |
@@ -397,7 +381,7 @@ floor is below what a real regression costs:
 | `caption_mismatch` | 0.05 | as `count_mismatch` for whole captions |
 | `caption_edit_distance` | 0.02 | about one character in 30-50 per caption |
 | `caption_similarity_divergence` | 0.02 | as edit distance |
-| `expected_score_abs_delta` | 0.02 | 1.5 x 0.02 = 0.03, under the PLAN cap 0.05 |
+| `expected_score_abs_delta` | 0.02 | 1.5 x 0.02 = 0.03, under the cap 0.05 |
 | `score_mismatch` | 0.05 | as `count_mismatch` |
 | `per_step_abs_delta` | 0.02 | one step in 50 off by one level |
 | `rank_divergence` | 0.05 | rho >= 0.925 |
@@ -423,8 +407,8 @@ repeated is not a noise sample. One missing balanced, noise or oracle episode st
 while >= 10 candidate and >= 5 noise (and witness) episodes pair. (The v3 certified plan ran
 the noise on the 6 `n-` episodes only.)
 
-**Absolute caps** from archive/PLAN-v3.md §2: terminal `E[s]` MAE <= 0.05 (`expected_score_abs_delta`).
-PLAN's other bar, "boundary F1 at most 1 point below", is not enforced: no boundary-F1 metric
+**Absolute caps**: terminal `E[s]` MAE <= 0.05 (`expected_score_abs_delta`).
+The build plan's other bar, "boundary F1 at most 1 point below", is not enforced: no boundary-F1 metric
 is computed yet.
 
 ### Verdict
@@ -572,12 +556,10 @@ pre-registration of the stage-isolated caption certificate. These rules hold for
 - **Policy unchanged:** tolerance 1.5, `NOISE_FLOOR`, `ABSOLUTE_FLOOR`, `min_samples` 10,
   `min_noise_samples` 5, `max_missing` 2, slack 0, no similarity hook. The caption threshold is
   `1.5 x max(noise, 0.05)` = **0.075** unless the measured isolated noise exceeds 5%.
-- **Generator v4**, `GENERATOR_VERSIONS = ("4",)`: every v3 certificate is retired, including
-  the committed v3 segment certificate (see the status at the top).
+- **Generator v4**, `GENERATOR_VERSIONS = ("4",)`: every v3 certificate is retired.
 
 **Outcome, committed in advance:**
-- **`certified`**: publish after `scripts/cert_check.py` passes
-  ([`certificate-check.md`](certificate-check.md)).
+- **`certified`**: publish after `scripts/cert_check.py` passes.
 - **`fail`**: no re-roll. Either ship the hybrid (balanced `segment`, certified, with `exact`'s
   Captioner), or fund diagnostics toward a **new** stack (for example FP32 `dt_bias` or
   batch-invariant decoding) that gets its own pre-registration.
@@ -641,7 +623,7 @@ revokes an older `certified`, and a later `certified` (e.g. on more data) supers
 `fail`. Only a deciding `certified` unlocks.
 
 The stage hash is recorded but not matched: it also covers the input dataset, and a certificate
-must apply to the same pool on other data (archive/PLAN-v3.md §9).
+must apply to the same pool on other data.
 
 One lookup for every caller: `certkey.lookup_context(cfg, kinds, derived_content=...)`
 gives embodiment, modes and content digests to:
