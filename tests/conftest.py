@@ -164,6 +164,11 @@ def _trusted_receipts(request, monkeypatch, tmp_path_factory):
 
     monkeypatch.setenv(receipts.RECEIPT_CACHE_ENV,
                        str(tmp_path_factory.mktemp("receipts") / "verified-receipts.json"))
+
+    def no_modal(name):  # tests never read the real flora-weights Volume; mock it to test it
+        raise ConnectionError("tests do not contact Modal")
+
+    monkeypatch.setattr(receipts, "read_volume_receipt", no_modal)
     if request.node.get_closest_marker("real_receipts"):
         return
     from flora_deploy.config.pins import DERIVED_PINS_BY_KEY

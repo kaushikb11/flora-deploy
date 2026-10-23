@@ -175,7 +175,7 @@ flora deploy [OPTIONS]
 | `--reconcile-cron` |  | Schedule the reconciler: 'on' (every 10 min) or a cron string. |
 | `--determinism` |  | Override pipeline.determinism (exact segcap worker): nvidia \| deterministic. Hashed: it changes the config hash and the app. |
 | `--emit` |  | Write the equivalent standalone script here instead of deploying. |
-| `--dry-run` | off | Print the plan; do not contact Modal. |
+| `--dry-run` | off | Print the plan; deploy nothing (it only reads the derived-weight receipts from the flora-weights Volume, read-only). |
 | `--json` | off | Print the plan as JSON. |
 | `--fake-models` | off | Test app: fake engines on CPU workers (no GPU, no weights; hashed apart from real outputs). |
 

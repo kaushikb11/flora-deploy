@@ -246,9 +246,11 @@ def derived_content(cfg: Any, overrides: Mapping[str, str] | None = None, *,
     when its content digest is known: a pinned build (:data:`KNOWN_RECEIPTS`), one ``flora
     prepare`` verified on this machine (:func:`remember_verified`), or, with ``read_receipt``
     (name -> the receipt file's bytes, or ``None``; e.g. from the ``flora-weights`` Volume),
-    one read now whose sha256 is the recorded identity. Fail closed: a name left out matches no
-    certificate, and ``.unchecked`` says why (the workers check the content again at load,
-    ``accel/captioner_load.py``)."""
+    one read now whose sha256 is the recorded identity (and then remembered, so the next check
+    on this machine needs no read). Fail closed: a name left out matches no certificate, and
+    ``.unchecked`` says why (the workers check the content again at load,
+    ``accel/captioner_load.py``). When a read raises (offline, no Modal credentials), the
+    Volume is taken as unreachable: the remaining names are not read, and say so."""
     import hashlib
     import json
 
@@ -256,6 +258,7 @@ def derived_content(cfg: Any, overrides: Mapping[str, str] | None = None, *,
                 **{k: v for k, v in (overrides or {}).items() if v}}
     out: dict[str, str] = {}
     why: dict[str, str] = {}
+    unreachable: str | None = None  # why the Volume could not be read, once a read failed
     for name in needed(cfg):
         pin = DERIVED_PINS_BY_KEY.get(pin_key(name))
         sha = recorded.get(name)
@@ -267,10 +270,17 @@ def derived_content(cfg: Any, overrides: Mapping[str, str] | None = None, *,
             continue
         content = verified_content(sha, name)
         if content is None and read_receipt is not None:
+            if unreachable is not None:
+                why[name] = unreachable
+                continue
             try:
                 raw = read_receipt(name)
             except Exception as e:  # noqa: BLE001 - reported as the reason
-                why[name] = f"could not read the {name} receipt ({type(e).__name__}: {e})"
+                detail = f"{type(e).__name__}: {e}".splitlines()[0][:200]
+                unreachable = why[name] = (
+                    "could not read the derived-weight receipts from the flora-weights Volume "
+                    f"({detail}); offline or no Modal credentials? (`modal token new`, or run "
+                    "`flora prepare` on this machine)")
                 continue
             if raw is None:
                 why[name] = f"no {name} receipt on the Volume (run `flora prepare`)"

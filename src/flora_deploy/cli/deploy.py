@@ -202,7 +202,8 @@ def deploy(
         "--emit", help="Write the equivalent standalone script here instead of deploying.")
     ] = None,
     dry_run: Annotated[bool, typer.Option(
-        "--dry-run", help="Print the plan; do not contact Modal.")] = False,
+        "--dry-run", help="Print the plan; deploy nothing (it only reads the derived-weight "
+                          "receipts from the flora-weights Volume, read-only).")] = False,
     as_json: Annotated[bool, typer.Option("--json", help="Print the plan as JSON.")] = False,
     fake_models: Annotated[bool, typer.Option(
         "--fake-models", help="Test app: fake engines on CPU workers (no GPU, no weights; "
@@ -218,12 +219,13 @@ def deploy(
     if store is not None and (why := unsupported_sink_message(store)):
         raise _fail(f"store {store!r}: {why}")
     overrides = _receipts(receipt)
-    # A real deploy reads each derived-weight receipt from the flora-weights Volume to check its
-    # content against the pin; --dry-run / --emit contact no Modal, so a receipt this machine has
-    # not verified (`flora prepare`) is reported as not checked instead of certified.
+    # A deploy and --dry-run read each derived-weight receipt this machine has not verified
+    # (`flora prepare`) from the flora-weights Volume (free, read-only) to check its content
+    # against the pin, and remember it. --emit contacts no Modal, and when the Volume cannot be
+    # read (offline, no credentials) the receipt is reported as not checked, with the reason.
     from flora_deploy.config.receipts import read_volume_receipt
 
-    reader = None if (dry_run or emit is not None or fake_models) else read_volume_receipt
+    reader = None if (emit is not None or fake_models) else read_volume_receipt
     try:
         cfg, content = load_certified(config, allow_uncertified=allow_uncertified,
                                       overrides=overrides, read_receipt=reader)

@@ -82,6 +82,7 @@ class Probes(Protocol):
     def store_write(self, sink: str, environment: str) -> str: ...
     def local_files(self, path: str, pattern: str) -> int | None: ...
     def certificate_status(self, cfg: Any) -> dict[str, str] | None: ...
+    def read_receipt(self, name: str) -> bytes | None: ...
 
 
 def _err(e: BaseException) -> str:
@@ -90,6 +91,9 @@ def _err(e: BaseException) -> str:
 
 class RealProbes:
     """The real probes: Modal control plane, Hugging Face metadata, the sink itself."""
+
+    def __init__(self) -> None:
+        self._receipts: dict[str, tuple[bytes | None, BaseException | None]] = {}
 
     def modal_version(self) -> str | None:
         from importlib.metadata import PackageNotFoundError, version
@@ -220,8 +224,27 @@ class RealProbes:
         from flora_deploy.config.receipts import derived_content
 
         rep = certificate_report(cfg, {k: p.gpu for k, p in cfg.pools().items()},
-                                 derived_content=derived_content(cfg))
-        return {k: r["label"] for k, r in rep.items()}
+                                 derived_content=derived_content(
+                                     cfg, read_receipt=self.read_receipt))
+        # "not checked": say why (no receipt, Volume unreachable, ...), not just the state
+        return {k: r["why"] if r["status"] == "unverified_weights" else r["label"]
+                for k, r in rep.items()}
+
+    def read_receipt(self, name: str) -> bytes | None:
+        """The derived weight's receipt from the flora-weights Volume (read-only, as a real
+        deploy reads it: ``config.receipts.read_volume_receipt``). Memoized, failures too, so
+        the config and certificate checks read the Volume at most once per receipt."""
+        from flora_deploy.config.receipts import read_volume_receipt
+
+        if name not in self._receipts:
+            try:
+                self._receipts[name] = (read_volume_receipt(name), None)
+            except Exception as e:  # noqa: BLE001 - derived_content reports it
+                self._receipts[name] = (None, e)
+        raw, err = self._receipts[name]
+        if err is not None:
+            raise err
+        return raw
 
 
 def _probe_local(root: Path, key: str, data: bytes) -> str:
@@ -269,7 +292,10 @@ def _probe_bucket(scheme: str, bucket: str, prefix: str, key: str, data: bytes) 
 # Checks
 
 
-def check_config(path: Path) -> tuple[Check, Any]:
+def check_config(path: Path, read_receipt: Callable[[str], bytes | None] | None = None
+                 ) -> tuple[Check, Any]:
+    """``read_receipt``: as for ``config.receipts.load_certified`` (the probes' Volume read),
+    so a derived weight ``flora prepare`` built on another machine still counts."""
     from flora_deploy.config.receipts import load_certified
     from flora_deploy.config.schema import ConfigError
 
@@ -277,7 +303,7 @@ def check_config(path: Path) -> tuple[Check, Any]:
         return Check("config", "fail", f"{path} not found",
                      "write one with `flora init` (or pass --config)"), None
     try:
-        cfg = load_certified(path)[0]
+        cfg = load_certified(path, read_receipt=read_receipt)[0]
     except ConfigError as e:
         text = str(e)
         first = next((ln.strip(" -") for ln in text.splitlines()[1:]), text)
@@ -646,7 +672,7 @@ def _local_input(p: Probes, cfg: Any) -> Check:
 def run_checks(config: Path, probes: Probes) -> list[Check]:
     """Every check, in order. A config that does not load skips the checks that need it; a
     local-only config (:func:`local_only`) skips the Modal-side ones."""
-    cfg_check, cfg = check_config(config)
+    cfg_check, cfg = check_config(config, getattr(probes, "read_receipt", None))
     out = [cfg_check]
     if cfg is not None and local_only(cfg):
         out += check_local_only(cfg)
