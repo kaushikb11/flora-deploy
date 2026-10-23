@@ -28,6 +28,8 @@ flora = "flora_deploy.cli:main"
 
 [dependency-groups]
 dev = [
+    # scripts/render_hero.py only (the README figure); never a runtime dependency.
+    "matplotlib>=3.8",
     "pytest>=8",
     "pytest-asyncio>=0.24",
     "pytest-xdist>=3.6",
