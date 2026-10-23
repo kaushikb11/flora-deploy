@@ -194,6 +194,33 @@ Now:
 - **Deadlines** cover two cold compiles: overhead + baseline build + plugin build + work, × 1.25.
   That is TempSeg 769 s and Captioner 1131 s, under the 1200 s container timeout. A call the
   budget left cannot carry to its expected length is not started.
+- **Every lab engine compiles cold.** The lab builds on its own unkeyed caches
+  (`flora-cache:/balanced/<engine>[-dtbias]`, `balanced_lab.cache_env`). The deployed workers
+  publish and seed keyed caches under `balanced-cc/<key>` (`engines/compile_cache.py`) and never
+  read or write the lab's, so no balanced job warms the lab. The certified run's lab ran after
+  (d)'s job and still recorded both caches cold (`compile_cache.*.warm: false`).
+- **The certifying plans split the Captioner lab** (`wave_h.LAB_CALLS`; the v1 plans keep one
+  call per kind). On the v4 engine (`max_num_seqs` 11, one HF processor replay per caption call
+  for its input digest), one call with both Captioner engines no longer fits the 1200 s
+  container: recertify's d2' attempt 1 (2026-10-23) hit its 1131 s client deadline with no
+  evidence and was charged $1.60. The certified lab of 2026-10-22, on the old engine, had taken
+  1096 s: baseline child 810 s (build 465 s with the 51 GiB of weights read cold, stage 330 s,
+  L0) and plugin child 264 s (build 232 s with the weights in page cache). The Captioner now runs
+  as two calls in one app, each in its own container under its own deadline:
+  - the **baseline call** (`arm: baseline`): L0, the stage and the Gate A requests. It stages
+    the requests and the baseline logits to `flora-golden:balanced-lab/<run>/captioner-gate/`
+    and returns their `gate_sha256`. Expected 30 + 465 + 345 + 120 s (the v4 stage estimate,
+    `LAB_V4_CAPTION_S`) = 960 s; deadline 1200 s.
+  - the **plugin call** (`arm: plugin`, given `gate_rel`): the dt_bias engine's Gate A on the
+    staged requests, compared with the staged logits. Its fresh container reads the weights
+    cold again, so it is priced as the baseline build: 30 + 465 + 35 = 530 s; deadline 662 s.
+
+  `wave_h.merge_lab_calls` writes one `balanced-captioner.json` in the one-call shape, with each
+  call's figures under `calls`. It is an error unless the plugin read the baseline's requests
+  (`gate_sha256`) for its baseline engine. A failed baseline call starts no plugin call. The
+  baseline result is also kept as `balanced-captioner-baseline.json`: a retry after a plugin
+  failure reuses it (same run, episodes, segments and baseline engine hash) and pays for the
+  plugin call alone. The dry run prices that retry the same way.
 
 ### Cold compile
 
@@ -485,8 +512,9 @@ engine-settings hash was recorded carry no hash, so today's certified run runs (
 - **Balanced:** the measured n=1 rates (segment 0.367 on L40S, caption 0.906 on H100, ±50%) and
   the measured cold startups (300 s and 325 s, `compile_cache: cold`). A warm compile cache
   only makes (d) cheaper.
-- **Lab:** two cold compiles per call, priced as in "The lab step (d2)". It costs $0 when the
-  lab is already done.
+- **Lab:** every engine cold, priced as in "The lab step (d2)": TempSeg one call (two
+  compiles), the Captioner two calls (baseline, then plugin). It costs $0 when the lab is
+  already done.
 
 ### Reusing step (d)'s balanced records: not possible
 
@@ -645,7 +673,7 @@ re-runs only, and the outcome committed in advance.
 uv run python scripts/wave_h.py --plan recertify --dry-run                 # steps, prices, caps
 #   phase 1, from main before the v4 code lands: f2 noise_all (main's recertify plan writes
 #   reports/wave-h/recertified/state.json with f2 done). Then land the v4 code (tests green):
-uv run python scripts/wave_h.py --plan recertify --yes-spend      # phase 2: lab, balanced, caption_iso, certify
+uv run python scripts/wave_h.py --plan recertify --yes-spend      # phase 2: balanced, lab, caption_iso, certify
 uv run python scripts/wave_h.py --plan recertify --status
 ```
 
@@ -684,25 +712,32 @@ change the `exact` segcap stage hash. So:
 | P1 | commit the pre-registration: the v4 text of `docs/certification.md` and this runbook (docs are not hashed) | | $0 | $0 |
 | `noise_all` | exact repeat of (b)'s job on **all 12** episodes: same config file and data dir, no `--limit`, a new job id, `nvidia` mode, H200, cold. Run from the **unchanged** checkout | the script recomputes the segcap stage hash and refuses unless it equals (b)'s | $2.74 | $4.17 |
 | (land) | land the v4 package code, tests green | | | |
-| `lab` | Captioner lab only (L0 + Gate A) on the new Captioner engine hash (`max_num_seqs` changed, so the old L0 is stale). TempSeg's saved L0 is **reused**: its engine settings are unchanged | code landed (`"4" in GENERATOR_VERSIONS`) | $1.28 | $1.69 |
-| `balanced` | J1: `balanced` end to end (segment + caption on its own segments), 12 episodes ($1.41 / $2.49: segment $0.54 / $0.86, caption $0.87 / $1.63). Then J1w: a **segment-only** forced-cold witness on the 6 `n-` episodes ($0.27 / $0.58; the segment stage hash does not depend on whether `caption` is in the job) | code landed; the built Captioner engine passes `check_mamba_blocks` at 11 | $1.68 | $3.06 |
+| `balanced` | J1: `balanced` end to end (segment + caption on its own segments), 12 episodes ($1.41 / $2.49: segment $0.54 / $0.86, caption $0.87 / $1.63). Then J1w: a **segment-only** forced-cold witness on the 6 `n-` episodes ($0.27 / $0.58; the segment stage hash does not depend on whether `caption` is in the job) | code landed (`"4" in GENERATOR_VERSIONS`); the built Captioner engine passes `check_mamba_blocks` at 11 | $1.68 | $3.06 |
+| `lab` | Captioner lab only (L0 + Gate A) on the new Captioner engine hash (`max_num_seqs` changed, so the old L0 is stale), on the certified run's (d) segments. Two calls: baseline ($1.36 / $1.78), then plugin ($0.75 / $1.02). TempSeg's saved L0 is **reused**: its engine settings are unchanged | code landed | $2.11 | $2.81 |
 | `caption_iso` | stage the oracle's `segment` records as a JSONL on the job store (sha256 pinned in the config's `pipeline.caption_segments`). J2: caption-only stage-isolated job, 12 episodes ($0.87 / $1.63). Then J2w: the same config, caption-only, forced cold, on the 6 `n-` episodes ($0.69 / $1.36) | code landed | $1.57 | $2.99 |
 | `certify` | `wave_h_finalize.py --fetch` exports the records and the per-side digest JSONs (hex only). Then `flora certify` per stage: `segment` from J1 + J1w + the noise-12 run (TempSeg L0 reused); `caption` from J2 + J2w + the noise-12 run, with the oracle segment file, the digests and `metrics.reported.e2e` from J1. Then `scripts/cert_check.py` | | $0 | $0 |
-| | **total (order A)** | | **$7.26** | **$11.90** |
+| | **total (order A)** | | **$8.09** | **$13.02** |
 
 - **Prices** come from `wave_h.project` / `balanced_job_seconds` on `planner/rates.json` at list
   $/h (segcap H200, balanced caption H100, balanced segment L40S), measured cold startups, their
   uncertainty bands and 240 s client slack per app. Single-pool jobs (the witnesses, J2) are
   priced as start + work + 30 s, with no segment scale-down tail. Of the total, `noise_all` is
-  $2.74 / $4.17; **phase 2** (`lab`, `balanced`, `caption_iso`, `certify`) is **$4.53 / $7.73**.
+  $2.74 / $4.17; **phase 2** (`balanced`, `lab`, `caption_iso`, `certify`) is **$5.35 / $8.86**.
   The pre-registration priced the plan at $7.12 / $11.69 (phase 2 $4.38 / $7.52) on the rates
   before (b)'s measured balanced rates were folded into `rates.json` (caption cold start 325 ->
-  373 s); the table above is the current projection.
+  373 s), and with the Captioner lab as one call ($1.28 / $1.69); the table above is the
+  current projection, with the lab split (d2' attempt 1, below).
+- **Order: d' before d2'** (2026-10-23), as (d) before (d2) in the certified run; e' stays after
+  g. It does **not** warm the lab: the lab compiles every engine cold on its own caches ("The
+  lab step (d2)"). J1 publishes its compile cache (`balanced-cc/<key>`) after its first shard,
+  as every deployed worker does, for later deployed jobs; J1w runs with
+  `FLORA_COMPILE_CACHE=off`, so it neither seeds nor publishes. The lab reads the certified
+  run's (d) segment records either way.
 - **Cap.** The user approved a global cap of **$11.70** of **real** spend for the plan, noise
   run included (`RECERT_GLOBAL_CAP_USD`; the derived cap is never higher). Step caps are each
   step's upper rounded up to $0.05; on the staged manifest's durations (what a run gates on):
-  lab $1.70, balanced **$3.05** (upper $3.03), caption_iso $3.00 (the offline dry run, +10%
-  durations, shows $3.10 for balanced).
+  lab **$2.85** (the split; it was $1.70 for one call), balanced **$3.05** (upper $3.03),
+  caption_iso $3.00 (the offline dry run, +10% durations, shows $3.10 for balanced).
 - **What f2 actually charged.** `noise_all` is done in the state with **two attempts charged
   $5.87**: attempt 1 is stored with `tracked_usd` $4.00 (`report_error: true`: its `flora
   report` failed, so it was charged its budget) and its own apps billed only about $0.17-0.32;
@@ -714,12 +749,23 @@ change the `exact` segcap stage hash. So:
   $11.70: bookkeeping cap = $11.70 + ($4.00 phantom − $0.32 real for attempt 1) = **$15.38**
   (real ≤ $11.70 exactly when bookkeeping ≤ $15.38; $15.35 is the $0.05-grid value). Pass it
   once with the first phase-2 `--yes-spend`; it is saved in the recertify state only, scoped to
-  this plan (`cap_override_plan`), and replaces the stale `--global-cap 8.00`. At $15.38 every
-  pending step runs: $5.87 + $7.67 = $13.54 ≤ $15.38; the step caps bind each attempt (lab
-  $1.70, balanced $3.05, caption_iso $3.00), so the worst case is bookkeeping $13.62, real about
-  $9.94. **Consequence:** the gated cap (`gate_cap`), `cert_check.py`'s "total over the gated
-  cap" row and the finalize report will all print **$15.38**: read it as the $11.70 real cap
-  plus the $3.68 phantom of f2's attempt 1, not as a raised budget.
+  this plan (`cap_override_plan`), and replaces the stale `--global-cap 8.00`. With the
+  one-call lab every pending step ran: $5.87 + $7.67 = $13.54 ≤ $15.38. **Consequence:** the
+  gated cap (`gate_cap`), `cert_check.py`'s "total over the gated cap" row and the finalize
+  report will all print the bookkeeping cap: read $15.38 as the $11.70 real cap plus the $3.68
+  phantom of f2's attempt 1, not as a raised budget.
+- **d2' attempt 1 (2026-10-23): failed, $1.60, no evidence.** The one-call Captioner lab ran
+  first in phase 2 and hit its 1131 s client deadline (`captioner: client deadline 1131 s`,
+  `episode_errors` 0): both Captioner engines compile cold in one container, and the v4 stage
+  is slower than the 2026-10-22 lab, which had already taken 1096 s of the 1131 s. A warm
+  cache would not have saved it in either order: the lab never reads the deployed workers'
+  caches. The fix splits the Captioner lab into a baseline and a plugin call ("The lab step
+  (d2)"); the step's attempt 2 runs both after d'. The state keeps attempt 1's $1.60 (its
+  per-attempt cap does not), so bookkeeping spent is $7.50 (f2 $5.87 + $1.60 + rounding).
+- **The split lab does not fit $15.38.** Spent $7.50 + the steps left (d' $3.03, d2' $2.81, g
+  $2.95, on the staged manifest) = **$16.29**, $0.91 over. The dry run prints `DOES NOT FIT` and
+  the run's stop rule refuses d' (the reserve keeps d2' and g). Running phase 2 needs a raise the
+  user approves (`--global-cap 16.30`, about $12.6 real at the worst case), or a cheaper lab.
 - **Before phase 2:** `uv run python scripts/cert_preflight.py --plan recertify` (its plan, lab
   and budget rows read the recertify state and `reports/wave-h/recertified/`; the budget row
   counts only the steps not done). The `git` row is the same for every plan: clean tree, HEAD

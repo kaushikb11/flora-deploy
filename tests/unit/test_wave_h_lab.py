@@ -467,12 +467,16 @@ def test_only_lab_dry_run_prices_only_what_is_not_reused(monkeypatch, tmp_path, 
 
 def test_lab_deadline_covers_two_cold_compiles_within_the_container_timeout():
     assert wh.LAB_TIMEOUT_S == lab.TIMEOUT_S
-    for kind, (base, plugin) in wh.LAB_BUILD_S.items():
-        exp, deadline = wh.lab_seconds(kind)
-        assert exp >= base + plugin + wh.LAB_WORK_S[kind]
-        assert exp < deadline <= wh.LAB_TIMEOUT_S
-    assert wh.LAB_BUILD_S["captioner"] == (325.0, 325.0)  # the measured H100 cold start, x2
+    for (kind, arm), (build, work) in wh.LAB_CALL_PARTS_S.items():
+        exp, deadline = wh.lab_call_seconds(kind, arm)
+        assert exp >= build + work
+        assert exp < deadline <= wh.LAB_TIMEOUT_S  # every call fits one container
+    # the v1 plans' one call per kind, priced as before
+    assert wh.LAB_CALL_PARTS_S[("captioner", "both")] == (650.0, 225.0)
     assert wh.LAB_DEADLINE_S["captioner"] > 600  # the old deadline cut it off mid-compile
+    assert wh.lab_calls("captioner") == ("both",)
+    assert wh.lab_calls("captioner", wh.SPECS[wh.CERTIFIED]) == ("baseline", "plugin")
+    assert wh.lab_calls("tempseg", wh.SPECS[wh.CERTIFIED]) == ("both",)
     p = wh.project("lab", wh.offline_manifest(wh.DURATION_HEADROOM))
     assert [i["gpu"] for i in p.items] == ["L40S", "H100"]
     assert p.usd_upper <= wh.CAPS_USD["lab"] < p.usd_upper + 0.05 + 1e-9

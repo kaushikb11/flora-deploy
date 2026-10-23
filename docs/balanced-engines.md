@@ -360,8 +360,16 @@ the caption run. The full JSON lands in `reports/balanced-lab/` (git-ignored).
 **Expected cost** (estimate): two cold engine builds per call, then the work. TempSeg: 270 s +
 190 s builds, ≈ 615 s (deadline 769 s), ≈ $0.46 (upper $0.62). Captioner: 2 × 325 s builds,
 ≈ 905 s (deadline 1131 s), ≈ $1.28 (upper $1.69). In total ≈ $1.74, upper $2.31
-(`wave_h.lab_seconds`). A warm `flora-cache` entry makes a build cheaper. Each result says
-whether its cache was warm.
+(`wave_h.lab_seconds`). Each result says whether its cache was warm. In practice it is cold:
+the lab builds on its own unkeyed `flora-cache:/balanced/<engine>[-dtbias]` dirs, which no
+deployed worker writes (workers use the keyed `balanced-cc/` caches).
+
+The certifying plans split the Captioner into two calls (`arm`: `baseline`, then `plugin` on
+the Gate A inputs the baseline staged under `flora-golden:balanced-lab/<run>/captioner-gate/`),
+each in its own container under the 20-minute timeout. On the v4 engine, one call with both
+cold builds passed its 1131 s deadline (2026-10-23). Baseline ≈ 960 s (deadline 1200 s),
+≈ $1.36 (upper $1.78); plugin ≈ 530 s (deadline 662 s), ≈ $0.75 (upper $1.02)
+(`docs/wave-h-runbook.md`, "The lab step (d2)").
 
 ## Results
 

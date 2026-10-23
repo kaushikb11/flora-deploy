@@ -23,6 +23,14 @@ A baseline run that sends zero requests (no episode ran) returns ``error`` and
 ``no_evidence`` and skips the plugin engine. The compile caches are committed after each child,
 and each result records whether its cache was warm (``compile_cache``).
 
+**Split calls** (``arm``): one call builds both engines (``"both"``, the default), or one engine
+per call, each in its own container under its own timeout: ``"baseline"`` (L0, the stage, the
+Gate A requests and baseline logits, which it stages to
+``flora-golden:balanced-lab/<run>/<kind>-gate/``) and then ``"plugin"`` (``gate_rel`` names
+that dir: the plugin engine's Gate A on the same requests, compared with the staged baseline
+logits; ``gate_sha256`` binds it to the baseline call). ``scripts/wave_h.py`` splits the
+Captioner: its two cold builds and the v4 caption stage do not fit one 20-minute container.
+
 Run (each call is one GPU container, hard timeout 20 min)::
 
     uv run modal run src/flora_deploy/modal_app/balanced_lab.py::preflight          # CPU, cents
@@ -390,13 +398,75 @@ def check_segments_from(segments: dict | None, segments_from: dict | None) -> st
     return None
 
 
+ARMS = ("both", "baseline", "plugin")
+GATE_REQUESTS, GATE_BASELINE = "requests.pkl", "baseline.json"
+
+
+def gate_dir_rel(run_id: str, kind: str) -> str:
+    """Where a ``baseline`` call stages the Gate A requests and baseline logits (relative to
+    the ``flora-golden`` mount) for the ``plugin`` call."""
+    return f"balanced-lab/{run_id}/{kind}-gate"
+
+
+def _sha256_file(path: Path) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def stage_gate(kind: str, run_id: str, requests: Path, baseline: dict,
+               root: Path | str = GOLDEN_MOUNT) -> dict:
+    """A ``baseline`` call's Gate A inputs for the ``plugin`` call: the pickled requests and
+    the baseline logits, under :func:`gate_dir_rel`. Returns ``gate_rel`` and the requests'
+    ``gate_sha256`` (the plugin call reports the digest it read)."""
+    import shutil
+
+    rel = gate_dir_rel(run_id, kind)
+    d = Path(root) / rel
+    d.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(requests, d / GATE_REQUESTS)
+    sha = _sha256_file(d / GATE_REQUESTS)
+    (d / GATE_BASELINE).write_text(json.dumps({"gate_a": baseline.get("gate_a"),
+                                               "engine_hash": baseline.get("engine_hash"),
+                                               "gate_sha256": sha}, default=str))
+    return {"gate_rel": rel, "gate_sha256": sha}
+
+
+def load_gate(gate_rel: str, requests_out: Path, root: Path | str = GOLDEN_MOUNT) -> dict:
+    """The ``plugin`` call's side of :func:`stage_gate`: copies the requests to
+    ``requests_out`` and returns the staged baseline record (with the requests' digest as
+    read, ``gate_sha256_read``). Raises ``OSError`` / ``ValueError`` when they are missing or
+    unreadable."""
+    import shutil
+
+    d = Path(root) / gate_rel
+    staged = json.loads((d / GATE_BASELINE).read_text())
+    shutil.copyfile(d / GATE_REQUESTS, requests_out)
+    staged["gate_sha256_read"] = _sha256_file(requests_out)
+    return staged
+
+
 def run_kind(kind: str, run_id: str, segments_rel: str = "",
              episodes: list[str] | None = None, gate_a: bool = True,
-             segments: dict | None = None, segments_from: dict | None = None) -> dict:
+             segments: dict | None = None, segments_from: dict | None = None,
+             arm: str = "both", gate_rel: str = "") -> dict:
     """One lab call. ``segments`` (golden id -> NVIDIA segment rows, e.g. the deployed job's
     records) takes precedence over ``segments_rel`` (a file on ``flora-golden``); inline
-    segments need ``segments_from`` (:func:`check_segments_from`), echoed in the result."""
-    if why := check_segments_from(segments, segments_from):
+    segments need ``segments_from`` (:func:`check_segments_from`), echoed in the result.
+    ``arm`` (module docstring, "Split calls"): ``both`` engines in this call, the ``baseline``
+    alone (its Gate A inputs staged for the plugin call) or the ``plugin`` alone on the Gate A
+    inputs a baseline call staged at ``gate_rel``."""
+    if arm not in ARMS:
+        return {"run": run_id, "kind": kind, "arm": arm, "no_evidence": True,
+                "error": f"unknown arm {arm!r} (one of {', '.join(ARMS)})"}
+    if arm == "plugin" and not gate_rel:
+        return {"run": run_id, "kind": kind, "arm": arm, "no_evidence": True,
+                "error": "plugin arm: no gate_rel (the baseline call's staged Gate A inputs)"}
+    if arm != "plugin" and (why := check_segments_from(segments, segments_from)):
         return {"run": run_id, "kind": kind, "error": why, "no_evidence": True,
                 "segments_from": segments_from}
     from flora_deploy.engines.patches import dt_bias_fp32
@@ -404,14 +474,17 @@ def run_kind(kind: str, run_id: str, segments_rel: str = "",
 
     t0 = time.time()
     prefetch = warm.start_prefetch(str(MODEL_DIRS[kind]), threads=16)
+    tmp = Path("/tmp/balanced-lab")
+    tmp.mkdir(parents=True, exist_ok=True)
+    gate_pkl = tmp / "gate.pkl"
+    if arm == "plugin":
+        return _run_plugin_arm(kind, run_id, gate_rel, gate_pkl, tmp, t0, prefetch, episodes)
     segments = dict(segments or {})
     if segments_rel and not segments:
         golden.reload()
         segments = json.loads((Path(GOLDEN_MOUNT) / segments_rel).read_text())
-    tmp = Path("/tmp/balanced-lab")
-    tmp.mkdir(parents=True, exist_ok=True)
     base = {"kind": kind, "gpu": GPUS[kind], "episodes": episodes, "segments": segments,
-            "gate_requests": str(tmp / "gate.pkl")}
+            "gate_requests": str(gate_pkl)}
     for e in cache_env(kind, False).values():
         Path(e).mkdir(parents=True, exist_ok=True)
     caches = {"baseline": compile_cache_state(kind, False)}
@@ -424,10 +497,18 @@ def run_kind(kind: str, run_id: str, segments_rel: str = "",
                               "engine_hashes": {"baseline": a.get("engine_hash")},
                               "compile_cache": caches,
                               "prefetch": (s.as_json() if (s := prefetch.wait(0)) else None)}
+    if arm != "both":
+        result["arm"] = arm
     if "error" in a:
         result["error"] = f"baseline: {a['error']}"
         result["no_evidence"] = True
-    if gate_a and "error" not in a:
+    if arm == "baseline" and gate_a and "error" not in a:
+        try:  # the plugin call's inputs, staged before this container goes
+            result.update(stage_gate(kind, run_id, gate_pkl, a))
+            golden.commit()
+        except (OSError, ValueError) as e:
+            result["error"] = f"baseline: staging the Gate A inputs: {e!r}"[:2000]
+    if arm == "both" and gate_a and "error" not in a:
         env = {**cache_env(kind, True), **dt_bias_fp32.install_entry_point(tmp / "plugin")}
         for e in cache_env(kind, True).values():
             Path(e).mkdir(parents=True, exist_ok=True)
@@ -455,6 +536,46 @@ def run_kind(kind: str, run_id: str, segments_rel: str = "",
     return result
 
 
+def _run_plugin_arm(kind: str, run_id: str, gate_rel: str, gate_pkl: Path, tmp: Path,
+                    t0: float, prefetch: Any, episodes: list[str] | None) -> dict:
+    """The ``plugin`` arm of :func:`run_kind`: the ``dt_bias`` plugin engine's Gate A on the
+    requests a ``baseline`` call staged at ``gate_rel``, compared with its staged logits."""
+    from flora_deploy.engines.patches import dt_bias_fp32
+
+    result: dict[str, Any] = {"run": run_id, "kind": kind, "arm": "plugin",
+                              "gate_rel": gate_rel, "engine_hashes": {}, "compile_cache": {}}
+    try:
+        golden.reload()
+        staged: dict | None = load_gate(gate_rel, gate_pkl)
+    except (OSError, ValueError) as e:
+        staged = None
+        result.update(error=f"plugin: the baseline call's Gate A inputs: {e!r}"[:2000],
+                      no_evidence=True)
+    if staged is not None:
+        result["gate_sha256"] = staged.get("gate_sha256_read")
+        result["baseline_engine_hash"] = staged.get("engine_hash")
+        env = {**cache_env(kind, True), **dt_bias_fp32.install_entry_point(tmp / "plugin")}
+        for e in cache_env(kind, True).values():
+            Path(e).mkdir(parents=True, exist_ok=True)
+        result["compile_cache"]["plugin"] = compile_cache_state(kind, True)
+        b = _run_child({"kind": kind, "gpu": GPUS[kind], "episodes": episodes, "segments": {},
+                        "gate_requests": str(gate_pkl), "plugin": True, "gate_only": True,
+                        "out": str(tmp / "b.json")}, env)
+        cache.commit()
+        result["dtbias"] = {k: v for k, v in b.items() if k != "gate_a"}
+        result["engine_hashes"]["plugin"] = b.get("engine_hash")
+        if "error" in b:
+            result["error"] = f"plugin: {b['error']}"
+        elif not staged.get("gate_a"):
+            result["error"] = "plugin: the staged baseline has no Gate A logits"
+        else:
+            result["gate_a"] = gate_a_compare(staged["gate_a"], b["gate_a"])
+    result["prefetch"] = s.as_json() if (s := prefetch.wait(0)) else None
+    result["container_s"] = round(time.time() - t0, 1)
+    result["usd_estimate"] = round(usd_per_h(kind) * result["container_s"] / 3600, 3)
+    return result
+
+
 _GPU_VOLUMES = {str(WEIGHTS_MOUNT): weights, str(GOLDEN_MOUNT): golden, str(CACHE_MOUNT): cache}
 
 
@@ -462,8 +583,10 @@ _GPU_VOLUMES = {str(WEIGHTS_MOUNT): weights, str(GOLDEN_MOUNT): golden, str(CACH
               memory=MEM_GIB["tempseg"] * 1024, timeout=TIMEOUT_S, volumes=_GPU_VOLUMES, env=ENV)
 def run_tempseg(run_id: str, segments_rel: str = "", episodes: list[str] | None = None,
                 gate_a: bool = True, segments: dict | None = None,
-                segments_from: dict | None = None) -> dict:
-    return run_kind("tempseg", run_id, segments_rel, episodes, gate_a, segments, segments_from)
+                segments_from: dict | None = None, arm: str = "both",
+                gate_rel: str = "") -> dict:
+    return run_kind("tempseg", run_id, segments_rel, episodes, gate_a, segments, segments_from,
+                    arm, gate_rel)
 
 
 @app.function(image=vllm_image(), gpu=GPUS["captioner"], cpu=CPU,
@@ -471,9 +594,10 @@ def run_tempseg(run_id: str, segments_rel: str = "", episodes: list[str] | None 
               env=ENV)
 def run_captioner(run_id: str, segments_rel: str = "", episodes: list[str] | None = None,
                   gate_a: bool = True, segments: dict | None = None,
-                  segments_from: dict | None = None) -> dict:
+                  segments_from: dict | None = None, arm: str = "both",
+                  gate_rel: str = "") -> dict:
     return run_kind("captioner", run_id, segments_rel, episodes, gate_a, segments,
-                    segments_from)
+                    segments_from, arm, gate_rel)
 
 
 @app.local_entrypoint()
