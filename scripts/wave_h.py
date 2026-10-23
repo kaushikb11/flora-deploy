@@ -68,12 +68,13 @@ v4 code lands (once it landed the check refuses: f2 is then already done in this
 read from ``reports/wave-h/certified/state.json`` (``--source-state``), never written, so the
 certified run's finished steps keep their records. Then, on the v4 code (``"4" in
 certkey.GENERATOR_VERSIONS``, :func:`require_code_landed`): **d2'** the Captioner lab only
-(TempSeg's saved result reused, :func:`run_recert_lab`), **d'** J1 + the segment-only J1w,
-**g** J2 + J2w, **e'** ``flora certify`` v4 (segment: J1 + J1w + noise-12; caption: J2 + J2w +
-noise-12 with the digests, the staged oracle segments, J1's captions reported only, the
-families and (b)'s old noise run as the repeat: :func:`certify_view`). Its jobs, configs and
-apps take the ``rc-`` prefix (:attr:`PlanSpec.job_prefix`): it shares (b)'s run id, work dir
-and store, so none may be (b)'s. Same stop rules, billing watermark and caps rule as
+(TempSeg's saved result reused, :func:`run_recert_lab`; on the certified run's (d) segments,
+so it needs no d'), **d'** J1 + the segment-only J1w, **g** J2 + J2w, **e'** ``flora
+certify`` v4 (segment: J1 + J1w + noise-12; caption: J2 + J2w + noise-12 with the digests,
+the staged oracle segments, J1's captions reported only, the families and (b)'s old noise
+run as the repeat: :func:`certify_view`). Its jobs, configs and apps take the ``rc-`` prefix
+(:attr:`PlanSpec.job_prefix`): it shares (b)'s run id, work dir and store, so none may be
+(b)'s. Same stop rules, billing watermark and caps rule as
 ``certified``; its global cap is the uppers' sum rounded up to $0.10, never above the
 user-approved :data:`RECERT_GLOBAL_CAP_USD` (f2 included) unless ``--global-cap`` raises it: a
 done f2 counts at its actual cost (spent), the later steps at their uppers.
@@ -112,9 +113,12 @@ d2. ``lab``: **only against (d)'s finished job** (``--only lab`` retries it alon
    ``balanced_lab`` L0 input parity + Gate A on 6 captured requests (``run_tempseg``, then
    ``run_captioner`` on (d)'s segment records), on (d)'s episodes. Preconditions are checked
    before any container (:func:`lab_preconditions`: episodes, camera files at the lab's paths,
-   segments), and a run that gets no request in is an error, not evidence. Each call compiles
-   two engines (baseline + plugin) and writes ``flora-cache:/balanced/<engine>[-dtbias]``,
-   committed after each engine, which later runs (lab and deployed workers) start from;
+   segments), and a run that gets no request in is an error, not evidence. TempSeg's one call
+   compiles two engines (baseline + plugin); the Captioner's lab is two calls, the baseline
+   (L0, stage, Gate A requests) and then the plugin (Gate A on the staged requests), each its
+   own container and deadline (:data:`LAB_CALLS`). The lab writes its own unkeyed
+   ``flora-cache:/balanced/<engine>[-dtbias]`` (committed after each engine), which only later
+   lab calls read: the deployed workers' caches are keyed (``balanced-cc/``), never the lab's;
 e. ``certify``: offline provisional certification of ``balanced`` from (b) + (d) ($0);
 f. ``noise``: (b)'s job **repeated** (same config file, staged data, stage hash, GPU and
    default mode; a new job id): the noise floor; (e) is re-evaluated. Its episodes are a subset
@@ -221,6 +225,9 @@ PLANS: dict[str, tuple[str, ...]] = {
     "certified": ("exact_e2e", "noise", "balanced", "lab", "caption_iso", "certify"),
     # The stage-isolated re-certification of human (module docstring, "recertify"): f2 -> d2'
     # -> d' -> g -> e', one after the other, on (b)'s oracle (read from the certified state).
+    # The lab first (user's choice, 2026-10-23): it reads the certified run's (d) segments, and
+    # no order warms it (its caches are its own, never J1's keyed balanced-cc/ ones), so a lab
+    # problem shows before J1 is paid for.
     "recertify": ("noise_all", "lab", "balanced", "caption_iso", "certify"),
 }
 # What each step needs done first (``--max-parallel``; ``_runbook.run_parallel``). The
@@ -550,28 +557,73 @@ MAX_GLOBAL_CAP_USD = _spend.project_budget_usd()
 # row of planner/rates.json (130 s, projected with a warm cache) is scaled by the Rewarder's
 # measured cold/warm @enter ratio, 318 s / 229 s (docs/rewarder-smoke.md, docs/cold-start.md).
 COLD_COMPILE_FACTOR = 318.0 / 229.0
-# (d2) lab call timing, per kind. Each call builds two engines one after the other (baseline,
-# then the FP32 ``dt_bias`` plugin, each with its own compile cache), so it pays two compiles.
-# Cold builds (2026-10-22 run): TempSeg 270 s baseline + 187 s plugin (lab, L40S); Captioner
-# 325 s (the deployed caption worker's cold startup on H100; the lab's own build was cut off by
-# the old 600 s deadline), assumed for the plugin build too. Work: the stage over the 6
-# episodes (the deployed job's busy 65 s / 161 s), L0 replay and two Gate A generations.
-LAB_BUILD_S = {"tempseg": (270.0, 190.0), "captioner": (325.0, 325.0)}  # (baseline, plugin)
-LAB_WORK_S = {"tempseg": 125.0, "captioner": 225.0}
+# (d2) lab call timing. Every engine the lab builds compiles cold: the lab's compile caches
+# are its own unkeyed ``flora-cache:/balanced/<engine>[-dtbias]`` dirs
+# (``balanced_lab.cache_env``), which no deployed worker writes (they publish keyed caches under
+# ``balanced-cc/``, ``engines/compile_cache.py``); the 2026-10-22 certified lab, run after (d)'s
+# job, recorded both of its caches cold (``compile_cache.*.warm: false``). The calls per kind
+# (:data:`LAB_CALLS`): TempSeg one call, both engines (``"both"``); the Captioner two calls, each
+# its own container under the 20-minute timeout: ``"baseline"`` (L0, the stage, the Gate A
+# requests) and ``"plugin"`` (the FP32 ``dt_bias`` engine's Gate A on the staged requests).
+# Measured 2026-10-22 (reports/wave-h/balanced-<kind>.json, the certified run's lab): TempSeg
+# 683 s for the one call (builds 272 s + 201 s); the Captioner one call 1,096 s wall, 1,075 s in
+# the container: the baseline child 810 s (engine build 465 s with the 51 GiB of weights read
+# cold, then the stage 330 s and L0 15 s) and the plugin child 264 s (build 232 s with the
+# weights already in the page cache, Gate A 32 s). The v4 caption stage is slower
+# (``max_num_seqs`` 16 -> 11 on H100, and one HF processor replay per call for its input
+# digest): the recertify lab of 2026-10-23, still one call, passed its 1,131 s deadline, so
+# both engines in one container no longer fit the timeout. :data:`LAB_V4_CAPTION_S` estimates
+# the extra stage time (more than the 38 s that attempt shows, at least). The plugin call starts
+# a fresh container, so it reads the weights cold again: its build is priced as the baseline's.
+# The split is the certifying plans' (:func:`lab_calls`); the v1 plans (``balanced-only``,
+# ``full``, from before v4) keep their one call per kind, priced as they always were (the
+# Captioner's two builds at the deployed worker's 325 s cold startup, 225 s of work).
+LAB_V4_CAPTION_S = 120.0
+LAB_CALLS: dict[str, tuple[str, ...]] = {"tempseg": ("both",),
+                                         "captioner": ("baseline", "plugin")}
+LAB_ONE_CALL = ("both",)
+LAB_CALL_PARTS_S: dict[tuple[str, str], tuple[float, float]] = {  # (engine builds, work)
+    ("tempseg", "both"): (270.0 + 190.0, 125.0),
+    ("captioner", "both"): (325.0 + 325.0, 225.0),  # the v1 plans' one call
+    ("captioner", "baseline"): (465.0, 345.0 + LAB_V4_CAPTION_S),
+    ("captioner", "plugin"): (465.0, 35.0),
+}
 LAB_OVERHEAD_S = 30.0  # container start, weight prefetch, child spawn
 LAB_UNCERTAINTY = 0.25
 LAB_SLACK_S = 60  # lab: client timeout -> cancel -> container gone
 LAB_TIMEOUT_S = 20 * 60  # modal_app/balanced_lab.py TIMEOUT_S: the container's hard limit
+LAB_CALL_DESC = {"both": "L0 + Gate A, one call: 2 cold compiles",
+                 "baseline": "baseline call: L0 + stage + Gate A requests, 1 cold compile",
+                 "plugin": "plugin call: dt_bias Gate A on the staged requests, 1 cold compile"}
 
 
-def lab_seconds(kind: str) -> tuple[float, float]:
-    """(expected, client deadline) seconds of one lab call with both compiles cold."""
-    expected = LAB_OVERHEAD_S + sum(LAB_BUILD_S[kind]) + LAB_WORK_S[kind]
+def lab_call_seconds(kind: str, arm: str) -> tuple[float, float]:
+    """(expected, client deadline) seconds of one lab call (``arm`` of :data:`LAB_CALLS`),
+    every compile cold; the deadline is expected x (1 + :data:`LAB_UNCERTAINTY`), at most the
+    container timeout."""
+    build, work = LAB_CALL_PARTS_S[(kind, arm)]
+    expected = LAB_OVERHEAD_S + build + work
     return expected, min(float(LAB_TIMEOUT_S), expected * (1 + LAB_UNCERTAINTY))
 
 
-LAB_EXPECTED_S = {k: lab_seconds(k)[0] for k in LAB_BUILD_S}
-LAB_DEADLINE_S = {k: lab_seconds(k)[1] for k in LAB_BUILD_S}
+def lab_calls(kind: str, spec: PlanSpec | None = None) -> tuple[str, ...]:
+    """The lab calls ``kind`` runs as under ``spec``'s plan: the certifying plans
+    :data:`LAB_CALLS` (the Captioner split), the v1 plans one call (:data:`LAB_ONE_CALL`)."""
+    return LAB_CALLS[kind] if spec is not None and spec.shared_data else LAB_ONE_CALL
+
+
+def lab_seconds(kind: str, spec: PlanSpec | None = None) -> tuple[float, float]:
+    """(expected, deadline) seconds of ``kind``'s whole lab under ``spec``'s plan (default a
+    v1 plan's one call): the sums over its calls."""
+    calls = [lab_call_seconds(kind, a) for a in lab_calls(kind, spec)]
+    return sum(c[0] for c in calls), sum(c[1] for c in calls)
+
+
+LAB_CALL_EXPECTED_S = {(k, a): lab_call_seconds(k, a)[0] for k, a in LAB_CALL_PARTS_S}
+LAB_CALL_DEADLINE_S = {(k, a): lab_call_seconds(k, a)[1] for k, a in LAB_CALL_PARTS_S}
+# one call per kind (the v1 plans)
+LAB_EXPECTED_S = {k: lab_seconds(k)[0] for k in LAB_CALLS}
+LAB_DEADLINE_S = {k: lab_seconds(k)[1] for k in LAB_CALLS}
 TEMPSEG_APP = "flora-convert"  # modal_app/convert_app.py
 MERGE_EXPECTED_S, MERGE_MAX_S = 300, 1200  # v2: FP64 merge, "a few minutes" (tempseg-merge.md)
 EQUIV_EXPECTED_S, EQUIV_MAX_S = 240, 600  # v1: 142 s + image start on one L40S
@@ -888,13 +940,20 @@ def project(step: str, manifest: Mapping[str, Any], spec: PlanSpec | None = None
         reuse = set(reuse)
         full = 0.0
         for kind in ("tempseg", "captioner"):
-            full += LAB[kind].usd_per_s() * (LAB_DEADLINE_S[kind] + LAB_SLACK_S)
+            full += LAB[kind].usd_per_s() * sum(LAB_CALL_DEADLINE_S[(kind, a)] + LAB_SLACK_S
+                                                for a in lab_calls(kind, spec))
             if kind in reuse:
                 p.add(f"balanced lab {kind}: saved result reused (has evidence), not run",
                       LAB[kind], 0.0, upper_s=0.0)
                 continue
-            p.add(f"balanced lab {kind} (L0 + Gate A, 2 cold compiles; after (d)'s job)",
-                  LAB[kind], LAB_EXPECTED_S[kind], upper_s=LAB_DEADLINE_S[kind] + LAB_SLACK_S)
+            for arm in lab_calls(kind, spec):
+                if f"{kind}:{arm}" in reuse:  # a saved baseline call: only the plugin runs
+                    p.add(f"balanced lab {kind} {arm} call: saved result reused, not run",
+                          LAB[kind], 0.0, upper_s=0.0)
+                    continue
+                p.add(f"balanced lab {kind} ({LAB_CALL_DESC[arm]})", LAB[kind],
+                      LAB_CALL_EXPECTED_S[(kind, arm)],
+                      upper_s=LAB_CALL_DEADLINE_S[(kind, arm)] + LAB_SLACK_S)
         p.peak_usd_per_s = max((LAB[k].usd_per_s() for k in LAB if k not in reuse),
                                default=0.0)  # one after the other
         # recertify reuses TempSeg's saved result by design (its engine did not change): its
@@ -1017,7 +1076,8 @@ def plan_projections(plan: str, manifest: Mapping[str, Any], *, lab_done: bool =
     certifying plans: the other plans run their lab; ``reuse``: :func:`lab_reuse`; recertify
     always reuses TempSeg's; ``spec``: default the plan's, :func:`spec_for` for another
     embodiment; ``witness_only``: :func:`witness_pending`, (d) priced at its cold witness
-    alone; ``iso_witness_only``: :func:`iso_witness_pending`, (g) at J2w alone)."""
+    alone; ``iso_witness_only``: :func:`iso_witness_pending`, (g) at J2w alone). ``reuse``
+    may also name a saved call (``"captioner:baseline"``: :func:`saved_lab_calls`)."""
     spec = spec or SPECS[plan]
     if plan == RECERTIFY:
         reuse = tuple(sorted(set(reuse) | {"tempseg"}))
@@ -2250,6 +2310,87 @@ def reusable_lab_result(kind: str, run_id: str, episodes: Sequence[str],
     return res if ok else None
 
 
+def baseline_call_path(kind: str, lab_dir: Path | None = None) -> Path:
+    """Where a split lab's baseline call result is kept (beside ``balanced-<kind>.json``), so
+    a retry whose plugin call failed pays for the plugin call alone."""
+    return (lab_dir or LAB_OUT) / f"balanced-{kind}-baseline.json"
+
+
+def reusable_baseline_call(kind: str, run_id: str, episodes: Sequence[str] | None = None,
+                           path: Path | None = None, *,
+                           segments_from: Mapping[str, str] | None = None,
+                           check_binding: bool = True) -> dict[str, Any] | None:
+    """A saved baseline call (``arm: baseline``) a retry can keep: same run and kind, no error,
+    L0 rows, the Gate A inputs it staged (``gate_rel``, ``gate_sha256``), measured under the
+    current baseline engine settings; with ``check_binding`` also on ``episodes`` and, for the
+    Captioner, the same ``segments_from`` (as :func:`reusable_lab_result`)."""
+    p = path or baseline_call_path(kind)
+    try:
+        res = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(res, dict):
+        return None
+    base = res.get("baseline") or {}
+    ok = (res.get("arm") == "baseline" and res.get("run") == f"wave-h-{run_id}"
+          and res.get("kind") == kind and not res.get("error") and not base.get("error")
+          and not res.get("no_evidence") and bool(base.get("l0"))
+          and bool(res.get("gate_rel")) and bool(res.get("gate_sha256"))
+          and (res.get("engine_hashes") or {}).get("baseline")
+          == lab_engine_hashes(kind)["baseline"])
+    if check_binding:
+        ok = ok and list(base.get("episodes_requested") or ()) == list(episodes or ())
+        if kind == "captioner":
+            ok = ok and segments_from is not None and \
+                res.get("segments_from") == dict(segments_from)
+    return res if ok else None
+
+
+def saved_lab_calls(run_id: str, spec: PlanSpec) -> tuple[str, ...]:
+    """The split lab calls a dry run prices at $0 (``"<kind>:baseline"``): a saved baseline
+    call of this run under the current engine settings, in the plan's lab dir (its episode
+    and segment binding is checked when the lab runs: :func:`reusable_baseline_call`)."""
+    return tuple(f"{k}:baseline" for k in LAB_CALLS if "baseline" in lab_calls(k, spec)
+                 and reusable_baseline_call(k, run_id, path=baseline_call_path(k, spec.labs),
+                                            check_binding=False) is not None)
+
+
+def merge_lab_calls(base: Mapping[str, Any], plug: Mapping[str, Any]) -> dict[str, Any]:
+    """One ``balanced-<kind>.json`` from a split lab's baseline and plugin calls, in the shape
+    of a one-call result (``baseline``, ``dtbias``, ``gate_a``, ``engine_hashes``,
+    ``compile_cache``, ``container_s``, ``usd_estimate``), with each call's own figures under
+    ``calls``. The plugin call must have read the requests the baseline call staged
+    (``gate_sha256``) for the baseline engine it ran (its engine hash); else an error."""
+    out = {k: v for k, v in base.items() if k not in ("arm", "error", "no_evidence")}
+    out["engine_hashes"] = {**(base.get("engine_hashes") or {}),
+                            **{k: v for k, v in (plug.get("engine_hashes") or {}).items()
+                               if k == "plugin"}}
+    out["compile_cache"] = {**(base.get("compile_cache") or {}),
+                            **{k: v for k, v in (plug.get("compile_cache") or {}).items()
+                               if k == "plugin"}}
+    if plug.get("dtbias") is not None:
+        out["dtbias"] = plug["dtbias"]
+    if plug.get("gate_a") is not None:
+        out["gate_a"] = plug["gate_a"]
+    out["calls"] = {arm: {k: r.get(k) for k in ("container_s", "usd_estimate", "prefetch",
+                                                  "compile_cache", "error")}
+                    for arm, r in (("baseline", base), ("plugin", plug))}
+    out["split"] = True
+    out["container_s"] = round(sum(float(r.get("container_s") or 0.0) for r in (base, plug)), 1)
+    out["usd_estimate"] = round(sum(float(r.get("usd_estimate") or 0.0) for r in (base, plug)),
+                                3)
+    err = plug.get("error")
+    if not err and plug.get("gate_sha256") != base.get("gate_sha256"):
+        err = "the Gate A requests it read are not the baseline call's (gate_sha256)"
+    elif not err and plug.get("baseline_engine_hash") != (base.get("engine_hashes")
+                                                          or {}).get("baseline"):
+        err = "the staged Gate A baseline is another baseline engine's"
+    if err:
+        out["error"] = err if str(err).startswith("plugin:") else f"plugin: {err}"
+        out.pop("gate_a", None)
+    return out
+
+
 def lab_reuse(st: State, spec: PlanSpec | None = None) -> tuple[str, ...]:
     """The lab kinds whose saved result (d2) reuses (:func:`reusable_lab_result`), on the
     plan's lab episodes (:attr:`PlanSpec.lab_episodes`) of (d)'s."""
@@ -2306,9 +2447,12 @@ def run_lab(ctx: Ctx, *, missing: Callable[[Iterable[str]], list[str]] | None = 
     (d)'s segment records for the Captioner (``--only lab`` retries it alone). Every
     precondition is checked before any container (:func:`lab_preconditions`); a failed one
     charges $0. TempSeg runs first; when it gets no request in, the Captioner is not started
-    (it reads the same inputs). Each call's deadline is :data:`LAB_DEADLINE_S` (two cold
-    compiles), shortened by the budget left; a call the budget cannot carry to its expected
-    length is not started. Spend is each started call's wall time x list $/s. ``source``: the
+    (it reads the same inputs). A kind runs as its :data:`LAB_CALLS` (the Captioner: a
+    baseline call, then a plugin call on the Gate A inputs it staged, merged by
+    :func:`merge_lab_calls`; a saved baseline call is reused, :func:`reusable_baseline_call`).
+    Each call's deadline is :data:`LAB_CALL_DEADLINE_S` (its cold compiles), shortened by the
+    budget left; a call the budget cannot carry to its expected length is not started. Spend
+    is each started call's wall time x list $/s. ``source``: the
     state whose (d) the lab reads (default this run's; recertify: (b)'s certified state,
     :func:`run_recert_lab`); ``kinds``: the lab kinds to run; ``lab_dir``: where the lab JSON
     is written (default :data:`LAB_OUT`)."""
@@ -2378,47 +2522,88 @@ def run_lab(ctx: Ctx, *, missing: Callable[[Iterable[str]], list[str]] | None = 
 
     rdir.mkdir(parents=True, exist_ok=True)
     fns = {"tempseg": lab.run_tempseg, "captioner": lab.run_captioner}
-    first = todo[0]  # a reused TempSeg result always had requests in
-    limit = min(LAB_DEADLINE_S[first],
-                ctx.deadline_s("lab", LAB[first], slack_s=LAB_SLACK_S))
-    if limit < LAB_EXPECTED_S[first]:  # the stop rule, before the app starts: charged $0
+    saved_base = {k: reusable_baseline_call(k, ctx.st.run_id, episodes,
+                                            path=baseline_call_path(k, rdir),
+                                            segments_from=bound)
+                  for k in todo if "baseline" in lab_calls(k, ctx.spec)}
+    arms = {k: tuple(a for a in lab_calls(k, ctx.spec)
+                     if not (a == "baseline" and saved_base.get(k))) for k in todo}
+    first = (todo[0], arms[todo[0]][0])  # a reused TempSeg result always had requests in
+    limit = min(LAB_CALL_DEADLINE_S[first],
+                ctx.deadline_s("lab", LAB[first[0]], slack_s=LAB_SLACK_S))
+    if limit < LAB_CALL_EXPECTED_S[first]:  # the stop rule, before the app starts: charged $0
         b = ctx.budget_of("lab")
-        raise StopRule(f"lab: budget left ${b.usd:.2f} allows {limit:.0f} s of the {first} "
-                       f"call, under the {LAB_EXPECTED_S[first]:.0f} s it needs (binding: "
-                       f"{b.binding}); no lab app started")
+        raise StopRule(f"lab: budget left ${b.usd:.2f} allows {limit:.0f} s of the {first[0]} "
+                       f"{first[1]} call, under the {LAB_CALL_EXPECTED_S[first]:.0f} s it "
+                       f"needs (binding: {b.binding}); no lab app started")
     # the app is noted only now: a precondition failure above charged $0
     with _lab_app(ctx, lab, modal, name):
         for kind in todo:
             fn, c = fns[kind], LAB[kind]
-            limit = min(LAB_DEADLINE_S[kind],
-                        ctx.deadline_s("lab", c, spent_in_step=spent, slack_s=LAB_SLACK_S))
             prev = out["kinds"].get("tempseg") or {}
             if kind == "captioner" and prev.get("requests") == 0:
                 out["kinds"][kind] = {"skipped": "TempSeg sent zero requests on the same "
                                       "inputs; not started", "usd": 0.0, "evidence": False,
                                       "error": NO_EVIDENCE}
                 continue
-            if limit < LAB_EXPECTED_S[kind]:
-                out["kinds"][kind] = {"skipped": f"budget left {limit:.0f} s < the "
-                                      f"{LAB_EXPECTED_S[kind]:.0f} s it needs", "usd": 0.0,
-                                      "evidence": False, "error": NO_EVIDENCE}
-                continue
-            t0 = time.time()
             cap = kind == "captioner"
-            call = fn.spawn(f"wave-h-{ctx.st.run_id}", "", episodes, True,
-                            segments if cap else None, bound if cap else None)
-            try:
-                res = call.get(timeout=limit)
-            except (TimeoutError, modal.exception.TimeoutError):
-                call.cancel()
-                res = {"error": f"client deadline {limit:.0f} s"}
-            except Exception as e:  # noqa: BLE001 - the remote call raised: this kind failed
-                res = {"error": f"lab call raised {e!r}"[:2000]}
-            wall = time.time() - t0
-            usd = c.usd_per_s() * wall
-            spent += usd
+            res: dict[str, Any] | None = saved_base.get(kind)
+            calls: dict[str, dict[str, Any]] = (
+                {"baseline": {"reused": str(baseline_call_path(kind, rdir)), "usd": 0.0}}
+                if res is not None else {})
+            wall = usd = 0.0
+            for arm in arms[kind]:
+                key = (kind, arm)
+                limit = min(LAB_CALL_DEADLINE_S[key],
+                            ctx.deadline_s("lab", c, spent_in_step=spent, slack_s=LAB_SLACK_S))
+                if limit < LAB_CALL_EXPECTED_S[key]:
+                    why = (f"budget left {limit:.0f} s < the {LAB_CALL_EXPECTED_S[key]:.0f} s "
+                           "it needs")
+                    calls[arm] = {"skipped": why, "usd": 0.0}
+                    res = None if res is None else {**res, "error": f"{arm} call not started: "
+                                                    f"{why}"}
+                    break
+                args: tuple[Any, ...] = (f"wave-h-{ctx.st.run_id}", "", episodes, True,
+                                         segments if cap else None, bound if cap else None)
+                if arm != "both":
+                    args += (arm, str((res or {}).get("gate_rel") or "") if arm == "plugin"
+                             else "")
+                t0 = time.time()
+                call = fn.spawn(*args)
+                try:
+                    got = call.get(timeout=limit)
+                except (TimeoutError, modal.exception.TimeoutError):
+                    call.cancel()
+                    got = {"error": f"client deadline {limit:.0f} s"}
+                except Exception as e:  # noqa: BLE001 - the remote call raised: it failed
+                    got = {"error": f"lab call raised {e!r}"[:2000]}
+                w = time.time() - t0
+                u = c.usd_per_s() * w
+                spent, wall, usd = spent + u, wall + w, usd + u
+                calls[arm] = {"wall_s": round(w, 1), "usd": round(u, 4),
+                              "deadline_s": round(limit), "error": got.get("error")}
+                if arm == "plugin":
+                    res = merge_lab_calls(res or {}, got)
+                else:
+                    res = got
+                if arm == "baseline":
+                    baseline_call_path(kind, rdir).write_text(json.dumps(got, default=str))
+                    if got.get("error") or not got.get("gate_rel"):
+                        if not got.get("error"):
+                            res = {**got, "error": "baseline call staged no Gate A inputs"}
+                        break  # no plugin call without the baseline's Gate A inputs
+                if arm != arms[kind][-1]:  # a split kind's progress lands in the state too
+                    out["kinds"][kind] = {**_lab_kind_summary(res, wall, usd), "calls": calls,
+                                          "partial": True}
+                    persist()
+            if res is None:  # its first call was not started
+                out["kinds"][kind] = {"skipped": calls[arms[kind][0]]["skipped"], "usd": 0.0,
+                                      "evidence": False, "error": NO_EVIDENCE, "calls": calls}
+                continue
             (rdir / f"balanced-{kind}.json").write_text(json.dumps(res, default=str))
             out["kinds"][kind] = _lab_kind_summary(res, wall, usd)
+            if len(lab_calls(kind, ctx.spec)) > 1:
+                out["kinds"][kind]["calls"] = calls
             stats = (res.get("baseline") or {}).get("batcher") or {}
             out["kinds"][kind]["requests"] = stats.get("requests")
             persist()
@@ -3380,12 +3565,17 @@ def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
                         f"{v['infer_episodes']} episodes per batcher" for k, v in lim.items())
             + "; its rates were measured before batch fill, so they can only overstate it")
     if "lab" in steps:
-        out("  assumption: each lab call compiles two engines cold (baseline + dt_bias "
-            "plugin): deadline " + ", ".join(f"{k} {LAB_DEADLINE_S[k]:.0f} s"
-                                             for k in LAB_DEADLINE_S)
-            + f" (expected x {1 + LAB_UNCERTAINTY:.2f}, <= the {LAB_TIMEOUT_S} s container "
-            "timeout); the lab commits flora-cache:/balanced/<engine>[-dtbias] after each "
-            "engine, so a warm cache only makes it cheaper")
+        out("  assumption: every lab engine compiles cold (the lab's own unkeyed "
+            "flora-cache:/balanced/<engine>[-dtbias]; no deployed job writes it, and the "
+            "2026-10-22 lab after (d) was cold too); calls and deadlines: "
+            + "; ".join(f"{k} " + " + ".join(f"{a} {LAB_CALL_DEADLINE_S[(k, a)]:.0f} s"
+                                              for a in lab_calls(k, spec)) for k in LAB_CALLS)
+            + f" (expected x {1 + LAB_UNCERTAINTY:.2f}, each <= the {LAB_TIMEOUT_S} s "
+            "container timeout)"
+            + ("; the Captioner is split (baseline, then plugin: one cold engine per "
+               "container; its v4 stage is priced at the measured 2026-10-22 lab + "
+               f"{LAB_V4_CAPTION_S:.0f} s); a saved baseline call is reused by a retry"
+               if len(lab_calls("captioner", spec)) > 1 else ""))
     if is_cert(plan) and "lab" in steps:
         done, why = lab_already_done(spec.labs)
         out(f"  lab (d2): {'already done, skipped at $0' if done else 'runs'} ({why})")
@@ -3403,6 +3593,11 @@ def print_plan(st: State, projections: Mapping[str, Projection], out=print, *,
     if left != list(steps) and upper_left <= gcap + 1e-9:  # a done step's actual cost counts
         out(f"  fits: spent ${st.spent:.2f} + the upper of the steps not done "
             f"${upper_left - st.spent:.2f} = ${upper_left:.2f} <= the ${gcap:.2f} global cap")
+    elif left != list(steps):
+        out(f"  DOES NOT FIT: spent ${st.spent:.2f} + the upper of the steps not done "
+            f"${upper_left - st.spent:.2f} = ${upper_left:.2f} > the ${gcap:.2f} global cap "
+            f"(short ${upper_left - gcap:.2f}); the runbook stops at the first step whose upper "
+            "projection, with the later steps' kept for them, no longer fits the cap left")
     elif upper > gcap + 1e-9:
         out(f"  NOT HONEST AT ${gcap:.2f}: the upper total needs a global cap of at "
             f"least ${honest['global']:.2f} (per step: "
@@ -3420,7 +3615,8 @@ def app_name(run_id: str, step: str, attempt: int) -> str:
 # Per step: stop -> container gone (the lab and conversion calls end with their client timeout;
 # a deployed job with ``flora run``'s), and the hard limit its containers cannot outlive.
 STEP_SLACK_S = {"tempseg": LAB_SLACK_S, "preflight": LAB_SLACK_S, "lab": LAB_SLACK_S}
-STEP_HARD_TIMEOUT_S = {"lab": 2 * LAB_TIMEOUT_S}  # two calls, one after the other
+# every lab call, one after the other (TempSeg one, the Captioner two)
+STEP_HARD_TIMEOUT_S = {"lab": sum(len(a) for a in LAB_CALLS.values()) * LAB_TIMEOUT_S}
 
 
 stop_killed = rb.stop_killed
@@ -3739,6 +3935,8 @@ def main(argv: list[str] | None = None) -> int:
               f"{', '.join(miss)})")
     lab_done = is_cert(args.plan) and lab_already_done(spec.labs)[0]
     reuse = () if lab_done or args.plan == RECERTIFY else lab_reuse(st, spec)
+    if not lab_done:  # a saved split baseline call: a retry pays for the plugin call alone
+        reuse = tuple(reuse) + saved_lab_calls(st.run_id, spec)
     pending = is_cert(args.plan) and witness_pending(st)
     iso_pending = is_cert(args.plan) and iso_witness_pending(st)
     projections = plan_projections(args.plan, manifest, lab_done=lab_done, reuse=reuse,

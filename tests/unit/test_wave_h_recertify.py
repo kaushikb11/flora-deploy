@@ -156,12 +156,13 @@ def test_noise_all_is_priced_as_b_on_all_twelve_and_capped_by_the_rounding_rule(
     assert wh.plan_global_cap(wh.RECERTIFY, projs) == wh.RECERT_GLOBAL_CAP_USD == 11.70
     st = rb.State(RUN, 0.0, "x", plan=wh.RECERTIFY)
     d = wh.decide(st, wh.RECERTIFY, "noise_all", projs)
-    # f2's upper with every phase-2 upper kept after it is $11.90 on today's rates: over the
-    # approved $11.70, so a fresh f2 here is stopped (it runs from main's checkout instead,
-    # under main's f2-only cap; this plan then finds it done at its actual cost) ...
+    # f2's upper with every phase-2 upper kept after it is $13.02 on today's rates (the
+    # Captioner lab split): over the approved $11.70, so a fresh f2 here is stopped (it runs
+    # from main's checkout instead, under main's f2-only cap; this plan then finds it done at
+    # its actual cost) ...
     assert d.action == "stop" and "reserve for lab, balanced, caption_iso" in d.message
     # ... and runs with a raise the user approves
-    st.cap_override, st.cap_override_plan = 12.0, wh.RECERTIFY
+    st.cap_override, st.cap_override_plan = 13.1, wh.RECERTIFY
     d = wh.decide(st, wh.RECERTIFY, "noise_all", projs)
     assert d.action == "run" and "--plan recertify --yes-spend" in d.command
 
@@ -339,6 +340,9 @@ def test_a_run_records_f2_in_its_own_state_on_b_run_id(tmp_path, monkeypatch):
         return {"ok": True, "tracked_usd": 2.5, "apps": ["app-noise12-a1"], "episodes": 12}
 
     monkeypatch.setitem(wh.RUNNERS, "noise_all", fake)
+    # a fresh f2 needs the later steps' uppers kept for them: over the pre-registered $11.70
+    # since the Captioner lab is split (the user approved more before running phase 2)
+    monkeypatch.setattr(wh, "RECERT_GLOBAL_CAP_USD", 13.0)
     monkeypatch.chdir(tmp_path)
     assert wh.main(["--plan", "recertify", "--yes-spend", "--only", "noise_all"]) == 0
     st = wh.load_state(spec.state)
@@ -436,6 +440,7 @@ def v3(monkeypatch):
 
 
 def test_recertify_steps_state_root_and_chain():
+    # the lab first (the user's choice), e' after g
     assert wh.PLANS[wh.RECERTIFY] == ("noise_all", "lab", "balanced", "caption_iso", "certify")
     assert wh.plan_deps(wh.RECERTIFY) == {"noise_all": (), "lab": ("noise_all",),
                                          "balanced": ("lab",), "caption_iso": ("balanced",),
@@ -696,7 +701,9 @@ def test_certify_view_takes_bs_oracle_f2_as_noise_and_bs_noise_as_repeat(tmp_pat
 PREREG_RATES = {"segment": (0.367, 300.5), "caption": (0.906, 325.0)}
 SECTION5 = {  # (expected, upper) per item, $ (caption pre-registration §5, human)
     "noise_all": [(2.739, 4.166)],
-    "lab": [(0.0, 0.0), (1.281, 1.686)],
+    # the Captioner lab split into its baseline and plugin calls (2026-10-23: the one call,
+    # (1.281, 1.686) in §5, passed its 1131 s deadline on the v4 engine)
+    "lab": [(0.0, 0.0), (1.359, 1.784), (0.750, 1.023)],
     "balanced": [(0.544, 0.873), (0.823, 1.554), (0.277, 0.585)],
     "caption_iso": [(0.823, 1.554), (0.634, 1.269)],
     "certify": []}
@@ -726,14 +733,16 @@ def test_projections_reproduce_section_5_on_its_rates(prereg_rates):
         for (a, b), (x, y) in zip(got, want, strict=True):
             assert a == pytest.approx(x, abs=6e-4) and b == pytest.approx(y, abs=6e-4), step
     steps = wh.PLANS[wh.RECERTIFY]
-    assert sum(ps[s].usd for s in steps) == pytest.approx(7.12, abs=0.005)
-    assert sum(ps[s].usd_upper for s in steps) == pytest.approx(11.69, abs=0.005)
+    assert sum(ps[s].usd for s in steps) == pytest.approx(7.95, abs=0.005)
+    assert sum(ps[s].usd_upper for s in steps) == pytest.approx(12.81, abs=0.005)
     assert ps["noise_all"].usd_upper == pytest.approx(4.166, abs=6e-4)  # f2 is inside it
-    assert wh.plan_global_cap(wh.RECERTIFY, ps) == 11.70  # derived: 11.686 -> 11.70
+    # derived 12.81 -> 12.90, held at the approved 11.70: only a user-approved raise runs it
+    assert wh.plan_global_cap(wh.RECERTIFY, ps) == 11.70
     caps = wh.plan_caps(wh.RECERTIFY, ps)
-    assert {s: caps[s] for s in steps} == {"noise_all": 4.20, "lab": 1.70, "balanced": 3.05,
+    assert {s: caps[s] for s in steps} == {"noise_all": 4.20, "lab": 2.85, "balanced": 3.05,
                                           "caption_iso": 2.85, "certify": 0.0}
     st = wh.State("r", 0.0, "x", plan=wh.RECERTIFY)
+    st.cap_override, st.cap_override_plan = 12.90, wh.RECERTIFY
     for s in steps:  # every step fits its cap and the global cap with the later ones kept
         assert wh.decide(st, wh.RECERTIFY, s, ps).runs, s
 
@@ -747,9 +756,9 @@ def test_global_cap_is_never_above_the_approved_11_70():
     assert g == min(11.70, round(-(-round(up, 6) * 10 // 1) / 10, 2))
     # the lab's reused TempSeg is not in its cap (by design); f2 is in the global sum
     assert ps["lab"].cap_usd_upper is None
-    assert ps["lab"].usd_upper == pytest.approx(wh.LAB["captioner"].usd_per_s()
-                                                * (wh.LAB_DEADLINE_S["captioner"]
-                                                   + wh.LAB_SLACK_S), abs=1e-3)
+    assert ps["lab"].usd_upper == pytest.approx(wh.LAB["captioner"].usd_per_s() * sum(
+        wh.LAB_CALL_DEADLINE_S[("captioner", a)] + wh.LAB_SLACK_S
+        for a in ("baseline", "plugin")), abs=1e-3)
     # only an approved override raises it
     assert wh.plan_global_cap(wh.RECERTIFY, ps, 12.0) == 12.0
     assert wh.check_global_cap(12.0, spent=0.0, derived=g) is None
