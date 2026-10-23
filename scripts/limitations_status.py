@@ -90,10 +90,38 @@ def block_certification(cert_dir: Path | None) -> str:
         lines.append(f"Certified today: {'; '.join(certified)}.\nEvery other `balanced` "
                      "segmentation or captioning stage needs `allow_uncertified: true`,\nand "
                      "its records say `certified: false`.")
+        if (any(row["segment"] == "certified" for row in st.values())
+                and not any(row["caption"] == "certified" for row in st.values())):
+            lines.append(caption_options())
     else:
         lines.append("Nothing is certified yet, so `balanced` segmentation and captioning need "
                      "`allow_uncertified: true`\nand their records say `certified: false`.")
     return "\n".join(lines) + "\n"
+
+
+def exact_price() -> str | None:
+    """``$36.39``: ``exact`` segmentation + captioning per video-hour of GPU work as ``flora
+    plan`` prices it, the same figure the README cost block quotes
+    (``wave_h_finalize.exact_price``, from the shipped rates; finalize never rewrites ``exact``
+    rates)."""
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import wave_h_finalize  # scripts/
+
+    return wave_h_finalize.exact_price()
+
+
+def caption_options() -> str:
+    """Segmentation certified, captioning not (for any embodiment): the two honest ways to get
+    captions."""
+    price = exact_price()
+    at = f"the `exact` price (about {price} per video-hour)" if price else "the `exact` price"
+    return ("\nCaptioning is not certified for any embodiment. For captions, either run one "
+            "`balanced` job with\n`allow_uncertified: true` (its caption records say "
+            "`certified: false`), or run captions as a\nseparate job with `preset: exact, "
+            "stages: [segment, caption]`: it captions `exact`'s own segments,\n"
+            f"at {at}.\nOne config has one preset, so the two cannot be mixed.")
 
 
 def describe(status: str, n: int | None, uncertainty: float, unit: str = "job") -> str:
