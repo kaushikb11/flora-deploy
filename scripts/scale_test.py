@@ -1297,7 +1297,10 @@ def cache_by_kind(audits: Sequence[Mapping[str, Any]], receipts: Sequence[Mappin
             if sid in seen or v is None:
                 continue
             seen.add(sid)
-            s = (v.get("state") or v.get("source")) if isinstance(v, dict) else v
+            # a string is the cache's identity, ``<state>[:<key>:<manifest sha>]``
+            # (``engines.compile_cache.CacheStatus.identity``): the state is its first field
+            s = (v.get("state") or v.get("source")) if isinstance(v, dict) else \
+                str(v).split(":", 1)[0]
             states[str(s)] = states.get(str(s), 0) + 1
         warm = k in warm_kinds
         if ok and warm and set(states) != {"warm"}:
@@ -1458,6 +1461,8 @@ def evaluate(r: Mapping[str, Any], mode: str, targets: Mapping[str, Any] | None 
     add(14, cp, f"<= {T['compose_max_s']} s and exit 0",
         None if cp is None else cp <= T["compose_max_s"] and crc == 0)
     _evaluate_proofs(r, local, add)
+    if r.get("resumed"):
+        _resumed_caveats(rows, r, T)
     return [rows[i] for i, _ in CRITERION_NAMES]
 
 
@@ -2275,6 +2280,435 @@ def proof_inputs(job: Any, ctx: Ctx, run: Mapping[str, Any], rep: Mapping[str, A
     return out
 
 
+# ---------------------------------------------------------------------------------------------
+# A run step the script lost but the job finished: reported from the job's own records
+#
+# ``run`` fails when its job stops (a stop rule, a budget stop, the script killed), yet the job
+# can still be finished by hand (``flora deploy`` + ``flora resume``) outside this script. Then
+# ``--report`` / ``--finalize`` read what the job store recorded (attempt markers, receipts,
+# ledgers, the orchestrator's drain and pre-warm records, the shard audit rows, ``flora
+# report``'s per-container rows) and Modal billing, split the job into its orchestrator
+# generations (``run.json``'s launches), and mark what the interruption skews.
+
+RESUMED_NA = ("resumed: the job was budget-stopped, then finished by `flora resume` outside "
+              "this script")
+# What the interruption skews, per criterion (:func:`_resumed_caveats`).
+RESUMED_CAVEATS: dict[int, str] = {
+    4: "a pool that first reached its size after the resume is timed from the resume's "
+       "launch, not the run start (a container the script did not sample counts from its "
+       "first call's spawn)",
+    6: "measured in the generation where both pools ran (after the resume), which had only "
+       "the segment shards the first generation left",
+    7: "the interruption added a second cold start per pool and the first generation's "
+       "pre-warm idle to the spend",
+    8: "the nominal projection prices one cold start per pool and no interruption",
+    9: "container lifetimes are derived from the attempt markers and the pools' scaledown "
+       "(the resumed generation's containers were not sampled); tails that began in the "
+       "interruption are excluded",
+    12: "only the polls of the first generation (the script did not poll the resumed one)",
+    16: "the containers' ends were not observed (no container samples after the stop); the "
+        "drain record and hourly billing are shown as evidence",
+    17: "the pre-warm was planned and run by the first generation, whose caption work the "
+        "stop cancelled; the resumed generation spawned its captions directly",
+}
+
+
+def resumable(st: wh.State, mode: str) -> bool:
+    """A non-local ``run`` step that ended failed or stopped (its job id recorded) and no
+    report from the job itself yet, or one built by :func:`resumed_report` (re-read: billing
+    settles later)."""
+    if mode == "local":
+        return False
+    run = st.steps.get("run")
+    if run is None or run.status not in ("failed", "stopped") or not run.result.get("job_id"):
+        return False
+    rep = st.steps.get("report")
+    return rep is None or not rep.result.get("criteria") or bool(rep.result.get("resumed"))
+
+
+def _timed_cli(ctx: Ctx, args: list[str], timeout: float) -> tuple[float, int, str]:
+    """``flora <args>`` (read-only: status / report): seconds, exit code, stdout."""
+    t = time.time()
+    p = subprocess.run([_flora(), *args], cwd=ctx.work, capture_output=True, text=True,
+                       timeout=timeout)
+    return round(time.time() - t, 2), p.returncode, p.stdout
+
+
+def read_resumed_job(ctx: Ctx) -> dict[str, Any]:
+    """Everything :func:`resumed_report` reads, from the job store and ``flora status`` /
+    ``flora report`` (both read-only; timed for criteria 12-13). Launches, cancels and deploys
+    nothing."""
+    from flora_deploy import sdk
+    from flora_deploy.jobs.pools import read_drains, read_prewarm_plans
+    from flora_deploy.jobs.store import JobPaths
+
+    s_t, s_rc, s_out = _timed_cli(ctx, ["status", ctx.job_id, *ctx.store_args(), "--json"],
+                                  600)
+    r_t, r_rc, r_out = _timed_cli(ctx, ["report", ctx.job_id, *ctx.store_args(), "--json"],
+                                  900)
+    status: dict[str, Any] = {}
+    rep: dict[str, Any] = {}
+    with contextlib.suppress(ValueError):
+        status = json.loads(s_out)
+    with contextlib.suppress(ValueError):
+        rep = json.loads(r_out)
+    job = sdk.open_job(ctx.job_id, store=ctx.store_uri)
+    manifest = job._deps().manifests.load()
+    root = JobPaths(ctx.job_id).root
+    drains, prewarms = read_drains(job.store, root, job.config_hash)
+    return {
+        "state": rep.get("state") or status.get("state"), "counts": status.get("counts"),
+        "app": job.app_name, "launches": list(job.spec.get("launches") or ()),
+        "files": read_shard_files(job.store, ctx.job_id, job.config_hash, manifest),
+        "durations": {e.uid: e.duration_s for e in manifest.episodes},
+        "shards": [{"kind": s.kind, "shard_id": s.shard_id, "episodes": list(s.episodes)}
+                   for s in manifest.shards],
+        "report": rep, "summary": job.summary(), "drains": drains, "prewarms": prewarms,
+        "plans": read_prewarm_plans(job.store, root, job.config_hash),
+        "audits": h0.job_audits(job.store, root),
+        "timings": {"status_final_s": s_t, "status_rc": s_rc, "report_s": r_t,
+                    "report_rc": r_rc}}
+
+
+def _generations(launches: Sequence[Mapping[str, Any]], run_start: float | None
+                 ) -> list[dict[str, Any]]:
+    """One per orchestrator launch (``run.json``), in time order: ``{"i", "reason", "t0",
+    "t1"}``; the first starts at the run start when known (time to peak counts from it)."""
+    ls = sorted((x for x in launches if _t(x.get("utc")) is not None),
+                key=lambda x: _t(x["utc"]))  # type: ignore[arg-type,return-value]
+    out = []
+    for i, x in enumerate(ls):
+        t0 = _t(x["utc"])
+        if i == 0 and run_start is not None:
+            t0 = min(t0, run_start)  # type: ignore[type-var]
+        t1 = _t(ls[i + 1]["utc"]) if i + 1 < len(ls) else None
+        out.append({"i": i + 1, "reason": x.get("reason"), "t0": t0, "t1": t1})
+    return out
+
+
+def _gen_files(files: Mapping[str, Sequence[Mapping[str, Any]]], t0: float, t1: float | None
+               ) -> dict[str, list[dict[str, Any]]]:
+    """The attempts that started in ``[t0, t1)`` and their receipts (all ledgers: they only
+    give the spawn times)."""
+    att = [dict(a) for a in files.get("attempts", ())
+           if (t := _t(a.get("started_utc"))) is not None and t >= t0
+           and (t1 is None or t < t1)]
+    keys = {(a["shard_id"], a["container_id"]) for a in att}
+    rec = [dict(r) for r in files.get("receipts", ())
+           if (r["shard_id"], r["container_id"]) in keys]
+    return {"attempts": att, "receipts": rec, "ledgers": [dict(x) for x in
+                                                          files.get("ledgers", ())]}
+
+
+def derived_lifetimes(report_rows: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, float]]:
+    """``{container_id: {"start", "end"}}`` from ``flora report``'s per-container rows: born at
+    its first call's spawn (first attempt start - ``startup_s``), alive ``seconds`` (to its last
+    shard end + the pool's scaledown). A model, not an observation."""
+    out = {}
+    for r in report_rows:
+        t = _t(r.get("started_utc"))
+        if t is None or r.get("seconds") is None:
+            continue
+        born = t - float(r.get("startup_s") or 0.0)
+        out[str(r["container_id"])] = {"start": born, "end": born + float(r["seconds"])}
+    return out
+
+
+def records_from_receipts(shards: Sequence[Mapping[str, Any]],
+                          receipts: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Lost / duplicate records without a compose summary: per kind, every manifest episode
+    a receipt finished (or failed) once. ``missing``: none did; ``duplicates``: more than
+    one did."""
+    by: dict[str, Any] = {}
+    for kind in sorted({s["kind"] for s in shards}):
+        want = {u for s in shards if s["kind"] == kind for u in s["episodes"]}
+        n: dict[str, int] = {}
+        for r in receipts:
+            if r.get("kind") == kind:
+                for u in [*r.get("episodes_done", ()), *r.get("episodes_failed", ())]:
+                    n[u] = n.get(u, 0) + 1
+        by[kind] = {"records": sum(1 for u in want if n.get(u)), "expected": len(want),
+                    "missing": sum(1 for u in want if not n.get(u)),
+                    "duplicates": sum(1 for u in want if n.get(u, 0) > 1),
+                    "failed": sum(len(r.get("episodes_failed") or ()) for r in receipts
+                                  if r.get("kind") == kind)}
+    return {"missing": sum(c["missing"] for c in by.values()),
+            "duplicates": sum(c["duplicates"] for c in by.values()),
+            "source": "receipts (no compose summary on the job store)", "by_stage": by}
+
+
+def resumed_spend(st: wh.State, apps: Sequence[str], billing: Mapping[str, float] | None,
+                  end_t: float | None, calls_usd: float | None) -> dict[str, Any]:
+    """The job's spend over every generation: Modal's billed delta of its apps once billing
+    covers the job's end (``billing.through`` >= ``end_t``); until then the larger of the
+    billed-so-far and ``flora report``'s call-priced total, provisional."""
+    out: dict[str, Any] = {"apps": sorted(set(apps)), "calls_usd": calls_usd}
+    if billing is None:
+        out.update(actual_usd=calls_usd, billed=False, billed_usd=None, through=None)
+        return out
+    billed = rb.billed_delta(st, apps, billing)
+    through = getattr(billing, "through", None)
+    settled = through is not None and end_t is not None and through >= end_t
+    hours: dict[str, float] = {}
+    for _oid, name, t, cost in getattr(billing, "rows", ()):
+        if name in apps and t is not None:
+            k = rb.utc(t)
+            hours[k] = round(hours.get(k, 0.0) + cost, 4)
+    out.update(billed_usd=billed, billed=settled, through=through, hours=hours,
+               actual_usd=billed if settled else round(max(billed, calls_usd or 0.0), 4))
+    return out
+
+
+def resumed_report(data: Mapping[str, Any], st: wh.State, mode: str,
+                   billing: Mapping[str, float] | None = None) -> dict[str, Any]:
+    """The ``report`` step's result for a job finished outside the script (module section
+    above), from :func:`read_resumed_job`'s ``data``: what :func:`run_report` measures, per
+    orchestrator generation where it matters (time to peak, peak, pipelining), and the
+    ``resumed`` facts :func:`evaluate` caveats with (:data:`RESUMED_CAVEATS`)."""
+    run = st.step("run").result
+    rep = dict(data.get("report") or {})
+    rows = [dict(c) for c in (rep.get("spend") or {}).get("containers") or ()]
+    files = data["files"]
+    dur = dict(data["durations"])
+    gens = _generations(data.get("launches") or (), run.get("started_at"))
+    rates = container_rates(mode)
+    lives = derived_lifetimes(rows)
+    for cid, obs in (run.get("containers") or {}).items():  # the run step's own samples
+        if cid in lives and obs.get("start") is not None:  # Modal's start, when it saw it
+            lives[cid]["start"] = float(obs["start"])
+    # the interruption: from the first generation's last recorded activity to the next launch
+    outage = None
+    if len(gens) > 1:
+        t_next = gens[1]["t0"]
+        acts = [t for k in ("attempts", "receipts") for x in files.get(k, ())
+                for t in (_t(x.get("started_utc")), _t(x.get("finished_utc")))
+                if t is not None and t < t_next]
+        acts += [_t(c.get("utc")) for led in files.get("ledgers", ()) for c in
+                 led.get("calls", ()) if c.get("utc") and _t(c["utc"]) < t_next]
+        acts += [float(b) for ivs in (data.get("prewarms") or {}).values()
+                 for b in ([ivs[1]] if ivs and len(ivs) > 1 and ivs[1] else [])
+                 if float(b) < t_next]
+        stop = max([a for a in acts if a is not None], default=gens[0]["t0"])
+        outage = (stop, t_next)
+    meas = measure(files, dur, lives or None, usd_per_s=rates, run_start=run.get("started_at"),
+                   outage=outage)
+    per_gen = []
+    for g in gens:
+        gf = _gen_files(files, g["t0"], g["t1"])
+        mine = {a["container_id"] for a in gf["attempts"]}
+        gm = measure(gf, dur, {c: v for c, v in lives.items() if c in mine} or None,
+                     usd_per_s=rates, run_start=g["t0"])
+        per_gen.append({"generation": g["i"], "reason": g["reason"],
+                        "launched_utc": rb.utc(g["t0"]),
+                        "pools": {k: {x: p.get(x) for x in ("containers", "peak_concurrent",
+                                                            "time_to_peak_s", "shards_done",
+                                                            "video_s")}
+                                  for k, p in gm["pools"].items()},
+                        "pipelining": gm.get("pipelining")})
+    late: list[str] = []  # pools first at their size after the first generation
+    for kind, p in meas["pools"].items():
+        reached = [(g, gm["pools"][kind]) for g, gm in zip(gens, per_gen, strict=True)
+                   if (gm["pools"][kind].get("peak_concurrent") or 0)
+                   >= POOLS[kind]["max_containers"]]
+        p["peak_concurrent"] = max((gm["pools"][kind].get("peak_concurrent") or 0
+                                    for gm in per_gen), default=p.get("peak_concurrent"))
+        if reached:
+            g, gp = reached[0]
+            p["time_to_peak_s"] = gp.get("time_to_peak_s")
+            p["time_to_peak_generation"] = g["i"]
+            if g["i"] > 1:
+                late.append(kind)
+        else:
+            p["time_to_peak_s"] = None
+    both = [gm for gm in per_gen if gm.get("pipelining")]
+    if both:
+        meas["pipelining"] = {**both[-1]["pipelining"], "generation": both[-1]["generation"]}
+    else:
+        meas.pop("pipelining", None)
+    summary = data.get("summary")
+    if summary:
+        stages = summary.get("stages", {})
+        records = {"missing": sum(int(c.get("missing", 0)) for c in stages.values()),
+                   "duplicates": len(summary.get("conflicts", [])),
+                   "source": "compose summary",
+                   "by_stage": {k: {kk: c.get(kk) for kk in ("records", "expected", "missing",
+                                                             "excused")}
+                                for k, c in stages.items()}}
+    else:
+        records = records_from_receipts(data.get("shards") or (), files.get("receipts", ()))
+    counts = data.get("counts") or {}
+    total = {k: sum(int(v) for v in c.values()) for k, c in counts.items()}
+    all_done = bool(counts) and all(int(c.get("done", 0)) == total[k]
+                                    for k, c in counts.items())
+    ends = [v["end"] for v in lives.values()]
+    end_t = max(ends) if ends else None
+    by_kind = (rep.get("spend") or {}).get("by_kind") or {}
+    calls_usd = (rep.get("spend") or {}).get("total_usd")
+    apps = sorted({*(st.step("run").apps), *([data["app"]] if data.get("app") else [])})
+    spend = resumed_spend(st, apps, billing, end_t, calls_usd)
+    proj = st.step("run")
+    pe: dict[str, Any] = {}
+    if proj.projected_usd and spend.get("actual_usd") is not None:
+        a = float(spend["actual_usd"])
+        pe = {"actual_usd": round(a, 4), "billed": bool(spend.get("billed")),
+              "billed_usd": spend.get("billed_usd"), "calls_usd": calls_usd,
+              "nominal_usd": proj.projected_usd, "upper_usd": proj.projected_upper_usd,
+              "vs_nominal": round(a / proj.projected_usd - 1, 3),
+              "vs_upper": round(a / (proj.projected_upper_usd or 1) - 1, 3),
+              "billing_through": rb.utc(spend.get("through")) if spend.get("through")
+              else None, "billed_hours": spend.get("hours"),
+              "flora_plan_options": st.step("plan").result.get("options")}
+    tm = dict(data.get("timings") or {})
+    timings = {"status_final_s": tm.get("status_final_s"), "report_s": tm.get("report_s"),
+               "status": _quant(run.get("status_s") or []),
+               "status_polls": len(run.get("status_s") or []),
+               "compose_s": None, "compose_rc": None}
+    warm = list(st.step("plan").result.get("warm_kinds") or ())
+    audits = list(data.get("audits") or ())
+    ok_pw, pw_detail = h0.prewarm_check(dict(data.get("plans") or {}),
+                                        dict(data.get("prewarms") or {}), rows, {})
+    drains = {k: [list(iv) for iv in v] for k, v in (data.get("drains") or {}).items()}
+    last_shard = max((t for r in files.get("receipts", ())
+                      if (t := _t(r.get("finished_utc"))) is not None), default=None)
+    after_end = None
+    through = spend.get("through")
+    if spend.get("hours") is not None and end_t is not None and through is not None \
+            and through >= rb.hour_floor(end_t) + 2 * rb.HOUR_S:  # the hour after is billed
+        after_end = round(sum(c for _o, n, t, c in getattr(billing, "rows", ())
+                              if n in apps and t is not None
+                              and t >= rb.hour_floor(end_t) + rb.HOUR_S), 4)
+    res = {"state": data.get("state"), "status_rc": tm.get("status_rc"),
+           "report_rc": tm.get("report_rc"), "report_spend": calls_usd,
+           "usd_per_video_hour": rep.get("usd_per_video_hour"), "measure": meas,
+           "records": records, "projection_error": pe, "timings": timings,
+           "orchestrator": run.get("orchestrator"), "chaos": run.get("chaos"),
+           "launches": len(data.get("launches") or ()), "sizes": pool_sizes(),
+           "startup_variant": "warm" if ASSUME_WARM else "cold",
+           "profile": PROFILE.name, "chaos_enabled": list(CHAOS),
+           "episodes": PROFILE.episodes, "report_containers": rows, "warm_kinds": warm,
+           "prewarm": {"ok": ok_pw, "detail": pw_detail,
+                       "plan": (data.get("plans") or {}).get("caption")},
+           "cache": cache_by_kind(audits, list(files.get("receipts") or ()), warm),
+           "batch_fill": batch_fill(audits),
+           "resumed": {
+               "note": RESUMED_NA, "run_step": st.step("run").status,
+               "run_step_state": run.get("state") or run.get("report_state"),
+               "generations": per_gen, "late_peak_pools": late,
+               "interruption": ({"stopped_utc": rb.utc(outage[0]),
+                                 "resumed_utc": rb.utc(outage[1]),
+                                 "gap_s": round(outage[1] - outage[0], 1)} if outage else None),
+               "all_shards_done": all_done, "counts": counts,
+               "composed": bool(summary), "spend": spend, "by_kind": by_kind,
+               "scale_to_zero": {"drains": drains,
+                                 "last_shard_end_utc": rb.utc(last_shard) if last_shard
+                                 else None,
+                                 "derived_end_utc": rb.utc(end_t) if end_t else None,
+                                 "billed_after_end_hour_usd": after_end}}}
+    res["criteria"] = evaluate(res, mode)
+    res.update(ok=bool(meas["pools"]) and data.get("state") in ("done", "composing"),
+               tracked_usd=0.0, apps=[])
+    if last_shard is not None:
+        res["finished_at"] = last_shard
+    return res
+
+
+def _resumed_caveats(rows: dict[int, dict[str, Any]], r: Mapping[str, Any],
+                     T: Mapping[str, Any]) -> None:  # noqa: N803 - evaluate's targets
+    """:func:`evaluate` on a :func:`resumed_report` result: the criteria the interruption
+    skews (:data:`RESUMED_CAVEATS`) say so; a FAIL among them is n.a. (the interruption, not
+    the policy under test, decided it); a PASS stays, caveated."""
+    rs = r.get("resumed") or {}
+
+    def note(i: int, why: str, *, force_na: bool = False, value: Any = None) -> None:
+        x = rows[i]
+        if value is not None:
+            x["value"] = value
+        if force_na or x["verdict"] == "FAIL":
+            x["verdict"] = "n.a."
+            x["reason"] = f"{RESUMED_NA}: {why}"
+        else:
+            x["reason"] = "; ".join(y for y in (x["reason"], f"caveat (resumed): {why}") if y)
+
+    st = r.get("state")
+    if st == "composing" and rs.get("all_shards_done"):
+        note(1, "every shard is done, but the job store holds no compose summary (the job "
+             "was not composed on its store)", force_na=True)
+    elif st == CRITERIA["end_state"]:
+        note(1, f"done after {len(rs.get('generations') or ())} orchestrator generations")
+    rec = r.get("records") or {}
+    if rec.get("source", "").startswith("receipts"):
+        rows[2]["reason"] = "; ".join(y for y in (rows[2]["reason"], f"from {rec['source']}")
+                                      if y)
+    late = rs.get("late_peak_pools") or []
+    if late:
+        # only the late pools' times are the interruption's: a pool timed from the run start
+        # that missed its target still fails
+        ttp = rows[4]["value"] if isinstance(rows[4]["value"], dict) else {}
+        own_fail = any(k not in late and (ttp.get(k) is None
+                                          or ttp[k] > T["time_to_peak_max_s"][k])
+                       for k in POOLS)
+        why = f"{', '.join(late)}: {RESUMED_CAVEATS[4]}"
+        if own_fail:
+            rows[4]["reason"] = "; ".join(y for y in (rows[4]["reason"],
+                                                      f"caveat (resumed): {why}") if y)
+        else:
+            note(4, why)
+    pe = r.get("projection_error") or {}
+    if pe and not pe.get("billed"):
+        rows[7]["reason"] = (f"provisional: Modal billed ${pe.get('billed_usd') or 0:.2f} "
+                             f"through {pe.get('billing_through')}; the larger `flora report` "
+                             f"call-priced ${pe.get('calls_usd') or 0:.2f} until billing covers "
+                             "the job's end (--report re-reads it)")
+    for i in (6, 7, 9, 12, 17):
+        note(i, RESUMED_CAVEATS[i])
+    note(8, RESUMED_CAVEATS[8], force_na=True)
+    note(14, "composed (if at all) outside this script: not timed", force_na=True)
+    note(16, RESUMED_CAVEATS[16], force_na=True, value=rs.get("scale_to_zero"))
+
+
+RESUMED_STEP_NOTE = ("report built from the job's own records: the run step failed, and the "
+                     "job was finished outside this script (flora resume)")
+
+
+def report_resumed(st: wh.State, mode: str, spath: Path, work: Path, *,
+                   read: Callable[[Ctx], dict[str, Any]] | None = None,
+                   billing: Callable[[str], Mapping[str, float]] | None = None,
+                   out: Callable[[str], None] = print) -> str | None:
+    """``--report`` / ``--finalize`` on a :func:`resumable` state: read the job
+    (:func:`read_resumed_job`, read-only) and Modal billing, and when the job finished (``done``,
+    or ``composing`` with every shard done) keep :func:`resumed_report` as the ``report``
+    step's result and save the state. Returns why it did not, else None."""
+    if not resumable(st, mode):
+        return "the run step did not fail, or its report is already measured"
+    ctx = Ctx(mode, st, work, spath, POLL_S[mode], log=out)
+    data = (read or read_resumed_job)(ctx)
+    bill = None
+    try:
+        bill = (billing or wh.billed_by_app)(st.billing_since)
+    except Exception as e:  # noqa: BLE001 - provisional: flora report's call-priced spend
+        out(f"billing unavailable ({e!r}): spend is provisional")
+    res = resumed_report(data, st, mode, bill)
+    if not res["ok"] or not (data.get("state") == "done"
+                             or res["resumed"]["all_shards_done"]):
+        return (f"job {ctx.job_id} is {data.get('state')!r} "
+                f"({json.dumps(data.get('counts'))}): nothing to report from it yet")
+    rep = st.step("report")
+    rep.result, rep.status = res, "done"
+    if RESUMED_STEP_NOTE not in rep.notes:
+        rep.notes.append(RESUMED_STEP_NOTE)
+    wh.save_state(st, spath)
+    return None
+
+
+def print_criteria(crit: Sequence[Mapping[str, Any]], out: Callable[[str], None] = print
+                   ) -> None:
+    for x in crit:
+        out(f"  {x['verdict']:5s} {x['id']:2d}. {x['criterion']}: {x['value']} "
+            f"(target {x['target']}){' - ' + x['reason'] if x['reason'] else ''}")
+    if crit:
+        out(f"  criteria: {criteria_summary(crit)}")
+
+
 RUNNERS: dict[str, Callable[[Ctx], dict[str, Any]]] = {
     "verify": run_verify, "index": run_index, "plan": run_plan, "deploy": run_deploy,
     "run": run_run, "report": run_report}
@@ -2294,7 +2728,9 @@ def recheck(st: wh.State, mode: str) -> list[dict[str, Any]]:
     res = dict(rep.result)
     pe = dict(res.get("projection_error") or {})
     run = st.steps.get("run")
-    if pe and run is not None and mode != "local":
+    # a resumed job's spend is its apps' billing over every generation, re-read by --report
+    # (resumed_report), not the failed run step's
+    if pe and run is not None and mode != "local" and not res.get("resumed"):
         actual = run.spent_at(st.watermark)
         pe.update(actual_usd=round(actual, 4), billed=run.billed_usd is not None)
         if pe.get("nominal_usd"):
@@ -2319,6 +2755,18 @@ def render_report(st: wh.State, mode: str, projs: Mapping[str, wh.Projection]) -
     rep = st.steps.get("report")
     crit = recheck(st, mode)
     if rep and crit:
+        rs = rep.result.get("resumed") or {}
+        if rs:
+            sp, gap = rs.get("spend") or {}, rs.get("interruption") or {}
+            lines += ["", f"**{RESUMED_NA}** ({len(rs.get('generations') or ())} orchestrator "
+                      f"generations; interrupted {gap.get('stopped_utc')} -> "
+                      f"{gap.get('resumed_utc')}). The job's spend over every generation: "
+                      f"${sp.get('actual_usd') or 0:.2f} ("
+                      + ("Modal billing, settled" if sp.get("billed") else
+                         f"provisional: billed so far ${sp.get('billed_usd') or 0:.2f}, "
+                         f"`flora report` ${sp.get('calls_usd') or 0:.2f}")
+                      + "). Criteria the interruption skews are caveated, or n.a. where it "
+                      "decided them."]
         lines += ["", "## Success criteria", "", f"**{criteria_summary(crit)}**", "",
                   "| # | criterion | value | target | verdict | note |",
                   "|---|---|---|---|---|---|"]
@@ -2335,7 +2783,9 @@ def render_report(st: wh.State, mode: str, projs: Mapping[str, wh.Projection]) -
                 lines.append(f"- {kind} {tbl}: {len(xs)} sample(s): {vals}")
             lines += [f"- note: {n}" for n in notes] + [f"- refused: {r}" for r in refusals]
         for key in ("measure", "projection_error", "timings", "orchestrator", "chaos",
-                    "records", "drain", "prewarm", "cache", "batch_fill"):
+                    "records", "drain", "prewarm", "cache", "batch_fill", "resumed"):
+            if key == "resumed" and not rep.result.get(key):
+                continue
             lines += ["", f"## {key}", "", "```json",
                       json.dumps(rep.result.get(key), indent=1, default=str)[:8000], "```"]
     for name in STEPS:
@@ -2507,19 +2957,27 @@ def finalize_samples(st: wh.State) -> tuple[dict[tuple[str, str], list[dict[str,
     if not res:
         return {}, [], ["no finished report step in the state"]
     refusals: list[str] = []
-    if res.get("state") != "done":
+    notes: list[str] = []
+    resumed = res.get("resumed") or {}
+    if resumed:
+        notes.append(f"{RESUMED_NA}: the rates come from {len(resumed.get('generations') or ())}"
+                     " orchestrator generations; each pool's startups include a second cold "
+                     "start")
+    if res.get("state") == "composing" and resumed.get("all_shards_done"):
+        notes.append("every shard is done but the job was not composed on its store: records "
+                     "checked against the receipts")
+    elif res.get("state") != "done":
         refusals.append(f"the job ended {res.get('state')!r}, not 'done'")
     rec = res.get("records") or {}
     if not rec or int(rec.get("missing", 0)) + int(rec.get("duplicates", 0)):
         refusals.append(f"records not clean: {rec or 'not recorded'}")
     if refusals:
         return {}, [], refusals
-    t_done = rep.attempts[-1].finished if rep.attempts else None
+    t_done = rep.attempts[-1].finished if rep.attempts else res.get("finished_at")
     date = time.strftime("%Y-%m-%d", time.gmtime(t_done or time.time()))
     source = f"docs/scale-test.md (scale test {res.get('profile', PROFILE.name)} run {st.run_id})"
     rows = {str(c["container_id"]): c for c in res.get("report_containers") or ()}
     out: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    notes: list[str] = []
     for kind in POOLS:
         gpu = POOLS[kind]["gpu"].rstrip("!")
         rate, starts = [], []
@@ -2604,6 +3062,12 @@ def finalize_main(args: argparse.Namespace, out=print) -> int:
         out(f"{spath}: no state")
         return 1
     st = wh.load_state(spath)
+    if resumable(st, args.mode):  # the job finished outside the script: measure it first
+        why = report_resumed(st, args.mode, spath,
+                             (getattr(args, "work", None) or spath.parent / "work").resolve(),
+                             out=out)
+        if why:
+            out(f"  resumed job: {why}")
     samples, notes, refusals = finalize_samples(st)
     for n in notes:
         out(f"  note: {n}")
@@ -2723,7 +3187,12 @@ def _main(args: argparse.Namespace) -> int:
             print_sizing()
     report_path = spath.parent / "report.md"
     if args.report:
+        if resumable(st, mode):  # the job finished outside the script: report from its records
+            why = report_resumed(st, mode, spath, work)
+            print(f"resumed job: {why}" if why else f"resumed job: report step rebuilt from "
+                  f"the job's records; state {spath}")
         report_path.write_text(render_report(st, mode, projs))
+        print_criteria(recheck(st, mode))
         print(f"wrote {report_path}")
         return 0
     if not go:
@@ -2814,12 +3283,7 @@ def _main(args: argparse.Namespace) -> int:
             wh.save_state(st, spath)
     wh.save_state(st, spath)
     report_path.write_text(render_report(st, mode, projs))
-    crit = recheck(st, mode)
-    for x in crit:
-        print(f"  {x['verdict']:5s} {x['id']:2d}. {x['criterion']}: {x['value']} "
-              f"(target {x['target']}){' - ' + x['reason'] if x['reason'] else ''}")
-    if crit:
-        print(f"  criteria: {criteria_summary(crit)}")
+    print_criteria(recheck(st, mode))
     print(f"wrote {report_path}; state {spath}")
     return rc
 
