@@ -116,6 +116,7 @@ same `<stage_hash>` directory.
 | `cert_key` | object or null | the certificate key document of the stack that produced the record (`validate.certkey.key_document`: engine and image, vLLM engine spec, NVIDIA and decode pins, derived-weight content digests, run modes, logic); `flora certify` refuses records without it (`docs/certification.md`) |
 | `compile_cache` | string or null | `balanced` segment / caption: the vLLM compile cache the worker ran (`warm:<key>:<manifest sha256 prefix>`, `legacy:<key>`, `cold`, or `cold:forced` under `FLORA_COMPILE_CACHE=off`). A warm start replays the publisher's Inductor autotune choices, so it is recorded (`engines/compile_cache.py`, "Determinism"); null for other stages |
 | `engine_preemptions` | int or null | `balanced` segment / caption: vLLM preemptions (`vllm:num_preemptions`) while the episode's requests were in flight; > 0 means some request then was preempted and recomputed (a path no certificate measures), null that the counter could not be read. `flora certify` certifies neither |
+| `segments_from` | object (absent unless set) | stage-isolated caption certification jobs only (`pipeline.caption_segments`): `{sha256, oracle_stage_hash}` of the pinned exact oracle segment records the caption stage captioned instead of its own job's segments (`docs/certification.md`, "Caption"). Left out of the JSON on every other record |
 
 ### `segments[]` (segment and caption stages)
 
