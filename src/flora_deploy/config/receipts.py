@@ -33,10 +33,11 @@ from typing import Any
 from flora_deploy.config.hashing import MissingReceiptError
 from flora_deploy.config.pins import DERIVED_PINS_BY_KEY
 
-__all__ = ["MissingReceiptError", "ReceiptPinMismatch", "UnpinnedDerivedWeight",
-           "check_overrides", "check_pinned", "derived_content", "load_certified", "needed",
-           "needed_by_kind", "pin_key", "record", "require_pinned", "resolve",
-           "set_derived_text", "unpinned", "unpinned_message"]
+__all__ = ["KNOWN_RECEIPTS", "DerivedContent", "MissingReceiptError", "ReceiptPinMismatch",
+           "UnpinnedDerivedWeight", "check_overrides", "check_pinned", "derived_content",
+           "load_certified", "needed", "needed_by_kind", "pin_key", "read_volume_receipt",
+           "record", "remember_verified", "require_pinned", "resolve", "set_derived_text",
+           "unpinned", "unpinned_message", "verified_content"]
 
 YAML_PATH = "weights.derived"
 
@@ -169,37 +170,162 @@ def resolve(cfg: Any, overrides: Mapping[str, str] | None = None, *,
     return out
 
 
-def derived_content(cfg: Any, overrides: Mapping[str, str] | None = None) -> dict[str, str]:
+# Receipt identities (sha256 of the ``derived_receipt.json`` file) whose content digest was read
+# from the receipt itself and equals the pin: the builds the pins were proven with
+# (``pins.DERIVED_PINS`` comments, docs/captioner-bf16.md, docs/tempseg-merge.md).
+KNOWN_RECEIPTS: dict[str, str] = {
+    "0e91e467c7ffdb636573e779672d11b203571f7869ca94317f1005eb700d9c65":
+        "d4c1bea5dbd3e49746a81279df2f27b904fdd2f4a71322df266201c72de0327e",  # captioner-bf16
+    "9cb1f755778da2716f190b40d71a401567061bee697c2b6b34073052ea4ae678":
+        "6356ab8c1499096512e1aa2a3aff4bfe4fcce9d67cce78a57e9a8484ef579303",  # tempseg-merged
+}
+
+# Receipts verified on this machine (``flora prepare``, or a deploy that read the receipt from
+# the Volume): receipt sha256 -> content digest. A cache, never a source of truth: an entry only
+# says that this receipt file was read and its content digest computed.
+RECEIPT_CACHE_ENV = "FLORA_RECEIPT_CACHE"
+_CACHE_DEFAULT = "~/.cache/flora-deploy/verified-receipts.json"
+
+
+def _cache_path() -> Path:
+    return Path(os.environ.get(RECEIPT_CACHE_ENV) or _CACHE_DEFAULT).expanduser()
+
+
+def _read_cache() -> dict[str, str]:
+    import json
+
+    try:
+        data = json.loads(_cache_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str)} \
+        if isinstance(data, dict) else {}
+
+
+def remember_verified(receipt_sha256: str, content_sha256: str) -> None:
+    """Record that the receipt file ``receipt_sha256`` was read and has ``content_sha256``
+    (best effort: an unwritable cache only means it is read again next time)."""
+    import json
+
+    data = _read_cache()
+    if data.get(receipt_sha256) == content_sha256:
+        return
+    data[receipt_sha256] = content_sha256
+    p = _cache_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def verified_content(receipt_sha256: str, name: str | None = None) -> str | None:
+    """The content digest of the receipt file ``receipt_sha256`` (of derived weight ``name``),
+    if it is known (a pinned build, :data:`KNOWN_RECEIPTS`) or was verified on this machine;
+    else ``None``."""
+    return KNOWN_RECEIPTS.get(receipt_sha256) or _read_cache().get(receipt_sha256)
+
+
+class DerivedContent(dict):
+    """:func:`derived_content`'s result: name -> pinned content digest, for the receipts that
+    count. ``unchecked``: name -> why a needed derived weight does not count (shown as the
+    reason its certificate is "not checked")."""
+
+    def __init__(self, *args: Any, unchecked: Mapping[str, str] | None = None, **kw: Any):
+        super().__init__(*args, **kw)
+        self.unchecked: dict[str, str] = dict(unchecked or {})
+
+
+def derived_content(cfg: Any, overrides: Mapping[str, str] | None = None, *,
+                    read_receipt: Any = None) -> DerivedContent:
     """Content digests of the derived weights ``cfg`` needs, for certificate matching
-    (``validate.certkey``): for each needed name with a receipt (``weights.derived`` plus
-    ``overrides``), the content its ``pins.DERIVED_PINS`` entry pins. ``flora prepare`` refuses
-    to record a receipt whose content is not the pinned one (:func:`check_pinned`) and the
-    workers refuse to load one (``accel/captioner_load.py``), so the pinned digest is the content
-    that runs. Fail closed: a name without a receipt, or whose pin has no content digest yet, is
-    left out, and a kind that needs it then matches no certificate."""
+    (``validate.certkey``): for each needed name whose receipt (``weights.derived`` plus
+    ``overrides``) is known to have the content its ``pins.DERIVED_PINS`` entry pins.
+
+    A receipt identity alone proves nothing (any 64 hex digits parse), so a receipt counts only
+    when its content digest is known: a pinned build (:data:`KNOWN_RECEIPTS`), one ``flora
+    prepare`` verified on this machine (:func:`remember_verified`), or, with ``read_receipt``
+    (name -> the receipt file's bytes, or ``None``; e.g. from the ``flora-weights`` Volume),
+    one read now whose sha256 is the recorded identity. Fail closed: a name left out matches no
+    certificate, and ``.unchecked`` says why (the workers check the content again at load,
+    ``accel/captioner_load.py``)."""
+    import hashlib
+    import json
+
     recorded = {**dict(cfg.weights.derived),
                 **{k: v for k, v in (overrides or {}).items() if v}}
     out: dict[str, str] = {}
+    why: dict[str, str] = {}
     for name in needed(cfg):
         pin = DERIVED_PINS_BY_KEY.get(pin_key(name))
-        if recorded.get(name) and pin is not None and pin.content_sha256:
-            out[name] = pin.content_sha256
-    return out
+        sha = recorded.get(name)
+        if not sha:
+            why[name] = f"no {name} receipt recorded (run `flora prepare`)"
+            continue
+        if pin is None or not pin.content_sha256:
+            why[name] = f"{pin_key(name)} has no pinned content digest yet"
+            continue
+        content = verified_content(sha, name)
+        if content is None and read_receipt is not None:
+            try:
+                raw = read_receipt(name)
+            except Exception as e:  # noqa: BLE001 - reported as the reason
+                why[name] = f"could not read the {name} receipt ({type(e).__name__}: {e})"
+                continue
+            if raw is None:
+                why[name] = f"no {name} receipt on the Volume (run `flora prepare`)"
+                continue
+            if hashlib.sha256(raw).hexdigest() != sha:
+                why[name] = (f"the {name} receipt on the Volume is not {sha[:12]}..., the one "
+                             "the config records (run `flora prepare`)")
+                continue
+            try:
+                content = check_pinned(name, json.loads(raw))
+            except (ReceiptPinMismatch, ValueError) as e:
+                why[name] = str(e)
+                continue
+            remember_verified(sha, content)
+        if content is None:
+            why[name] = (f"{name} receipt {sha[:12]}... is not one `flora prepare` verified on "
+                         "this machine, so its content is unchecked (run `flora prepare`)")
+        elif content != pin.content_sha256:
+            why[name] = (f"receipt {sha[:12]}... for {name} has content {content[:12]}..., not "
+                         f"the pinned {pin.content_sha256[:12]}...")
+        else:
+            out[name] = content
+    return DerivedContent(out, unchecked=why)
+
+
+def read_volume_receipt(name: str) -> bytes | None:
+    """The ``derived_receipt.json`` of derived weight ``name`` on the ``flora-weights`` Volume,
+    read through the Modal client (no container); ``None`` when it does not exist. A
+    ``read_receipt`` for :func:`derived_content` on paths that contact Modal anyway."""
+    import modal
+
+    from flora_deploy.layout import WEIGHTS_VOLUME
+    from flora_deploy.prep.derived import DERIVED_BUILDS
+
+    vol = modal.Volume.from_name(WEIGHTS_VOLUME, version=2)
+    try:
+        return b"".join(vol.read_file(DERIVED_BUILDS[name].receipt_path()))
+    except FileNotFoundError:
+        return None
 
 
 def load_certified(path: str | os.PathLike[str], *, allow_uncertified: bool = False,
-                   overrides: Mapping[str, str] | None = None) -> tuple[Any, dict[str, str]]:
+                   overrides: Mapping[str, str] | None = None,
+                   read_receipt: Any = None) -> tuple[Any, DerivedContent]:
     """``(config, derived content digests)``: ``path`` validated with the content digests of its
     own derived weights (:func:`derived_content`), so the certificate check can match a kind
     that needs derived weights. What ``flora deploy`` / ``run`` / ``plan`` and ``sdk.submit``
-    load a config with."""
+    load a config with. ``read_receipt``: as for :func:`derived_content`."""
     from flora_deploy.config.schema import loads_yaml, parse_config
 
     p = Path(path)
     data = loads_yaml(p.read_text(encoding="utf-8"), source=str(p))
     base = p.resolve().parent  # a relative input.path resolves against it
     first = parse_config(data, source=str(p), allow_uncertified=True, base_dir=base)
-    content = derived_content(first, overrides)
+    content = derived_content(first, overrides, read_receipt=read_receipt)
     if allow_uncertified:
         return first, content
     return parse_config(data, source=str(p), allow_uncertified=False,

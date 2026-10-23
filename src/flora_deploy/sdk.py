@@ -837,13 +837,14 @@ def _done_shards(job: Job, manifest: Any) -> set[str]:
 
 
 def _load_cfg(cfg: Any, *, allow_uncertified: bool = False,
-              receipts: Mapping[str, str] | None = None) -> Any:
+              receipts: Mapping[str, str] | None = None, read_receipt: Any = None) -> Any:
     """A ``FloraConfig`` (a path is loaded with its derived content digests,
     ``config.receipts.load_certified``, so a certified preset validates)."""
     if isinstance(cfg, str | Path):
         from flora_deploy.config.receipts import load_certified
 
-        return load_certified(cfg, allow_uncertified=allow_uncertified, overrides=receipts)[0]
+        return load_certified(cfg, allow_uncertified=allow_uncertified, overrides=receipts,
+                              read_receipt=read_receipt)[0]
     return cfg
 
 
@@ -900,7 +901,7 @@ def submit(cfg: Any, *, job_id: str | None = None, store: str | None = None,
     (recorded by ``flora prepare``; ``config.receipts.resolve``). ``budget_usd`` overrides
     ``modal.budget_usd``."""
     from flora_deploy.config.hashing import MissingReceiptError
-    from flora_deploy.config.receipts import derived_content
+    from flora_deploy.config.receipts import derived_content, read_volume_receipt
     from flora_deploy.config.receipts import resolve as resolve_receipts
     from flora_deploy.config.schema import to_run_settings
     from flora_deploy.jobs.orchestrator import utc
@@ -909,12 +910,16 @@ def submit(cfg: Any, *, job_id: str | None = None, store: str | None = None,
 
     say = log or (lambda m: None)
     be = backend or get_backend()
-    cfg = _load_cfg(cfg, allow_uncertified=allow_uncertified, receipts=receipts)
+    # a receipt counts for certificates only once its content is checked against the pin
+    # (config.receipts.derived_content): read it from the flora-weights Volume if need be
+    reader = None if fake_models else read_volume_receipt
+    cfg = _load_cfg(cfg, allow_uncertified=allow_uncertified, receipts=receipts,
+                    read_receipt=reader)
     try:
         plan = (planner or _plan_deployment)(
             cfg, store=store, bucket_secret=bucket_secret,
             derived_receipts=resolve_receipts(cfg, receipts, fake_models=fake_models),
-            derived_content=derived_content(cfg, receipts),
+            derived_content=derived_content(cfg, receipts, read_receipt=reader),
             allow_uncertified=allow_uncertified, determinism=determinism)
     except (DeployError, MissingReceiptError, ValueError) as e:
         raise FloraError(str(e)) from None
@@ -1005,14 +1010,20 @@ def plan(cfg: Any, *, video_hours: float | None = None, episodes: int | None = N
          deadline_s: float | None = None, presets: Iterable[str] | None = None,
          max_gpus: int | None = None, rates_file: str | Path | None = None,
          live_prices: bool = False) -> list[Any]:
-    """``flora plan``: 2-4 ``planner.options.PlanOption``s for a workload. ``index``: the
-    ``summary.json`` ``flora index`` wrote (dict or path); else ``video_hours`` [``episodes``]."""
-    from flora_deploy.config.presets import AVAILABLE_PRESETS
+    """``flora plan``: 2-4 ``planner.options.PlanOption``s for a workload, in the CLI's order
+    (``balanced`` first) and with the same certificates applied; the CLI's recommendation is
+    ``planner.options.recommended(options, certified={o.name for o in options if
+    o.certification == "certified"})``. ``index``: the ``summary.json`` ``flora index`` wrote
+    (dict or path); else ``video_hours`` [``episodes``]."""
+    from flora_deploy.cli._certs import UNLOCKS, certificate_report
+    from flora_deploy.config.receipts import derived_content
     from flora_deploy.jobs.budget import load_rates, modal_rates_provider, region_multiplier_for
     from flora_deploy.planner.options import (
         PlanRequest,
         WorkloadSummary,
+        default_presets,
         plan_options,
+        with_certificates,
         with_pool_overrides,
     )
     from flora_deploy.planner.rates import RateTable
@@ -1032,11 +1043,18 @@ def plan(cfg: Any, *, video_hours: float | None = None, episodes: int | None = N
     rates = load_rates(modal_rates_provider if live_prices else None,
                        region_multiplier=region_multiplier_for(cfg.modal.region))
     req = PlanRequest(workload=workload, stages=cfg.pipeline.stages,
-                      presets=tuple(presets or AVAILABLE_PRESETS), deadline_s=deadline_s,
+                      presets=tuple(presets or default_presets()), deadline_s=deadline_s,
                       budget_usd=budget_usd if budget_usd is not None else cfg.modal.budget_usd,
-                      max_gpus=max_gpus or cfg.modal.max_gpus)
+                      max_gpus=max_gpus or cfg.modal.max_gpus,
+                      allow_uncertified=cfg.allow_uncertified)
     req = with_pool_overrides(req, cfg.preset, cfg.pools())
-    return plan_options(req, table=table, rates=rates)
+    options = plan_options(req, table=table, rates=rates)
+    content = derived_content(cfg)
+    certified = {o.name for o in options if all(
+        c["status"] in UNLOCKS for c in certificate_report(
+            cfg, {k.kind: k.gpu for k in o.kinds}, preset=o.preset,
+            derived_content=content).values())}
+    return with_certificates(options, certified)
 
 
 __all__ = [

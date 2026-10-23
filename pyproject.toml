@@ -66,5 +66,6 @@ markers = [
     "nvlink: needs NVIDIA's code pins fetched via scripts/fetch_nv_code.py (CPU only)",
     "modal: runs on the Modal account (costs money; never in CI)",
     "torch: needs the CPU torch stack (`--group nvlink`); CI runs these in the nvlink job",
+    "real_receipts: keep the derived-weight receipt content check (tests/conftest.py)",
 ]
 addopts = "-m 'not modal and not nvlink and not torch'"
