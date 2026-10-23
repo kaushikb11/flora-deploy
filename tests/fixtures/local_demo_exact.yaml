@@ -1,0 +1,57 @@
+# Test fixture: the local demo on the `exact` preset (the shipped local_demo template is
+# balanced). Tests that exercise the exact segcap worker locally start from this.
+#
+# flora.yaml: the local demo. Runs the whole job system on your machine with fake models:
+#
+#   flora init --template local_demo
+#   flora run --local --fake-models --sample-data      # makes ./videos, then runs the job
+#   flora results caption                              # reads ./flora-local-store
+#
+# No Modal account, no GPU, no NVIDIA weights. The models are deterministic fakes, so the
+# outputs only demonstrate the pipeline (index -> plan -> run -> compose -> results); they are
+# marked `certificate: local-fake-models` and never share a config hash with real outputs.
+# Fake-models jobs run under `<project>.fake`, so they never share job state with real jobs.
+# The demo uses the `exact` stage layout (segment + caption in one `segcap` worker); `flora
+# init` writes the `balanced` config real jobs start from. Common keys are documented in
+# `flora init --template balanced_lerobot real.yaml`; the full list is in the repository's
+# src/flora_deploy/config/schema.py. Unknown keys are an error.
+
+project: local-demo
+
+# NVIDIA's Flora models are licensed for non-commercial research only. Required.
+license_ack: research-only
+
+modal:
+  environment: main
+  max_gpus: 4                       # the local spawner honours the same GPU cap
+  budget_usd: 5                     # priced as if on Modal; the budget gate is the real one
+  region: null
+  tags: {}
+
+preset: exact
+
+input:
+  format: mp4_dir                   # ./videos/ep000.mp4 + ep000.txt (task text), ...
+  path: ./videos                    # relative to this file
+  stage_to: null
+
+pipeline:
+  stages: [segment, caption, reward.terminal, reward.dense]
+  embodiment: human
+  episode_instruction:
+    source: dataset_task            # the .txt next to each video
+  envelope: warn
+  shard_target_gpu_minutes: 0.5     # GPU-minutes per shard (default 10); small shards, so the
+                                    # demo has several of each kind
+
+resources:
+  segcap: {max_containers: 2}
+  reward.terminal: {max_containers: 1}
+  reward.dense: {max_containers: 1}
+
+output:
+  sink: volume://flora-results/local-demo   # Modal runs; `--local` writes ./flora-local-store
+  formats: [parquet, jsonl]
+
+retries:
+  max_starts_before_quarantine: 3

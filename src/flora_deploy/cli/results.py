@@ -257,6 +257,8 @@ def _certified(r) -> str:
     if r.certified:
         return f"yes (certificate {p.certificate[:13]})" if p.certificate else "yes (reference)"
     reason = r.uncertified_reason
+    if p.certificate == "local-fake-models":  # whatever else is true, these are stand-ins
+        reason = "fake_models"
     if reason == "uncovered_pool":
         why = f"not certified for {p.embodiment}" if p.embodiment else "embodiment not covered"
     else:

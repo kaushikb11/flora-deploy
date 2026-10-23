@@ -131,13 +131,23 @@ def _h(*parts: Any) -> int:
 # ---------------------------------------------------------------------------------------------
 
 
+# Shortest fake segment: cuts closer than this to the previous boundary or the end are dropped,
+# so no segment reads as zero-length (e.g. ``2.6–2.6 s``) at one decimal.
+_MIN_SEGMENT_S = 0.15
+
+
 def fake_segments(digest: str, duration_s: float, instruction: str) -> list[dict]:
-    """1-4 contiguous segments over the episode, captions from small word lists."""
+    """1-4 contiguous segments over the episode, each at least ``_MIN_SEGMENT_S`` long (when
+    the episode is), captions from small word lists."""
     duration_s = max(duration_s, 0.1)
     n = 1 + _h(digest, "n") % 4
     cuts = sorted({round(duration_s * (0.15 + 0.7 * (_h(digest, "cut", i) % 1000) / 1000), 3)
                    for i in range(n - 1)})
-    bounds = [0.0, *[c for c in cuts if 0.0 < c < duration_s], round(duration_s, 3)]
+    bounds = [0.0]
+    for c in cuts:
+        if c - bounds[-1] >= _MIN_SEGMENT_S and duration_s - c >= _MIN_SEGMENT_S:
+            bounds.append(c)
+    bounds.append(round(duration_s, 3))
     out = []
     for i, (a, b) in enumerate(zip(bounds, bounds[1:], strict=False)):
         verb = _VERBS[_h(digest, "verb", i) % len(_VERBS)]

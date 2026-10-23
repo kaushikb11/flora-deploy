@@ -8,7 +8,7 @@
 # outputs only demonstrate the pipeline (index -> plan -> run -> compose -> results); they are
 # marked `certificate: local-fake-models` and never share a config hash with real outputs.
 # Fake-models jobs run under `<project>.fake`, so they never share job state with real jobs.
-# Common keys are documented in `flora init --template exact_lerobot`; the full list is in
+# Common keys are documented in `flora init --template balanced_lerobot`; the full list is in
 # src/flora_deploy/config/schema.py. Unknown keys are an error.
 
 project: local-demo-lerobot
@@ -23,7 +23,9 @@ modal:
   region: null
   tags: {}
 
-preset: exact
+preset: balanced
+# balanced segment and caption records say `certified: false` today, so the preset needs this.
+allow_uncertified: true
 
 input:
   format: lerobot_v3                # a 6-episode, one-camera LeRobot v3.0 dataset
@@ -40,7 +42,8 @@ pipeline:
                                     # demo has several of each kind
 
 resources:
-  segcap: {max_containers: 2}
+  segment: {max_containers: 1}
+  caption: {max_containers: 1}
   reward.terminal: {max_containers: 1}
   reward.dense: {max_containers: 1}
 

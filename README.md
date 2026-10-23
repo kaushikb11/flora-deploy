@@ -24,6 +24,7 @@ Apache-2.0; the Flora models are licensed by NVIDIA for **non-commercial researc
 | `caption` | a caption for each subtask | "pick up plates with right hand" |
 | `reward.terminal` | did it succeed? A 1–5 score, with probabilities | `5` (expected `4.6`) |
 | `reward.dense` | failure / suboptimal / normal (1–3) for every 0.5 s | `3, 3, 2, 3, …` |
+| `reward.rubric` | a grade for each step of a rubric you write (experimental) | not yet run on a GPU ([limitations](docs/limitations.md)) |
 
 **Why not just run NVIDIA's release?** It gives you the models and a reference pipeline; this adds
 LeRobot and MP4 input, many GPUs in parallel, a budget cap, resume, and outputs keyed by episode.
@@ -31,7 +32,8 @@ LeRobot and MP4 input, many GPUs in parallel, a budget cap, resume, and outputs 
 ## Try it in a few minutes (no GPU, no account)
 
 The whole pipeline runs on your machine with stand-in models, so the captions are placeholders.
-You need Python 3.11+ and [uv](https://docs.astral.sh/uv/).
+The demo uses the default `balanced` preset. You need Python 3.11+ and
+[uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv tool install git+https://github.com/kaushikb11/flora-deploy
@@ -42,10 +44,14 @@ flora results caption
 ```
 
 ```text
-local-demo.fake caption: 6 episodes, 19 subtasks
+no real run of local-demo; showing local-demo.fake, a fake-models run: these labels come from stand-in models, not Flora
+local-demo.fake caption: 6 episodes, 18 subtasks
  uid            #  span        caption
  videos--ep000  0  0.0–0.8 s   push the bowl (task: pick up the red block)
 ```
+
+The first line is expected: the demo's labels come from stand-in models, and every
+`flora results`, `status` and `report` says so.
 
 ## Will it work on my data?
 

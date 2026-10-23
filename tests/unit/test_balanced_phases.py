@@ -210,7 +210,7 @@ def test_shard_audit_rows_carry_the_policy_digest(monkeypatch):
 # --- a 64-episode local fake-model balanced job ---------------------------------------------
 
 
-TEMPLATE = Path(__file__).resolve().parents[2] / "src/flora_deploy/config/templates/local_demo.yaml"
+TEMPLATE = Path(__file__).resolve().parents[2] / "tests/fixtures/local_demo_exact.yaml"
 
 
 def _prepare_first_episodes_together(monkeypatch, n: int = 2) -> None:

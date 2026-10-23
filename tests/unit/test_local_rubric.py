@@ -16,7 +16,7 @@ from flora_deploy.jobs.stores import LocalStore
 from flora_deploy.local import run_local
 from flora_deploy.local import sample_dataset as make_sample
 
-TEMPLATE = Path(__file__).resolve().parents[2] / "src/flora_deploy/config/templates/local_demo.yaml"
+TEMPLATE = Path(__file__).resolve().parents[2] / "tests/fixtures/local_demo_exact.yaml"
 RUBRIC = """  rubric:
     robot: two-finger gripper on a tabletop arm
     cameras:

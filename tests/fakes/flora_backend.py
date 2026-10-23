@@ -24,7 +24,7 @@ import yaml
 from flora_deploy.jobs.stores import LocalStore
 from tests.fakes.jobs import FakeDict
 
-TEMPLATE = Path(__file__).resolve().parents[2] / "src/flora_deploy/config/templates/local_demo.yaml"
+TEMPLATE = Path(__file__).resolve().parents[2] / "tests/fixtures/local_demo_exact.yaml"
 RECEIPTS = {"captioner_bf16": "0" * 64}
 JOB = "local-demo"
 

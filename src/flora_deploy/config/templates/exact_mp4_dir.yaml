@@ -1,6 +1,6 @@
 # flora.yaml: REFERENCE / CERTIFICATION template. Labels a directory of MP4 episodes with
 # NVIDIA's own pipeline (`exact` preset), the reference `balanced` is certified against. For
-# everyday labelling start from balanced_mp4_dir.yaml.
+# everyday labeling start from balanced_mp4_dir.yaml.
 # Common keys are documented in `flora init --template exact_lerobot`;
 # the full list is in src/flora_deploy/config/schema.py.
 # Unknown keys are an error.

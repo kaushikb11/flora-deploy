@@ -132,7 +132,7 @@ def test_store_option_finds_the_job(deployed):
 def test_local_mode_still_dispatches_to_run_local(tmp_path):
     from pathlib import Path
 
-    tpl = Path(__file__).resolve().parents[2] / "src/flora_deploy/config/templates/local_demo.yaml"
+    tpl = Path(__file__).resolve().parents[2] / "tests/fixtures/local_demo_exact.yaml"
     (tmp_path / "flora.yaml").write_text(tpl.read_text())
     o = cli.invoke(app, ["run", "--local", "--fake-models", "--sample-data",
                          "--config", str(tmp_path / "flora.yaml")])

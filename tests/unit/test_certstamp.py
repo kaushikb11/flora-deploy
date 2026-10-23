@@ -27,7 +27,7 @@ from flora_deploy.workers_impl import certstamp as CS
 from tests.unit.test_balanced_deps import balanced_yaml
 from tests.unit.test_local_rubric import RUBRIC
 
-TEMPLATE = Path(__file__).resolve().parents[2] / "src/flora_deploy/config/templates/local_demo.yaml"
+TEMPLATE = Path(__file__).resolve().parents[2] / "tests/fixtures/local_demo_exact.yaml"
 STAGES = ("segment", "caption", "reward.terminal", "reward.dense", "reward.rubric")
 
 

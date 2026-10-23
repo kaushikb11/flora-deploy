@@ -235,10 +235,12 @@ def test_local_run_prints_progress_and_no_jargon(tmp_path, monkeypatch):
         _ok(["init", "--template", "local_demo"])
         out = _ok(["run", "--local", "--fake-models", "--sample-data"], columns="200")
     assert "index: 6 episodes in 6 source files" in out
-    assert re.search(r"started segcap shard \(\d episodes\)", out)
-    assert re.search(r"finished reward\.dense shard \(6 episodes\): \d/5 shards done", out)
-    assert re.search(r"running \dm\d\ds: segcap \d/6, .*episodes started; \d/5 shards done", out)
-    assert "all 5 shards finished" in out and "6/6 episodes labelled" in out
+    assert re.search(r"started segment shard \(\d episodes\)", out)
+    assert re.search(r"finished reward\.dense shard \(6 episodes\): \d/4 shards done", out)
+    for line in (ln for ln in out.splitlines() if ln.lstrip().startswith("running ")):
+        assert re.search(r"running \dm\d\ds: segment \d/6, .*episodes started; \d/4 shards "
+                         r"done", line), line  # only on a run slower than the 15 s heartbeat
+    assert "all 4 shards finished" in out and "6/6 episodes labeled" in out
     hits = sorted({m.group(0) for m in RUN_JARGON.finditer(out)})
     assert not hits, f"run output jargon {hits}:\n{out}"
 

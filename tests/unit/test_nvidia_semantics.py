@@ -114,7 +114,7 @@ def test_local_job_excuses_a_geometry_pool_rejection(tmp_path, monkeypatch):
     from flora_deploy.local import engines as LE
     from flora_deploy.local import run_local, sample_dataset
 
-    template = SRC / "config" / "templates" / "local_demo.yaml"
+    template = Path(__file__).resolve().parents[2] / "tests/fixtures/local_demo_exact.yaml"
     runs = {"n": 0}
     orig = LE.FakeSegcapEngine.result_for
 

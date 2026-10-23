@@ -22,7 +22,7 @@ from flora_deploy.local.faults import ContainerCrash
 from flora_deploy.modal_app import factory as F
 from flora_deploy.modal_app import workers_app as W
 
-TEMPLATE = Path(__file__).resolve().parents[2] / "src/flora_deploy/config/templates/local_demo.yaml"
+TEMPLATE = Path(__file__).resolve().parents[2] / "tests/fixtures/local_demo_exact.yaml"
 STAGES = ("segment", "caption", "reward.terminal", "reward.dense")
 
 

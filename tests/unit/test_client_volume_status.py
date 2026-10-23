@@ -17,7 +17,7 @@ from flora_deploy.local.runner import run_local
 from flora_deploy.local.sample import sample_dataset
 from tests.fakes.client_volume import FakeClientVolume
 
-TEMPLATE = Path(__file__).resolve().parents[2] / "src/flora_deploy/config/templates/local_demo.yaml"
+TEMPLATE = Path(__file__).resolve().parents[2] / "tests/fixtures/local_demo_exact.yaml"
 JOB = "local-demo.fake"  # local fake-models runs get their own job id (jobs.store.fake_job_id)
 
 

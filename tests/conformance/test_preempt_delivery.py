@@ -38,7 +38,7 @@ from flora_deploy.modal_app import factory as F
 from flora_deploy.modal_app import workers_app as W
 
 ROOT = Path(__file__).resolve().parents[2]
-TEMPLATE = ROOT / "src/flora_deploy/config/templates/local_demo.yaml"
+TEMPLATE = ROOT / "tests/fixtures/local_demo_exact.yaml"
 
 # (config flavour, preempted kind): every shard worker kind
 CASES = [("exact", "segcap"), ("balanced", "segment"), ("balanced", "caption"),

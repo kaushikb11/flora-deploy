@@ -110,8 +110,10 @@ def _rest(r: dict, job: str) -> None:
     for prob in [*e.get("problems", []), *e["notes"]][:10]:
         _p(f"  [yellow]{escape(prob)}[/yellow]")
     c = r["certification"]
-    fake = c["stages"] and all(set(s["uncertified_reasons"]) == {"fake_models"}
-                               for s in c["stages"].values())
+    from flora_deploy.jobs.store import is_fake_job_id
+
+    fake = c["stages"] and (is_fake_job_id(str(r.get("job_id", ""))) or all(
+        set(s["uncertified_reasons"]) == {"fake_models"} for s in c["stages"].values()))
     if fake:
         _p("certification: none (fake models)")
     else:

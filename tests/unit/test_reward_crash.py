@@ -6,11 +6,10 @@ from __future__ import annotations
 
 import shutil
 
-import flora_deploy
 from flora_deploy.workers_impl.reward import ShardInfraError, end_failed_shard
 
-TEMPLATE = __import__("pathlib").Path(flora_deploy.__file__).parent / \
-    "config/templates/local_demo.yaml"
+TEMPLATE = __import__("pathlib").Path(__file__).resolve().parents[2] / \
+    "tests/fixtures/local_demo_exact.yaml"
 CUDA = "CUDA error: an illegal memory access was encountered"
 
 

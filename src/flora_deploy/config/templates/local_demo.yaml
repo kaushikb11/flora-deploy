@@ -8,8 +8,8 @@
 # outputs only demonstrate the pipeline (index -> plan -> run -> compose -> results); they are
 # marked `certificate: local-fake-models` and never share a config hash with real outputs.
 # Fake-models jobs run under `<project>.fake`, so they never share job state with real jobs.
-# The demo uses the `exact` stage layout (segment + caption in one `segcap` worker); `flora
-# init` writes the `balanced` config real jobs start from. Common keys are documented in
+# The demo uses the default `balanced` preset, like the config `flora init` writes for real
+# jobs. Common keys are documented in
 # `flora init --template balanced_lerobot real.yaml`; the full list is in the repository's
 # src/flora_deploy/config/schema.py. Unknown keys are an error.
 
@@ -25,7 +25,9 @@ modal:
   region: null
   tags: {}
 
-preset: exact
+preset: balanced
+# balanced segment and caption records say `certified: false` today, so the preset needs this.
+allow_uncertified: true
 
 input:
   format: mp4_dir                   # ./videos/ep000.mp4 + ep000.txt (task text), ...
@@ -42,7 +44,8 @@ pipeline:
                                     # demo has several of each kind
 
 resources:
-  segcap: {max_containers: 2}
+  segment: {max_containers: 1}
+  caption: {max_containers: 1}
   reward.terminal: {max_containers: 1}
   reward.dense: {max_containers: 1}
 

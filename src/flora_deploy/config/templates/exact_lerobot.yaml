@@ -1,6 +1,6 @@
 # flora.yaml: REFERENCE / CERTIFICATION template. Labels a LeRobot dataset with NVIDIA's own
 # pipeline (`exact` preset): the reference `balanced` is certified against. For everyday
-# labelling start from balanced_lerobot.yaml (`flora init`'s default).
+# labeling start from balanced_lerobot.yaml (`flora init`'s default).
 # The common keys are documented below; the full list is in src/flora_deploy/config/schema.py.
 # Unknown keys are an error.
 

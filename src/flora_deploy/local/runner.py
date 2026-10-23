@@ -851,7 +851,7 @@ def summary_lines(res: LocalRunResult, *, results_cmd: str | None = None) -> lis
     s = res.summary
     if s:
         for stage, c in s["stages"].items():
-            lines.append(f"  {stage}: {c['records']}/{c['expected']} episodes labelled"
+            lines.append(f"  {stage}: {c['records']}/{c['expected']} episodes labeled"
                          + _gaps(c) + ("" if not c["certified_share"] else
                                        f", {c['certified_share']:.0%} certified"))
         shards = s["shards"]

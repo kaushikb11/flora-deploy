@@ -45,7 +45,7 @@ from tests.unit.test_segcap_worker import (
     world,
 )
 
-TEMPLATE = Path(__file__).resolve().parents[2] / "src/flora_deploy/config/templates/local_demo.yaml"
+TEMPLATE = Path(__file__).resolve().parents[2] / "tests/fixtures/local_demo_exact.yaml"
 
 
 def nvidia(exc):
