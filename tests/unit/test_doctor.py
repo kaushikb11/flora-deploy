@@ -20,7 +20,7 @@ from flora_deploy.layout import RECEIPT_NAME, snapshot_dirname
 EXAMPLE_FILE = Path(__file__).resolve().parents[2] / "examples" / "lerobot_small" / "flora.yaml"
 ALL_OK_SINK = "s3://my-bucket/flora/lerobot-small"
 # The suite runs on the example with an S3 sink, so the bucket checks are exercised (the example
-# itself ships a Volume sink: test_newcomer2_dx).
+# itself ships a Volume sink: test_readme_walkthrough_cli).
 EXAMPLE = Path(tempfile.mkdtemp(prefix="doctor-example-")) / "flora.yaml"
 EXAMPLE.write_text(EXAMPLE_FILE.read_text().replace("volume://flora-results/lerobot-small",
                                                     ALL_OK_SINK, 1))

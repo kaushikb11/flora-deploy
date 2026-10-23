@@ -1,6 +1,6 @@
 """validate/certify.py + validate/certkey.py: metrics, pass rule, certificate content, matching.
 
-The review 7 repros (H1-H7, M1, M2, M4, M6) are in ``test_certify_review7.py``."""
+The review 7 repros (H1-H7, M1, M2, M4, M6) are in ``test_certify_refusals.py``."""
 
 from __future__ import annotations
 

@@ -565,12 +565,12 @@ def test_status_shows_the_approval_and_only_the_latest_error(monkeypatch, tmp_pa
                                 budget=2.35, rate=LAB_RATE, apps=[]))
     lab["attempts"][-1]["notes"] = ["error: RuntimeError('camera files missing')"]
     lab["notes"] = []
-    d.update(cap_override_by="kaushik", cap_override_at=RETRY_AT - 120)
+    d.update(cap_override_by="maintainer", cap_override_at=RETRY_AT - 120)
     state = tmp_path / "state.json"
     state.write_text(json.dumps(d))
     assert wh.main(["--status", "--offline", "--state", str(state)]) == 0
     out = capsys.readouterr().out
-    assert "approved by kaushik at 2026-10-22 06:20 UTC" in out
+    assert "approved by maintainer at 2026-10-22 06:20 UTC" in out
     row = next(ln for ln in out.splitlines() if ln.strip().startswith("d2."))
     assert "camera files missing" in row and "BlockingIOError" not in row
     assert "held: lab attempt 1 charged $0.84" in out and "06:15 UTC" in out
