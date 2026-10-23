@@ -26,6 +26,15 @@ Callers that are about to read a whole area (``jobs.store.prefetch_areas``) hand
 :meth:`prefetch`, which reads them :data:`PREFETCH_WORKERS` at a time into the read cache, so
 the loop that follows is served from memory: the same number of reads, in about
 1/:data:`PREFETCH_WORKERS` of the wall time.
+
+**Fewer serial round trips** (perf/cli-volume-latency: ``flora status`` still took 20-32 s,
+``report`` and ``compose`` ~70 s on a 15-shard job). What was left was serial: after its
+``refresh`` a status listed each area it touched (``calls``, ``receipts``, ``replans``, five
+``control`` kinds, ``errors``, ``containers``, ``attempts``) one call after another, about 20
+listings, and compose uploaded its 9 output files as 9 separate ``batch_upload`` commits. Now
+:meth:`snapshot` lists a job's whole directory in one recursive call (every later ``exists`` /
+``list`` below it is answered from that listing), and :meth:`put_many` uploads several files in
+one ``batch_upload`` (one commit).
 """
 
 from __future__ import annotations
@@ -33,7 +42,7 @@ from __future__ import annotations
 import io
 import posixpath
 import threading
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -43,7 +52,7 @@ _FILE = 1  # modal.volume.FileEntryType.FILE
 LIST_DEPTH = 5  # flora/<job>/<hash>/<area>/<kind>
 MAX_CACHED_FILE = 1 << 20
 MAX_CACHED_BYTES = 64 << 20
-PREFETCH_WORKERS = 16  # concurrent read_file calls in prefetch()
+PREFETCH_WORKERS = 32  # concurrent read_file calls in prefetch()
 
 
 def _not_found(e: BaseException) -> bool:
@@ -62,6 +71,10 @@ class ClientVolumeStore:
         self._reads: dict[str, bytes] = {}
         self._read_bytes = 0
         self.calls = {"listdir": 0, "read_file": 0, "batch_upload": 0}
+
+    def _count(self, call: str) -> None:
+        with self._lock:
+            self.calls[call] += 1
 
     @classmethod
     def from_uri(cls, uri: str, *, environment: str | None = None,
@@ -99,10 +112,20 @@ class ClientVolumeStore:
 
     # Store ---------------------------------------------------------------------------------
     def put_bytes(self, path: str, data: bytes) -> None:
-        dest = self._abs(path)
-        self.calls["batch_upload"] += 1
+        self.put_many({path: data})
+
+    def put_many(self, files: Mapping[str, bytes]) -> None:
+        """Write every file of ``files`` (store-relative path -> bytes) in one ``batch_upload``
+        (one round trip and one commit instead of one per file). Each file is still a whole-file
+        write; callers that need an order between files (compose's pointer last) make separate
+        calls."""
+        dests = [(self._abs(p), bytes(d)) for p, d in files.items()]
+        if not dests:
+            return
+        self._count("batch_upload")
         with self.volume.batch_upload(force=True) as batch:
-            batch.put_file(io.BytesIO(data), dest)
+            for dest, data in dests:
+                batch.put_file(io.BytesIO(data), dest)
         self.refresh()
 
     def get_bytes(self, path: str) -> bytes:
@@ -111,7 +134,7 @@ class ClientVolumeStore:
             hit = self._reads.get(path)
         if hit is not None:
             return hit
-        self.calls["read_file"] += 1
+        self._count("read_file")
         try:
             data = b"".join(self.volume.read_file(self._abs(path)))
         except Exception as e:
@@ -173,7 +196,7 @@ class ClientVolumeStore:
                         files = fs
                         break
         if files is None:
-            self.calls["listdir"] += 1
+            self._count("listdir")
             try:
                 entries = self.volume.listdir(self._abs_dir(top), recursive=True)
             except Exception as e:
@@ -187,6 +210,16 @@ class ClientVolumeStore:
             with self._lock:
                 self._dirs[top] = files
         return files
+
+    def snapshot(self, d: str) -> int:
+        """List directory ``d`` (store-relative; e.g. a job root ``flora/<job>``) in one recursive
+        call, unless a cached listing already covers it, so every ``exists`` / ``list`` below it
+        is answered from memory until the next :meth:`refresh` or write. Returns the number of
+        files under ``d``."""
+        d = d.strip("/")
+        if d:
+            check_list_prefix(d + "/")
+        return len(self._files_under(d))
 
     def exists(self, path: str) -> bool:
         check_rel_path(path)

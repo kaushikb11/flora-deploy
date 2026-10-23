@@ -46,6 +46,26 @@ def prefetch_areas(store: Store, root: str, hashes: Iterable[str], areas: Iterab
     return prefetch(store, paths)
 
 
+def snapshot(store: Store, prefix: str) -> int:
+    """Let ``store`` list everything under directory ``prefix`` in one call, when it can (a
+    ``ClientVolumeStore``: every later ``exists`` / ``list`` below it is then answered from that
+    listing instead of one listing round trip per area); a no-op (0) for every other store."""
+    fn = getattr(store, "snapshot", None)
+    return int(fn(prefix)) if callable(fn) else 0
+
+
+def put_many(store: Store, files: Mapping[str, bytes]) -> None:
+    """Write several whole files: one upload and one commit when the store batches
+    (``put_many``: a Volume through the client or a mounted Volume), else one ``put_bytes``
+    each, in order. Use separate calls where the order between files matters."""
+    fn = getattr(store, "put_many", None)
+    if callable(fn):
+        fn(dict(files))
+        return
+    for path, data in files.items():
+        store.put_bytes(path, data)
+
+
 def _fan(key: str) -> str:
     h = hashlib.sha256(key.encode()).hexdigest()
     return f"{h[:2]}/{h[2:4]}"
