@@ -42,8 +42,7 @@ Store and media Volumes are not mounted and nothing is written anywhere. Checks:
    (stamp, determinism, cache, receipts, image fingerprint) accepts it;
 5. **accounting**: each function returns its seconds and a list-price cost estimate.
 
-``scripts/image_smoke.py`` runs all five in one ephemeral app (``app.run()``), prints the table
-and stops the app; ``--dry-run`` contacts nothing. Never deployed; never requests a GPU.
+Run all five in one ephemeral app (``app.run()``). Never deployed; never requests a GPU.
 """
 
 from __future__ import annotations
@@ -81,7 +80,7 @@ USD_PER_S = CPU * USD_PER_CORE_S + MEMORY_MIB / 1024 * USD_PER_GIB_S
 # Derived-weight receipts (``weights.derived``) the planned env carries. captioner_bf16: the
 # receipt file of the pinned build (docs/captioner-bf16.md). tempseg_merged: the merger-v1 receipt
 # file now on flora-weights (no content digest is pinned for it yet, so it must be refused).
-# ``FLORA_SMOKE_RECEIPTS`` (JSON) overrides them; scripts/image_smoke.py sets it from --receipt.
+# ``FLORA_SMOKE_RECEIPTS`` (JSON) overrides them.
 RECEIPTS_ENV = "FLORA_SMOKE_RECEIPTS"
 RECEIPTS = {
     "captioner_bf16": "0e91e467c7ffdb636573e779672d11b203571f7869ca94317f1005eb700d9c65",
@@ -165,7 +164,7 @@ EXPECTED: dict[str, dict[str, Any]] = {}
 if modal.is_local():
     try:
         EXPECTED = expected()
-    except Exception as e:  # noqa: BLE001 - reported by scripts/image_smoke.py
+    except Exception as e:  # noqa: BLE001 - reported by the caller
         PLAN_ERROR = f"{type(e).__name__}: {e}"
 
 

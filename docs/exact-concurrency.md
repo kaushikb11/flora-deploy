@@ -21,7 +21,7 @@ This page holds numbers only. Results stay on `flora-golden:/reference_runs/<run
 - **`ReferenceWorker.annotate_batch(episodes, concurrency, measure, torch_threads, tag)`**
   installs the lock once at `@modal.enter`. It persists results after each batch, from the
   calling thread.
-- **`scripts/reference_smoke.py`** has new flags:
+- **`scripts/reference_smoke.py`** (since removed) had new flags:
   `--concurrency N --sequential --measure [--cpu C] [--torch-threads T] [--repeat K] [--compare-to S]`.
   It runs the same episodes sequentially and then concurrently in one container, and compares
   NVIDIA's full result dicts. The comparison leaves out only `elapsed_s` and our

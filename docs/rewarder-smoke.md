@@ -4,9 +4,12 @@
 episode list. NVIDIA's Rewarder `core` does frame sampling, collage, prompts, regexes, parsers,
 `score_probabilities` and dense stitching. The reference is NVIDIA's own
 `terminal_reward.main` / `dense_reward.main`, run with argv on the same jobs JSONL in the same
-container and on the same engine. Rubric rewards are **deferred** (PLAN.md P2: TP=2,
+container and on the same engine. Rubric rewards are **deferred** (TP=2,
 `max_model_len` 98304, one video per camera); `check_mode("rubric")` raises
 `NotImplementedError`.
+
+The driver script used for these runs (`scripts/rewarder_smoke.py`) has since been removed; the commands
+below are kept as a record.
 
 ```bash
 uv run modal run scripts/rewarder_smoke.py                            # stage samples + all modes

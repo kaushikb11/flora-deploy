@@ -31,7 +31,7 @@ Status: first run 2026-10-21, run id `wsd-20261021T052758Z`. Numbers only. The f
   - `stage_samples` (CPU) stages the samples and checks them with NVIDIA's `probe` and
     `check_synchronized`. `offline_check` (CPU, network blocked) dry-runs the offline
     resolution.
-- `scripts/reference_smoke.py`: `uv run python scripts/reference_smoke.py [--summary PATH]`.
+- `scripts/reference_smoke.py` (since removed): `uv run python scripts/reference_smoke.py [--summary PATH]`.
 
 ## How offline weight loading works
 

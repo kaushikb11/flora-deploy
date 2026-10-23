@@ -176,6 +176,9 @@ That gives ≈$36/video-h at the default $5.68/h. W3-A's $23 belongs to the cu13
 - the persisted results above were downloaded from `flora-golden`;
 - they were re-scored with this branch's `accel.identity` / `identity_summary`.
 
+The driver script used for these runs (`scripts/reference_smoke.py`) has since been removed; the commands
+below are kept as a record.
+
 ```bash
 uv run python scripts/reference_smoke.py --validate --memory-gib 160 --deadline-min 19 \
     --timeout-min 22 [--golden ID ...] [--nvidia ID ...] [--determinism deterministic] \
@@ -264,6 +267,9 @@ Since generation is the bound, OPT-1's CPU savings mostly show up as lock queuei
 Total ≈ **$2.0 of the $3 cap**.
 
 ## Re-running
+
+The driver script used for these runs (`scripts/reference_smoke.py`) has since been removed; the commands
+below are kept as a record.
 
 ```bash
 uv run python scripts/reference_smoke.py --offline-check
